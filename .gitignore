@@ -1,0 +1,15 @@
+.idea
+.vscode
+.env
+.env.local
+
+# build artifacts
+/main
+/http
+/worker
+/migrate
+*.exe
+
+# test / coverage
+*.out
+coverage.*
