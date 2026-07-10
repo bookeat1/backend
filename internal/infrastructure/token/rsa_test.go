@@ -4,11 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"backend-core/internal/infrastructure/token/tokentest"
+
 	"github.com/google/uuid"
 )
 
 func TestIssueAndParseRoundTrip(t *testing.T) {
-	iss, err := NewRSAIssuer(GenerateTestKeyPEM(t), "kid-1", 15*time.Minute)
+	iss, err := NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid-1", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("NewRSAIssuer: %v", err)
 	}
@@ -30,14 +32,14 @@ func TestIssueAndParseRoundTrip(t *testing.T) {
 }
 
 func TestParseRejectsGarbage(t *testing.T) {
-	iss, _ := NewRSAIssuer(GenerateTestKeyPEM(t), "kid-1", time.Minute)
+	iss, _ := NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid-1", time.Minute)
 	if _, _, err := iss.ParseAccess("not.a.jwt"); err == nil {
 		t.Error("expected error for invalid token")
 	}
 }
 
 func TestJWKSExposesKey(t *testing.T) {
-	iss, _ := NewRSAIssuer(GenerateTestKeyPEM(t), "kid-1", time.Minute)
+	iss, _ := NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid-1", time.Minute)
 	jwks := iss.JWKS()
 	keys, ok := jwks["keys"].([]map[string]any)
 	if !ok || len(keys) != 1 {
