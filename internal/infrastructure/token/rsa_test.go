@@ -1,29 +1,11 @@
 package token
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
-
-// GenerateTestKeyPEM returns a fresh RSA private key in PKCS#8 PEM for tests.
-func GenerateTestKeyPEM(t *testing.T) string {
-	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("gen key: %v", err)
-	}
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatalf("marshal key: %v", err)
-	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
-}
 
 func TestIssueAndParseRoundTrip(t *testing.T) {
 	iss, err := NewRSAIssuer(GenerateTestKeyPEM(t), "kid-1", 15*time.Minute)

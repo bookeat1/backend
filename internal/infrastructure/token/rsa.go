@@ -3,6 +3,7 @@
 package token
 
 import (
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -10,11 +11,27 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
+
+// GenerateTestKeyPEM returns a fresh RSA private key in PKCS#8 PEM for tests.
+// Exported (and kept in a non-test file) so other packages' tests can reuse it.
+func GenerateTestKeyPEM(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+}
 
 // RSAIssuer signs access tokens with an RSA private key.
 type RSAIssuer struct {
