@@ -33,6 +33,12 @@ func (m *Manager) WithinTx(ctx context.Context, fn func(ctx context.Context) err
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
 	if err := fn(context.WithValue(ctx, ctxKey{}, tx)); err != nil {
 		_ = tx.Rollback()
 		return err
