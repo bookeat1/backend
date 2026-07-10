@@ -1980,11 +1980,12 @@ import (
 	"time"
 
 	"backend-core/internal/infrastructure/token"
+	"backend-core/internal/infrastructure/token/tokentest"
 )
 
 func newTestService(t *testing.T) (*Service, *stubSender) {
 	t.Helper()
-	iss, err := token.NewRSAIssuer(token.GenerateTestKeyPEM(t), "kid", 15*time.Minute)
+	iss, err := token.NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("issuer: %v", err)
 	}
@@ -3398,7 +3399,7 @@ git commit -m "feat(etl): one-time idempotent Supabase dump -> users migration"
 - Modify: root `../CLAUDE.md` (workspace file) — add the backend commands note; and `backend-core/CLAUDE.md` — add new commands.
 
 **Interfaces:**
-- Consumes: `bootstrap.NewApp`, `bootstrap.NewDeps`, `token.GenerateTestKeyPEM`, `testdb`.
+- Consumes: `bootstrap.NewApp`, `bootstrap.NewDeps`, `tokentest.GenerateKeyPEM`, `testdb`.
 
 - [ ] **Step 1: Write the end-to-end HTTP test**
 
@@ -3415,7 +3416,7 @@ import (
 	"time"
 
 	"backend-core/internal/infrastructure/postgres/testdb"
-	"backend-core/internal/infrastructure/token"
+	"backend-core/internal/infrastructure/token/tokentest"
 	"backend-core/internal/logger"
 )
 
@@ -3429,7 +3430,7 @@ func buildTestApp(t *testing.T) http.Handler {
 	cfg := Config{}
 	cfg.App.Environment = "test"
 	cfg.Auth = AuthConfig{
-		JWTPrivateKeyPEM: token.GenerateTestKeyPEM(t),
+		JWTPrivateKeyPEM: tokentest.GenerateKeyPEM(t),
 		JWTKeyID:         "test",
 		AccessTokenTTL:   15 * time.Minute,
 		RefreshTokenTTL:  time.Hour,
