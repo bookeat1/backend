@@ -14,8 +14,9 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App AppConfig
-	DB  DBConfig
+	App  AppConfig
+	DB   DBConfig
+	Auth AuthConfig
 }
 
 type AppConfig struct {
@@ -40,6 +41,17 @@ type PostgresConfig struct {
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
 	ConnMaxIdleTime time.Duration
+}
+
+type AuthConfig struct {
+	JWTPrivateKeyPEM    string        // RSA private key (PEM). env: AUTH_JWT_PRIVATE_KEY
+	JWTKeyID            string        // kid advertised in JWKS. env: AUTH_JWT_KID
+	AccessTokenTTL      time.Duration // env: AUTH_ACCESS_TOKEN_TTL
+	RefreshTokenTTL     time.Duration // env: AUTH_REFRESH_TOKEN_TTL
+	OTPCodeTTL          time.Duration // env: AUTH_OTP_TTL
+	OTPRateLimitPerMin  int           // env: AUTH_OTP_RATE_PER_MIN
+	OTPRateLimitPerHour int           // env: AUTH_OTP_RATE_PER_HOUR
+	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
 }
 
 func (p PostgresConfig) DSN() string {
@@ -79,6 +91,16 @@ func NewConfig() (Config, error) {
 				ConnMaxIdleTime: getEnvDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
 			},
 		},
+		Auth: AuthConfig{
+			JWTPrivateKeyPEM:    getEnv("AUTH_JWT_PRIVATE_KEY", ""),
+			JWTKeyID:            getEnv("AUTH_JWT_KID", "bookeat-dev"),
+			AccessTokenTTL:      getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+			RefreshTokenTTL:     getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 720*time.Hour),
+			OTPCodeTTL:          getEnvDuration("AUTH_OTP_TTL", 5*time.Minute),
+			OTPRateLimitPerMin:  getEnvInt("AUTH_OTP_RATE_PER_MIN", 1),
+			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
+			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
+		},
 	}
 
 	return cfg, nil
@@ -110,6 +132,17 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok {
 		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+// getEnvBool returns the boolean value of the environment variable named by
+// key, or def when unset or unparseable. Accepts 1/t/true/0/f/false.
+func getEnvBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			return b
 		}
 	}
 	return def
