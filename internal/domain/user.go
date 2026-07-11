@@ -24,6 +24,7 @@ type User struct {
 	Phone             *string
 	FullName          string
 	Role              Role
+	IsActive          bool
 	AvatarURL         *string
 	PreferredLanguage string
 	City              *string

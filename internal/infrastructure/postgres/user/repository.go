@@ -18,20 +18,20 @@ type Repository struct{ pool sqltx.DBTX }
 
 func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
 
-const columns = `id, email, phone, full_name, role, avatar_url,
+const columns = `id, email, phone, full_name, role, is_active, avatar_url,
 	preferred_language, city, email_verified_at, phone_verified_at,
 	created_at, updated_at`
 
 func (r *Repository) Create(ctx context.Context, u *domain.User) error {
 	q := `INSERT INTO users (` + columns + `)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
 	now := time.Now()
 	if u.CreatedAt.IsZero() {
 		u.CreatedAt = now
 	}
 	u.UpdatedAt = now
 	_, err := sqltx.From(ctx, r.pool).ExecContext(ctx, q,
-		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.AvatarURL,
+		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
 		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt,
 		u.CreatedAt, u.UpdatedAt)
 	if err != nil {
@@ -68,10 +68,10 @@ func (r *Repository) getBy(ctx context.Context, where string, arg any) (*domain.
 func (r *Repository) Update(ctx context.Context, u *domain.User) error {
 	u.UpdatedAt = time.Now()
 	q := `UPDATE users SET email=$2, phone=$3, full_name=$4, role=$5,
-		avatar_url=$6, preferred_language=$7, city=$8, email_verified_at=$9,
-		phone_verified_at=$10, updated_at=$11 WHERE id=$1`
+		is_active=$6, avatar_url=$7, preferred_language=$8, city=$9,
+		email_verified_at=$10, phone_verified_at=$11, updated_at=$12 WHERE id=$1`
 	res, err := sqltx.From(ctx, r.pool).ExecContext(ctx, q,
-		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.AvatarURL,
+		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
 		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt, u.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("update user: %w", err)
@@ -90,7 +90,7 @@ func scan(row scanner) (*domain.User, error) {
 	var u domain.User
 	var role string
 	if err := row.Scan(&u.ID, &u.Email, &u.Phone, &u.FullName, &role,
-		&u.AvatarURL, &u.PreferredLanguage, &u.City, &u.EmailVerifiedAt,
+		&u.IsActive, &u.AvatarURL, &u.PreferredLanguage, &u.City, &u.EmailVerifiedAt,
 		&u.PhoneVerifiedAt, &u.CreatedAt, &u.UpdatedAt); err != nil {
 		return nil, err
 	}

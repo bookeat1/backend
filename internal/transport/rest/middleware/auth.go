@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/transport/rest/response"
 	"backend-core/internal/usecase/auth"
 )
@@ -18,9 +19,10 @@ type AuthUser struct {
 	Role string
 }
 
-// Auth verifies the Bearer access token and stores an AuthUser on the context.
-// Rejects missing/invalid tokens with 401.
-func Auth(issuer auth.TokenIssuer) gin.HandlerFunc {
+// Auth verifies the Bearer access token, loads the user from the DB, and
+// stores an AuthUser on the context. Rejects missing/invalid tokens and
+// deleted/inactive users with 401.
+func Auth(issuer auth.TokenIssuer, users domain.UserRepository) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.GetHeader("Authorization")
 		if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
@@ -28,13 +30,24 @@ func Auth(issuer auth.TokenIssuer) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		id, role, err := issuer.ParseAccess(strings.TrimSpace(h[7:]))
+		id, _, err := issuer.ParseAccess(strings.TrimSpace(h[7:]))
 		if err != nil {
 			response.Error(c.Writer, http.StatusUnauthorized, "invalid token")
 			c.Abort()
 			return
 		}
-		c.Set(ctxKeyString, AuthUser{ID: id, Role: role})
+		u, err := users.GetByID(c.Request.Context(), id)
+		if err != nil { // ErrNotFound (deleted) or any load error → not authorized
+			response.Error(c.Writer, http.StatusUnauthorized, "invalid token")
+			c.Abort()
+			return
+		}
+		if !u.IsActive {
+			response.Error(c.Writer, http.StatusUnauthorized, "account is inactive")
+			c.Abort()
+			return
+		}
+		c.Set(ctxKeyString, AuthUser{ID: u.ID, Role: string(u.Role)})
 		c.Next()
 	}
 }

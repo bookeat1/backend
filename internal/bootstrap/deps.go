@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/otpsender"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
@@ -20,6 +21,7 @@ import (
 type Deps struct {
 	AuthService *auth.Service
 	UsersFacade *users.Facade
+	UsersRepo   domain.UserRepository
 	Issuer      *token.RSAIssuer
 }
 
@@ -56,6 +58,7 @@ func NewDeps(cfg Config, db *sql.DB, log *slog.Logger) (*Deps, error) {
 	return &Deps{
 		AuthService: authSvc,
 		UsersFacade: users.NewFacade(usersRepo),
+		UsersRepo:   usersRepo,
 		Issuer:      issuer,
 	}, nil
 }

@@ -95,7 +95,7 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenP
 		u, err := s.d.Users.GetByPhone(ctx, p)
 		if errors.Is(err, domain.ErrNotFound) {
 			now := time.Now()
-			u = &domain.User{ID: uuid.New(), Phone: &p, Role: domain.RoleUser, PreferredLanguage: "ru", PhoneVerifiedAt: &now}
+			u = &domain.User{ID: uuid.New(), Phone: &p, Role: domain.RoleUser, IsActive: true, PreferredLanguage: "ru", PhoneVerifiedAt: &now}
 			if err := s.d.Users.Create(ctx, u); err != nil {
 				return err
 			}

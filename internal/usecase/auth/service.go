@@ -75,7 +75,7 @@ func (s *Service) Signup(ctx context.Context, email, pw, fullName string) (*Toke
 		if err != nil {
 			return err
 		}
-		u := &domain.User{ID: uuid.New(), Email: &email, FullName: fullName, Role: domain.RoleUser, PreferredLanguage: "ru"}
+		u := &domain.User{ID: uuid.New(), Email: &email, FullName: fullName, Role: domain.RoleUser, IsActive: true, PreferredLanguage: "ru"}
 		if err := s.d.Users.Create(ctx, u); err != nil {
 			return err
 		}

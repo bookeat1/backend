@@ -26,7 +26,7 @@ func NewApp(cfg Config, deps *Deps, log *slog.Logger) *gin.Engine {
 	authrest.NewHandler(deps.AuthService).RegisterRoutes(api)
 
 	authed := api.Group("")
-	authed.Use(middleware.Auth(deps.Issuer))
+	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 
 	return r
