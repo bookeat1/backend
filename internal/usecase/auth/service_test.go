@@ -2,9 +2,11 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/token/tokentest"
 )
@@ -40,18 +42,18 @@ func TestSignupThenLogin(t *testing.T) {
 		t.Fatal("expected non-empty token pair")
 	}
 
-	if _, err := svc.Signup(ctx, "a@b.com", "pw", "Dup"); err == nil {
-		t.Error("expected ErrAlreadyExists on duplicate email")
+	if _, err := svc.Signup(ctx, "a@b.com", "pw", "Dup"); !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Errorf("expected ErrAlreadyExists on duplicate email, got %v", err)
 	}
 
 	if _, err := svc.Login(ctx, "a@b.com", "pw12345"); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if _, err := svc.Login(ctx, "a@b.com", "wrong"); err == nil {
-		t.Error("expected error on wrong password")
+	if _, err := svc.Login(ctx, "a@b.com", "wrong"); !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized on wrong password, got %v", err)
 	}
-	if _, err := svc.Login(ctx, "nobody@b.com", "pw"); err == nil {
-		t.Error("expected error on unknown email")
+	if _, err := svc.Login(ctx, "nobody@b.com", "pw"); !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized on unknown email, got %v", err)
 	}
 }
 
@@ -72,14 +74,14 @@ func TestRefreshRotatesAndRevokes(t *testing.T) {
 		t.Error("refresh token should rotate")
 	}
 	// Old token must now be rejected (revoked).
-	if _, err := svc.Refresh(ctx, pair.RefreshToken); err == nil {
-		t.Error("old refresh token must be rejected after rotation")
+	if _, err := svc.Refresh(ctx, pair.RefreshToken); !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("old refresh token must be rejected after rotation with ErrUnauthorized, got %v", err)
 	}
 	// Logout revokes the current one.
 	if err := svc.Logout(ctx, rotated.RefreshToken); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
-	if _, err := svc.Refresh(ctx, rotated.RefreshToken); err == nil {
-		t.Error("refresh after logout must fail")
+	if _, err := svc.Refresh(ctx, rotated.RefreshToken); !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("refresh after logout must fail with ErrUnauthorized, got %v", err)
 	}
 }

@@ -15,6 +15,11 @@ import (
 	"backend-core/internal/domain"
 )
 
+// dummyPasswordHash is a valid bcrypt hash used only to equalize Login timing on
+// the user-not-found / no-credential branches, so response latency does not
+// reveal whether an email exists (defeats a timing-based enumeration oracle).
+const dummyPasswordHash = "$2a$10$agfc3jmOzd2VFYd88HzJwe7fzRu49fXBTFt3GKrOoV780qxbiYEKC"
+
 // hashOpaque returns the sha256 hex of an opaque token (refresh tokens are
 // stored hashed, never in the clear).
 func hashOpaque(tok string) string {
@@ -91,6 +96,7 @@ func (s *Service) Signup(ctx context.Context, email, pw, fullName string) (*Toke
 func (s *Service) Login(ctx context.Context, email, pw string) (*TokenPair, error) {
 	u, err := s.d.Users.GetByEmail(ctx, email)
 	if errors.Is(err, domain.ErrNotFound) {
+		password.Verify(dummyPasswordHash, pw)
 		return nil, domain.ErrUnauthorized
 	}
 	if err != nil {
@@ -98,6 +104,7 @@ func (s *Service) Login(ctx context.Context, email, pw string) (*TokenPair, erro
 	}
 	cred, err := s.d.Credentials.GetByUserID(ctx, u.ID)
 	if errors.Is(err, domain.ErrNotFound) {
+		password.Verify(dummyPasswordHash, pw)
 		return nil, domain.ErrUnauthorized
 	}
 	if err != nil {
