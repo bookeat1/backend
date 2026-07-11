@@ -12,8 +12,6 @@ import (
 	"backend-core/internal/usecase/auth"
 )
 
-type ctxKey struct{}
-
 // AuthUser is the authenticated principal stored on the request context.
 type AuthUser struct {
 	ID   uuid.UUID
