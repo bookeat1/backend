@@ -23,8 +23,6 @@ make test           # go test ./...       — full suite
 make test-short     # go test -short ./... — unit only
 go test ./internal/usecase/<pkg>/ -run TestName   # single test
 
-make mocks          # regenerate mockgen mocks (run after changing any mocked interface)
-
 go run ./cmd/etl/main.go        # one-time Supabase dump → users ETL (see cmd/etl/README.md)
 TEST_DATABASE_URL=... go test ./...   # integration tests (need a migrated Postgres)
 
@@ -74,6 +72,6 @@ Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) 
 - **Migrations:** SQL in `migrations/`, goose format (`-- +goose Up` / `-- +goose Down`), embedded via `migrations/embed.go`. `VARCHAR` for enumerated fields, validated in app code — no DB enums.
 - **Naming:** package names are short, lower-case, no underscores. Interfaces are declared where they are **consumed** (the usecase/transport layer), not where implemented.
 - **Formatting:** run `gofmt -w .` and `go vet ./...` before finishing any change.
-- **Mocks:** after changing any interface listed in the `mocks` target of the Makefile, run `make mocks`. Generated mocks live under `internal/mocks/`.
+- **Test doubles:** use **hand-written fakes**, not a mock-generation framework — this keeps the dependency set minimal. Put fakes in the consuming package's `*_test.go` (e.g. `usecase/auth/fakes_test.go`), implementing the small port/repository interfaces directly. Integration tests that need Postgres use `infrastructure/postgres/testdb` and are gated behind `TEST_DATABASE_URL` (skipped by `-short`).
 - **Tests:** table-driven where it fits; unit tests must pass under `go test -short ./...` without external services. Integration tests that need Postgres are gated behind the non-short suite.
 - **No private deps:** this repo builds only against public modules + stdlib. If you reach for a private/internal library, stop and find a public equivalent.

@@ -1,4 +1,4 @@
-.PHONY: run build tidy migrate-up migrate-down test test-short mocks fmt vet check etl test-integration
+.PHONY: run build tidy migrate-up migrate-down test test-short fmt vet check etl test-integration
 
 run:
 	go run ./cmd/http/main.go
@@ -22,10 +22,6 @@ test:
 # Unit-only — skips anything needing external services.
 test-short:
 	go test -short ./...
-
-# Regenerate mockgen mocks. Add one line per mocked interface as the domain grows.
-mocks:
-	@echo "no mocks defined yet — add mockgen lines here as interfaces appear"
 
 fmt:
 	gofmt -w .
