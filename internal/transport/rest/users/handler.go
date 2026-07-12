@@ -12,9 +12,9 @@ import (
 	uc "backend-core/internal/usecase/users"
 )
 
-type Handler struct{ facade *uc.Facade }
+type Handler struct{ facade uc.Facade }
 
-func NewHandler(f *uc.Facade) *Handler { return &Handler{facade: f} }
+func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	g := rg.Group("/users")

@@ -18,6 +18,8 @@ type Repository struct{ pool sqltx.DBTX }
 
 func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
 
+var _ domain.UserCredentialRepository = (*Repository)(nil)
+
 func (r *Repository) Upsert(ctx context.Context, c *domain.UserCredential) error {
 	q := `INSERT INTO user_credentials (user_id, password_hash)
 		VALUES ($1,$2)

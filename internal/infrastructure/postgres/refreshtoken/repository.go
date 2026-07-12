@@ -19,6 +19,8 @@ type Repository struct{ pool sqltx.DBTX }
 
 func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
 
+var _ domain.RefreshTokenRepository = (*Repository)(nil)
+
 func (r *Repository) Create(ctx context.Context, t *domain.RefreshToken) error {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()

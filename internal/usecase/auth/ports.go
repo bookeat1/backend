@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"backend-core/internal/domain"
 )
 
 // TokenIssuer issues and verifies access tokens. Implemented by
@@ -39,20 +37,3 @@ type Config struct {
 	OTPPerHour   int
 	OTPDevExpose bool
 }
-
-// Deps bundles everything the Service needs. Wired in bootstrap.NewDeps.
-type Deps struct {
-	Users       domain.UserRepository
-	Credentials domain.UserCredentialRepository
-	Refresh     domain.RefreshTokenRepository
-	OTP         domain.OTPRepository
-	Tx          domain.TxManager
-	Tokens      TokenIssuer
-	OTPSender   OTPSender
-	Config      Config
-}
-
-// Service implements the auth usecases.
-type Service struct{ d Deps }
-
-func NewService(d Deps) *Service { return &Service{d: d} }

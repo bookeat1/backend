@@ -15,6 +15,37 @@ import (
 	"backend-core/internal/domain"
 )
 
+// Facade is the core credential/session authentication usecase: email+password
+// signup and login, JWT issuance, and refresh-token rotation. Phone-OTP login is
+// a separate concern, exposed by OTPUseCase (otp.go).
+type Facade interface {
+	Signup(ctx context.Context, email, pw, fullName string) (*TokenPair, error)
+	Login(ctx context.Context, email, pw string) (*TokenPair, error)
+	Refresh(ctx context.Context, refresh string) (*TokenPair, error)
+	Logout(ctx context.Context, refresh string) error
+}
+
+type facade struct {
+	users   domain.UserRepository
+	creds   domain.UserCredentialRepository
+	refresh domain.RefreshTokenRepository
+	tx      domain.TxManager
+	tokens  TokenIssuer
+	cfg     Config
+}
+
+// NewFacade constructs the core auth Facade.
+func NewFacade(
+	users domain.UserRepository,
+	creds domain.UserCredentialRepository,
+	refresh domain.RefreshTokenRepository,
+	tx domain.TxManager,
+	tokens TokenIssuer,
+	cfg Config,
+) Facade {
+	return &facade{users: users, creds: creds, refresh: refresh, tx: tx, tokens: tokens, cfg: cfg}
+}
+
 // dummyPasswordHash is a valid bcrypt hash used only to equalize Login timing on
 // the user-not-found / no-credential branches, so response latency does not
 // reveal whether an email exists (defeats a timing-based enumeration oracle).
@@ -36,37 +67,45 @@ func randomToken() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// issuePair issues an access JWT and a fresh rotating refresh token for user.
-func (s *Service) issuePair(ctx context.Context, u *domain.User) (*TokenPair, error) {
-	access, exp, err := s.d.Tokens.IssueAccess(u.ID, string(u.Role))
+// issuePair issues an access JWT and a fresh rotating refresh token for u. It is
+// shared by the Facade and the OTPUseCase, so it is a free function over the
+// minimal set of dependencies it needs rather than a method.
+func issuePair(
+	ctx context.Context,
+	tokens TokenIssuer,
+	refresh domain.RefreshTokenRepository,
+	refreshTTL time.Duration,
+	u *domain.User,
+) (*TokenPair, error) {
+	access, exp, err := tokens.IssueAccess(u.ID, string(u.Role))
 	if err != nil {
 		return nil, fmt.Errorf("issue access: %w", err)
 	}
-	refresh, err := randomToken()
+	tok, err := randomToken()
 	if err != nil {
 		return nil, err
 	}
 	rt := &domain.RefreshToken{
 		ID:        uuid.New(),
 		UserID:    u.ID,
-		TokenHash: hashOpaque(refresh),
-		ExpiresAt: time.Now().Add(s.d.Config.RefreshTTL),
+		TokenHash: hashOpaque(tok),
+		ExpiresAt: time.Now().Add(refreshTTL),
 	}
-	if err := s.d.Refresh.Create(ctx, rt); err != nil {
+	if err := refresh.Create(ctx, rt); err != nil {
 		return nil, fmt.Errorf("store refresh: %w", err)
 	}
-	return &TokenPair{AccessToken: access, RefreshToken: refresh, ExpiresAt: exp}, nil
+	return &TokenPair{AccessToken: access, RefreshToken: tok, ExpiresAt: exp}, nil
 }
 
 // Signup creates a password user and returns a token pair. ErrAlreadyExists if
 // the email is taken.
-func (s *Service) Signup(ctx context.Context, email, pw, fullName string) (*TokenPair, error) {
+func (f *facade) Signup(ctx context.Context, email, pw, fullName string) (*TokenPair, error) {
 	if email == "" || pw == "" {
 		return nil, fmt.Errorf("%w: email and password required", domain.ErrValidation)
 	}
 	var pair *TokenPair
-	err := s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		if _, err := s.d.Users.GetByEmail(ctx, email); err == nil {
+	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if _, err := f.users.GetByEmail(ctx, email); err == nil {
 			return fmt.Errorf("%w: email", domain.ErrAlreadyExists)
 		} else if !errors.Is(err, domain.ErrNotFound) {
 			return err
@@ -76,13 +115,13 @@ func (s *Service) Signup(ctx context.Context, email, pw, fullName string) (*Toke
 			return err
 		}
 		u := &domain.User{ID: uuid.New(), Email: &email, FullName: fullName, Role: domain.RoleUser, IsActive: true, PreferredLanguage: "ru"}
-		if err := s.d.Users.Create(ctx, u); err != nil {
+		if err := f.users.Create(ctx, u); err != nil {
 			return err
 		}
-		if err := s.d.Credentials.Upsert(ctx, &domain.UserCredential{UserID: u.ID, PasswordHash: hash}); err != nil {
+		if err := f.creds.Upsert(ctx, &domain.UserCredential{UserID: u.ID, PasswordHash: hash}); err != nil {
 			return err
 		}
-		pair, err = s.issuePair(ctx, u)
+		pair, err = issuePair(ctx, f.tokens, f.refresh, f.cfg.RefreshTTL, u)
 		return err
 	})
 	if err != nil {
@@ -93,8 +132,8 @@ func (s *Service) Signup(ctx context.Context, email, pw, fullName string) (*Toke
 
 // Login verifies an email/password and returns a token pair. Returns
 // ErrUnauthorized on any mismatch (no user-enumeration signal).
-func (s *Service) Login(ctx context.Context, email, pw string) (*TokenPair, error) {
-	u, err := s.d.Users.GetByEmail(ctx, email)
+func (f *facade) Login(ctx context.Context, email, pw string) (*TokenPair, error) {
+	u, err := f.users.GetByEmail(ctx, email)
 	if errors.Is(err, domain.ErrNotFound) {
 		password.Verify(dummyPasswordHash, pw)
 		return nil, domain.ErrUnauthorized
@@ -102,7 +141,7 @@ func (s *Service) Login(ctx context.Context, email, pw string) (*TokenPair, erro
 	if err != nil {
 		return nil, err
 	}
-	cred, err := s.d.Credentials.GetByUserID(ctx, u.ID)
+	cred, err := f.creds.GetByUserID(ctx, u.ID)
 	if errors.Is(err, domain.ErrNotFound) {
 		password.Verify(dummyPasswordHash, pw)
 		return nil, domain.ErrUnauthorized
@@ -113,15 +152,15 @@ func (s *Service) Login(ctx context.Context, email, pw string) (*TokenPair, erro
 	if !password.Verify(cred.PasswordHash, pw) {
 		return nil, domain.ErrUnauthorized
 	}
-	return s.issuePair(ctx, u)
+	return issuePair(ctx, f.tokens, f.refresh, f.cfg.RefreshTTL, u)
 }
 
 // Refresh validates a refresh token, rotates it (revokes the old, issues a new
 // pair). Rejects unknown, expired, revoked, or reused tokens.
-func (s *Service) Refresh(ctx context.Context, refresh string) (*TokenPair, error) {
+func (f *facade) Refresh(ctx context.Context, refresh string) (*TokenPair, error) {
 	var pair *TokenPair
-	err := s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		rt, err := s.d.Refresh.GetByHash(ctx, hashOpaque(refresh))
+	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		rt, err := f.refresh.GetByHash(ctx, hashOpaque(refresh))
 		if errors.Is(err, domain.ErrNotFound) {
 			return domain.ErrUnauthorized
 		}
@@ -131,14 +170,14 @@ func (s *Service) Refresh(ctx context.Context, refresh string) (*TokenPair, erro
 		if rt.RevokedAt != nil || time.Now().After(rt.ExpiresAt) {
 			return domain.ErrUnauthorized
 		}
-		if err := s.d.Refresh.Revoke(ctx, rt.ID); err != nil {
+		if err := f.refresh.Revoke(ctx, rt.ID); err != nil {
 			return err
 		}
-		u, err := s.d.Users.GetByID(ctx, rt.UserID)
+		u, err := f.users.GetByID(ctx, rt.UserID)
 		if err != nil {
 			return err
 		}
-		pair, err = s.issuePair(ctx, u)
+		pair, err = issuePair(ctx, f.tokens, f.refresh, f.cfg.RefreshTTL, u)
 		return err
 	})
 	if err != nil {
@@ -148,13 +187,13 @@ func (s *Service) Refresh(ctx context.Context, refresh string) (*TokenPair, erro
 }
 
 // Logout revokes the given refresh token. Unknown tokens are a no-op success.
-func (s *Service) Logout(ctx context.Context, refresh string) error {
-	rt, err := s.d.Refresh.GetByHash(ctx, hashOpaque(refresh))
+func (f *facade) Logout(ctx context.Context, refresh string) error {
+	rt, err := f.refresh.GetByHash(ctx, hashOpaque(refresh))
 	if errors.Is(err, domain.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	return s.d.Refresh.Revoke(ctx, rt.ID)
+	return f.refresh.Revoke(ctx, rt.ID)
 }

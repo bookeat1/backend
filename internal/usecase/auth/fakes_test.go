@@ -2,11 +2,14 @@ package auth
 
 import (
 	"context"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/token"
+	"backend-core/internal/infrastructure/token/tokentest"
 )
 
 // fakeUsers is an in-memory domain.UserRepository.
@@ -152,4 +155,12 @@ func (s *stubSender) Send(_ context.Context, _, code string) (string, error) {
 	return "test", nil
 }
 
-// realIssuer builds a real RSAIssuer for tests via the token package helper.
+// testIssuer builds a real RSAIssuer for tests via the token package helper.
+func testIssuer(t *testing.T) TokenIssuer {
+	t.Helper()
+	iss, err := token.NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("issuer: %v", err)
+	}
+	return iss
+}

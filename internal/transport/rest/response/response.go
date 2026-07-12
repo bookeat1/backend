@@ -9,6 +9,7 @@ package response
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"backend-core/internal/domain"
@@ -31,22 +32,39 @@ func Error(w http.ResponseWriter, status int, msg string) {
 	write(w, status, Envelope{Error: msg})
 }
 
-// HandleError maps a domain sentinel error to the matching HTTP status.
-// Always `return` immediately after calling this from a handler.
+// HandleError maps a domain sentinel error to the matching HTTP status and a
+// generic, non-revealing message, then logs the underlying error server-side.
+// The original error text (which may carry wrapped internal context, SQL, etc.)
+// is never sent to the client, so it cannot leak. Always `return` immediately
+// after calling this from a handler.
 func HandleError(w http.ResponseWriter, err error) {
+	status, msg := classify(err)
+	if status >= http.StatusInternalServerError {
+		slog.Error("request failed", "status", status, "error", err)
+	} else {
+		slog.Warn("request rejected", "status", status, "error", err)
+	}
+	Error(w, status, msg)
+}
+
+// classify maps a domain sentinel error to an HTTP status and a fixed, generic
+// message safe to return to clients.
+func classify(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
-		Error(w, http.StatusNotFound, err.Error())
+		return http.StatusNotFound, "not found"
 	case errors.Is(err, domain.ErrAlreadyExists):
-		Error(w, http.StatusConflict, err.Error())
+		return http.StatusConflict, "already exists"
 	case errors.Is(err, domain.ErrForbidden):
-		Error(w, http.StatusForbidden, err.Error())
+		return http.StatusForbidden, "forbidden"
 	case errors.Is(err, domain.ErrUnauthorized):
-		Error(w, http.StatusUnauthorized, err.Error())
-	case errors.Is(err, domain.ErrValidation), errors.Is(err, domain.ErrInvalidStatus):
-		Error(w, http.StatusUnprocessableEntity, err.Error())
+		return http.StatusUnauthorized, "unauthorized"
+	case errors.Is(err, domain.ErrValidation):
+		return http.StatusUnprocessableEntity, "validation failed"
+	case errors.Is(err, domain.ErrInvalidStatus):
+		return http.StatusUnprocessableEntity, "invalid status transition"
 	default:
-		Error(w, http.StatusInternalServerError, "internal server error")
+		return http.StatusInternalServerError, "internal server error"
 	}
 }
 

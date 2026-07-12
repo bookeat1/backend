@@ -13,6 +13,9 @@ import (
 
 // NewApp builds the Gin engine with all routes wired.
 func NewApp(cfg Config, deps *Deps, log *slog.Logger) *gin.Engine {
+	// response.HandleError logs failures via slog.Default(); point it at the
+	// configured logger so those logs use the app's handler and level.
+	slog.SetDefault(log)
 	if cfg.App.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -23,7 +26,7 @@ func NewApp(cfg Config, deps *Deps, log *slog.Logger) *gin.Engine {
 	r.GET("/.well-known/jwks.json", func(c *gin.Context) { c.JSON(http.StatusOK, deps.Issuer.JWKS()) })
 
 	api := r.Group("/api/v1")
-	authrest.NewHandler(deps.AuthService).RegisterRoutes(api)
+	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
 
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))

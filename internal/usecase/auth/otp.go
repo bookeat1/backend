@@ -15,26 +15,57 @@ import (
 
 const maxOTPAttempts = 5
 
+// OTPUseCase is the phone-OTP authentication usecase: request a one-time code
+// and verify it (find-or-create the user, then issue a token pair). It is a
+// distinct usecase from the core credential Facade (facade.go).
+type OTPUseCase interface {
+	RequestOTP(ctx context.Context, rawPhone string) (string, error)
+	VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error)
+}
+
+type otpUseCase struct {
+	users   domain.UserRepository
+	otp     domain.OTPRepository
+	refresh domain.RefreshTokenRepository
+	tx      domain.TxManager
+	tokens  TokenIssuer
+	sender  OTPSender
+	cfg     Config
+}
+
+// NewOTPUseCase constructs the phone-OTP authentication usecase.
+func NewOTPUseCase(
+	users domain.UserRepository,
+	otp domain.OTPRepository,
+	refresh domain.RefreshTokenRepository,
+	tx domain.TxManager,
+	tokens TokenIssuer,
+	sender OTPSender,
+	cfg Config,
+) OTPUseCase {
+	return &otpUseCase{users: users, otp: otp, refresh: refresh, tx: tx, tokens: tokens, sender: sender, cfg: cfg}
+}
+
 // RequestOTP normalizes the phone, enforces rate limits, stores a hashed code,
 // and asks the sender to deliver it. Returns the code only when OTPDevExpose.
-func (s *Service) RequestOTP(ctx context.Context, rawPhone string) (string, error) {
+func (o *otpUseCase) RequestOTP(ctx context.Context, rawPhone string) (string, error) {
 	p := phone.Normalize(rawPhone)
 	if p == "" {
 		return "", fmt.Errorf("%w: phone required", domain.ErrValidation)
 	}
 
-	perMin, err := s.d.OTP.CountSince(ctx, p, time.Now().Add(-time.Minute))
+	perMin, err := o.otp.CountSince(ctx, p, time.Now().Add(-time.Minute))
 	if err != nil {
 		return "", err
 	}
-	if perMin >= s.d.Config.OTPPerMin {
+	if perMin >= o.cfg.OTPPerMin {
 		return "", fmt.Errorf("%w: too many requests, wait a minute", domain.ErrValidation)
 	}
-	perHour, err := s.d.OTP.CountSince(ctx, p, time.Now().Add(-time.Hour))
+	perHour, err := o.otp.CountSince(ctx, p, time.Now().Add(-time.Hour))
 	if err != nil {
 		return "", err
 	}
-	if perHour >= s.d.Config.OTPPerHour {
+	if perHour >= o.cfg.OTPPerHour {
 		return "", fmt.Errorf("%w: hourly OTP limit reached", domain.ErrValidation)
 	}
 
@@ -42,7 +73,7 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	channel, err := s.d.OTPSender.Send(ctx, p, code)
+	channel, err := o.sender.Send(ctx, p, code)
 	if err != nil {
 		return "", fmt.Errorf("send otp: %w", err)
 	}
@@ -52,13 +83,13 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string) (string, erro
 		Phone:     p,
 		CodeHash:  otpcode.Hash(code),
 		Channel:   channel,
-		ExpiresAt: now.Add(s.d.Config.OTPTTL),
+		ExpiresAt: now.Add(o.cfg.OTPTTL),
 		CreatedAt: now,
 	}
-	if err := s.d.OTP.Create(ctx, rec); err != nil {
+	if err := o.otp.Create(ctx, rec); err != nil {
 		return "", err
 	}
-	if s.d.Config.OTPDevExpose {
+	if o.cfg.OTPDevExpose {
 		return code, nil
 	}
 	return "", nil
@@ -66,7 +97,7 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string) (string, erro
 
 // VerifyOTP checks the latest active code for the phone; on success it marks the
 // code used, finds-or-creates the user, and returns a token pair.
-func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error) {
+func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error) {
 	p := phone.Normalize(rawPhone)
 	if p == "" || code == "" {
 		return nil, fmt.Errorf("%w: phone and code required", domain.ErrValidation)
@@ -75,7 +106,7 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenP
 	// Read + attempt accounting happen OUTSIDE the transaction: a failed guess
 	// must durably increment attempts (if it were inside the tx that returns the
 	// auth error, the rollback would discard it and the lockout would never fire).
-	rec, err := s.d.OTP.LatestActiveByPhone(ctx, p)
+	rec, err := o.otp.LatestActiveByPhone(ctx, p)
 	if errors.Is(err, domain.ErrNotFound) {
 		return nil, domain.ErrUnauthorized
 	}
@@ -86,22 +117,22 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenP
 		return nil, domain.ErrUnauthorized
 	}
 	if otpcode.Hash(code) != rec.CodeHash {
-		_ = s.d.OTP.IncrementAttempts(ctx, rec.ID) // committed immediately (no active tx)
+		_ = o.otp.IncrementAttempts(ctx, rec.ID) // committed immediately (no active tx)
 		return nil, domain.ErrUnauthorized
 	}
 
 	// Correct code: mark used + find-or-create the user + issue tokens atomically.
 	var pair *TokenPair
-	err = s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		if err := s.d.OTP.MarkUsed(ctx, rec.ID); err != nil {
+	err = o.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
 			return err
 		}
 
-		u, err := s.d.Users.GetByPhone(ctx, p)
+		u, err := o.users.GetByPhone(ctx, p)
 		if errors.Is(err, domain.ErrNotFound) {
 			now := time.Now()
 			u = &domain.User{ID: uuid.New(), Phone: &p, Role: domain.RoleUser, IsActive: true, PreferredLanguage: "ru", PhoneVerifiedAt: &now}
-			if err := s.d.Users.Create(ctx, u); err != nil {
+			if err := o.users.Create(ctx, u); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -109,12 +140,12 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenP
 		} else if u.PhoneVerifiedAt == nil {
 			now := time.Now()
 			u.PhoneVerifiedAt = &now
-			if err := s.d.Users.Update(ctx, u); err != nil {
+			if err := o.users.Update(ctx, u); err != nil {
 				return err
 			}
 		}
 
-		pair, err = s.issuePair(ctx, u)
+		pair, err = issuePair(ctx, o.tokens, o.refresh, o.cfg.RefreshTTL, u)
 		return err
 	})
 	if err != nil {

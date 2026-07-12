@@ -19,8 +19,9 @@ import (
 
 // Deps holds the constructed usecases and shared infrastructure.
 type Deps struct {
-	AuthService *auth.Service
-	UsersFacade *users.Facade
+	AuthFacade  auth.Facade
+	AuthOTP     auth.OTPUseCase
+	UsersFacade users.Facade
 	UsersRepo   domain.UserRepository
 	Issuer      *token.RSAIssuer
 }
@@ -38,25 +39,19 @@ func NewDeps(cfg Config, db *sql.DB, log *slog.Logger) (*Deps, error) {
 	refreshRepo := rtrepo.New(db)
 	otpRepo := otprepo.New(db)
 
-	authSvc := auth.NewService(auth.Deps{
-		Users:       usersRepo,
-		Credentials: credsRepo,
-		Refresh:     refreshRepo,
-		OTP:         otpRepo,
-		Tx:          txm,
-		Tokens:      issuer,
-		OTPSender:   otpsender.NewStub(log),
-		Config: auth.Config{
-			RefreshTTL:   cfg.Auth.RefreshTokenTTL,
-			OTPTTL:       cfg.Auth.OTPCodeTTL,
-			OTPPerMin:    cfg.Auth.OTPRateLimitPerMin,
-			OTPPerHour:   cfg.Auth.OTPRateLimitPerHour,
-			OTPDevExpose: cfg.Auth.OTPDevExpose,
-		},
-	})
+	authCfg := auth.Config{
+		RefreshTTL:   cfg.Auth.RefreshTokenTTL,
+		OTPTTL:       cfg.Auth.OTPCodeTTL,
+		OTPPerMin:    cfg.Auth.OTPRateLimitPerMin,
+		OTPPerHour:   cfg.Auth.OTPRateLimitPerHour,
+		OTPDevExpose: cfg.Auth.OTPDevExpose,
+	}
+	authFacade := auth.NewFacade(usersRepo, credsRepo, refreshRepo, txm, issuer, authCfg)
+	authOTP := auth.NewOTPUseCase(usersRepo, otpRepo, refreshRepo, txm, issuer, otpsender.NewStub(log), authCfg)
 
 	return &Deps{
-		AuthService: authSvc,
+		AuthFacade:  authFacade,
+		AuthOTP:     authOTP,
 		UsersFacade: users.NewFacade(usersRepo),
 		UsersRepo:   usersRepo,
 		Issuer:      issuer,

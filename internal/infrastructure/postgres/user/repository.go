@@ -18,6 +18,8 @@ type Repository struct{ pool sqltx.DBTX }
 
 func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
 
+var _ domain.UserRepository = (*Repository)(nil)
+
 const columns = `id, email, phone, full_name, role, is_active, avatar_url,
 	preferred_language, city, email_verified_at, phone_verified_at,
 	created_at, updated_at`

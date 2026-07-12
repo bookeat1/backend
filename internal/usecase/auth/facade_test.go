@@ -7,31 +7,16 @@ import (
 	"time"
 
 	"backend-core/internal/domain"
-	"backend-core/internal/infrastructure/token"
-	"backend-core/internal/infrastructure/token/tokentest"
 )
 
-func newTestService(t *testing.T) (*Service, *stubSender) {
+// newTestFacade wires the core auth Facade over in-memory fakes.
+func newTestFacade(t *testing.T) Facade {
 	t.Helper()
-	iss, err := token.NewRSAIssuer(tokentest.GenerateKeyPEM(t), "kid", 15*time.Minute)
-	if err != nil {
-		t.Fatalf("issuer: %v", err)
-	}
-	sender := &stubSender{}
-	return NewService(Deps{
-		Users:       newFakeUsers(),
-		Credentials: newFakeCreds(),
-		Refresh:     newFakeRefresh(),
-		OTP:         newFakeOTP(),
-		Tx:          noTx{},
-		Tokens:      iss,
-		OTPSender:   sender,
-		Config:      Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 1, OTPPerHour: 5},
-	}), sender
+	return NewFacade(newFakeUsers(), newFakeCreds(), newFakeRefresh(), noTx{}, testIssuer(t), Config{RefreshTTL: time.Hour})
 }
 
 func TestSignupThenLogin(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc := newTestFacade(t)
 	ctx := context.Background()
 
 	pair, err := svc.Signup(ctx, "a@b.com", "pw12345", "Alice")
@@ -58,7 +43,7 @@ func TestSignupThenLogin(t *testing.T) {
 }
 
 func TestRefreshRotatesAndRevokes(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc := newTestFacade(t)
 	ctx := context.Background()
 
 	pair, err := svc.Signup(ctx, "r@b.com", "pw12345", "R")

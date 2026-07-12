@@ -18,6 +18,8 @@ type Repository struct{ pool sqltx.DBTX }
 
 func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
 
+var _ domain.OTPRepository = (*Repository)(nil)
+
 func (r *Repository) Create(ctx context.Context, c *domain.OTPCode) error {
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = time.Now()
