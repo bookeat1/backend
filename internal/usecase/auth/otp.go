@@ -72,22 +72,27 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenP
 		return nil, fmt.Errorf("%w: phone and code required", domain.ErrValidation)
 	}
 
+	// Read + attempt accounting happen OUTSIDE the transaction: a failed guess
+	// must durably increment attempts (if it were inside the tx that returns the
+	// auth error, the rollback would discard it and the lockout would never fire).
+	rec, err := s.d.OTP.LatestActiveByPhone(ctx, p)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil, domain.ErrUnauthorized
+	}
+	if err != nil {
+		return nil, err
+	}
+	if rec.Attempts >= maxOTPAttempts {
+		return nil, domain.ErrUnauthorized
+	}
+	if otpcode.Hash(code) != rec.CodeHash {
+		_ = s.d.OTP.IncrementAttempts(ctx, rec.ID) // committed immediately (no active tx)
+		return nil, domain.ErrUnauthorized
+	}
+
+	// Correct code: mark used + find-or-create the user + issue tokens atomically.
 	var pair *TokenPair
-	err := s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
-		rec, err := s.d.OTP.LatestActiveByPhone(ctx, p)
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.ErrUnauthorized
-		}
-		if err != nil {
-			return err
-		}
-		if rec.Attempts >= maxOTPAttempts {
-			return domain.ErrUnauthorized
-		}
-		if otpcode.Hash(code) != rec.CodeHash {
-			_ = s.d.OTP.IncrementAttempts(ctx, rec.ID)
-			return domain.ErrUnauthorized
-		}
+	err = s.d.Tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := s.d.OTP.MarkUsed(ctx, rec.ID); err != nil {
 			return err
 		}
