@@ -22,6 +22,15 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	g.PATCH("/me", h.updateMe)
 }
 
+// me returns the authenticated user's profile.
+// @Summary     Get current user
+// @Description Returns the profile of the authenticated user.
+// @Tags        users
+// @Produce     json
+// @Security    BearerAuth
+// @Success     200 {object} response.Envelope{data=userResponse}
+// @Failure     401 {object} response.Envelope "unauthorized"
+// @Router      /api/v1/users/me [get]
 func (h *Handler) me(c *gin.Context) {
 	au, ok := middleware.GetAuthUser(c.Request.Context())
 	if !ok {
@@ -36,6 +45,19 @@ func (h *Handler) me(c *gin.Context) {
 	response.OK(c.Writer, fromDomain(u))
 }
 
+// updateMe applies a partial update to the authenticated user's profile.
+// @Summary     Update current user
+// @Description Partially updates the authenticated user's profile. Only the
+// @Description provided fields are changed; omitted fields are left untouched.
+// @Tags        users
+// @Accept      json
+// @Produce     json
+// @Security    BearerAuth
+// @Param       body body updateMeRequest true "Fields to update (all optional)"
+// @Success     200 {object} response.Envelope{data=userResponse}
+// @Failure     401 {object} response.Envelope "unauthorized"
+// @Failure     422 {object} response.Envelope "validation failed"
+// @Router      /api/v1/users/me [patch]
 func (h *Handler) updateMe(c *gin.Context) {
 	au, ok := middleware.GetAuthUser(c.Request.Context())
 	if !ok {

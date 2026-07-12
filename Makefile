@@ -1,4 +1,4 @@
-.PHONY: run build tidy migrate-up migrate-down test test-short fmt vet check etl test-integration
+.PHONY: run build tidy migrate-up migrate-down test test-short fmt vet check etl test-integration swagger
 
 run:
 	go run ./cmd/http/main.go
@@ -38,3 +38,10 @@ etl:
 # Integration tests need a migrated Postgres; point TEST_DATABASE_URL at it.
 test-integration:
 	go test ./...
+
+# Regenerate the committed OpenAPI/Swagger spec from swaggo annotations.
+# Runs swag as a one-off tool (no go.mod dependency); docs.go is discarded so
+# nothing pulls swaggo into the build.
+swagger:
+	go run github.com/swaggo/swag/cmd/swag@latest init -g cmd/http/swagger.go -d ./ --parseInternal -o docs
+	rm -f docs/docs.go
