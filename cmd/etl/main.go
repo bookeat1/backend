@@ -69,8 +69,10 @@ func run(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 		}
 
 		var phonePtr any
-		if rawPhone.Valid && rawPhone.String != "" {
-			phonePtr = phone.Normalize(rawPhone.String)
+		if rawPhone.Valid {
+			if n := phone.Normalize(rawPhone.String); n != "" {
+				phonePtr = n
+			}
 		}
 
 		const upsertUser = `
