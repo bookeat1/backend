@@ -23,7 +23,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 func (h *Handler) me(c *gin.Context) {
-	au, ok := middleware.GetAuthUser(c)
+	au, ok := middleware.GetAuthUser(c.Request.Context())
 	if !ok {
 		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
 		return
@@ -37,7 +37,7 @@ func (h *Handler) me(c *gin.Context) {
 }
 
 func (h *Handler) updateMe(c *gin.Context) {
-	au, ok := middleware.GetAuthUser(c)
+	au, ok := middleware.GetAuthUser(c.Request.Context())
 	if !ok {
 		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
 		return

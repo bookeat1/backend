@@ -64,7 +64,7 @@ Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) 
 
 ### Auth & routing (`bootstrap/app.go`)
 
-- `/health` is **unauthenticated**.
+- `/health` (liveness), `/health/ready` (readiness — pings the DB), and `/.well-known/jwks.json` are **unauthenticated**. CORS is applied globally via `middleware.CORS` from `APP_CORS_ORIGINS`.
 - `/api/*` runs `middleware.Auth`: strips the `Bearer` token, verifies it, loads the local user, rejects inactive users, and stashes an `AuthUser{ID, Role}` in the request context (read via `middleware.GetAuthUser`).
 - Role-restricted groups use `middleware.RequireRole`.
 

@@ -20,10 +20,11 @@ type Config struct {
 }
 
 type AppConfig struct {
-	Name        string
-	Environment string
-	URL         string
-	LogLevel    string
+	Name               string
+	Environment        string
+	URL                string
+	LogLevel           string
+	CORSAllowedOrigins []string
 }
 
 type DBConfig struct {
@@ -72,10 +73,11 @@ func NewConfig() (Config, error) {
 
 	cfg := Config{
 		App: AppConfig{
-			Name:        getEnv("APP_NAME", "backend-core"),
-			Environment: getEnv("APP_ENV", "development"),
-			URL:         getEnv("APP_URL", "0.0.0.0:8080"),
-			LogLevel:    getEnv("APP_LOG_LEVEL", "info"),
+			Name:               getEnv("APP_NAME", "backend-core"),
+			Environment:        getEnv("APP_ENV", "development"),
+			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
+			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
+			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
 		},
 		DB: DBConfig{
 			Postgres: PostgresConfig{
@@ -135,6 +137,21 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// getEnvList returns the comma-separated value of the environment variable named
+// by key (each element trimmed, empties dropped), or def parsed the same way
+// when the variable is unset.
+func getEnvList(key, def string) []string {
+	raw := getEnv(key, def)
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // getEnvBool returns the boolean value of the environment variable named by

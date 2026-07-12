@@ -36,7 +36,7 @@ func buildTestApp(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("NewDeps: %v", err)
 	}
-	return NewApp(cfg, deps, log)
+	return NewApp(cfg, deps, db, log)
 }
 
 func doJSON(t *testing.T, app http.Handler, method, path, token string, body any) (*httptest.ResponseRecorder, map[string]any) {
@@ -82,6 +82,30 @@ func TestSignupLoginMeFlow(t *testing.T) {
 	rec, _ = doJSON(t, app, "GET", "/api/v1/users/me", "", nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without token, got %d", rec.Code)
+	}
+}
+
+func TestHealthReadyAndCORSPreflight(t *testing.T) {
+	app := buildTestApp(t)
+
+	// Readiness probe pings the DB and reports ready.
+	req := httptest.NewRequest("GET", "/health/ready", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readiness status %d", rec.Code)
+	}
+
+	// A CORS preflight is answered with 204 and permissive origin (default "*").
+	req = httptest.NewRequest("OPTIONS", "/api/v1/auth/login", nil)
+	req.Header.Set("Origin", "https://app.bookeat.com")
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status %d, want 204", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Allow-Origin = %q, want *", got)
 	}
 }
 

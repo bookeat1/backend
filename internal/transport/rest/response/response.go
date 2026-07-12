@@ -21,6 +21,29 @@ type Envelope struct {
 	Error string `json:"error,omitempty"`
 }
 
+// Page is the uniform envelope for a paginated list. Wrap list results in it and
+// pass to OK so every list endpoint reports totals the same way.
+type Page[T any] struct {
+	Items   []T `json:"items"`
+	Total   int `json:"total"`
+	Pages   int `json:"pages"`
+	Page    int `json:"page"`
+	PerPage int `json:"per_page"`
+}
+
+// NewPage builds a Page, computing the page count from total and perPage. items
+// is normalized to a non-nil slice so it serializes as [] rather than null.
+func NewPage[T any](items []T, total, page, perPage int) Page[T] {
+	if items == nil {
+		items = []T{}
+	}
+	pages := 0
+	if perPage > 0 {
+		pages = (total + perPage - 1) / perPage
+	}
+	return Page[T]{Items: items, Total: total, Pages: pages, Page: page, PerPage: perPage}
+}
+
 // OK writes a 200 with the payload.
 func OK(w http.ResponseWriter, data any) { write(w, http.StatusOK, Envelope{Data: data}) }
 

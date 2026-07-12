@@ -2,6 +2,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -47,19 +48,18 @@ func Auth(issuer auth.TokenIssuer, users domain.UserRepository) gin.HandlerFunc 
 			c.Abort()
 			return
 		}
-		c.Set(ctxKeyString, AuthUser{ID: u.ID, Role: string(u.Role)})
+		ctx := context.WithValue(c.Request.Context(), authUserKey{}, AuthUser{ID: u.ID, Role: string(u.Role)})
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }
 
-const ctxKeyString = "auth_user"
+// authUserKey is the private context key under which Auth stores the AuthUser —
+// a typed key (not a string) so lookups are type-safe and decoupled from gin.
+type authUserKey struct{}
 
-// GetAuthUser returns the AuthUser set by Auth.
-func GetAuthUser(c *gin.Context) (AuthUser, bool) {
-	v, ok := c.Get(ctxKeyString)
-	if !ok {
-		return AuthUser{}, false
-	}
-	au, ok := v.(AuthUser)
+// GetAuthUser returns the AuthUser stored by Auth on the request context.
+func GetAuthUser(ctx context.Context) (AuthUser, bool) {
+	au, ok := ctx.Value(authUserKey{}).(AuthUser)
 	return au, ok
 }
