@@ -25,6 +25,9 @@ go test ./internal/usecase/<pkg>/ -run TestName   # single test
 
 make mocks          # regenerate mockgen mocks (run after changing any mocked interface)
 
+go run ./cmd/etl/main.go        # one-time Supabase dump → users ETL (see cmd/etl/README.md)
+TEST_DATABASE_URL=... go test ./...   # integration tests (need a migrated Postgres)
+
 go vet ./... && gofmt -w .
 ```
 

@@ -1,4 +1,4 @@
-.PHONY: run build tidy migrate-up migrate-down test test-short mocks fmt vet check
+.PHONY: run build tidy migrate-up migrate-down test test-short mocks fmt vet check etl test-integration
 
 run:
 	go run ./cmd/http/main.go
@@ -35,3 +35,10 @@ vet:
 
 check: fmt vet
 	go build ./...
+
+etl:
+	go run ./cmd/etl/main.go
+
+# Integration tests need a migrated Postgres; point TEST_DATABASE_URL at it.
+test-integration:
+	go test ./...
