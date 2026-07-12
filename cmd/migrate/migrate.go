@@ -23,7 +23,7 @@ func main() {
 		slog.Error("load config", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	db, err := bootstrap.NewDB(cfg.DB.Postgres)
+	db, err := bootstrap.NewSQLDB(cfg.DB.Postgres)
 	if err != nil {
 		slog.Error("connect db", slog.String("error", err.Error()))
 		os.Exit(1)

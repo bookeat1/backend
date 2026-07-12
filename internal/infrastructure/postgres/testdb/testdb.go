@@ -4,15 +4,15 @@
 package testdb
 
 import (
-	"database/sql"
+	"context"
 	"os"
 	"testing"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Connect returns a live *sql.DB or skips the test.
-func Connect(t *testing.T) *sql.DB {
+// Connect returns a live *pgxpool.Pool or skips the test.
+func Connect(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration test in -short mode")
@@ -21,22 +21,22 @@ func Connect(t *testing.T) *sql.DB {
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
-	db, err := sql.Open("pgx", dsn)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-	if err := db.Ping(); err != nil {
+	if err := pool.Ping(context.Background()); err != nil {
 		t.Fatalf("ping test db: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
-	return db
+	t.Cleanup(pool.Close)
+	return pool
 }
 
 // Truncate clears the given tables between tests.
-func Truncate(t *testing.T, db *sql.DB, tables ...string) {
+func Truncate(t *testing.T, pool *pgxpool.Pool, tables ...string) {
 	t.Helper()
 	for _, tbl := range tables {
-		if _, err := db.Exec("TRUNCATE " + tbl + " CASCADE"); err != nil {
+		if _, err := pool.Exec(context.Background(), "TRUNCATE "+tbl+" CASCADE"); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
 	}

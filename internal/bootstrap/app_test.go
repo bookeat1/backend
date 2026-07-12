@@ -22,6 +22,8 @@ func buildTestApp(t *testing.T) http.Handler {
 	log := logger.New("error")
 	cfg := Config{}
 	cfg.App.Environment = "test"
+	cfg.App.CORSAllowedOrigins = []string{"*"} // NewConfig's default; set explicitly since this bypasses it
+
 	cfg.Auth = AuthConfig{
 		JWTPrivateKeyPEM:    tokentest.GenerateKeyPEM(t),
 		JWTKeyID:            "test",

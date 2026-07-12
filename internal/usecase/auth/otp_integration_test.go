@@ -2,12 +2,12 @@ package auth
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/auth/otpcode"
 	"backend-core/internal/domain"
@@ -30,7 +30,7 @@ func (realStubSender) Send(_ context.Context, _, _ string) (string, error) { ret
 // the real sqltx.Manager, so that transaction rollback behavior is exercised for
 // real (unlike the noTx fake used by the unit tests). It returns the OTP repo
 // (for seeding) and the db handle (for direct assertions).
-func newRealTestOTP(t *testing.T) (OTPUseCase, domain.OTPRepository, *sql.DB) {
+func newRealTestOTP(t *testing.T) (OTPUseCase, domain.OTPRepository, *pgxpool.Pool) {
 	t.Helper()
 	db := testdb.Connect(t)
 	testdb.Truncate(t, db, "refresh_tokens", "user_credentials", "otp_codes", "users")
@@ -86,7 +86,7 @@ func TestVerifyOTPWrongCodePersistsAttemptAcrossRealTx(t *testing.T) {
 	}
 
 	var attempts int
-	if err := db.QueryRow(`SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
+	if err := db.QueryRow(ctx, `SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
 		t.Fatalf("query attempts: %v", err)
 	}
 	if attempts != 1 {
@@ -101,7 +101,7 @@ func TestVerifyOTPWrongCodePersistsAttemptAcrossRealTx(t *testing.T) {
 			t.Fatalf("VerifyOTP(wrong code) attempt %d = %v, want ErrUnauthorized", i, err)
 		}
 	}
-	if err := db.QueryRow(`SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
+	if err := db.QueryRow(ctx, `SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
 		t.Fatalf("query attempts after lockout loop: %v", err)
 	}
 	if attempts != maxOTPAttempts {
@@ -113,7 +113,7 @@ func TestVerifyOTPWrongCodePersistsAttemptAcrossRealTx(t *testing.T) {
 	if _, err := uc.VerifyOTP(ctx, phone, "000000"); !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("VerifyOTP after lockout = %v, want ErrUnauthorized", err)
 	}
-	if err := db.QueryRow(`SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
+	if err := db.QueryRow(ctx, `SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
 		t.Fatalf("query attempts after lockout guess: %v", err)
 	}
 	if attempts != maxOTPAttempts {

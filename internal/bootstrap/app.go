@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	authrest "backend-core/internal/transport/rest/auth"
 	"backend-core/internal/transport/rest/middleware"
@@ -20,7 +20,7 @@ import (
 
 // NewApp builds the Gin engine with all routes wired. db is used by the
 // readiness probe to verify database connectivity.
-func NewApp(cfg Config, deps *Deps, db *sql.DB, log *slog.Logger) *gin.Engine {
+func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Engine {
 	// response.HandleError logs failures via slog.Default(); point it at the
 	// configured logger so those logs use the app's handler and level.
 	slog.SetDefault(log)
@@ -37,7 +37,7 @@ func NewApp(cfg Config, deps *Deps, db *sql.DB, log *slog.Logger) *gin.Engine {
 	r.GET("/health/ready", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
+		if err := db.Ping(ctx); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"data": gin.H{"status": "unavailable"}})
 			return
 		}

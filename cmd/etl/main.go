@@ -22,7 +22,7 @@ func main() {
 		os.Exit(1)
 	}
 	log := logger.New(cfg.App.LogLevel)
-	db, err := bootstrap.NewDB(cfg.DB.Postgres)
+	db, err := bootstrap.NewSQLDB(cfg.DB.Postgres)
 	if err != nil {
 		log.Error("connect db", slog.String("error", err.Error()))
 		os.Exit(1)

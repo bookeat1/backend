@@ -1,9 +1,10 @@
 package bootstrap
 
 import (
-	"database/sql"
 	"fmt"
 	"log/slog"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/otpsender"
@@ -27,7 +28,7 @@ type Deps struct {
 }
 
 // NewDeps constructs repositories, infrastructure clients, and usecases.
-func NewDeps(cfg Config, db *sql.DB, log *slog.Logger) (*Deps, error) {
+func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	issuer, err := token.NewRSAIssuer(cfg.Auth.JWTPrivateKeyPEM, cfg.Auth.JWTKeyID, cfg.Auth.AccessTokenTTL)
 	if err != nil {
 		return nil, fmt.Errorf("build token issuer: %w", err)

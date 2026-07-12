@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -43,6 +44,25 @@ func TestCreateGetUpdate(t *testing.T) {
 	got, _ = repo.GetByID(ctx, u.ID)
 	if got.FullName != "Alice B" {
 		t.Errorf("update not persisted: %q", got.FullName)
+	}
+}
+
+func TestCreateDuplicateEmailMapsToAlreadyExists(t *testing.T) {
+	db := testdb.Connect(t)
+	testdb.Truncate(t, db, "users")
+	repo := New(db)
+	ctx := context.Background()
+
+	first := &domain.User{ID: uuid.New(), Email: strp("dup@b.com"), FullName: "First", Role: domain.RoleUser, PreferredLanguage: "ru"}
+	if err := repo.Create(ctx, first); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	// Same email, different id: the UNIQUE constraint fires and must surface as
+	// ErrAlreadyExists (SQLSTATE 23505 mapping), not a raw error.
+	second := &domain.User{ID: uuid.New(), Email: strp("dup@b.com"), FullName: "Second", Role: domain.RoleUser, PreferredLanguage: "ru"}
+	if err := repo.Create(ctx, second); !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("duplicate email Create = %v, want ErrAlreadyExists", err)
 	}
 }
 

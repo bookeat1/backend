@@ -58,7 +58,9 @@ Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) 
 
 ### Transactions
 
-`domain.TxManager` (`WithinTx(ctx, fn)`) is implemented by `sqltx.Manager`. It injects the active `*sql.Tx` into the context; nested `WithinTx` calls reuse the existing tx (no double-begin). Postgres repositories must pull the active tx from the context via `sqltx.From(ctx)` so that multi-repository operations inside a usecase share one transaction.
+The DB layer uses **pgx** natively: `bootstrap.NewDB` returns a `*pgxpool.Pool`, and repositories take a `sqltx.Querier` (satisfied by both the pool and an active `pgx.Tx`). `bootstrap.NewSQLDB` returns a `database/sql` handle **only** for goose migrations and the one-time ETL. Repositories map the `unique_violation` SQLSTATE (`23505`) to `domain.ErrAlreadyExists`.
+
+`domain.TxManager` (`WithinTx(ctx, fn)`) is implemented by `sqltx.Manager`. It injects the active `pgx.Tx` into the context; nested `WithinTx` calls reuse the existing tx (no double-begin). Postgres repositories must pull the active querier from the context via `sqltx.From(ctx, r.pool)` so that multi-repository operations inside a usecase share one transaction.
 
 ### Auth & routing (`bootstrap/app.go`)
 

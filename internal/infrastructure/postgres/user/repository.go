@@ -3,22 +3,26 @@ package user
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/sqltx"
 )
 
-type Repository struct{ pool sqltx.DBTX }
+type Repository struct{ pool sqltx.Querier }
 
-func New(pool sqltx.DBTX) *Repository { return &Repository{pool: pool} }
+func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 
 var _ domain.UserRepository = (*Repository)(nil)
+
+// uniqueViolation is the Postgres SQLSTATE for a unique_violation.
+const uniqueViolation = "23505"
 
 const columns = `id, email, phone, full_name, role, is_active, avatar_url,
 	preferred_language, city, email_verified_at, phone_verified_at,
@@ -32,11 +36,19 @@ func (r *Repository) Create(ctx context.Context, u *domain.User) error {
 		u.CreatedAt = now
 	}
 	u.UpdatedAt = now
-	_, err := sqltx.From(ctx, r.pool).ExecContext(ctx, q,
+	_, err := sqltx.From(ctx, r.pool).Exec(ctx, q,
 		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
 		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt,
 		u.CreatedAt, u.UpdatedAt)
 	if err != nil {
+		// The email and phone columns are UNIQUE; a concurrent insert of the same
+		// identity surfaces here as a unique_violation. Map it to ErrAlreadyExists
+		// so callers get a clean 409 instead of a 500 (and so signup stays correct
+		// under a race that slips past any pre-check).
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+			return fmt.Errorf("%w: user", domain.ErrAlreadyExists)
+		}
 		return fmt.Errorf("create user: %w", err)
 	}
 	return nil
@@ -56,9 +68,9 @@ func (r *Repository) GetByPhone(ctx context.Context, phone string) (*domain.User
 
 func (r *Repository) getBy(ctx context.Context, where string, arg any) (*domain.User, error) {
 	q := `SELECT ` + columns + ` FROM users WHERE ` + where
-	row := sqltx.From(ctx, r.pool).QueryRowContext(ctx, q, arg)
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx, q, arg)
 	u, err := scan(row)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
 	if err != nil {
@@ -72,13 +84,17 @@ func (r *Repository) Update(ctx context.Context, u *domain.User) error {
 	q := `UPDATE users SET email=$2, phone=$3, full_name=$4, role=$5,
 		is_active=$6, avatar_url=$7, preferred_language=$8, city=$9,
 		email_verified_at=$10, phone_verified_at=$11, updated_at=$12 WHERE id=$1`
-	res, err := sqltx.From(ctx, r.pool).ExecContext(ctx, q,
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q,
 		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
 		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt, u.UpdatedAt)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+			return fmt.Errorf("%w: user", domain.ErrAlreadyExists)
+		}
 		return fmt.Errorf("update user: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound
 	}
 	return nil
