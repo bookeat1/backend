@@ -1,0 +1,477 @@
+definitions:
+  auth.loginRequest:
+    properties:
+      email:
+        example: user@example.com
+        type: string
+      password:
+        example: s3cret123
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  auth.otpRequestRequest:
+    properties:
+      phone:
+        example: "+77011234567"
+        type: string
+    required:
+    - phone
+    type: object
+  auth.otpRequestedResponse:
+    properties:
+      code:
+        description: populated only when AUTH_OTP_DEV_EXPOSE=true
+        example: "123456"
+        type: string
+      sent:
+        example: true
+        type: boolean
+    type: object
+  auth.otpVerifyRequest:
+    properties:
+      code:
+        example: "123456"
+        type: string
+      phone:
+        example: "+77011234567"
+        type: string
+    required:
+    - code
+    - phone
+    type: object
+  auth.refreshRequest:
+    properties:
+      refresh_token:
+        example: 9c8b7a6f-...-refresh
+        type: string
+    required:
+    - refresh_token
+    type: object
+  auth.signupRequest:
+    properties:
+      email:
+        example: user@example.com
+        type: string
+      full_name:
+        example: Jane Doe
+        type: string
+      password:
+        example: s3cret123
+        minLength: 6
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  auth.tokenPairResponse:
+    properties:
+      access_token:
+        example: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+        type: string
+      expires_at:
+        example: "2026-07-12T18:30:00Z"
+        type: string
+      refresh_token:
+        example: 9c8b7a6f-4d3e-2b1a-...-refresh
+        type: string
+    type: object
+  response.Envelope:
+    properties:
+      data: {}
+      error:
+        type: string
+    type: object
+  users.updateMeRequest:
+    properties:
+      avatar_url:
+        example: https://cdn.example.com/a/jane.png
+        type: string
+      city:
+        example: almaty
+        type: string
+      full_name:
+        example: Jane Doe
+        type: string
+      preferred_language:
+        example: ru
+        type: string
+    type: object
+  users.userResponse:
+    properties:
+      avatar_url:
+        example: https://cdn.example.com/a/jane.png
+        type: string
+      city:
+        example: almaty
+        type: string
+      created_at:
+        example: "2026-01-15T08:30:00Z"
+        type: string
+      email:
+        example: user@example.com
+        type: string
+      email_verified_at:
+        example: "2026-07-10T09:00:00Z"
+        type: string
+      full_name:
+        example: Jane Doe
+        type: string
+      id:
+        example: 550e8400-e29b-41d4-a716-446655440000
+        type: string
+      phone:
+        example: "+77011234567"
+        type: string
+      phone_verified_at:
+        example: "2026-07-10T09:00:00Z"
+        type: string
+      preferred_language:
+        example: ru
+        type: string
+      role:
+        example: user
+        type: string
+    type: object
+info:
+  contact: {}
+  description: |-
+    Core backend service for BookEat.
+
+    Every response is wrapped in a JSON envelope — {"data": ...} on
+    success, {"error": "..."} on failure — except /.well-known/jwks.json,
+    which returns a raw JWKS document.
+  title: BookEat backend-core API
+  version: "1.0"
+paths:
+  /.well-known/jwks.json:
+    get:
+      description: |-
+        Public RS256 keys used to verify access-token signatures. This
+        response is NOT wrapped in the standard envelope.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{\"keys\":[{\"kty\":\"RSA\",\"use\":\"sig\",\"alg\":\"RS256\",\"kid\":\"...\",\"n\":\"...\",\"e\":\"AQAB\"}]}'
+          schema:
+            additionalProperties: true
+            type: object
+      summary: JWKS
+      tags:
+      - system
+  /api/v1/auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Authenticates by email + password and returns a token pair.
+      parameters:
+      - description: Credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.loginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/auth.tokenPairResponse'
+              type: object
+        "401":
+          description: invalid credentials
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Log in
+      tags:
+      - auth
+  /api/v1/auth/logout:
+    post:
+      consumes:
+      - application/json
+      description: Revokes the given refresh token so it can no longer be used.
+      parameters:
+      - description: Refresh token to revoke
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.refreshRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{\"data\":{\"ok\":true}}'
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  type: object
+              type: object
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Log out
+      tags:
+      - auth
+  /api/v1/auth/otp/request:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Generates a one-time code and delivers it to the phone. Rate-limited
+        (per-minute and per-hour); over the limit returns 422. The response
+        "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
+      parameters:
+      - description: Phone number
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.otpRequestRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/auth.otpRequestedResponse'
+              type: object
+        "422":
+          description: validation failed / rate limited
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Request an OTP code
+      tags:
+      - auth
+  /api/v1/auth/otp/verify:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Verifies the latest active code for the phone. On success, finds or
+        creates the user and returns a token pair. Wrong/expired codes and
+        too many attempts return 401.
+      parameters:
+      - description: Phone and code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.otpVerifyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/auth.tokenPairResponse'
+              type: object
+        "401":
+          description: invalid or expired code
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Verify an OTP code
+      tags:
+      - auth
+  /api/v1/auth/refresh:
+    post:
+      consumes:
+      - application/json
+      description: Exchanges a valid refresh token for a new access/refresh token
+        pair.
+      parameters:
+      - description: Refresh token
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.refreshRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/auth.tokenPairResponse'
+              type: object
+        "401":
+          description: invalid or expired refresh token
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Refresh tokens
+      tags:
+      - auth
+  /api/v1/auth/signup:
+    post:
+      consumes:
+      - application/json
+      description: Registers a new user with email + password and returns a token
+        pair.
+      parameters:
+      - description: New account details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/auth.signupRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/auth.tokenPairResponse'
+              type: object
+        "409":
+          description: email already registered
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Sign up
+      tags:
+      - auth
+  /api/v1/users/me:
+    get:
+      description: Returns the profile of the authenticated user.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/users.userResponse'
+              type: object
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Get current user
+      tags:
+      - users
+    patch:
+      consumes:
+      - application/json
+      description: |-
+        Partially updates the authenticated user's profile. Only the
+        provided fields are changed; omitted fields are left untouched.
+      parameters:
+      - description: Fields to update (all optional)
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/users.updateMeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Envelope'
+            - properties:
+                data:
+                  $ref: '#/definitions/users.userResponse'
+              type: object
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Update current user
+      tags:
+      - users
+  /health:
+    get:
+      description: Returns 200 while the process is up. Does not check dependencies.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{\"data\":{\"status\":\"ok\"}}'
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Liveness probe
+      tags:
+      - system
+  /health/ready:
+    get:
+      description: Pings the database. Returns 200 when reachable, 503 otherwise.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{\"data\":{\"status\":\"ready\"}}'
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: '{\"data\":{\"status\":\"unavailable\"}}'
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Readiness probe
+      tags:
+      - system
+securityDefinitions:
+  BearerAuth:
+    description: |-
+      Access token from POST /api/v1/auth/login (or signup / otp/verify /
+      refresh), sent as: Authorization: Bearer <access_token>
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

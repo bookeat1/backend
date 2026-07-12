@@ -9,6 +9,7 @@ package response
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"backend-core/internal/domain"
@@ -18,6 +19,29 @@ import (
 type Envelope struct {
 	Data  any    `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
+}
+
+// Page is the uniform envelope for a paginated list. Wrap list results in it and
+// pass to OK so every list endpoint reports totals the same way.
+type Page[T any] struct {
+	Items   []T `json:"items"`
+	Total   int `json:"total"`
+	Pages   int `json:"pages"`
+	Page    int `json:"page"`
+	PerPage int `json:"per_page"`
+}
+
+// NewPage builds a Page, computing the page count from total and perPage. items
+// is normalized to a non-nil slice so it serializes as [] rather than null.
+func NewPage[T any](items []T, total, page, perPage int) Page[T] {
+	if items == nil {
+		items = []T{}
+	}
+	pages := 0
+	if perPage > 0 {
+		pages = (total + perPage - 1) / perPage
+	}
+	return Page[T]{Items: items, Total: total, Pages: pages, Page: page, PerPage: perPage}
 }
 
 // OK writes a 200 with the payload.
@@ -31,22 +55,39 @@ func Error(w http.ResponseWriter, status int, msg string) {
 	write(w, status, Envelope{Error: msg})
 }
 
-// HandleError maps a domain sentinel error to the matching HTTP status.
-// Always `return` immediately after calling this from a handler.
+// HandleError maps a domain sentinel error to the matching HTTP status and a
+// generic, non-revealing message, then logs the underlying error server-side.
+// The original error text (which may carry wrapped internal context, SQL, etc.)
+// is never sent to the client, so it cannot leak. Always `return` immediately
+// after calling this from a handler.
 func HandleError(w http.ResponseWriter, err error) {
+	status, msg := classify(err)
+	if status >= http.StatusInternalServerError {
+		slog.Error("request failed", "status", status, "error", err)
+	} else {
+		slog.Warn("request rejected", "status", status, "error", err)
+	}
+	Error(w, status, msg)
+}
+
+// classify maps a domain sentinel error to an HTTP status and a fixed, generic
+// message safe to return to clients.
+func classify(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
-		Error(w, http.StatusNotFound, err.Error())
+		return http.StatusNotFound, "not found"
 	case errors.Is(err, domain.ErrAlreadyExists):
-		Error(w, http.StatusConflict, err.Error())
+		return http.StatusConflict, "already exists"
 	case errors.Is(err, domain.ErrForbidden):
-		Error(w, http.StatusForbidden, err.Error())
+		return http.StatusForbidden, "forbidden"
 	case errors.Is(err, domain.ErrUnauthorized):
-		Error(w, http.StatusUnauthorized, err.Error())
-	case errors.Is(err, domain.ErrValidation), errors.Is(err, domain.ErrInvalidStatus):
-		Error(w, http.StatusUnprocessableEntity, err.Error())
+		return http.StatusUnauthorized, "unauthorized"
+	case errors.Is(err, domain.ErrValidation):
+		return http.StatusUnprocessableEntity, "validation failed"
+	case errors.Is(err, domain.ErrInvalidStatus):
+		return http.StatusUnprocessableEntity, "invalid status transition"
 	default:
-		Error(w, http.StatusInternalServerError, "internal server error")
+		return http.StatusInternalServerError, "internal server error"
 	}
 }
 

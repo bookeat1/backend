@@ -23,7 +23,8 @@ make test           # go test ./...       — full suite
 make test-short     # go test -short ./... — unit only
 go test ./internal/usecase/<pkg>/ -run TestName   # single test
 
-make mocks          # regenerate mockgen mocks (run after changing any mocked interface)
+go run ./cmd/etl/main.go        # one-time Supabase dump → users ETL (see cmd/etl/README.md)
+TEST_DATABASE_URL=... go test ./...   # integration tests (need a migrated Postgres)
 
 go vet ./... && gofmt -w .
 ```
@@ -38,7 +39,11 @@ Clean/Hexagonal. Dependencies point **inward**: `transport → usecase → domai
 
 **`internal/domain/`** — flat package, **one file per entity** (`user.go`, `<entity>.go`, …). Each file holds the entity struct, its repository interface, and related typed constants. **No business logic, no frameworks** (no gin/sql/http imports). Status/role/state values are Go constants of a named string type (e.g. `type Role string`), and are stored as `VARCHAR` in the DB — **never `CREATE TYPE ... AS ENUM`** in migrations. `errors.go` defines the sentinel errors (`ErrNotFound`, `ErrAlreadyExists`, `ErrForbidden`, `ErrUnauthorized`, `ErrInvalidStatus`, `ErrValidation`) that drive HTTP status mapping. `tx.go` defines the `TxManager` port.
 
-**`internal/usecase/`** — application logic, grouped by actor/context (e.g. `admin/`, `users/`, …). A `Facade` holds basic CRUD/read operations; complex operations get their own file + interface next to the facade (e.g. `<pkg>/<operation>.go` defining a focused `...UseCase` interface). A usecase **never imports another domain's concrete repository** — when it needs cross-domain data or an external system it declares a minimal local **port interface** (Interface Segregation), bound to a concrete impl in `deps.go`. Ports for transactions and external systems live in `domain` (`domain.TxManager`, …).
+**`internal/usecase/`** — application logic, grouped by actor/context (e.g. `admin/`, `users/`, …). The settled shape (see `usecase/auth`, `usecase/users`):
+- An exported **`Facade` interface** holds the basic CRUD/read operations, implemented by an unexported `facade` struct. Dependencies are passed as **individual positional arguments** to `NewFacade(...)` — **not** a `Deps` bundle and **not** an exported `Service` struct.
+- **Complex operations get their own file + focused interface** next to the facade (e.g. `<pkg>/otp.go` defining a `...UseCase` interface implemented by an unexported struct, constructed by `New...UseCase(...)`). Split by logical concern, not by CRUD verb.
+- Logic **shared** between the facade and the extra usecases (e.g. token issuance in `auth`) is a package-level **free function** over the minimal deps it needs, not a method — so no struct has to own another's state.
+- External-system **port interfaces** are declared where consumed, in the package's `ports.go`. A usecase **never imports another domain's concrete repository** — it declares a minimal local port (Interface Segregation), bound to a concrete impl in `deps.go`. Ports for transactions and external systems live in `domain` (`domain.TxManager`, …).
 
 **`internal/transport/rest/`** — Gin HTTP handlers, grouped like usecases, plus shared `middleware/`, `response/`, `httputil/`. Per resource:
 - `handler.go` — depends on the usecase facade/interfaces, exposes `RegisterRoutes`.
@@ -53,11 +58,13 @@ Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) 
 
 ### Transactions
 
-`domain.TxManager` (`WithinTx(ctx, fn)`) is implemented by `sqltx.Manager`. It injects the active `*sql.Tx` into the context; nested `WithinTx` calls reuse the existing tx (no double-begin). Postgres repositories must pull the active tx from the context via `sqltx.From(ctx)` so that multi-repository operations inside a usecase share one transaction.
+The DB layer uses **pgx** natively: `bootstrap.NewDB` returns a `*pgxpool.Pool`, and repositories take a `sqltx.Querier` (satisfied by both the pool and an active `pgx.Tx`). `bootstrap.NewSQLDB` returns a `database/sql` handle **only** for goose migrations and the one-time ETL. Repositories map the `unique_violation` SQLSTATE (`23505`) to `domain.ErrAlreadyExists`.
+
+`domain.TxManager` (`WithinTx(ctx, fn)`) is implemented by `sqltx.Manager`. It injects the active `pgx.Tx` into the context; nested `WithinTx` calls reuse the existing tx (no double-begin). Postgres repositories must pull the active querier from the context via `sqltx.From(ctx, r.pool)` so that multi-repository operations inside a usecase share one transaction.
 
 ### Auth & routing (`bootstrap/app.go`)
 
-- `/health` is **unauthenticated**.
+- `/health` (liveness), `/health/ready` (readiness — pings the DB), and `/.well-known/jwks.json` are **unauthenticated**. CORS is applied globally via `middleware.CORS` from `APP_CORS_ORIGINS`.
 - `/api/*` runs `middleware.Auth`: strips the `Bearer` token, verifies it, loads the local user, rejects inactive users, and stashes an `AuthUser{ID, Role}` in the request context (read via `middleware.GetAuthUser`).
 - Role-restricted groups use `middleware.RequireRole`.
 
@@ -67,6 +74,6 @@ Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) 
 - **Migrations:** SQL in `migrations/`, goose format (`-- +goose Up` / `-- +goose Down`), embedded via `migrations/embed.go`. `VARCHAR` for enumerated fields, validated in app code — no DB enums.
 - **Naming:** package names are short, lower-case, no underscores. Interfaces are declared where they are **consumed** (the usecase/transport layer), not where implemented.
 - **Formatting:** run `gofmt -w .` and `go vet ./...` before finishing any change.
-- **Mocks:** after changing any interface listed in the `mocks` target of the Makefile, run `make mocks`. Generated mocks live under `internal/mocks/`.
+- **Test doubles:** use **hand-written fakes**, not a mock-generation framework — this keeps the dependency set minimal. Put fakes in the consuming package's `*_test.go` (e.g. `usecase/auth/fakes_test.go`), implementing the small port/repository interfaces directly. Integration tests that need Postgres use `infrastructure/postgres/testdb` and are gated behind `TEST_DATABASE_URL` (skipped by `-short`).
 - **Tests:** table-driven where it fits; unit tests must pass under `go test -short ./...` without external services. Integration tests that need Postgres are gated behind the non-short suite.
 - **No private deps:** this repo builds only against public modules + stdlib. If you reach for a private/internal library, stop and find a public equivalent.

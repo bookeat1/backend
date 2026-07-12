@@ -1,0 +1,44 @@
+package otp
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/postgres/testdb"
+)
+
+func TestCreateLatestActiveAndUse(t *testing.T) {
+	db := testdb.Connect(t)
+	testdb.Truncate(t, db, "otp_codes")
+	repo := New(db)
+	ctx := context.Background()
+
+	c := &domain.OTPCode{ID: uuid.New(), Phone: "+77070000000", CodeHash: "h", Channel: "stub", ExpiresAt: time.Now().Add(5 * time.Minute)}
+	if err := repo.Create(ctx, c); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := repo.LatestActiveByPhone(ctx, "+77070000000")
+	if err != nil || got.ID != c.ID {
+		t.Fatalf("LatestActiveByPhone = %+v, %v", got, err)
+	}
+
+	if err := repo.IncrementAttempts(ctx, c.ID); err != nil {
+		t.Fatalf("IncrementAttempts: %v", err)
+	}
+	if err := repo.MarkUsed(ctx, c.ID); err != nil {
+		t.Fatalf("MarkUsed: %v", err)
+	}
+	if _, err := repo.LatestActiveByPhone(ctx, "+77070000000"); err == nil {
+		t.Error("used code must not be active")
+	}
+
+	n, err := repo.CountSince(ctx, "+77070000000", time.Now().Add(-time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("CountSince = %d, %v", n, err)
+	}
+}

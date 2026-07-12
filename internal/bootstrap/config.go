@@ -14,15 +14,17 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App AppConfig
-	DB  DBConfig
+	App  AppConfig
+	DB   DBConfig
+	Auth AuthConfig
 }
 
 type AppConfig struct {
-	Name        string
-	Environment string
-	URL         string
-	LogLevel    string
+	Name               string
+	Environment        string
+	URL                string
+	LogLevel           string
+	CORSAllowedOrigins []string
 }
 
 type DBConfig struct {
@@ -40,6 +42,17 @@ type PostgresConfig struct {
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
 	ConnMaxIdleTime time.Duration
+}
+
+type AuthConfig struct {
+	JWTPrivateKeyPEM    string        // RSA private key (PEM). env: AUTH_JWT_PRIVATE_KEY
+	JWTKeyID            string        // kid advertised in JWKS. env: AUTH_JWT_KID
+	AccessTokenTTL      time.Duration // env: AUTH_ACCESS_TOKEN_TTL
+	RefreshTokenTTL     time.Duration // env: AUTH_REFRESH_TOKEN_TTL
+	OTPCodeTTL          time.Duration // env: AUTH_OTP_TTL
+	OTPRateLimitPerMin  int           // env: AUTH_OTP_RATE_PER_MIN
+	OTPRateLimitPerHour int           // env: AUTH_OTP_RATE_PER_HOUR
+	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
 }
 
 func (p PostgresConfig) DSN() string {
@@ -60,10 +73,11 @@ func NewConfig() (Config, error) {
 
 	cfg := Config{
 		App: AppConfig{
-			Name:        getEnv("APP_NAME", "backend-core"),
-			Environment: getEnv("APP_ENV", "development"),
-			URL:         getEnv("APP_URL", "0.0.0.0:8080"),
-			LogLevel:    getEnv("APP_LOG_LEVEL", "info"),
+			Name:               getEnv("APP_NAME", "backend-core"),
+			Environment:        getEnv("APP_ENV", "development"),
+			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
+			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
+			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
 		},
 		DB: DBConfig{
 			Postgres: PostgresConfig{
@@ -78,6 +92,16 @@ func NewConfig() (Config, error) {
 				ConnMaxLifetime: getEnvDuration("DB_CONN_MAX_LIFETIME", 5*time.Minute),
 				ConnMaxIdleTime: getEnvDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
 			},
+		},
+		Auth: AuthConfig{
+			JWTPrivateKeyPEM:    getEnv("AUTH_JWT_PRIVATE_KEY", ""),
+			JWTKeyID:            getEnv("AUTH_JWT_KID", "bookeat-dev"),
+			AccessTokenTTL:      getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+			RefreshTokenTTL:     getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 720*time.Hour),
+			OTPCodeTTL:          getEnvDuration("AUTH_OTP_TTL", 5*time.Minute),
+			OTPRateLimitPerMin:  getEnvInt("AUTH_OTP_RATE_PER_MIN", 1),
+			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
+			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
 		},
 	}
 
@@ -110,6 +134,32 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok {
 		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+// getEnvList returns the comma-separated value of the environment variable named
+// by key (each element trimmed, empties dropped), or def parsed the same way
+// when the variable is unset.
+func getEnvList(key, def string) []string {
+	raw := getEnv(key, def)
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// getEnvBool returns the boolean value of the environment variable named by
+// key, or def when unset or unparseable. Accepts 1/t/true/0/f/false.
+func getEnvBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			return b
 		}
 	}
 	return def
