@@ -15,6 +15,7 @@ import (
 
 	authrest "backend-core/internal/transport/rest/auth"
 	"backend-core/internal/transport/rest/middleware"
+	"backend-core/internal/transport/rest/swaggerui"
 	usersrest "backend-core/internal/transport/rest/users"
 )
 
@@ -44,6 +45,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"status": "ready"}})
 	})
 	r.GET("/.well-known/jwks.json", func(c *gin.Context) { c.JSON(http.StatusOK, deps.Issuer.JWKS()) })
+
+	// Interactive API docs at /docs — mounted only outside production.
+	swaggerui.Register(r, cfg.App.Environment)
 
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
