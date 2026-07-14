@@ -61,8 +61,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 
+	// Wave 1: admin-only. Per-restaurant self-service for restaurant-role
+	// managers (scoped via RestaurantManagers.Manages) is a deliberate
+	// follow-up, not yet wired here.
 	adminRest := authed.Group("")
-	adminRest.Use(middleware.RequireRole(domain.RoleAdmin, domain.RoleRestaurant))
+	adminRest.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdmin(adminRest)
 
 	return r

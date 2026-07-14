@@ -31,6 +31,9 @@ func (f *fakeRestaurantRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.R
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
+	if f.agg == nil {
+		return &domain.RestaurantAggregate{}, nil
+	}
 	return f.agg, nil
 }
 func (f *fakeRestaurantRepo) ListActive(_ context.Context, _ domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
@@ -41,7 +44,18 @@ func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) 
 	return nil
 }
 
-type fakeRelated struct{ replaced int }
+// fakeRelated records both the total number of Replace* calls (replaced, kept
+// for backward-compat with existing assertions) and which specific
+// collections were touched, so tests can assert that Update only replaces
+// the collections explicitly provided in the request.
+type fakeRelated struct {
+	replaced int
+
+	imagesReplaced      bool
+	featuresReplaced    bool
+	tagsReplaced        bool
+	socialLinksReplaced bool
+}
 
 func (f *fakeRelated) ListImages(context.Context, uuid.UUID) ([]domain.Image, error) { return nil, nil }
 func (f *fakeRelated) ListFeatures(context.Context, uuid.UUID) ([]domain.Feature, error) {
@@ -65,18 +79,22 @@ func (f *fakeRelated) GetFloorPlan(context.Context, uuid.UUID) (*domain.FloorPla
 }
 func (f *fakeRelated) ReplaceImages(context.Context, uuid.UUID, []domain.Image) error {
 	f.replaced++
+	f.imagesReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceFeatures(context.Context, uuid.UUID, []domain.Feature) error {
 	f.replaced++
+	f.featuresReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceTags(context.Context, uuid.UUID, []domain.Tag) error {
 	f.replaced++
+	f.tagsReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceSocialLinks(context.Context, uuid.UUID, []domain.SocialLink) error {
 	f.replaced++
+	f.socialLinksReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceWorkingHours(context.Context, uuid.UUID, []domain.WorkingHours) error {

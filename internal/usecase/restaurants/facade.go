@@ -40,12 +40,16 @@ func NewFacade(
 }
 
 // SaveInput carries a restaurant plus its inline collections for create/update.
+// The collection fields and SetActive are pointers so the facade can
+// distinguish "not provided in the request" (nil, preserve on Update) from
+// "provided as empty" (non-nil, replace with empty). See Create/Update.
 type SaveInput struct {
-	Restaurant  domain.Restaurant
-	Images      []domain.Image
-	Features    []domain.Feature
-	Tags        []domain.Tag
-	SocialLinks []domain.SocialLink
+	Restaurant  domain.Restaurant // scalar fields (name, description, city, ...)
+	SetActive   *bool             // nil = leave is_active unchanged (Update) / default true (Create)
+	Images      *[]domain.Image   // nil = collection not provided (preserve on Update)
+	Features    *[]domain.Feature
+	Tags        *[]domain.Tag
+	SocialLinks *[]domain.SocialLink
 }
 
 // PartnershipInput is a public partnership lead submission.
@@ -79,12 +83,17 @@ func (f *facade) Create(ctx context.Context, in SaveInput) (*domain.RestaurantAg
 	if in.Restaurant.ID == uuid.Nil {
 		in.Restaurant.ID = uuid.New()
 	}
+	if in.SetActive != nil {
+		in.Restaurant.IsActive = *in.SetActive
+	} else {
+		in.Restaurant.IsActive = true
+	}
 	var out *domain.RestaurantAggregate
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := f.repo.Create(ctx, &in.Restaurant); err != nil {
 			return err
 		}
-		return f.saveCollections(ctx, in)
+		return f.saveAllCollections(ctx, in)
 	})
 	if err != nil {
 		return nil, err
@@ -99,10 +108,19 @@ func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domai
 	}
 	in.Restaurant.ID = id
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		existing, err := f.repo.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if in.SetActive != nil {
+			in.Restaurant.IsActive = *in.SetActive
+		} else {
+			in.Restaurant.IsActive = existing.IsActive
+		}
 		if err := f.repo.Update(ctx, &in.Restaurant); err != nil {
 			return err
 		}
-		return f.saveCollections(ctx, in)
+		return f.saveProvidedCollections(ctx, in)
 	})
 	if err != nil {
 		return nil, err
@@ -110,18 +128,57 @@ func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domai
 	return f.repo.GetByID(ctx, id)
 }
 
-func (f *facade) saveCollections(ctx context.Context, in SaveInput) error {
+// saveAllCollections replaces all four inline collections, treating a nil
+// pointer as an explicitly empty collection. Used by Create, where a
+// brand-new restaurant has no prior rows to preserve.
+func (f *facade) saveAllCollections(ctx context.Context, in SaveInput) error {
 	rid := in.Restaurant.ID
-	if err := f.related.ReplaceImages(ctx, rid, in.Images); err != nil {
+	if err := f.related.ReplaceImages(ctx, rid, deref(in.Images)); err != nil {
 		return err
 	}
-	if err := f.related.ReplaceFeatures(ctx, rid, in.Features); err != nil {
+	if err := f.related.ReplaceFeatures(ctx, rid, deref(in.Features)); err != nil {
 		return err
 	}
-	if err := f.related.ReplaceTags(ctx, rid, in.Tags); err != nil {
+	if err := f.related.ReplaceTags(ctx, rid, deref(in.Tags)); err != nil {
 		return err
 	}
-	return f.related.ReplaceSocialLinks(ctx, rid, in.SocialLinks)
+	return f.related.ReplaceSocialLinks(ctx, rid, deref(in.SocialLinks))
+}
+
+// saveProvidedCollections replaces only the collections explicitly present in
+// in (non-nil pointer). Used by Update so that omitting a collection in a
+// PATCH preserves its existing rows instead of wiping them.
+func (f *facade) saveProvidedCollections(ctx context.Context, in SaveInput) error {
+	rid := in.Restaurant.ID
+	if in.Images != nil {
+		if err := f.related.ReplaceImages(ctx, rid, *in.Images); err != nil {
+			return err
+		}
+	}
+	if in.Features != nil {
+		if err := f.related.ReplaceFeatures(ctx, rid, *in.Features); err != nil {
+			return err
+		}
+	}
+	if in.Tags != nil {
+		if err := f.related.ReplaceTags(ctx, rid, *in.Tags); err != nil {
+			return err
+		}
+	}
+	if in.SocialLinks != nil {
+		if err := f.related.ReplaceSocialLinks(ctx, rid, *in.SocialLinks); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deref returns the empty/nil-slice value of *p, or nil if p is nil.
+func deref[T any](p *[]T) []T {
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 func (f *facade) SetActive(ctx context.Context, id uuid.UUID, active bool) error {

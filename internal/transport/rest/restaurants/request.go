@@ -49,6 +49,11 @@ type socialInput struct {
 	URL  string `json:"url"`
 }
 
+// toInput maps the request to uc.SaveInput with opt-in semantics: a field or
+// collection that is absent from the JSON body (nil) leaves the existing
+// value untouched on Update; only fields/collections explicitly present are
+// applied. IsActive and each collection are therefore only forced when the
+// corresponding JSON key was present in the request.
 func (r saveRestaurantRequest) toInput() uc.SaveInput {
 	rest := domain.Restaurant{
 		Name: r.Name, NameI18n: r.NameI18n, Description: r.Description,
@@ -57,27 +62,39 @@ func (r saveRestaurantRequest) toInput() uc.SaveInput {
 		Email: r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
 	}
-	rest.IsActive = true
-	if r.IsActive != nil {
-		rest.IsActive = *r.IsActive
-	}
 	if r.CategoryID != nil {
 		if id, err := uuid.Parse(*r.CategoryID); err == nil {
 			rest.CategoryID = &id
 		}
 	}
-	in := uc.SaveInput{Restaurant: rest}
-	for _, i := range r.Images {
-		in.Images = append(in.Images, domain.Image{ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
+	in := uc.SaveInput{Restaurant: rest, SetActive: r.IsActive}
+	if r.Images != nil {
+		imgs := make([]domain.Image, 0, len(r.Images))
+		for _, i := range r.Images {
+			imgs = append(imgs, domain.Image{ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
+		}
+		in.Images = &imgs
 	}
-	for _, f := range r.Features {
-		in.Features = append(in.Features, domain.Feature{Name: f.Name, NameI18n: f.NameI18n})
+	if r.Features != nil {
+		feats := make([]domain.Feature, 0, len(r.Features))
+		for _, f := range r.Features {
+			feats = append(feats, domain.Feature{Name: f.Name, NameI18n: f.NameI18n})
+		}
+		in.Features = &feats
 	}
-	for _, t := range r.Tags {
-		in.Tags = append(in.Tags, domain.Tag{TagName: t.TagName, TagNameI18n: t.TagNameI18n})
+	if r.Tags != nil {
+		tags := make([]domain.Tag, 0, len(r.Tags))
+		for _, t := range r.Tags {
+			tags = append(tags, domain.Tag{TagName: t.TagName, TagNameI18n: t.TagNameI18n})
+		}
+		in.Tags = &tags
 	}
-	for _, s := range r.SocialLinks {
-		in.SocialLinks = append(in.SocialLinks, domain.SocialLink{Type: s.Type, URL: s.URL})
+	if r.SocialLinks != nil {
+		socials := make([]domain.SocialLink, 0, len(r.SocialLinks))
+		for _, s := range r.SocialLinks {
+			socials = append(socials, domain.SocialLink{Type: s.Type, URL: s.URL})
+		}
+		in.SocialLinks = &socials
 	}
 	return in
 }

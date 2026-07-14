@@ -31,7 +31,7 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
-// RegisterAdmin mounts routes on a group already gated by RequireRole(admin[,restaurant]).
+// RegisterAdmin mounts routes on a group already gated by RequireRole(admin).
 func (h *Handler) RegisterAdmin(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
 	rg.PATCH("/restaurants/:id", h.update)

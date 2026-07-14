@@ -15,9 +15,10 @@ func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	rel := &fakeRelated{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
+	images := []domain.Image{{ImageURL: "a"}}
 	_, err := f.Create(context.Background(), SaveInput{
 		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		Images:     []domain.Image{{ImageURL: "a"}},
+		Images:     &images,
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -25,8 +26,14 @@ func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	if repo.created == nil || repo.created.ID == uuid.Nil {
 		t.Error("expected restaurant created with generated ID")
 	}
+	if !repo.created.IsActive {
+		t.Error("expected new restaurant to default to active when SetActive is nil")
+	}
 	if rel.replaced != 4 { // images, features, tags, social
 		t.Errorf("replaced collections = %d, want 4", rel.replaced)
+	}
+	if !rel.imagesReplaced || !rel.featuresReplaced || !rel.tagsReplaced || !rel.socialLinksReplaced {
+		t.Error("expected Create to replace all four collections, including empty ones")
 	}
 }
 
@@ -37,9 +44,10 @@ func TestUpdateValidatesAndSavesCollections(t *testing.T) {
 	tx := &inlineTx{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, tx)
 
+	images := []domain.Image{{ImageURL: "a"}}
 	_, err := f.Update(context.Background(), id, SaveInput{
 		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		Images:     []domain.Image{{ImageURL: "a"}},
+		Images:     &images,
 	})
 	if err != nil {
 		t.Fatalf("update: %v", err)
@@ -47,11 +55,106 @@ func TestUpdateValidatesAndSavesCollections(t *testing.T) {
 	if repo.updated == nil || repo.updated.ID != id {
 		t.Error("expected restaurant updated with the passed id")
 	}
-	if rel.replaced != 4 { // images, features, tags, social
-		t.Errorf("replaced collections = %d, want 4", rel.replaced)
+	if !rel.imagesReplaced {
+		t.Error("expected ReplaceImages to be called since Images was provided")
 	}
 	if !tx.called {
 		t.Error("expected Update to route through the TxManager")
+	}
+}
+
+// TestUpdatePreservesIsActiveWhenOmitted proves fix #2(a): a PATCH that omits
+// is_active (SetActive == nil) must not silently reactivate a soft-deleted
+// restaurant.
+func TestUpdatePreservesIsActiveWhenOmitted(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{
+		Restaurant: domain.Restaurant{ID: id, IsActive: false},
+	}}
+	rel := &fakeRelated{}
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), id, SaveInput{
+		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
+		SetActive:  nil,
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if repo.updated == nil {
+		t.Fatal("expected restaurant to be updated")
+	}
+	if repo.updated.IsActive {
+		t.Error("expected IsActive to remain false when SetActive is omitted, got true (silent reactivation)")
+	}
+}
+
+// TestUpdateSetsActiveWhenProvided proves that an explicit is_active in the
+// PATCH body still takes effect.
+func TestUpdateSetsActiveWhenProvided(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{
+		Restaurant: domain.Restaurant{ID: id, IsActive: false},
+	}}
+	rel := &fakeRelated{}
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	active := true
+	_, err := f.Update(context.Background(), id, SaveInput{
+		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
+		SetActive:  &active,
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if repo.updated == nil || !repo.updated.IsActive {
+		t.Error("expected IsActive to be set to true when SetActive=&true")
+	}
+}
+
+// TestUpdateOnlyReplacesProvidedCollections proves fix #2(b): a PATCH that
+// only carries images must not wipe features/tags/social_links.
+func TestUpdateOnlyReplacesProvidedCollections(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: id}}}
+	rel := &fakeRelated{}
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	images := []domain.Image{{ImageURL: "a"}}
+	_, err := f.Update(context.Background(), id, SaveInput{
+		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
+		Images:     &images,
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !rel.imagesReplaced {
+		t.Error("expected ReplaceImages to be called since Images was provided")
+	}
+	if rel.featuresReplaced || rel.tagsReplaced || rel.socialLinksReplaced {
+		t.Error("expected features/tags/social_links to be left untouched when omitted from the request")
+	}
+	if rel.replaced != 1 {
+		t.Errorf("replaced collections = %d, want 1 (only images)", rel.replaced)
+	}
+}
+
+// TestUpdatePropagatesNotFound proves that Updating a nonexistent restaurant
+// surfaces ErrNotFound (so the handler maps it to 404) instead of blowing up
+// or silently creating rows.
+func TestUpdatePropagatesNotFound(t *testing.T) {
+	repo := &fakeRestaurantRepo{getErr: domain.ErrNotFound}
+	rel := &fakeRelated{}
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), uuid.New(), SaveInput{
+		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+	if rel.replaced != 0 {
+		t.Error("expected no collection replace calls when the restaurant doesn't exist")
 	}
 }
 
