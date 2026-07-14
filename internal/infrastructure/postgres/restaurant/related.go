@@ -183,13 +183,13 @@ func (r *Related) ReplaceImages(ctx context.Context, rid uuid.UUID, items []doma
 	if err := r.del(ctx, "restaurant_images", rid); err != nil {
 		return fmt.Errorf("replace images: %w", err)
 	}
-	for _, i := range items {
-		if i.ID == uuid.Nil {
-			i.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_images (id, restaurant_id, image_url, is_primary, created_at)
-			 VALUES ($1,$2,$3,$4,now())`, i.ID, rid, i.ImageURL, i.IsPrimary); err != nil {
+			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].ImageURL, items[i].IsPrimary); err != nil {
 			return fmt.Errorf("replace images: %w", err)
 		}
 	}
@@ -200,13 +200,13 @@ func (r *Related) ReplaceFeatures(ctx context.Context, rid uuid.UUID, items []do
 	if err := r.del(ctx, "restaurant_features", rid); err != nil {
 		return fmt.Errorf("replace features: %w", err)
 	}
-	for _, f := range items {
-		if f.ID == uuid.Nil {
-			f.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_features (id, restaurant_id, name, name_i18n, created_at)
-			 VALUES ($1,$2,$3,$4,now())`, f.ID, rid, f.Name, i18nToDB(f.NameI18n)); err != nil {
+			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].Name, i18nToDB(items[i].NameI18n)); err != nil {
 			return fmt.Errorf("replace features: %w", err)
 		}
 	}
@@ -217,13 +217,13 @@ func (r *Related) ReplaceTags(ctx context.Context, rid uuid.UUID, items []domain
 	if err := r.del(ctx, "restaurant_tags", rid); err != nil {
 		return fmt.Errorf("replace tags: %w", err)
 	}
-	for _, tg := range items {
-		if tg.ID == uuid.Nil {
-			tg.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_tags (id, restaurant_id, tag_name, tag_name_i18n, created_at)
-			 VALUES ($1,$2,$3,$4,now())`, tg.ID, rid, tg.TagName, i18nToDB(tg.TagNameI18n)); err != nil {
+			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].TagName, i18nToDB(items[i].TagNameI18n)); err != nil {
 			return fmt.Errorf("replace tags: %w", err)
 		}
 	}
@@ -234,13 +234,13 @@ func (r *Related) ReplaceSocialLinks(ctx context.Context, rid uuid.UUID, items [
 	if err := r.del(ctx, "restaurant_social_links", rid); err != nil {
 		return fmt.Errorf("replace social links: %w", err)
 	}
-	for _, s := range items {
-		if s.ID == uuid.Nil {
-			s.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_social_links (id, restaurant_id, type, url, created_at)
-			 VALUES ($1,$2,$3,$4,now())`, s.ID, rid, s.Type, s.URL); err != nil {
+			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].Type, items[i].URL); err != nil {
 			return fmt.Errorf("replace social links: %w", err)
 		}
 	}
@@ -251,13 +251,13 @@ func (r *Related) ReplaceWorkingHours(ctx context.Context, rid uuid.UUID, items 
 	if err := r.del(ctx, "restaurant_working_hours", rid); err != nil {
 		return fmt.Errorf("replace working hours: %w", err)
 	}
-	for _, w := range items {
-		if w.ID == uuid.Nil {
-			w.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_working_hours (id, restaurant_id, day_of_week, open_time, close_time, is_open, created_at, updated_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, w.ID, rid, w.DayOfWeek, w.OpenTime, w.CloseTime, w.IsOpen); err != nil {
+			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, items[i].ID, rid, items[i].DayOfWeek, items[i].OpenTime, items[i].CloseTime, items[i].IsOpen); err != nil {
 			return fmt.Errorf("replace working hours: %w", err)
 		}
 	}
@@ -268,13 +268,13 @@ func (r *Related) ReplaceTimeSlots(ctx context.Context, rid uuid.UUID, items []d
 	if err := r.del(ctx, "restaurant_time_slots", rid); err != nil {
 		return fmt.Errorf("replace time slots: %w", err)
 	}
-	for _, s := range items {
-		if s.ID == uuid.Nil {
-			s.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_time_slots (id, restaurant_id, day_of_week, start_time, end_time, is_manually_disabled, created_at, updated_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, s.ID, rid, s.DayOfWeek, s.StartTime, s.EndTime, s.IsManuallyDisabled); err != nil {
+			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, items[i].ID, rid, items[i].DayOfWeek, items[i].StartTime, items[i].EndTime, items[i].IsManuallyDisabled); err != nil {
 			return fmt.Errorf("replace time slots: %w", err)
 		}
 	}
@@ -285,13 +285,13 @@ func (r *Related) ReplaceTables(ctx context.Context, rid uuid.UUID, items []doma
 	if err := r.del(ctx, "restaurant_tables", rid); err != nil {
 		return fmt.Errorf("replace tables: %w", err)
 	}
-	for _, tb := range items {
-		if tb.ID == uuid.Nil {
-			tb.ID = uuid.New()
+	for i := range items {
+		if items[i].ID == uuid.Nil {
+			items[i].ID = uuid.New()
 		}
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO restaurant_tables (id, restaurant_id, name, capacity, description, is_active, created_at, updated_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, tb.ID, rid, tb.Name, tb.Capacity, tb.Description, tb.IsActive); err != nil {
+			 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, items[i].ID, rid, items[i].Name, items[i].Capacity, items[i].Description, items[i].IsActive); err != nil {
 			return fmt.Errorf("replace tables: %w", err)
 		}
 	}
@@ -352,7 +352,7 @@ func (c *Categories) Create(ctx context.Context, cat *domain.RestaurantCategory)
 		 VALUES ($1,$2,$3,$4,$5,now())`,
 		cat.ID, cat.Name, i18nToDB(cat.NameI18n), cat.Description, i18nToDB(cat.DescriptionI18n))
 	if err != nil {
-		return fmt.Errorf("create category: %w", err)
+		return mapWrite(err, "create category")
 	}
 	return nil
 }
@@ -444,7 +444,7 @@ func (p *Partnership) Create(ctx context.Context, req *domain.PartnershipRequest
 		req.ID, req.RestaurantName, req.ContactName, req.Email, req.Phone, req.Address,
 		req.CuisineType, req.Description, req.AdditionalInfo, req.Status)
 	if err != nil {
-		return fmt.Errorf("create partnership request: %w", err)
+		return mapWrite(err, "create partnership request")
 	}
 	return nil
 }

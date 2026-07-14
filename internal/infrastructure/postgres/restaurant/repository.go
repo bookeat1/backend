@@ -56,9 +56,15 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		address_i18n=$10, opening_hours=$11, opening_hours_i18n=$12, city=$13,
 		price_category=$14, email=$15, phone=$16, latitude=$17, longitude=$18,
 		kwaaka_restaurant_id=$19, is_active=$20, is_new=$21, is_popular=$22,
-		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$27
+		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$26
 		WHERE id=$1`
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(m)...)
+	// r.args(m) is ordered ID..DisplayOrder ($1..$25), CreatedAt, UpdatedAt.
+	// Update never touches created_at, so drop it and keep UpdatedAt as $26.
+	// The full-slice-expression forces a fresh backing array so append can't
+	// alias/clobber the slice returned by r.args.
+	all := r.args(m)
+	updArgs := append(all[:25:25], all[26])
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, updArgs...)
 	if err != nil {
 		return mapWrite(err, "update restaurant")
 	}
@@ -262,10 +268,13 @@ func i18nFromDB(b []byte) domain.I18n {
 	return m
 }
 
-func mapWrite(err error, ctx string) error {
+// mapWrite maps a unique_violation to domain.ErrAlreadyExists, otherwise wraps
+// err with resource for context. resource should name the entity/operation
+// being written (e.g. "create restaurant", "create manager").
+func mapWrite(err error, resource string) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
-		return fmt.Errorf("%w: restaurant", domain.ErrAlreadyExists)
+		return fmt.Errorf("%w: %s", domain.ErrAlreadyExists, resource)
 	}
-	return fmt.Errorf("%s: %w", ctx, err)
+	return fmt.Errorf("%s: %w", resource, err)
 }

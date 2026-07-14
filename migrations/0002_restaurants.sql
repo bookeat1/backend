@@ -129,7 +129,7 @@ CREATE TABLE restaurant_floor_plans
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_restaurant_floor_plans_rid ON restaurant_floor_plans (restaurant_id);
+CREATE UNIQUE INDEX idx_restaurant_floor_plans_rid ON restaurant_floor_plans (restaurant_id);
 
 CREATE TABLE restaurant_managers
 (

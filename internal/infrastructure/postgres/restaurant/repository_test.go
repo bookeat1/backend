@@ -56,4 +56,45 @@ func TestRestaurantCRUDAndList(t *testing.T) {
 	}
 }
 
+func TestRepositoryUpdate(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
+	repo := New(pool)
+	ctx := context.Background()
+
+	m := &domain.Restaurant{
+		ID: uuid.New(), Name: "Original Name", City: domain.CityAlmaty,
+		PriceCategory: domain.PriceMid, IsActive: true,
+	}
+	if err := repo.Create(ctx, m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	createdAt := m.CreatedAt
+
+	upd := &domain.Restaurant{
+		ID: m.ID, Name: "Updated Name", City: domain.CityAstana,
+		PriceCategory: domain.PriceHigh, IsActive: false,
+		// CreatedAt intentionally left zero, as it would be on a request DTO;
+		// Update must not write it to the created_at column.
+	}
+	if err := repo.Update(ctx, upd); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Name != "Updated Name" || got.City != domain.CityAstana || got.PriceCategory != domain.PriceHigh || got.IsActive {
+		t.Errorf("update did not persist: %+v", got.Restaurant)
+	}
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Errorf("created_at changed: got %v, want %v", got.CreatedAt, createdAt)
+	}
+
+	if err := repo.Update(ctx, &domain.Restaurant{ID: uuid.New(), Name: "x", City: domain.CityAlmaty, PriceCategory: domain.PriceLow}); err != domain.ErrNotFound {
+		t.Errorf("update missing err = %v, want ErrNotFound", err)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }
