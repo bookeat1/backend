@@ -13,8 +13,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
 	"backend-core/internal/transport/rest/middleware"
+	restrest "backend-core/internal/transport/rest/restaurants"
 	"backend-core/internal/transport/rest/swaggerui"
 	usersrest "backend-core/internal/transport/rest/users"
 )
@@ -52,9 +54,16 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
 
+	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers)
+	restHandler.RegisterPublic(api)
+
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
+
+	adminRest := authed.Group("")
+	adminRest.Use(middleware.RequireRole(domain.RoleAdmin, domain.RoleRestaurant))
+	restHandler.RegisterAdmin(adminRest)
 
 	return r
 }
