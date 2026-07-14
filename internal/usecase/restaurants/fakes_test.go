@@ -132,6 +132,9 @@ func (f *fakeUsers) GetByID(_ context.Context, id uuid.UUID) (*domain.User, erro
 }
 
 // inlineTx runs fn directly (no real transaction) for unit tests.
-type inlineTx struct{}
+type inlineTx struct{ called bool }
 
-func (inlineTx) WithinTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
+func (t *inlineTx) WithinTx(ctx context.Context, fn func(context.Context) error) error {
+	t.called = true
+	return fn(ctx)
+}

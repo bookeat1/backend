@@ -13,7 +13,7 @@ import (
 func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{}}
 	rel := &fakeRelated{}
-	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, inlineTx{})
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
 	_, err := f.Create(context.Background(), SaveInput{
 		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
@@ -30,8 +30,43 @@ func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	}
 }
 
+func TestUpdateValidatesAndSavesCollections(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{}}
+	rel := &fakeRelated{}
+	tx := &inlineTx{}
+	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, tx)
+
+	_, err := f.Update(context.Background(), id, SaveInput{
+		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
+		Images:     []domain.Image{{ImageURL: "a"}},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if repo.updated == nil || repo.updated.ID != id {
+		t.Error("expected restaurant updated with the passed id")
+	}
+	if rel.replaced != 4 { // images, features, tags, social
+		t.Errorf("replaced collections = %d, want 4", rel.replaced)
+	}
+	if !tx.called {
+		t.Error("expected Update to route through the TxManager")
+	}
+}
+
+func TestUpdateRejectsInvalidCity(t *testing.T) {
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+	_, err := f.Update(context.Background(), uuid.New(), SaveInput{
+		Restaurant: domain.Restaurant{Name: "Bad", City: "Nowhere", PriceCategory: domain.PriceLow},
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
 func TestCreateRejectsInvalidCity(t *testing.T) {
-	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, inlineTx{})
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 	_, err := f.Create(context.Background(), SaveInput{
 		Restaurant: domain.Restaurant{Name: "Bad", City: "Nowhere", PriceCategory: domain.PriceLow},
 	})
@@ -42,7 +77,7 @@ func TestCreateRejectsInvalidCity(t *testing.T) {
 
 func TestSubmitPartnershipValidates(t *testing.T) {
 	p := &fakePartners{}
-	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, p, inlineTx{})
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, p, &inlineTx{})
 	if err := f.SubmitPartnership(context.Background(), PartnershipInput{}); !errors.Is(err, domain.ErrValidation) {
 		t.Errorf("empty submit err = %v, want ErrValidation", err)
 	}
@@ -60,6 +95,28 @@ func TestManagerAssignChecksUserExists(t *testing.T) {
 	u := NewManagerUseCase(&fakeManagers{}, &fakeUsers{err: domain.ErrNotFound})
 	if _, err := u.Assign(context.Background(), AssignManagerInput{UserID: uuid.New(), RestaurantID: uuid.New()}); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("assign missing user err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestManagerAssignSuccess(t *testing.T) {
+	rid, uid := uuid.New(), uuid.New()
+	fm := &fakeManagers{}
+	u := NewManagerUseCase(fm, &fakeUsers{})
+
+	m, err := u.Assign(context.Background(), AssignManagerInput{
+		RestaurantID: rid, UserID: uid, WhatsappOptIn: true,
+	})
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected non-nil manager")
+	}
+	if fm.created == nil {
+		t.Fatal("expected manager created")
+	}
+	if fm.created.RestaurantID != rid || fm.created.UserID != uid || !fm.created.WhatsappOptIn {
+		t.Errorf("created = %+v, want RestaurantID=%v UserID=%v WhatsappOptIn=true", fm.created, rid, uid)
 	}
 }
 
