@@ -15,6 +15,7 @@ import (
 
 	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
+	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	"backend-core/internal/transport/rest/swaggerui"
@@ -61,12 +62,25 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 
-	// Wave 1: admin-only. Per-restaurant self-service for restaurant-role
-	// managers (scoped via RestaurantManagers.Manages) is a deliberate
-	// follow-up, not yet wired here.
-	adminRest := authed.Group("")
-	adminRest.Use(middleware.RequireRole(domain.RoleAdmin))
-	restHandler.RegisterAdmin(adminRest)
+	menuHandler := menurest.NewHandler(deps.MenuFacade)
+	menuHandler.RegisterPublic(api)
+
+	// Global admin-only routes (no single-restaurant scope).
+	adminGlobal := authed.Group("")
+	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
+	restHandler.RegisterAdminGlobal(adminGlobal)
+	menuHandler.RegisterAdmin(adminGlobal)
+
+	// Restaurant-scoped mutations: admin OR the restaurant's own manager.
+	// Every route under /restaurants/:… uses the ":id" param (gin forbids mixing
+	// ":id" and ":restaurantId" at the same position), so both gates read "id".
+	restScoped := authed.Group("")
+	restScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	restHandler.RegisterRestaurantScoped(restScoped)
+
+	menuScoped := authed.Group("")
+	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	menuHandler.RegisterScoped(menuScoped)
 
 	return r
 }

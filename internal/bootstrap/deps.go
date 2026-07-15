@@ -8,6 +8,7 @@ import (
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/otpsender"
+	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
@@ -16,6 +17,7 @@ import (
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/usecase/auth"
+	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/users"
 )
@@ -28,6 +30,7 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
+	MenuFacade         menu.Facade
 	Issuer             *token.RSAIssuer
 }
 
@@ -60,6 +63,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	restManagers := restrepo.NewManagers(db)
 	restPartners := restrepo.NewPartnership(db)
 
+	menuItems := menurepo.New(db)
+	menuCategories := menurepo.NewCategories(db)
+
 	return &Deps{
 		AuthFacade:         authFacade,
 		AuthOTP:            authOTP,
@@ -67,6 +73,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersRepo:          usersRepo,
 		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
 		RestaurantManagers: restaurants.NewManagerUseCase(restManagers, usersRepo),
+		MenuFacade:         menu.NewFacade(menuItems, menuCategories, txm),
 		Issuer:             issuer,
 	}, nil
 }

@@ -31,9 +31,15 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
-// RegisterAdmin mounts routes on a group already gated by RequireRole(admin).
-func (h *Handler) RegisterAdmin(rg *gin.RouterGroup) {
+// RegisterAdminGlobal mounts admin-only routes that are not scoped to a single
+// restaurant (creating a new restaurant). Mount on a RequireRole(admin) group.
+func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
+}
+
+// RegisterRestaurantScoped mounts mutations on an existing restaurant. Mount on
+// a RequireRestaurantManager(..., "id") group (admin or the restaurant's manager).
+func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
 	rg.PATCH("/restaurants/:id", h.update)
 	rg.DELETE("/restaurants/:id", h.deactivate)
 	rg.GET("/restaurants/:id/managers", h.listManagers)
