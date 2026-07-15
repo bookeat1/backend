@@ -31,20 +31,25 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
-// RegisterAdminGlobal mounts admin-only routes that are not scoped to a single
-// restaurant (creating a new restaurant). Mount on a RequireRole(admin) group.
+// RegisterAdminGlobal mounts admin-only routes: creating a new restaurant, and
+// all restaurant-manager management (list/assign/remove). Manager management is
+// intentionally admin-only, not gated by restaurant ownership: removeManager
+// deletes a manager record by managerID alone, so scoping this by "is a manager
+// of :id" would let a manager of restaurant A delete a manager record belonging
+// to restaurant B (cross-tenant IDOR). Mount on a RequireRole(admin) group.
 func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
-}
-
-// RegisterRestaurantScoped mounts mutations on an existing restaurant. Mount on
-// a RequireRestaurantManager(..., "id") group (admin or the restaurant's manager).
-func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
-	rg.PATCH("/restaurants/:id", h.update)
-	rg.DELETE("/restaurants/:id", h.deactivate)
 	rg.GET("/restaurants/:id/managers", h.listManagers)
 	rg.POST("/restaurants/:id/managers", h.assignManager)
 	rg.DELETE("/restaurants/:id/managers/:managerID", h.removeManager)
+}
+
+// RegisterRestaurantScoped mounts mutations on an existing restaurant's own
+// fields. Mount on a RequireRestaurantManager(..., "id") group (admin or the
+// restaurant's own manager).
+func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
+	rg.PATCH("/restaurants/:id", h.update)
+	rg.DELETE("/restaurants/:id", h.deactivate)
 }
 
 func (h *Handler) list(c *gin.Context) {
