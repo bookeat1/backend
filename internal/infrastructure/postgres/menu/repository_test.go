@@ -75,6 +75,71 @@ func TestMenuItemCRUDListTagsAvailability(t *testing.T) {
 	}
 }
 
+func TestMenuItemUpdate(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "menu_items", "menu_categories", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'R','Алматы','₸')`, rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+
+	repo := New(pool)
+	lang := "ru"
+	order := 1
+	m := &domain.MenuItem{
+		ID: uuid.New(), RestaurantID: rid, Name: "Plov", NameI18n: domain.I18n{"ru": "Плов"},
+		Price: "3500.00", IsAvailable: true, Category: ptr("Основные"), Language: &lang, DisplayOrder: &order,
+	}
+	if err := repo.Create(ctx, m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	created, err := repo.GetByID(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get after create: %v", err)
+	}
+
+	m.Name = "Lagman"
+	m.Price = "4200.00"
+	if err := repo.Update(ctx, m); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if got.Name != "Lagman" || got.Price != "4200.00" {
+		t.Errorf("update mismatch: name=%q price=%q", got.Name, got.Price)
+	}
+	if got.RestaurantID != created.RestaurantID {
+		t.Errorf("restaurant_id changed: got %v, want %v", got.RestaurantID, created.RestaurantID)
+	}
+	if !got.CreatedAt.Equal(created.CreatedAt) {
+		t.Errorf("created_at changed: got %v, want %v", got.CreatedAt, created.CreatedAt)
+	}
+
+	// positive language filter: item with Language="en" must be returned by ListByRestaurant(Language: "en").
+	en := "en"
+	enOrder := 2
+	enItem := &domain.MenuItem{
+		ID: uuid.New(), RestaurantID: rid, Name: "Burger", Price: "2500.00",
+		IsAvailable: true, Language: &en, DisplayOrder: &enOrder,
+	}
+	if err := repo.Create(ctx, enItem); err != nil {
+		t.Fatalf("create en item: %v", err)
+	}
+	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid, Language: &en})
+	if err != nil {
+		t.Fatalf("list(en): %v", err)
+	}
+	if len(items) != 1 || items[0].ID != enItem.ID {
+		t.Fatalf("list(en) = %d items, want 1 matching enItem.ID", len(items))
+	}
+}
+
 func TestMenuCategoryCRUD(t *testing.T) {
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, "menu_categories")

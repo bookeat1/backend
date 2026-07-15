@@ -131,11 +131,14 @@ func (r *Repository) Create(ctx context.Context, m *domain.MenuItem) error {
 
 func (r *Repository) Update(ctx context.Context, m *domain.MenuItem) error {
 	m.UpdatedAt = time.Now()
-	q := `UPDATE menu_items SET name=$3, name_i18n=$4, description=$5, description_i18n=$6,
-		price=$7::numeric, image_url=$8, is_available=$9, category=$10, category_i18n=$11,
-		subcategory=$12, subcategory_i18n=$13, portion_size=$14, portion_size_i18n=$15,
-		language=$16, display_order=$17, updated_at=$19 WHERE id=$1`
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(m)...)
+	q := `UPDATE menu_items SET name=$2, name_i18n=$3, description=$4, description_i18n=$5,
+		price=$6::numeric, image_url=$7, is_available=$8, category=$9, category_i18n=$10,
+		subcategory=$11, subcategory_i18n=$12, portion_size=$13, portion_size_i18n=$14,
+		language=$15, display_order=$16, updated_at=$17 WHERE id=$1`
+	a := r.args(m)
+	updArgs := append(a[:1:1], a[2:17]...) // ID + Name..DisplayOrder (16 values, $1..$16)
+	updArgs = append(updArgs, a[18])       // UpdatedAt -> $17
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, updArgs...)
 	if err != nil {
 		return mapWrite(err, "update menu item")
 	}
