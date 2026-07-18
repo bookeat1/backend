@@ -29,8 +29,24 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := run(context.Background(), db, log); err != nil {
-		log.Error("etl failed", slog.String("error", err.Error()))
+	target := "users"
+	if len(os.Args) > 1 {
+		target = os.Args[1]
+	}
+	var runErr error
+	switch target {
+	case "users":
+		runErr = run(context.Background(), db, log)
+	case "restaurants":
+		runErr = runRestaurants(context.Background(), db, log)
+	case "menu":
+		runErr = runMenu(context.Background(), db, log)
+	default:
+		log.Error("unknown etl target", slog.String("target", target))
+		os.Exit(1)
+	}
+	if runErr != nil {
+		log.Error("etl failed", slog.String("error", runErr.Error()))
 		os.Exit(1)
 	}
 	log.Info("etl complete")

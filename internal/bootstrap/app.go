@@ -13,8 +13,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
+	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
+	restrest "backend-core/internal/transport/rest/restaurants"
 	"backend-core/internal/transport/rest/swaggerui"
 	usersrest "backend-core/internal/transport/rest/users"
 )
@@ -52,9 +55,32 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
 
+	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers)
+	restHandler.RegisterPublic(api)
+
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
+
+	menuHandler := menurest.NewHandler(deps.MenuFacade)
+	menuHandler.RegisterPublic(api)
+
+	// Global admin-only routes (no single-restaurant scope).
+	adminGlobal := authed.Group("")
+	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
+	restHandler.RegisterAdminGlobal(adminGlobal)
+	menuHandler.RegisterAdmin(adminGlobal)
+
+	// Restaurant-scoped mutations: admin OR the restaurant's own manager.
+	// Every route under /restaurants/:… uses the ":id" param (gin forbids mixing
+	// ":id" and ":restaurantId" at the same position), so both gates read "id".
+	restScoped := authed.Group("")
+	restScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	restHandler.RegisterRestaurantScoped(restScoped)
+
+	menuScoped := authed.Group("")
+	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	menuHandler.RegisterScoped(menuScoped)
 
 	return r
 }

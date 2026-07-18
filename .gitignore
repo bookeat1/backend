@@ -13,3 +13,6 @@
 # test / coverage
 *.out
 coverage.*
+
+# stray go build artifacts from `go build ./cmd/...`
+/etl
