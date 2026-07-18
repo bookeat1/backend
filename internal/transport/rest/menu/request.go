@@ -1,6 +1,8 @@
 package menu
 
 import (
+	"fmt"
+
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
@@ -48,12 +50,14 @@ type menuCategoryRequest struct {
 	DisplayOrder int               `json:"display_order"`
 }
 
-func (r menuCategoryRequest) toInput() uc.CategoryInput {
+func (r menuCategoryRequest) toInput() (uc.CategoryInput, error) {
 	in := uc.CategoryInput{Name: r.Name, NameI18n: domain.I18n(r.NameI18n), DisplayOrder: r.DisplayOrder}
 	if r.ParentID != nil {
-		if id, err := uuid.Parse(*r.ParentID); err == nil {
-			in.ParentID = &id
+		id, err := uuid.Parse(*r.ParentID)
+		if err != nil {
+			return uc.CategoryInput{}, fmt.Errorf("invalid parent_id: %w", domain.ErrValidation)
 		}
+		in.ParentID = &id
 	}
-	return in
+	return in, nil
 }

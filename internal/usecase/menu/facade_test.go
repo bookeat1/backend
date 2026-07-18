@@ -70,6 +70,64 @@ func TestUpdatePreservesTagsWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestCreateDedupesTags(t *testing.T) {
+	items := newFakeItems()
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+	rid := uuid.New()
+	_, err := f.Create(context.Background(), rid, ItemInput{
+		Name: strp("Plov"), Price: strp("1"), Tags: &[]string{"halal", "halal", "spicy"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	tags := items.tagsFor[items.created.ID]
+	if len(tags) != 2 {
+		t.Errorf("tags = %d, want 2 after de-dup of [halal, halal, spicy]", len(tags))
+	}
+}
+
+func TestUpdateCategoryRejectsSelfParent(t *testing.T) {
+	id := uuid.New()
+	cats := &fakeCategories{}
+	f := NewFacade(newFakeItems(), cats, &inlineTx{})
+	_, err := f.UpdateCategory(context.Background(), id, CategoryInput{Name: "X", ParentID: &id})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("self-parent err = %v, want ErrValidation", err)
+	}
+	if cats.updated != nil {
+		t.Error("must not persist a self-referential parent")
+	}
+}
+
+func TestUpdateCategoryRejectsCycle(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	// Existing tree: b's parent is a. Re-parenting a under b closes an a→b→a loop.
+	cats := &fakeCategories{list: []domain.MenuCategory{
+		{ID: a},
+		{ID: b, ParentID: &a},
+	}}
+	f := NewFacade(newFakeItems(), cats, &inlineTx{})
+	_, err := f.UpdateCategory(context.Background(), a, CategoryInput{Name: "A", ParentID: &b})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("cycle err = %v, want ErrValidation", err)
+	}
+	if cats.updated != nil {
+		t.Error("must not persist a parent assignment that creates a cycle")
+	}
+}
+
+func TestUpdateCategoryAllowsValidReparent(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	cats := &fakeCategories{list: []domain.MenuCategory{{ID: a}, {ID: b}}}
+	f := NewFacade(newFakeItems(), cats, &inlineTx{})
+	if _, err := f.UpdateCategory(context.Background(), a, CategoryInput{Name: "A", ParentID: &b}); err != nil {
+		t.Fatalf("valid reparent: %v", err)
+	}
+	if cats.updated == nil || cats.updated.ParentID == nil || *cats.updated.ParentID != b {
+		t.Error("expected a to be re-parented under b")
+	}
+}
+
 func TestSetAvailableChecksOwnership(t *testing.T) {
 	items := newFakeItems()
 	itemID, rid := uuid.New(), uuid.New()

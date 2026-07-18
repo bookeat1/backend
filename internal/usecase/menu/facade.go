@@ -168,6 +168,11 @@ func (f *facade) UpdateCategory(ctx context.Context, id uuid.UUID, in CategoryIn
 	if in.Name == "" {
 		return nil, domain.ErrValidation
 	}
+	if in.ParentID != nil {
+		if err := f.checkNoCycle(ctx, id, *in.ParentID); err != nil {
+			return nil, err
+		}
+	}
 	c := &domain.MenuCategory{ID: id, Name: in.Name, NameI18n: in.NameI18n, ParentID: in.ParentID, DisplayOrder: in.DisplayOrder}
 	if err := f.categories.Update(ctx, c); err != nil {
 		return nil, err
@@ -177,6 +182,33 @@ func (f *facade) UpdateCategory(ctx context.Context, id uuid.UUID, in CategoryIn
 
 func (f *facade) DeleteCategory(ctx context.Context, id uuid.UUID) error {
 	return f.categories.Delete(ctx, id)
+}
+
+// checkNoCycle rejects assigning parentID to category id when doing so would
+// make id its own ancestor — a self-reference or a longer loop — which would
+// make a parent-chain traversal spin forever. It walks the existing parent
+// links up from parentID looking for id, bounded by the category count so a
+// pre-existing cycle can't hang the check either.
+func (f *facade) checkNoCycle(ctx context.Context, id, parentID uuid.UUID) error {
+	if parentID == id {
+		return domain.ErrValidation
+	}
+	cats, err := f.categories.List(ctx)
+	if err != nil {
+		return err
+	}
+	parent := make(map[uuid.UUID]*uuid.UUID, len(cats))
+	for _, c := range cats {
+		parent[c.ID] = c.ParentID
+	}
+	cur := &parentID
+	for steps := 0; cur != nil && steps <= len(cats); steps++ {
+		if *cur == id {
+			return domain.ErrValidation
+		}
+		cur = parent[*cur]
+	}
+	return nil
 }
 
 // applyItem copies the non-nil fields of in onto m.
@@ -231,13 +263,20 @@ func applyItem(m *domain.MenuItem, in ItemInput) {
 	}
 }
 
-// tagsOf builds MenuItemTag rows from the input tag strings (nil → empty).
+// tagsOf builds MenuItemTag rows from the input tag strings (nil → empty),
+// de-duplicating so a body like ["halal","halal"] doesn't trip the
+// UNIQUE(menu_item_id, tag) constraint (which would surface as a 500).
 func tagsOf(itemID uuid.UUID, tags *[]string) []domain.MenuItemTag {
 	if tags == nil {
 		return nil
 	}
+	seen := make(map[string]bool, len(*tags))
 	out := make([]domain.MenuItemTag, 0, len(*tags))
 	for _, t := range *tags {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
 		out = append(out, domain.MenuItemTag{MenuItemID: itemID, Tag: t})
 	}
 	return out

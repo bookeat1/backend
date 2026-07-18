@@ -27,7 +27,7 @@ func runMenu(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 			  price, image_url, is_available, category, category_i18n, subcategory, subcategory_i18n,
 			  portion_size, portion_size_i18n, language, display_order, created_at, updated_at)
 			SELECT mi.id, mi.restaurant_id, mi.name, mi.name_i18n, COALESCE(mi.description,''), mi.description_i18n,
-			  COALESCE(mi.price, 0), mi.image_url, COALESCE(mi.is_available, true), mi.category, mi.category_i18n,
+			  GREATEST(COALESCE(mi.price, 0), 0), mi.image_url, COALESCE(mi.is_available, true), mi.category, mi.category_i18n,
 			  mi.subcategory, mi.subcategory_i18n, mi.portion_size, mi.portion_size_i18n, mi.language,
 			  mi.display_order, COALESCE(mi.created_at, now()), COALESCE(mi.updated_at, now())
 			FROM raw_supabase.menu_items mi

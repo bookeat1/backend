@@ -86,7 +86,7 @@ CREATE TABLE restaurant_working_hours
 (
     id            uuid PRIMARY KEY,
     restaurant_id uuid        NOT NULL REFERENCES restaurants (id) ON DELETE CASCADE,
-    day_of_week   integer     NOT NULL,
+    day_of_week   integer     NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
     open_time     varchar,
     close_time    varchar,
     is_open       boolean     NOT NULL DEFAULT true,
@@ -99,7 +99,7 @@ CREATE TABLE restaurant_time_slots
 (
     id                   uuid PRIMARY KEY,
     restaurant_id        uuid        NOT NULL REFERENCES restaurants (id) ON DELETE CASCADE,
-    day_of_week          integer     NOT NULL,
+    day_of_week          integer     NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
     start_time           varchar     NOT NULL,
     end_time             varchar     NOT NULL,
     is_manually_disabled boolean     NOT NULL DEFAULT false,
@@ -136,7 +136,7 @@ CREATE TABLE restaurant_managers
     id             uuid PRIMARY KEY,
     restaurant_id  uuid        NOT NULL REFERENCES restaurants (id) ON DELETE CASCADE,
     user_id        uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    created_by     uuid,
+    created_by     uuid        REFERENCES users (id) ON DELETE SET NULL,
     whatsapp_opt_in boolean    NOT NULL DEFAULT false,
     whatsapp_phone varchar,
     created_at     timestamptz NOT NULL DEFAULT now(),

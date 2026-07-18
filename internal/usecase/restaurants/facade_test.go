@@ -10,16 +10,27 @@ import (
 	"backend-core/internal/domain"
 )
 
+func strp(s string) *string { return &s }
+func boolp(b bool) *bool    { return &b }
+
+// validInput is the minimal valid SaveInput (required enumerated fields set).
+func validInput() SaveInput {
+	return SaveInput{
+		Name:          strp("Ok"),
+		City:          strp(string(domain.CityAlmaty)),
+		PriceCategory: strp(string(domain.PriceLow)),
+	}
+}
+
 func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{}}
 	rel := &fakeRelated{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
 	images := []domain.Image{{ImageURL: "a"}}
-	_, err := f.Create(context.Background(), SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		Images:     &images,
-	})
+	in := validInput()
+	in.Images = &images
+	_, err := f.Create(context.Background(), in)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -27,7 +38,7 @@ func TestCreateValidatesAndSavesCollections(t *testing.T) {
 		t.Error("expected restaurant created with generated ID")
 	}
 	if !repo.created.IsActive {
-		t.Error("expected new restaurant to default to active when SetActive is nil")
+		t.Error("expected new restaurant to default to active when IsActive is nil")
 	}
 	if rel.replaced != 4 { // images, features, tags, social
 		t.Errorf("replaced collections = %d, want 4", rel.replaced)
@@ -45,10 +56,9 @@ func TestUpdateValidatesAndSavesCollections(t *testing.T) {
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, tx)
 
 	images := []domain.Image{{ImageURL: "a"}}
-	_, err := f.Update(context.Background(), id, SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		Images:     &images,
-	})
+	in := validInput()
+	in.Images = &images
+	_, err := f.Update(context.Background(), id, in)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -63,9 +73,46 @@ func TestUpdateValidatesAndSavesCollections(t *testing.T) {
 	}
 }
 
-// TestUpdatePreservesIsActiveWhenOmitted proves fix #2(a): a PATCH that omits
-// is_active (SetActive == nil) must not silently reactivate a soft-deleted
-// restaurant.
+// TestUpdatePreservesUntouchedScalars proves the blocker #1 fix: a PATCH that
+// carries only a new name must not blank/NULL every other scalar column. The
+// stored row's description, kwaaka_restaurant_id and hidden_from_home have to
+// survive read-modify-write.
+func TestUpdatePreservesUntouchedScalars(t *testing.T) {
+	id := uuid.New()
+	kwaaka := "kw-123"
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+		ID: id, Name: "Old", Description: "keep me", City: domain.CityAlmaty,
+		PriceCategory: domain.PriceLow, KwaakaRestaurantID: &kwaaka, HiddenFromHome: true,
+	}}}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), id, SaveInput{Name: strp("New name")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got == nil {
+		t.Fatal("expected restaurant to be updated")
+	}
+	if got.Name != "New name" {
+		t.Errorf("Name = %q, want the provided value", got.Name)
+	}
+	if got.Description != "keep me" {
+		t.Errorf("Description = %q, want it preserved from the stored row", got.Description)
+	}
+	if got.KwaakaRestaurantID == nil || *got.KwaakaRestaurantID != kwaaka {
+		t.Errorf("KwaakaRestaurantID = %v, want it preserved (not NULLed)", got.KwaakaRestaurantID)
+	}
+	if !got.HiddenFromHome {
+		t.Error("HiddenFromHome = false, want it preserved as true")
+	}
+	if string(got.City) != string(domain.CityAlmaty) {
+		t.Errorf("City = %q, want it preserved", got.City)
+	}
+}
+
+// TestUpdatePreservesIsActiveWhenOmitted proves a PATCH that omits is_active
+// (IsActive == nil) must not silently reactivate a soft-deleted restaurant.
 func TestUpdatePreservesIsActiveWhenOmitted(t *testing.T) {
 	id := uuid.New()
 	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{
@@ -74,10 +121,9 @@ func TestUpdatePreservesIsActiveWhenOmitted(t *testing.T) {
 	rel := &fakeRelated{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
-	_, err := f.Update(context.Background(), id, SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		SetActive:  nil,
-	})
+	in := validInput()
+	in.IsActive = nil
+	_, err := f.Update(context.Background(), id, in)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -85,7 +131,7 @@ func TestUpdatePreservesIsActiveWhenOmitted(t *testing.T) {
 		t.Fatal("expected restaurant to be updated")
 	}
 	if repo.updated.IsActive {
-		t.Error("expected IsActive to remain false when SetActive is omitted, got true (silent reactivation)")
+		t.Error("expected IsActive to remain false when IsActive is omitted, got true (silent reactivation)")
 	}
 }
 
@@ -99,21 +145,19 @@ func TestUpdateSetsActiveWhenProvided(t *testing.T) {
 	rel := &fakeRelated{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
-	active := true
-	_, err := f.Update(context.Background(), id, SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		SetActive:  &active,
-	})
+	in := validInput()
+	in.IsActive = boolp(true)
+	_, err := f.Update(context.Background(), id, in)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	if repo.updated == nil || !repo.updated.IsActive {
-		t.Error("expected IsActive to be set to true when SetActive=&true")
+		t.Error("expected IsActive to be set to true when IsActive=&true")
 	}
 }
 
-// TestUpdateOnlyReplacesProvidedCollections proves fix #2(b): a PATCH that
-// only carries images must not wipe features/tags/social_links.
+// TestUpdateOnlyReplacesProvidedCollections proves a PATCH that only carries
+// images must not wipe features/tags/social_links.
 func TestUpdateOnlyReplacesProvidedCollections(t *testing.T) {
 	id := uuid.New()
 	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: id}}}
@@ -121,10 +165,9 @@ func TestUpdateOnlyReplacesProvidedCollections(t *testing.T) {
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
 	images := []domain.Image{{ImageURL: "a"}}
-	_, err := f.Update(context.Background(), id, SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-		Images:     &images,
-	})
+	in := validInput()
+	in.Images = &images
+	_, err := f.Update(context.Background(), id, in)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -147,9 +190,7 @@ func TestUpdatePropagatesNotFound(t *testing.T) {
 	rel := &fakeRelated{}
 	f := NewFacade(repo, rel, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
-	_, err := f.Update(context.Background(), uuid.New(), SaveInput{
-		Restaurant: domain.Restaurant{Name: "Ok", City: domain.CityAlmaty, PriceCategory: domain.PriceLow},
-	})
+	_, err := f.Update(context.Background(), uuid.New(), validInput())
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -160,9 +201,9 @@ func TestUpdatePropagatesNotFound(t *testing.T) {
 
 func TestUpdateRejectsInvalidCity(t *testing.T) {
 	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
-	_, err := f.Update(context.Background(), uuid.New(), SaveInput{
-		Restaurant: domain.Restaurant{Name: "Bad", City: "Nowhere", PriceCategory: domain.PriceLow},
-	})
+	in := validInput()
+	in.City = strp("Nowhere")
+	_, err := f.Update(context.Background(), uuid.New(), in)
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
 	}
@@ -170,11 +211,21 @@ func TestUpdateRejectsInvalidCity(t *testing.T) {
 
 func TestCreateRejectsInvalidCity(t *testing.T) {
 	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
-	_, err := f.Create(context.Background(), SaveInput{
-		Restaurant: domain.Restaurant{Name: "Bad", City: "Nowhere", PriceCategory: domain.PriceLow},
-	})
+	in := validInput()
+	in.City = strp("Nowhere")
+	_, err := f.Create(context.Background(), in)
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+func TestCreateRejectsMissingName(t *testing.T) {
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+	_, err := f.Create(context.Background(), SaveInput{
+		City: strp(string(domain.CityAlmaty)), PriceCategory: strp(string(domain.PriceLow)),
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation for missing name", err)
 	}
 }
 

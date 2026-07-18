@@ -64,12 +64,14 @@ func (h *Handler) list(c *gin.Context) {
 		}
 	}
 	if v := c.Query("is_popular"); v != "" {
-		b := v == "true"
-		f.IsPopular = &b
+		if b, err := strconv.ParseBool(v); err == nil {
+			f.IsPopular = &b
+		}
 	}
 	if v := c.Query("is_new"); v != "" {
-		b := v == "true"
-		f.IsNew = &b
+		if b, err := strconv.ParseBool(v); err == nil {
+			f.IsNew = &b
+		}
 	}
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
@@ -103,6 +105,14 @@ func (h *Handler) get(c *gin.Context) {
 	agg, err := h.facade.Get(c.Request.Context(), id)
 	if err != nil {
 		response.HandleError(c.Writer, err)
+		return
+	}
+	// This is the unauthenticated catalog route. A deactivated (soft-deleted)
+	// restaurant must not be reachable by direct id, same as it is excluded
+	// from the listing. hidden_from_home is intentionally still served so
+	// deep links to off-home venues keep working.
+	if !agg.IsActive {
+		response.HandleError(c.Writer, domain.ErrNotFound)
 		return
 	}
 	response.OK(c.Writer, aggregateToResponse(agg))
@@ -140,7 +150,12 @@ func (h *Handler) create(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	agg, err := h.facade.Create(c.Request.Context(), req.toInput())
+	in, err := req.toInput()
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	agg, err := h.facade.Create(c.Request.Context(), in)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -159,7 +174,24 @@ func (h *Handler) update(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	agg, err := h.facade.Update(c.Request.Context(), id, req.toInput())
+	in, err := req.toInput()
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	// This route is reachable by a restaurant's own manager (not just admins).
+	// Marketing/curation fields are admin-only: a manager must not be able to
+	// self-promote (is_premium/is_popular/is_new/display_order) or reactivate a
+	// venue an admin deactivated (is_active). Strip them for non-admin callers;
+	// managers deactivate via DELETE, and only an admin can reactivate.
+	if au, ok := middleware.GetAuthUser(c.Request.Context()); !ok || au.Role != string(domain.RoleAdmin) {
+		in.IsActive = nil
+		in.IsNew = nil
+		in.IsPopular = nil
+		in.IsPremium = nil
+		in.DisplayOrder = nil
+	}
+	agg, err := h.facade.Update(c.Request.Context(), id, in)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return

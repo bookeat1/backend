@@ -149,7 +149,12 @@ func (h *Handler) createCategory(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	cat, err := h.facade.CreateCategory(c.Request.Context(), req.toInput())
+	in, err := req.toInput()
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	cat, err := h.facade.CreateCategory(c.Request.Context(), in)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -168,7 +173,12 @@ func (h *Handler) updateCategory(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	cat, err := h.facade.UpdateCategory(c.Request.Context(), id, req.toInput())
+	in, err := req.toInput()
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	cat, err := h.facade.UpdateCategory(c.Request.Context(), id, in)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return

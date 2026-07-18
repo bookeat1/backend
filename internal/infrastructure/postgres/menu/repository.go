@@ -135,10 +135,16 @@ func (r *Repository) Update(ctx context.Context, m *domain.MenuItem) error {
 		price=$6::numeric, image_url=$7, is_available=$8, category=$9, category_i18n=$10,
 		subcategory=$11, subcategory_i18n=$12, portion_size=$13, portion_size_i18n=$14,
 		language=$15, display_order=$16, updated_at=$17 WHERE id=$1`
-	a := r.args(m)
-	updArgs := append(a[:1:1], a[2:17]...) // ID + Name..DisplayOrder (16 values, $1..$16)
-	updArgs = append(updArgs, a[18])       // UpdatedAt -> $17
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, updArgs...)
+	// Built explicitly (not sliced out of r.args) so adding an INSERT column
+	// can't silently shift the UPDATE placeholders. Update omits restaurant_id
+	// and created_at.
+	args := []any{
+		m.ID, m.Name, i18nToDB(m.NameI18n), m.Description, i18nToDB(m.DescriptionI18n),
+		m.Price, m.ImageURL, m.IsAvailable, m.Category, i18nToDB(m.CategoryI18n),
+		m.Subcategory, i18nToDB(m.SubcategoryI18n), m.PortionSize, i18nToDB(m.PortionSizeI18n),
+		m.Language, m.DisplayOrder, m.UpdatedAt,
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
 		return mapWrite(err, "update menu item")
 	}
@@ -183,7 +189,10 @@ func (r *Repository) ReplaceTags(ctx context.Context, itemID uuid.UUID, tags []d
 		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 			`INSERT INTO menu_item_tags (id, menu_item_id, tag, created_at) VALUES ($1,$2,$3,now())`,
 			tags[i].ID, itemID, tags[i].Tag); err != nil {
-			return fmt.Errorf("replace tags: %w", err)
+			// Map the UNIQUE(menu_item_id, tag) violation to ErrAlreadyExists
+			// (409) instead of leaking a raw 500. The facade also de-dups, so
+			// this is a backstop for any duplicate that slips through.
+			return mapWrite(err, "replace tags")
 		}
 	}
 	return nil

@@ -1,24 +1,30 @@
 package restaurants
 
 import (
+	"fmt"
+
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
 	uc "backend-core/internal/usecase/restaurants"
 )
 
+// saveRestaurantRequest is the PATCH/POST body. Scalar fields are pointers so an
+// absent JSON key (nil) is distinguishable from an explicit empty value: on
+// Update the facade preserves omitted fields (read-modify-write) instead of
+// wiping them.
 type saveRestaurantRequest struct {
 	CategoryID    *string           `json:"category_id"`
-	Name          string            `json:"name"`
+	Name          *string           `json:"name"`
 	NameI18n      map[string]string `json:"name_i18n"`
-	Description   string            `json:"description"`
-	CuisineType   string            `json:"cuisine_type"`
-	Address       string            `json:"address"`
-	OpeningHours  string            `json:"opening_hours"`
-	City          string            `json:"city"`
-	PriceCategory string            `json:"price_category"`
-	Email         string            `json:"email"`
-	Phone         string            `json:"phone"`
+	Description   *string           `json:"description"`
+	CuisineType   *string           `json:"cuisine_type"`
+	Address       *string           `json:"address"`
+	OpeningHours  *string           `json:"opening_hours"`
+	City          *string           `json:"city"`
+	PriceCategory *string           `json:"price_category"`
+	Email         *string           `json:"email"`
+	Phone         *string           `json:"phone"`
 	Latitude      *float64          `json:"latitude"`
 	Longitude     *float64          `json:"longitude"`
 	IsActive      *bool             `json:"is_active"`
@@ -50,24 +56,25 @@ type socialInput struct {
 }
 
 // toInput maps the request to uc.SaveInput with opt-in semantics: a field or
-// collection that is absent from the JSON body (nil) leaves the existing
-// value untouched on Update; only fields/collections explicitly present are
-// applied. IsActive and each collection are therefore only forced when the
-// corresponding JSON key was present in the request.
-func (r saveRestaurantRequest) toInput() uc.SaveInput {
-	rest := domain.Restaurant{
-		Name: r.Name, NameI18n: r.NameI18n, Description: r.Description,
+// collection that is absent from the JSON body (nil) leaves the existing value
+// untouched on Update; only fields/collections explicitly present are applied.
+// A malformed category_id is a hard error (mapped to 422) rather than being
+// silently dropped, so a typo can't slip through as "field omitted".
+func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
+	in := uc.SaveInput{
+		Name: r.Name, NameI18n: domain.I18n(r.NameI18n), Description: r.Description,
 		CuisineType: r.CuisineType, Address: r.Address, OpeningHours: r.OpeningHours,
-		City: domain.City(r.City), PriceCategory: domain.PriceCategory(r.PriceCategory),
-		Email: r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
+		City: r.City, PriceCategory: r.PriceCategory, Email: r.Email, Phone: r.Phone,
+		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
 	}
 	if r.CategoryID != nil {
-		if id, err := uuid.Parse(*r.CategoryID); err == nil {
-			rest.CategoryID = &id
+		id, err := uuid.Parse(*r.CategoryID)
+		if err != nil {
+			return uc.SaveInput{}, fmt.Errorf("invalid category_id: %w", domain.ErrValidation)
 		}
+		in.CategoryID = &id
 	}
-	in := uc.SaveInput{Restaurant: rest, SetActive: r.IsActive}
 	if r.Images != nil {
 		imgs := make([]domain.Image, 0, len(r.Images))
 		for _, i := range r.Images {
@@ -96,7 +103,7 @@ func (r saveRestaurantRequest) toInput() uc.SaveInput {
 		}
 		in.SocialLinks = &socials
 	}
-	return in
+	return in, nil
 }
 
 type partnershipRequest struct {

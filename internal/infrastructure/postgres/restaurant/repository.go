@@ -58,13 +58,18 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		kwaaka_restaurant_id=$19, is_active=$20, is_new=$21, is_popular=$22,
 		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$26
 		WHERE id=$1`
-	// r.args(m) is ordered ID..DisplayOrder ($1..$25), CreatedAt, UpdatedAt.
-	// Update never touches created_at, so drop it and keep UpdatedAt as $26.
-	// The full-slice-expression forces a fresh backing array so append can't
-	// alias/clobber the slice returned by r.args.
-	all := r.args(m)
-	updArgs := append(all[:25:25], all[26])
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, updArgs...)
+	// Built explicitly (not sliced out of r.args) so adding an INSERT column
+	// can't silently shift the UPDATE placeholders out of alignment. Update
+	// intentionally omits created_at.
+	args := []any{
+		m.ID, m.CategoryID, m.Name, i18nToDB(m.NameI18n), m.Description,
+		i18nToDB(m.DescriptionI18n), m.CuisineType, i18nToDB(m.CuisineTypeI18n),
+		m.Address, i18nToDB(m.AddressI18n), m.OpeningHours, i18nToDB(m.OpeningHoursI18n),
+		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
+		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
+		m.HiddenFromHome, m.DisplayOrder, m.UpdatedAt,
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
 		return mapWrite(err, "update restaurant")
 	}
@@ -132,7 +137,9 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 		add("r.is_new = $%d", *f.IsNew)
 	}
 	if s := strings.TrimSpace(f.Search); s != "" {
-		add("r.name ILIKE '%%' || $%d || '%%'", s)
+		// Escape LIKE wildcards so a term containing % or _ matches literally
+		// instead of turning "%" into a match-everything filter.
+		add(`r.name ILIKE '%%' || $%d || '%%' ESCAPE '\'`, escapeLike(s))
 	}
 	whereSQL := strings.Join(where, " AND ")
 
@@ -238,6 +245,12 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	m.AddressI18n = i18nFromDB(addr)
 	m.OpeningHoursI18n = i18nFromDB(opening)
 	return &m, primary, nil
+}
+
+// escapeLike escapes the LIKE/ILIKE metacharacters (backslash first) so a
+// user-supplied term is matched literally under `ESCAPE '\'`.
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // prefixed rewrites a bare column list into a table-qualified one.

@@ -18,7 +18,7 @@ CREATE TABLE menu_items
     name_i18n          jsonb,
     description        varchar        NOT NULL DEFAULT '',
     description_i18n   jsonb,
-    price              numeric(12, 2) NOT NULL DEFAULT 0,
+    price              numeric(12, 2) NOT NULL DEFAULT 0 CHECK (price >= 0),
     image_url          varchar,
     is_available       boolean        NOT NULL DEFAULT true,
     category           varchar,

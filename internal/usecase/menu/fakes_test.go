@@ -56,9 +56,10 @@ func (f *fakeItems) ReplaceTags(_ context.Context, itemID uuid.UUID, tags []doma
 type fakeCategories struct {
 	created, updated *domain.MenuCategory
 	deleted          uuid.UUID
+	list             []domain.MenuCategory
 }
 
-func (f *fakeCategories) List(context.Context) ([]domain.MenuCategory, error) { return nil, nil }
+func (f *fakeCategories) List(context.Context) ([]domain.MenuCategory, error) { return f.list, nil }
 func (f *fakeCategories) Create(_ context.Context, c *domain.MenuCategory) error {
 	f.created = c
 	return nil
