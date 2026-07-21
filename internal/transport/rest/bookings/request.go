@@ -235,3 +235,44 @@ func parseUUIDs(vs []string, field string) ([]uuid.UUID, error) {
 	}
 	return out, nil
 }
+
+// bookingPolicyRequest is the body of PATCH /restaurants/{id}/booking-policy.
+// Every field is a pointer so an absent JSON key ("don't touch this column")
+// is distinguishable from an explicit zero ("no buffer", "auto-confirm off") —
+// the difference between inheriting the global default and overriding it with 0.
+type bookingPolicyRequest struct {
+	Timezone               *string `json:"timezone"`
+	BookingDurationMinutes *int    `json:"booking_duration_minutes"`
+	BookingBufferMinutes   *int    `json:"booking_buffer_minutes"`
+	BookingLeadMinutes     *int    `json:"booking_lead_minutes"`
+	BookingHorizonDays     *int    `json:"booking_horizon_days"`
+	CancelDeadlineMinutes  *int    `json:"cancel_deadline_minutes"`
+	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
+	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
+	AutoConfirm            *bool   `json:"auto_confirm"`
+}
+
+// Validate rejects a body that would patch nothing. Range checks live in the
+// usecase (single source of truth, reachable from any transport).
+func (r bookingPolicyRequest) Validate() error {
+	if r.Timezone == nil && r.BookingDurationMinutes == nil && r.BookingBufferMinutes == nil &&
+		r.BookingLeadMinutes == nil && r.BookingHorizonDays == nil && r.CancelDeadlineMinutes == nil &&
+		r.ConfirmSLAMinutes == nil && r.MaxGuestsPerBooking == nil && r.AutoConfirm == nil {
+		return fmt.Errorf("%w: no policy fields provided", domain.ErrValidation)
+	}
+	return nil
+}
+
+func (r bookingPolicyRequest) toDomain() domain.BookingPolicyOverride {
+	return domain.BookingPolicyOverride{
+		Timezone:               r.Timezone,
+		BookingDurationMinutes: r.BookingDurationMinutes,
+		BookingBufferMinutes:   r.BookingBufferMinutes,
+		BookingLeadMinutes:     r.BookingLeadMinutes,
+		BookingHorizonDays:     r.BookingHorizonDays,
+		CancelDeadlineMinutes:  r.CancelDeadlineMinutes,
+		ConfirmSLAMinutes:      r.ConfirmSLAMinutes,
+		MaxGuestsPerBooking:    r.MaxGuestsPerBooking,
+		AutoConfirm:            r.AutoConfirm,
+	}
+}

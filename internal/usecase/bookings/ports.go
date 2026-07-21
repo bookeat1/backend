@@ -25,6 +25,14 @@ type restaurantReader interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error)
 }
 
+// policyWriter is the minimal slice of the restaurant repository needed to
+// persist a venue's booking-policy overrides. Kept separate from
+// restaurantReader so the read-only consumers of this package (availability,
+// the worker) cannot accidentally gain write access to the catalog.
+type policyWriter interface {
+	UpdateBookingPolicy(ctx context.Context, restaurantID uuid.UUID, o domain.BookingPolicyOverride) error
+}
+
 // scheduleReader is the minimal slice of the restaurant "related" repository
 // used by the availability engine (opening hours, bookable slots, tables).
 type scheduleReader interface {

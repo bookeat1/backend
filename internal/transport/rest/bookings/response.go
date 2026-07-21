@@ -227,3 +227,66 @@ func idPtr[T interface{ String() string }](v *T) *string {
 	s := (*v).String()
 	return &s
 }
+
+// bookingPolicyResponse carries both levels of the policy: `effective` is what
+// the engine will actually apply, `overrides` is what this venue stores (a null
+// field means "inherit the global default"). Clients need both to render an
+// editor without guessing which values are inherited.
+type bookingPolicyResponse struct {
+	RestaurantID string                     `json:"restaurant_id"`
+	Effective    effectiveBookingPolicy     `json:"effective"`
+	Overrides    bookingPolicyOverrideBlock `json:"overrides"`
+}
+
+type effectiveBookingPolicy struct {
+	Timezone              string `json:"timezone"`
+	DurationMinutes       int    `json:"duration_minutes"`
+	BufferMinutes         int    `json:"buffer_minutes"`
+	LeadMinutes           int    `json:"lead_minutes"`
+	HorizonDays           int    `json:"horizon_days"`
+	CancelDeadlineMinutes int    `json:"cancel_deadline_minutes"`
+	ConfirmSLAMinutes     int    `json:"confirm_sla_minutes"`
+	MaxGuestsPerBooking   int    `json:"max_guests_per_booking"`
+	AutoConfirm           bool   `json:"auto_confirm"`
+}
+
+type bookingPolicyOverrideBlock struct {
+	Timezone               *string `json:"timezone"`
+	BookingDurationMinutes *int    `json:"booking_duration_minutes"`
+	BookingBufferMinutes   *int    `json:"booking_buffer_minutes"`
+	BookingLeadMinutes     *int    `json:"booking_lead_minutes"`
+	BookingHorizonDays     *int    `json:"booking_horizon_days"`
+	CancelDeadlineMinutes  *int    `json:"cancel_deadline_minutes"`
+	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
+	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
+	AutoConfirm            *bool   `json:"auto_confirm"`
+}
+
+func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyResponse {
+	e, o := v.Effective, v.Override
+	return bookingPolicyResponse{
+		RestaurantID: restaurantID,
+		Effective: effectiveBookingPolicy{
+			Timezone:              e.Timezone,
+			DurationMinutes:       int(e.Duration / time.Minute),
+			BufferMinutes:         int(e.Buffer / time.Minute),
+			LeadMinutes:           int(e.Lead / time.Minute),
+			HorizonDays:           e.HorizonDays,
+			CancelDeadlineMinutes: int(e.CancelDeadline / time.Minute),
+			ConfirmSLAMinutes:     int(e.ConfirmSLA / time.Minute),
+			MaxGuestsPerBooking:   e.MaxGuestsPerBooking,
+			AutoConfirm:           e.AutoConfirm,
+		},
+		Overrides: bookingPolicyOverrideBlock{
+			Timezone:               o.Timezone,
+			BookingDurationMinutes: o.BookingDurationMinutes,
+			BookingBufferMinutes:   o.BookingBufferMinutes,
+			BookingLeadMinutes:     o.BookingLeadMinutes,
+			BookingHorizonDays:     o.BookingHorizonDays,
+			CancelDeadlineMinutes:  o.CancelDeadlineMinutes,
+			ConfirmSLAMinutes:      o.ConfirmSLAMinutes,
+			MaxGuestsPerBooking:    o.MaxGuestsPerBooking,
+			AutoConfirm:            o.AutoConfirm,
+		},
+	}
+}

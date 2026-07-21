@@ -102,6 +102,11 @@ type RestaurantRepository interface {
 	// Ordering: display_order (NULLs last), then name. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
 	SetActive(ctx context.Context, id uuid.UUID, active bool) error
+	// UpdateBookingPolicy patches the venue's booking-policy overrides: only
+	// the non-nil fields of o are written, every other column keeps its current
+	// value (a NULL stays NULL, i.e. "use the global default"). Returns
+	// ErrNotFound when the restaurant does not exist.
+	UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o BookingPolicyOverride) error
 }
 
 // RestaurantListItem is a lightweight row for the catalog listing.

@@ -228,3 +228,47 @@ func (f *fakeBlacklist) Add(context.Context, uc.Actor, uuid.UUID, uc.BlacklistIn
 }
 
 func (f *fakeBlacklist) Remove(context.Context, uc.Actor, uuid.UUID, uuid.UUID) error { return f.err }
+
+// fakePolicy records the override it was patched with and echoes back a view
+// built from it, so the handler test can assert both the mapping in and out.
+type fakePolicy struct {
+	err      error
+	gotID    uuid.UUID
+	gotIn    domain.BookingPolicyOverride
+	view     *uc.PolicyView
+	patchCnt int
+}
+
+func (f *fakePolicy) Get(_ context.Context, _ uc.Actor, id uuid.UUID) (*uc.PolicyView, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.gotID = id
+	return f.viewOrDefault(), nil
+}
+
+func (f *fakePolicy) Update(_ context.Context, _ uc.Actor, id uuid.UUID, in domain.BookingPolicyOverride) (*uc.PolicyView, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.patchCnt++
+	f.gotID, f.gotIn = id, in
+	if f.view == nil {
+		f.view = &uc.PolicyView{
+			Override: in,
+			Effective: domain.BookingPolicy{
+				Timezone: "Asia/Almaty", Duration: 90 * time.Minute, Buffer: 15 * time.Minute,
+				Lead: 30 * time.Minute, HorizonDays: 45, CancelDeadline: 60 * time.Minute,
+				ConfirmSLA: 20 * time.Minute, MaxGuestsPerBooking: 12, AutoConfirm: false,
+			},
+		}
+	}
+	return f.view, nil
+}
+
+func (f *fakePolicy) viewOrDefault() *uc.PolicyView {
+	if f.view != nil {
+		return f.view
+	}
+	return &uc.PolicyView{Effective: domain.BookingPolicy{Timezone: "Asia/Almaty"}}
+}

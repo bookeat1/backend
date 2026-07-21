@@ -41,6 +41,7 @@ type Deps struct {
 	BookingUpdate      bookings.UpdateUseCase
 	BookingAvail       bookings.AvailabilityUseCase
 	BookingBlacklist   bookings.BlacklistUseCase
+	BookingPolicy      bookings.PolicyUseCase
 	Issuer             *token.RSAIssuer
 }
 
@@ -113,6 +114,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
 		BookingAvail:     bookings.NewAvailabilityUseCase(bookingLinks, restRepo, restRelated, bookingCfg),
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
+		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
 		Issuer:           issuer,
 	}, nil
 }

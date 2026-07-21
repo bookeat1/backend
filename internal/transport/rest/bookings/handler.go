@@ -49,6 +49,7 @@ type Handler struct {
 	update     uc.UpdateUseCase
 	avail      uc.AvailabilityUseCase
 	blacklist  uc.BlacklistUseCase
+	policy     uc.PolicyUseCase
 }
 
 // NewHandler wires the booking usecases into a handler.
@@ -60,10 +61,11 @@ func NewHandler(
 	update uc.UpdateUseCase,
 	avail uc.AvailabilityUseCase,
 	blacklist uc.BlacklistUseCase,
+	policy uc.PolicyUseCase,
 ) *Handler {
 	return &Handler{
 		facade: facade, create: create, idempotent: idempotent, status: status,
-		update: update, avail: avail, blacklist: blacklist,
+		update: update, avail: avail, blacklist: blacklist, policy: policy,
 	}
 }
 
@@ -108,6 +110,48 @@ func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
 	rg.GET("/restaurants/:id/blacklist", h.listBlacklist)
 	rg.POST("/restaurants/:id/blacklist", h.addBlacklist)
 	rg.DELETE("/restaurants/:id/blacklist/:entryID", h.removeBlacklist)
+	rg.GET("/restaurants/:id/booking-policy", h.getBookingPolicy)
+	rg.PATCH("/restaurants/:id/booking-policy", h.patchBookingPolicy)
+}
+
+// getBookingPolicy returns the venue's stored policy overrides plus the
+// effective policy they resolve to.
+func (h *Handler) getBookingPolicy(c *gin.Context) {
+	actor, rid, ok := actorAndID(c)
+	if !ok {
+		return
+	}
+	view, err := h.policy.Get(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, policyToResponse(rid.String(), view))
+}
+
+// patchBookingPolicy edits the venue's level-2 policy overrides (spec §4.2):
+// this is the only way a restaurant can turn off its own auto-confirmation or
+// lengthen its confirmation SLA. Omitted fields are left untouched.
+func (h *Handler) patchBookingPolicy(c *gin.Context) {
+	actor, rid, ok := actorAndID(c)
+	if !ok {
+		return
+	}
+	var req bookingPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if err := req.Validate(); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	view, err := h.policy.Update(c.Request.Context(), actor, rid, req.toDomain())
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, policyToResponse(rid.String(), view))
 }
 
 func (h *Handler) availability(c *gin.Context) {

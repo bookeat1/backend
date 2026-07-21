@@ -27,6 +27,7 @@ type deps struct {
 	update     *fakeUpdate
 	avail      *fakeAvail
 	blacklist  *fakeBlacklist
+	policy     *fakePolicy
 	role       domain.Role
 	manages    bool
 }
@@ -37,7 +38,7 @@ func newDeps() *deps {
 		facade: &fakeFacade{}, create: create,
 		idempotent: uc.NewIdempotentCreateUseCase(create, newFakeKeys(), fakeTx{}),
 		status:     &fakeStatus{}, update: &fakeUpdate{}, avail: &fakeAvail{},
-		blacklist: &fakeBlacklist{}, role: domain.RoleUser, manages: false,
+		blacklist: &fakeBlacklist{}, policy: &fakePolicy{}, role: domain.RoleUser, manages: false,
 	}
 }
 
@@ -47,7 +48,7 @@ func newDeps() *deps {
 func newRouter(d *deps) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist)
+	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist, d.policy)
 
 	api := r.Group("/api/v1")
 	h.RegisterPublic(api)
@@ -104,6 +105,8 @@ func TestManagerOfAnotherRestaurantForbidden(t *testing.T) {
 			{http.MethodGet, "/api/v1/restaurants/" + rid.String() + "/blacklist"},
 			{http.MethodPost, "/api/v1/restaurants/" + rid.String() + "/blacklist"},
 			{http.MethodDelete, "/api/v1/restaurants/" + rid.String() + "/blacklist/" + uuid.New().String()},
+			{http.MethodGet, "/api/v1/restaurants/" + rid.String() + "/booking-policy"},
+			{http.MethodPatch, "/api/v1/restaurants/" + rid.String() + "/booking-policy"},
 		}
 		for _, tc := range cases {
 			w := do(r, tc.method, tc.path, gin.H{}, authHeader(uid))

@@ -100,6 +100,80 @@ func (r *Repository) SetActive(ctx context.Context, id uuid.UUID, active bool) e
 	return nil
 }
 
+// UpdateBookingPolicy patches the venue's booking-policy overrides. PATCH
+// semantics: a nil field of o leaves its column untouched (so a NULL — "use the
+// global default" — survives), a non-nil field is written. The SET list and its
+// placeholders are built from scratch for this statement only, so the fixed
+// numbering of Create/Update is unaffected.
+func (r *Repository) UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o domain.BookingPolicyOverride) error {
+	args := []any{id}
+	sets := make([]string, 0, 10)
+	set := func(col string, val any) {
+		args = append(args, val)
+		sets = append(sets, fmt.Sprintf("%s=$%d", col, len(args)))
+	}
+	if v := o.Timezone; v != nil {
+		set("timezone", *v)
+	}
+	if v := o.BookingDurationMinutes; v != nil {
+		set("booking_duration_minutes", *v)
+	}
+	if v := o.BookingBufferMinutes; v != nil {
+		set("booking_buffer_minutes", *v)
+	}
+	if v := o.BookingLeadMinutes; v != nil {
+		set("booking_lead_minutes", *v)
+	}
+	if v := o.BookingHorizonDays; v != nil {
+		set("booking_horizon_days", *v)
+	}
+	if v := o.CancelDeadlineMinutes; v != nil {
+		set("cancel_deadline_minutes", *v)
+	}
+	if v := o.ConfirmSLAMinutes; v != nil {
+		set("confirm_sla_minutes", *v)
+	}
+	if v := o.MaxGuestsPerBooking; v != nil {
+		set("max_guests_per_booking", *v)
+	}
+	if v := o.AutoConfirm; v != nil {
+		set("auto_confirm", *v)
+	}
+
+	if len(sets) == 0 {
+		// An empty patch is a no-op, but it must still report ErrNotFound for an
+		// unknown venue rather than a silent success.
+		return r.exists(ctx, id)
+	}
+	// updated_at is bumped through now() instead of a Go timestamp: this is a
+	// blind UPDATE with no prior read, so there is no in-memory row to keep in
+	// sync and the DB clock is the authoritative one.
+	sets = append(sets, "updated_at=now()")
+
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants SET `+strings.Join(sets, ", ")+` WHERE id=$1`, args...)
+	if err != nil {
+		return fmt.Errorf("update booking policy: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// exists returns nil when the restaurant is present, domain.ErrNotFound otherwise.
+func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
+	var one int
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT 1 FROM restaurants WHERE id=$1`, id).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("check restaurant: %w", err)
+	}
+	return nil
+}
+
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+`, `+policyCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
