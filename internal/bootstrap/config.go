@@ -14,11 +14,12 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App     AppConfig
-	DB      DBConfig
-	Auth    AuthConfig
-	Booking BookingConfig
-	Worker  WorkerConfig
+	App      AppConfig
+	DB       DBConfig
+	Auth     AuthConfig
+	Booking  BookingConfig
+	Worker   WorkerConfig
+	Payments PaymentsConfig
 }
 
 type AppConfig struct {
@@ -91,6 +92,41 @@ type WorkerConfig struct {
 	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
+// PaymentsConfig holds the global (level-1) payment settings. A restaurant may
+// override most of them per venue (restaurants.payments_enabled /
+// deposit_* / preorder_payment_required / service_fee_bps / payment_provider,
+// all NULLABLE — NULL means "use the value from here"). Resolution:
+// usecase/payments.
+//
+// Acquirer credentials are deliberately NOT part of this struct: each adapter
+// reads its own keys from env, and they never reach the database (spec §8).
+type PaymentsConfig struct {
+	Enabled bool // env: PAYMENTS_ENABLED — master switch, off by default
+
+	// DefaultProvider is the acquirer used when the venue has no preference or
+	// its preferred one is disabled in the payment_providers registry.
+	DefaultProvider string // env: PAYMENTS_DEFAULT_PROVIDER
+
+	// ServiceFeeBps is the BookEat service fee charged to the guest, in basis
+	// points (350 = 3.5%). Basis points, not a float percentage: 3.5% in a
+	// float is a rounding error in somebody else's wallet.
+	ServiceFeeBps int // env: PAYMENTS_SERVICE_FEE_BPS
+
+	// RefundAcquiringBps is what is withheld from a refund to cover the cost of
+	// moving money back, in basis points of the total (100 = 1%). It is a cost
+	// booked to the `acquirer` ledger account, not platform revenue.
+	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
+
+	// DepositDefaultMinor is the deposit charged per booking, in tiyn, when the
+	// venue requires one but sets no amount of its own.
+	DepositDefaultMinor int64 // env: PAYMENTS_DEPOSIT_DEFAULT_MINOR
+
+	// HoldTTL is how long an authorization is expected to stay valid. The
+	// acquirer has the final say; this drives payments.expires_at and the
+	// reconciliation worker.
+	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
+}
+
 func (p PostgresConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -158,6 +194,14 @@ func NewConfig() (Config, error) {
 			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
 			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
+		Payments: PaymentsConfig{
+			Enabled:             getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:     getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:       getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:  getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
+			DepositDefaultMinor: getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			HoldTTL:             getEnvDuration("PAYMENTS_HOLD_TTL", 168*time.Hour),
+		},
 	}
 
 	return cfg, nil
@@ -192,6 +236,18 @@ func getEnvMinutes(key string, defMinutes int) time.Duration {
 		n = defMinutes
 	}
 	return time.Duration(n) * time.Minute
+}
+
+// getEnvInt64 returns the 64-bit integer value of the environment variable
+// named by key, or def when the variable is unset or not a valid integer. Money
+// amounts are int64 (tiyn) everywhere, so they need their own reader.
+func getEnvInt64(key string, def int64) int64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 // getEnvDuration returns the duration value of the environment variable named
