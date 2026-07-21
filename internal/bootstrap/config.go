@@ -14,9 +14,10 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App  AppConfig
-	DB   DBConfig
-	Auth AuthConfig
+	App     AppConfig
+	DB      DBConfig
+	Auth    AuthConfig
+	Booking BookingConfig
 }
 
 type AppConfig struct {
@@ -53,6 +54,21 @@ type AuthConfig struct {
 	OTPRateLimitPerMin  int           // env: AUTH_OTP_RATE_PER_MIN
 	OTPRateLimitPerHour int           // env: AUTH_OTP_RATE_PER_HOUR
 	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
+}
+
+// BookingConfig holds the global (level-1) booking policy. A restaurant may
+// override any of these per venue (restaurants.booking_* columns, all NULLABLE
+// — NULL means "use the value from here"). Resolution: usecase/bookings.
+type BookingConfig struct {
+	DefaultDuration       time.Duration // env: BOOKING_DEFAULT_DURATION_MINUTES
+	DefaultBuffer         time.Duration // env: BOOKING_DEFAULT_BUFFER_MINUTES — cleanup gap added on both sides of the occupied slot
+	DefaultLead           time.Duration // env: BOOKING_DEFAULT_LEAD_MINUTES — minimum distance from now to starts_at
+	DefaultHorizonDays    int           // env: BOOKING_DEFAULT_HORIZON_DAYS — furthest bookable day ahead
+	DefaultCancelDeadline time.Duration // env: BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES — guest may cancel until starts_at minus this
+	DefaultConfirmSLA     time.Duration // env: BOOKING_DEFAULT_CONFIRM_SLA_MINUTES — pending auto-confirm / escalation deadline
+	DefaultMaxGuests      int           // env: BOOKING_DEFAULT_MAX_GUESTS
+	DefaultAutoConfirm    bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM
+	TimezoneFallback      string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
 }
 
 func (p PostgresConfig) DSN() string {
@@ -103,6 +119,17 @@ func NewConfig() (Config, error) {
 			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
 			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
 		},
+		Booking: BookingConfig{
+			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 120),
+			DefaultBuffer:         getEnvMinutes("BOOKING_DEFAULT_BUFFER_MINUTES", 0),
+			DefaultLead:           getEnvMinutes("BOOKING_DEFAULT_LEAD_MINUTES", 60),
+			DefaultHorizonDays:    getEnvInt("BOOKING_DEFAULT_HORIZON_DAYS", 60),
+			DefaultCancelDeadline: getEnvMinutes("BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES", 180),
+			DefaultConfirmSLA:     getEnvMinutes("BOOKING_DEFAULT_CONFIRM_SLA_MINUTES", 120),
+			DefaultMaxGuests:      getEnvInt("BOOKING_DEFAULT_MAX_GUESTS", 20),
+			DefaultAutoConfirm:    getEnvBool("BOOKING_DEFAULT_AUTO_CONFIRM", true),
+			TimezoneFallback:      getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
+		},
 	}
 
 	return cfg, nil
@@ -126,6 +153,17 @@ func getEnvInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// getEnvMinutes returns the environment variable named by key interpreted as a
+// whole number of minutes, or defMinutes when unset or unparseable. Negative
+// values fall back to the default (a negative buffer or lead is meaningless).
+func getEnvMinutes(key string, defMinutes int) time.Duration {
+	n := getEnvInt(key, defMinutes)
+	if n < 0 {
+		n = defMinutes
+	}
+	return time.Duration(n) * time.Minute
 }
 
 // getEnvDuration returns the duration value of the environment variable named

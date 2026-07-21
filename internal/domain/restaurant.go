@@ -64,8 +64,12 @@ type Restaurant struct {
 	IsPremium          *bool
 	HiddenFromHome     bool
 	DisplayOrder       *int
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// BookingPolicy holds the venue's optional overrides of the global booking
+	// policy (Wave 3). Nil fields fall back to the BOOKING_DEFAULT_* env values;
+	// resolution lives in usecase/bookings.
+	BookingPolicy BookingPolicyOverride
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // RestaurantAggregate is a restaurant with its inline collections, matching the
