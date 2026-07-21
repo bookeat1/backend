@@ -167,7 +167,7 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	if err != nil {
 		return nil, err
 	}
-	if err := u.checkWindow(startsAt, policy, sched); err != nil {
+	if err := u.checkWindow(startsAt, policy, sched, acc.staff()); err != nil {
 		return nil, err
 	}
 
@@ -258,19 +258,53 @@ func (u *createUseCase) checkRate(ctx context.Context, normalizedPhone string) e
 
 // checkWindow enforces the lead time, the horizon and the venue's opening
 // hours / bookable slots. All calendar maths happens in the venue's timezone.
-func (u *createUseCase) checkWindow(startsAt time.Time, policy domain.BookingPolicy, sched schedule) error {
-	switch windowReason(startsAt, policy, time.Now()) {
-	case ReasonTooSoon:
-		return fmt.Errorf("%w: bookings must be made at least %d minutes ahead",
-			domain.ErrValidation, int(policy.Lead/time.Minute))
-	case ReasonHorizon:
+//
+// Staff booking on behalf of a guest (phone call, walk-in) are held to a looser
+// rule, decided by the owner on 2026-07-21: the visit only has to fit inside the
+// opening hours. A guest asking for 19:15 when slots run every half hour is a
+// normal request at the venue's own desk, and the lead time is meaningless for
+// someone standing at the door. The horizon still applies — a booking a year out
+// is a mistake whoever enters it.
+func (u *createUseCase) checkWindow(startsAt time.Time, policy domain.BookingPolicy, sched schedule, staff bool) error {
+	reason := windowReason(startsAt, policy, time.Now())
+	if reason == ReasonHorizon {
 		return fmt.Errorf("%w: bookings open at most %d days ahead",
 			domain.ErrValidation, policy.HorizonDays)
+	}
+	if staff {
+		if !withinOpeningHours(sched, startsAt, policy) {
+			return fmt.Errorf("%w: the restaurant is closed at this time", domain.ErrValidation)
+		}
+		return nil
+	}
+	if reason == ReasonTooSoon {
+		return fmt.Errorf("%w: bookings must be made at least %d minutes ahead",
+			domain.ErrValidation, int(policy.Lead/time.Minute))
 	}
 	if !isBookableStart(sched, startsAt, policy, u.cfg.SlotStep) {
 		return fmt.Errorf("%w: the restaurant is not open for bookings at this time", domain.ErrValidation)
 	}
 	return nil
+}
+
+// withinOpeningHours reports whether the whole visit fits inside the venue's
+// opening hours, ignoring the bookable-slot grid. Both the start's calendar day
+// and the previous one are checked so a venue closing past midnight still
+// accepts a 01:00 start.
+func withinOpeningHours(sched schedule, startsAt time.Time, policy domain.BookingPolicy) bool {
+	loc := policyLocation(policy)
+	local := startsAt.In(loc)
+	day := startOfDay(local, loc)
+	for _, d := range []time.Time{day, day.AddDate(0, 0, -1)} {
+		open, close_, ok := openingWindow(sched.hours, int(d.Weekday()), d, loc)
+		if !ok {
+			continue
+		}
+		if !local.Before(open) && !local.Add(policy.Duration).After(close_) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBookableStart reports whether startsAt is one of the venue's bookable start

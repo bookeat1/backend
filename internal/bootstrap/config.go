@@ -120,7 +120,7 @@ func NewConfig() (Config, error) {
 			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
 		},
 		Booking: BookingConfig{
-			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 120),
+			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 90),
 			DefaultBuffer:         getEnvMinutes("BOOKING_DEFAULT_BUFFER_MINUTES", 0),
 			DefaultLead:           getEnvMinutes("BOOKING_DEFAULT_LEAD_MINUTES", 60),
 			DefaultHorizonDays:    getEnvInt("BOOKING_DEFAULT_HORIZON_DAYS", 60),

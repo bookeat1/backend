@@ -403,3 +403,26 @@ func TestCreateInactiveRestaurant(t *testing.T) {
 		t.Fatalf("inactive restaurant = %v, want ErrForbidden", err)
 	}
 }
+
+// Owner decision 2026-07-21: staff booking on behalf of a guest only has to fit
+// inside the opening hours — no slot grid, no lead time. Guests keep both.
+func TestCreateStaffWindowIsRelaxed(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	// 13:15 local — inside the 12:00–22:00 opening hours, off the slot grid.
+	offGrid := h.startsAt.Add(15 * time.Minute)
+
+	in := h.input()
+	in.StartsAt = offGrid
+	if _, err := h.uc.Create(context.Background(), h.guest, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("guest off-grid = %v, want ErrValidation", err)
+	}
+
+	h2 := newCreateHarness(t, domain.BookingPolicyOverride{})
+	in2 := h2.input()
+	in2.UserID = nil
+	in2.StartsAt = h2.startsAt.Add(15 * time.Minute)
+	in2.Source = domain.SourceAdmin
+	if _, err := h2.uc.Create(context.Background(), h2.manager, in2); err != nil {
+		t.Fatalf("staff off-grid = %v, want success", err)
+	}
+}
