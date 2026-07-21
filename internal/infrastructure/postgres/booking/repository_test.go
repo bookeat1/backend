@@ -240,7 +240,7 @@ func TestBookingClaimDueSkipLocked(t *testing.T) {
 
 	cutoff := time.Now().Add(-time.Hour)
 	err := txm.WithinTx(ctx, func(ctx context.Context) error {
-		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending}, cutoff, 10)
+		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending}, domain.ClaimByCreatedAt, cutoff, 10)
 		if err != nil {
 			return err
 		}
@@ -250,7 +250,7 @@ func TestBookingClaimDueSkipLocked(t *testing.T) {
 
 		// A parallel worker must not see the same row.
 		locked, err := repo.ClaimDue(context.Background(),
-			[]domain.BookingStatus{domain.BookingPending}, cutoff, 10)
+			[]domain.BookingStatus{domain.BookingPending}, domain.ClaimByCreatedAt, cutoff, 10)
 		if err != nil {
 			return err
 		}
@@ -264,7 +264,7 @@ func TestBookingClaimDueSkipLocked(t *testing.T) {
 	}
 
 	err = txm.WithinTx(ctx, func(ctx context.Context) error {
-		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingArrived}, cutoff, 10)
+		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingArrived}, domain.ClaimByEndsAt, cutoff, 10)
 		if err != nil {
 			return err
 		}
@@ -276,4 +276,110 @@ func TestBookingClaimDueSkipLocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim arrived tx: %v", err)
 	}
+}
+
+// ClaimDue must not starve. The query cuts off on one column and therefore has
+// to ORDER BY that same column: when the batch is smaller than the candidate
+// set, the rows that have waited longest must be the ones returned.
+//
+// The earlier version cut off on created_at but ordered by starts_at, so a
+// genuinely overdue request whose visit is far in the future could be pushed
+// out of every batch by fresher ones starting sooner — forever.
+func TestBookingClaimDueOrdersByCutoffColumn(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	repo := New(pool)
+	txm := sqltx.NewManager(pool)
+
+	// oldest waited 10h but is booked far ahead; newest was created 1h ago for
+	// tonight. Ordering by starts_at would return them in exactly this reverse.
+	oldest := newBooking(rid, time.Now().Add(400*time.Hour))
+	oldest.CreatedAt = time.Now().Add(-10 * time.Hour)
+	middle := newBooking(rid, time.Now().Add(100*time.Hour))
+	middle.CreatedAt = time.Now().Add(-5 * time.Hour)
+	newest := newBooking(rid, time.Now().Add(6*time.Hour))
+	newest.CreatedAt = time.Now().Add(-time.Hour)
+	for _, b := range []*domain.Booking{newest, middle, oldest} { // inserted out of order on purpose
+		if err := repo.Create(ctx, b); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+
+	cutoff := time.Now()
+	wantOrder := []uuid.UUID{oldest.ID, middle.ID, newest.ID}
+
+	// A batch of one must take the oldest, not whatever starts soonest.
+	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
+		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending},
+			domain.ClaimByCreatedAt, cutoff, 1)
+		if err != nil {
+			return err
+		}
+		if len(due) != 1 || due[0].ID != oldest.ID {
+			t.Errorf("batch of 1 claimed %v, want the oldest (%s) — the stale row is being starved", ids(due), oldest.ID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("claim tx: %v", err)
+	}
+
+	// The full batch comes back oldest-first.
+	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
+		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending},
+			domain.ClaimByCreatedAt, cutoff, 10)
+		if err != nil {
+			return err
+		}
+		got := ids(due)
+		if len(got) != 3 {
+			t.Fatalf("claimed %d rows, want 3", len(got))
+		}
+		for i := range wantOrder {
+			if got[i] != wantOrder[i] {
+				t.Fatalf("claim order = %v, want oldest created_at first (%v)", got, wantOrder)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("claim tx: %v", err)
+	}
+
+	// The same rows ordered by the other clock are a different sequence, which
+	// is what proves the ORDER BY really follows the caller's column.
+	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
+		due, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending},
+			domain.ClaimByEndsAt, time.Now().Add(500*time.Hour), 10)
+		if err != nil {
+			return err
+		}
+		got := ids(due)
+		want := []uuid.UUID{newest.ID, middle.ID, oldest.ID}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("claim order by ends_at = %v, want %v", got, want)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("claim tx: %v", err)
+	}
+}
+
+// An unknown claim column must be rejected, not interpolated into the SQL.
+func TestBookingClaimDueRejectsUnknownColumn(t *testing.T) {
+	pool, ctx := setup(t)
+	repo := New(pool)
+	_, err := repo.ClaimDue(ctx, []domain.BookingStatus{domain.BookingPending},
+		domain.ClaimColumn("starts_at; DROP TABLE bookings"), time.Now(), 10)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("= %v, want ErrValidation", err)
+	}
+}
+
+func ids(bs []domain.Booking) []uuid.UUID {
+	out := make([]uuid.UUID, len(bs))
+	for i, b := range bs {
+		out[i] = b.ID
+	}
+	return out
 }

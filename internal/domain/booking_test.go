@@ -15,7 +15,6 @@ func TestValidateTransition(t *testing.T) {
 		{"pending → confirmed", BookingPending, BookingConfirmed, nil},
 		{"pending → waitlist", BookingPending, BookingWaitlist, nil},
 		{"pending → cancelled", BookingPending, BookingCancelled, nil},
-		{"pending → no_show", BookingPending, BookingNoShow, nil},
 		{"waitlist → confirmed", BookingWaitlist, BookingConfirmed, nil},
 		{"waitlist → cancelled", BookingWaitlist, BookingCancelled, nil},
 		{"confirmed → arrived", BookingConfirmed, BookingArrived, nil},
@@ -25,6 +24,11 @@ func TestValidateTransition(t *testing.T) {
 		{"arrived → cancelled", BookingArrived, BookingCancelled, nil},
 
 		{"pending → arrived skips confirm", BookingPending, BookingArrived, ErrInvalidStatus},
+		// A no-show is the guest breaking a promise the venue accepted, so it
+		// is reachable only from confirmed. A request the venue never answered
+		// is closed as cancelled by the worker instead.
+		{"pending → no_show", BookingPending, BookingNoShow, ErrInvalidStatus},
+		{"waitlist → no_show", BookingWaitlist, BookingNoShow, ErrInvalidStatus},
 		{"pending → completed", BookingPending, BookingCompleted, ErrInvalidStatus},
 		{"waitlist → arrived", BookingWaitlist, BookingArrived, ErrInvalidStatus},
 		{"confirmed → completed skips arrive", BookingConfirmed, BookingCompleted, ErrInvalidStatus},

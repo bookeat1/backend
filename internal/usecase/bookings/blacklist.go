@@ -15,10 +15,17 @@ import (
 // /restaurants/{id}/blacklist). Every method resolves venue access first;
 // a manager of another restaurant is rejected with ErrForbidden.
 //
-// Entries created here are always venue-scoped: a manager must not be able to
-// ban a guest platform-wide. Global entries (restaurant_id IS NULL) are
-// readable by the venue — they explain a refusal the manager did not cause —
-// but only an admin can create one, via the same endpoint on any venue.
+// Entries created here are always venue-scoped, for EVERY actor including an
+// admin: a stop-list write reached through /restaurants/{id}/blacklist is a
+// statement about that venue, and letting the same call mean "ban platform-wide"
+// depending on who is logged in is exactly the kind of ambient authority that
+// gets used by accident.
+//
+// Global entries (restaurant_id IS NULL) are therefore NOT creatable here. They
+// are readable by the venue — they explain a refusal the manager did not cause
+// — and Remove refuses to let a manager lift one. Creating them belongs to a
+// separate admin endpoint that does not exist yet; until it does, they are
+// seeded out of band.
 type BlacklistUseCase interface {
 	List(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.BlacklistEntry, error)
 	Add(ctx context.Context, actor Actor, restaurantID uuid.UUID, in BlacklistInput) (*domain.BlacklistEntry, error)
@@ -56,6 +63,8 @@ func (u *blacklistUseCase) Add(ctx context.Context, actor Actor, restaurantID uu
 	if _, err := requireStaff(ctx, u.managers, actor, restaurantID); err != nil {
 		return nil, err
 	}
+	// Always venue-scoped — an admin acting here bans the guest at this venue
+	// only, never platform-wide (see the interface doc).
 	e := &domain.BlacklistEntry{
 		ID:           uuid.New(),
 		RestaurantID: &restaurantID,

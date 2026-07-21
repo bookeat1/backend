@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,6 +196,69 @@ func TestSortedBookingsIsDeterministic(t *testing.T) {
 	for i := 1; i < len(first); i++ {
 		if first[i].startsAt.Before(first[i-1].startsAt) {
 			t.Fatal("sortedBookings is not ordered by starts_at")
+		}
+	}
+}
+
+// The migration deliberately leaves confirmed_at, arrived_at and cancelled_by
+// NULL: Supabase never recorded them. cancelled_by in particular feeds
+// venue-reliability statistics, so defaulting it to 'restaurant' would not be a
+// placeholder but a fabricated accusation against every venue with cancelled
+// history. cancelled_at / cancellation_reason DO come across, so a human can
+// still see that and why a booking was cancelled.
+//
+// This test guards the decision: it fails the moment someone starts sourcing
+// those three columns from the dump without revisiting the reasoning (see
+// cmd/etl/README.md).
+func TestMigratedBookingsHaveNoInventedActorOrTimestamps(t *testing.T) {
+	// The INSERT column list and the VALUES list, in order.
+	insertCols := []string{
+		"id", "restaurant_id", "user_id", "name", "phone", "email", "phone_normalized",
+		"guests", "starts_at", "ends_at", "status", "source", "notes", "promotion_id", "event_id",
+		"created_by_admin", "forced_placement", "confirmed_at", "arrived_at", "cancelled_at", "cancelled_by",
+		"cancellation_reason_code", "cancellation_reason", "late_notification_sent",
+		"user_notified_late_at", "user_late_message", "reminder_60_sent_at", "reminder_30_sent_at",
+		"original_booking_time_text", "created_at", "updated_at",
+	}
+	values := []string{
+		"$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15",
+		"$16", "false", "NULL", "NULL", "$17", "NULL",
+		"$18", "$19", "$20", "$21", "$22", "$23", "$24", "$25", "$26", "$27",
+	}
+	if len(insertCols) != len(values) {
+		t.Fatalf("test fixture is inconsistent: %d columns vs %d values", len(insertCols), len(values))
+	}
+
+	normalized := strings.Join(strings.Fields(upsertBooking), " ")
+	mustBeNull := map[string]bool{"confirmed_at": true, "arrived_at": true, "cancelled_by": true}
+	for i, col := range insertCols {
+		if !mustBeNull[col] {
+			continue
+		}
+		if values[i] != "NULL" {
+			t.Errorf("%s is bound to %s; it must stay NULL — the dump has no data for it", col, values[i])
+		}
+		// …and it must not be revived on a re-run either.
+		if strings.Contains(normalized, col+"=EXCLUDED."+col) {
+			t.Errorf("%s is written by the ON CONFLICT branch; it must stay NULL", col)
+		}
+	}
+	// The fixture above must actually describe the live statement. Compared
+	// without whitespace, so re-wrapping the SQL does not fail the test.
+	dense := strings.ReplaceAll(normalized, " ", "")
+	wantInsert := "INSERTINTObookings(" + strings.Join(insertCols, ",") + ")"
+	wantValues := "VALUES(" + strings.Join(values, ",") + ")"
+	if !strings.Contains(dense, wantInsert) {
+		t.Errorf("upsertBooking column list changed; update this test:\n%s", normalized)
+	}
+	if !strings.Contains(dense, wantValues) {
+		t.Errorf("upsertBooking VALUES list changed; update this test:\n%s", normalized)
+	}
+
+	// What the dump DOES have about a cancellation is carried over.
+	for _, col := range []string{"cancelled_at", "cancellation_reason", "cancellation_reason_code"} {
+		if !strings.Contains(normalized, col+"=EXCLUDED."+col) {
+			t.Errorf("%s must be migrated: the source has it", col)
 		}
 	}
 }

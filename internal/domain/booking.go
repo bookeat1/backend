@@ -45,13 +45,16 @@ func (s BookingStatus) Terminal() bool { return len(bookingTransitions[s]) == 0 
 //	pending ──waitlist──▶ waitlist ──confirm──▶ confirmed
 //
 // no_show is set by the background worker for bookings that were never marked
-// arrived once ends_at + grace has passed.
+// arrived once ends_at + grace has passed. It is reachable ONLY from confirmed:
+// a no-show is the guest breaking a promise the venue accepted, so a booking
+// the venue never confirmed cannot be one. A pending / waitlist booking whose
+// visit window has passed unanswered is closed as cancelled by the worker
+// instead (cancelled_by = system).
 var bookingTransitions = map[BookingStatus]map[BookingStatus]struct{}{
 	BookingPending: {
 		BookingConfirmed: {},
 		BookingWaitlist:  {},
 		BookingCancelled: {},
-		BookingNoShow:    {},
 	},
 	BookingWaitlist: {
 		BookingConfirmed: {},
@@ -214,8 +217,29 @@ type BookingRepository interface {
 	// UpdateStatus writes the new status and its timestamp columns. Call inside
 	// a TxManager together with the history and outbox inserts.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status BookingStatus, at time.Time) error
-	// ClaimDue locks up to limit bookings in the given statuses whose cutoff
-	// column has passed, using FOR UPDATE SKIP LOCKED so parallel workers do not
-	// collide.
-	ClaimDue(ctx context.Context, statuses []BookingStatus, before time.Time, limit int) ([]Booking, error)
+	// ClaimDue locks up to limit bookings in the given statuses whose `by`
+	// column is older than before, using FOR UPDATE SKIP LOCKED so parallel
+	// workers do not collide. Results are ordered by that same column, oldest
+	// first, so a batch smaller than the candidate set never starves the rows
+	// that have been waiting longest.
+	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
+}
+
+// ClaimColumn names the timestamp ClaimDue compares against its cutoff. It is a
+// closed set on purpose: the value reaches the SQL text, so it must never be
+// caller-shaped data.
+type ClaimColumn string
+
+const (
+	// ClaimByCreatedAt is the confirm-SLA clock: how long the venue has been
+	// sitting on an unanswered request.
+	ClaimByCreatedAt ClaimColumn = "created_at"
+	// ClaimByEndsAt is the visit-window clock: used to close bookings whose
+	// time has passed.
+	ClaimByEndsAt ClaimColumn = "ends_at"
+)
+
+// Valid reports whether c is a known claim column.
+func (c ClaimColumn) Valid() bool {
+	return c == ClaimByCreatedAt || c == ClaimByEndsAt
 }

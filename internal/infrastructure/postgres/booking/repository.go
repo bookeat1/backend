@@ -168,18 +168,27 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 // TxManager transaction — outside one the locks are released immediately and
 // two workers can pick up the same row.
 //
-// The cutoff column depends on the status: bookings still waiting for the venue
-// (pending / waitlist) are due relative to created_at (confirm SLA), bookings
-// that already started are due relative to ends_at (auto-complete / no-show).
-func (r *Repository) ClaimDue(ctx context.Context, statuses []domain.BookingStatus, before time.Time, limit int) ([]domain.Booking, error) {
+// The caller picks the cutoff column: created_at is the confirm-SLA clock,
+// ends_at the visit-window clock. The ORDER BY is that same column, oldest
+// first — ordering by anything else lets a batch smaller than the candidate set
+// starve the rows that have waited longest (a stale booking pushed out of every
+// batch by fresher ones is never processed at all).
+//
+// The column reaches the SQL text, so it is taken from the closed
+// domain.ClaimColumn set and rejected otherwise — never interpolated raw.
+func (r *Repository) ClaimDue(ctx context.Context, statuses []domain.BookingStatus, by domain.ClaimColumn, before time.Time, limit int) ([]domain.Booking, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
+	if !by.Valid() {
+		return nil, fmt.Errorf("%w: unknown claim column %q", domain.ErrValidation, by)
+	}
+	col := string(by)
 	limit, _ = window(limit, 0)
 	q := `SELECT ` + cols + ` FROM bookings
 		WHERE status = ANY($1)
-		  AND (CASE WHEN status IN ('pending','waitlist') THEN created_at ELSE ends_at END) < $2
-		ORDER BY starts_at
+		  AND ` + col + ` < $2
+		ORDER BY ` + col + `, id
 		LIMIT $3
 		FOR UPDATE SKIP LOCKED`
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, statusStrings(statuses), before, limit)

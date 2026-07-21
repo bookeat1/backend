@@ -88,17 +88,27 @@ func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.Bo
 
 type claimCall struct {
 	statuses []domain.BookingStatus
+	by       domain.ClaimColumn
 	before   time.Time
 	limit    int
 }
 
-// ClaimDue mirrors the real query: pending/waitlist are due relative to
-// created_at (confirm SLA), everything else relative to ends_at, ordered by
-// starts_at.
-func (f *fakeBookings) ClaimDue(_ context.Context, statuses []domain.BookingStatus, before time.Time, limit int) ([]domain.Booking, error) {
-	f.claims = append(f.claims, claimCall{statuses: statuses, before: before, limit: limit})
+// ClaimDue mirrors the real query: the caller names the cutoff column, and the
+// result is ordered by that same column so the oldest waiting row wins a short
+// batch (the anti-starvation property the real query has to provide).
+func (f *fakeBookings) ClaimDue(_ context.Context, statuses []domain.BookingStatus, by domain.ClaimColumn, before time.Time, limit int) ([]domain.Booking, error) {
+	f.claims = append(f.claims, claimCall{statuses: statuses, by: by, before: before, limit: limit})
 	if f.claimErr != nil {
 		return nil, f.claimErr
+	}
+	if !by.Valid() {
+		return nil, domain.ErrValidation
+	}
+	cutoffOf := func(b *domain.Booking) time.Time {
+		if by == domain.ClaimByCreatedAt {
+			return b.CreatedAt
+		}
+		return b.EndsAt
 	}
 	wanted := map[domain.BookingStatus]bool{}
 	for _, s := range statuses {
@@ -106,21 +116,15 @@ func (f *fakeBookings) ClaimDue(_ context.Context, statuses []domain.BookingStat
 	}
 	var out []domain.Booking
 	for _, b := range f.byID {
-		if !wanted[b.Status] {
-			continue
-		}
-		cutoff := b.EndsAt
-		if b.Status == domain.BookingPending || b.Status == domain.BookingWaitlist {
-			cutoff = b.CreatedAt
-		}
-		if !cutoff.Before(before) {
+		if !wanted[b.Status] || !cutoffOf(b).Before(before) {
 			continue
 		}
 		out = append(out, *b)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if !out[i].StartsAt.Equal(out[j].StartsAt) {
-			return out[i].StartsAt.Before(out[j].StartsAt)
+		a, b := cutoffOf(&out[i]), cutoffOf(&out[j])
+		if !a.Equal(b) {
+			return a.Before(b)
 		}
 		return out[i].ID.String() < out[j].ID.String()
 	})
@@ -270,8 +274,11 @@ func (f *fakeOutbox) types() []domain.BookingEventType {
 }
 
 type fakeBlacklist struct {
-	match   *domain.BlacklistEntry
-	lastQry domain.BlacklistQuery
+	match       *domain.BlacklistEntry
+	lastQry     domain.BlacklistQuery
+	list        []domain.BlacklistEntry
+	created     []domain.BlacklistEntry
+	deactivated []uuid.UUID
 }
 
 func (f *fakeBlacklist) Match(_ context.Context, q domain.BlacklistQuery) (*domain.BlacklistEntry, error) {
@@ -279,10 +286,16 @@ func (f *fakeBlacklist) Match(_ context.Context, q domain.BlacklistQuery) (*doma
 	return f.match, nil
 }
 func (f *fakeBlacklist) ListByRestaurant(context.Context, uuid.UUID) ([]domain.BlacklistEntry, error) {
-	return nil, nil
+	return f.list, nil
 }
-func (f *fakeBlacklist) Create(context.Context, *domain.BlacklistEntry) error { return nil }
-func (f *fakeBlacklist) Deactivate(context.Context, uuid.UUID) error          { return nil }
+func (f *fakeBlacklist) Create(_ context.Context, e *domain.BlacklistEntry) error {
+	f.created = append(f.created, *e)
+	return nil
+}
+func (f *fakeBlacklist) Deactivate(_ context.Context, id uuid.UUID) error {
+	f.deactivated = append(f.deactivated, id)
+	return nil
+}
 
 type fakeRateLog struct {
 	count   int
@@ -352,3 +365,5 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 	f.calls++
 	return fn(ctx)
 }
+
+func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }

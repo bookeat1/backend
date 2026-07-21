@@ -243,17 +243,160 @@ func TestWorkerClosesExpiredBookings(t *testing.T) {
 	}
 }
 
-// The expiry cutoff must be ends_at + grace, not now.
-func TestWorkerExpiryCutoffUsesGrace(t *testing.T) {
+// Each pass must claim on the column it actually reasons about, with the right
+// cutoff: the abandoned and expiry passes on ends_at + grace, the confirm-SLA
+// pass on created_at up to now.
+func TestWorkerClaimColumnsAndCutoffs(t *testing.T) {
 	h := newWorkerHarness(t)
 	if _, err := h.w.Tick(context.Background()); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if len(h.bookings.claims) != 2 {
-		t.Fatalf("claims = %d, want 2 (sla pass + expiry pass)", len(h.bookings.claims))
+	if len(h.bookings.claims) != 3 {
+		t.Fatalf("claims = %d, want 3 (abandoned + sla + expiry)", len(h.bookings.claims))
 	}
-	if want := h.now.Add(-30 * time.Minute); !h.bookings.claims[1].before.Equal(want) {
-		t.Fatalf("expiry cutoff = %s, want %s", h.bookings.claims[1].before, want)
+	grace := h.now.Add(-30 * time.Minute)
+	want := []struct {
+		by     domain.ClaimColumn
+		before time.Time
+	}{
+		{domain.ClaimByEndsAt, grace},    // abandoned
+		{domain.ClaimByCreatedAt, h.now}, // confirm SLA
+		{domain.ClaimByEndsAt, grace},    // expiry
+	}
+	for i, w := range want {
+		got := h.bookings.claims[i]
+		if got.by != w.by || !got.before.Equal(w.before) {
+			t.Errorf("claim %d = (%s, %s), want (%s, %s)", i, got.by, got.before, w.by, w.before)
+		}
+	}
+}
+
+// A pending booking the venue never answered and whose visit window is long
+// past must not stay pending forever: no_show is unreachable from pending, so
+// the worker closes it as cancelled, attributed to the system.
+func TestWorkerCancelsAbandonedBookings(t *testing.T) {
+	rid := uuid.New()
+	h := newWorkerHarness(t)
+	h.venue(rid, ptrBool(false), nil) // auto_confirm off: nobody ever answered
+
+	abandoned := h.booking(rid, domain.BookingPending, 30*time.Hour, time.Hour)
+	waitlisted := h.booking(rid, domain.BookingWaitlist, 30*time.Hour, time.Hour)
+	// Ended 10 minutes ago — still inside the grace window, hands off. Created
+	// just now too, so the confirm-SLA pass has no opinion about it either.
+	fresh := h.booking(rid, domain.BookingPending, 10*time.Minute, 10*time.Minute)
+	for _, b := range []*domain.Booking{abandoned, waitlisted, fresh} {
+		h.bookings.byID[b.ID] = b
+	}
+
+	res, err := h.w.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Abandoned != 2 {
+		t.Fatalf("got %+v, want 2 abandoned", res)
+	}
+	for _, b := range []*domain.Booking{abandoned, waitlisted} {
+		if got := h.statusOf(b.ID); got != domain.BookingCancelled {
+			t.Fatalf("abandoned booking → %s, want cancelled", got)
+		}
+	}
+	if got := h.statusOf(fresh.ID); got != domain.BookingPending {
+		t.Fatalf("booking inside the grace window changed to %s", got)
+	}
+
+	// Attribution: system, with a reason a human can read.
+	if n := len(h.bookings.updated); n != 2 {
+		t.Fatalf("metadata writes = %d, want 2", n)
+	}
+	for _, u := range h.bookings.updated {
+		if u.CancelledBy == nil || *u.CancelledBy != domain.CancelledBySystem {
+			t.Fatalf("cancelled_by = %v, want system", u.CancelledBy)
+		}
+		if u.CancelledAt == nil || !u.CancelledAt.Equal(h.now) {
+			t.Fatalf("cancelled_at = %v, want %s", u.CancelledAt, h.now)
+		}
+		if u.CancellationReason == nil || *u.CancellationReason != abandonedReason {
+			t.Fatalf("cancellation_reason = %v, want %q", u.CancellationReason, abandonedReason)
+		}
+	}
+	for _, c := range h.history.created {
+		if c.ActorType != domain.ActorSystem || c.ToStatus != domain.BookingCancelled ||
+			c.Reason == nil || *c.Reason != abandonedReason {
+			t.Fatalf("history row = %+v", c)
+		}
+	}
+	if types := h.outbox.types(); len(types) != 2 ||
+		types[0] != domain.EventBookingCancelled || types[1] != domain.EventBookingCancelled {
+		t.Fatalf("outbox = %v, want two booking.cancelled events", types)
+	}
+
+	// Idempotent: a second tick finds nothing left to do.
+	before := len(h.outbox.created)
+	if _, err := h.w.Tick(context.Background()); err != nil {
+		t.Fatalf("second tick: %v", err)
+	}
+	if len(h.outbox.created) != before {
+		t.Fatalf("second tick emitted %d extra events", len(h.outbox.created)-before)
+	}
+}
+
+// An abandoned booking must be cancelled rather than auto-confirmed into a
+// visit that already happened (and then blamed on the guest as a no-show), even
+// at a venue with auto_confirm on. This is why the abandoned pass runs first.
+func TestWorkerAbandonedBeatsAutoConfirm(t *testing.T) {
+	rid := uuid.New()
+	h := newWorkerHarness(t)
+	h.venue(rid, ptrBool(true), nil)
+	b := h.booking(rid, domain.BookingPending, 30*time.Hour, time.Hour)
+	h.bookings.byID[b.ID] = b
+
+	res, err := h.w.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Abandoned != 1 || res.Confirmed != 0 || res.NoShow != 0 {
+		t.Fatalf("got %+v, want 1 abandoned and nothing else", res)
+	}
+	if got := h.statusOf(b.ID); got != domain.BookingCancelled {
+		t.Fatalf("status = %s, want cancelled", got)
+	}
+}
+
+// Starvation guard: when the batch is smaller than the candidate set, the
+// bookings that have waited LONGEST must be the ones processed. The old query
+// ordered by starts_at while cutting off on created_at, so a genuinely overdue
+// request could be pushed out of every batch forever by fresher ones that
+// happen to start sooner.
+func TestWorkerConfirmSLADoesNotStarveOldest(t *testing.T) {
+	rid := uuid.New()
+	h := newWorkerHarness(t)
+	h.venue(rid, nil, nil)
+	h.w.wcfg.BatchSize = 1
+
+	// oldest was created 10h ago but is booked for the far future; newer was
+	// created 3h ago for a table tonight. Ordering by starts_at would pick
+	// newer every single tick.
+	oldest := h.booking(rid, domain.BookingPending, 10*time.Hour, -100*time.Hour)
+	newer := h.booking(rid, domain.BookingPending, 3*time.Hour, -5*time.Hour)
+	h.bookings.byID[oldest.ID] = oldest
+	h.bookings.byID[newer.ID] = newer
+
+	if _, err := h.w.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if got := h.statusOf(oldest.ID); got != domain.BookingConfirmed {
+		t.Fatalf("oldest pending is %s, want confirmed first — it is being starved", got)
+	}
+	if got := h.statusOf(newer.ID); got != domain.BookingPending {
+		t.Fatalf("newer booking = %s, want pending (batch size is 1)", got)
+	}
+
+	// It drains: the next tick takes the one that is now the oldest.
+	if _, err := h.w.Tick(context.Background()); err != nil {
+		t.Fatalf("second tick: %v", err)
+	}
+	if got := h.statusOf(newer.ID); got != domain.BookingConfirmed {
+		t.Fatalf("newer booking = %s after the second tick, want confirmed", got)
 	}
 }
 

@@ -162,3 +162,5 @@ func (t *inlineTx) WithinTx(ctx context.Context, fn func(context.Context) error)
 	t.called = true
 	return fn(ctx)
 }
+
+func (t *inlineTx) Detach(ctx context.Context) context.Context { return ctx }

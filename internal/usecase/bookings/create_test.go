@@ -320,8 +320,8 @@ func TestCreateBlacklistQueryIsNormalized(t *testing.T) {
 	}
 }
 
-// force=true skips table selection only: the booking is recorded as unassigned
-// seating, and the blacklist still applies.
+// force=true skips availability-based selection but NOT the placement itself:
+// the manager must name the tables, and those tables are really occupied.
 func TestCreateForcedPlacement(t *testing.T) {
 	h := newCreateHarness(t, domain.BookingPolicyOverride{})
 	h.links.busy = []domain.TableBusyInterval{
@@ -330,6 +330,7 @@ func TestCreateForcedPlacement(t *testing.T) {
 	}
 	in := h.input()
 	in.Force = true
+	in.TableIDs = []uuid.UUID{h.tableSmall.ID}
 
 	got, err := h.uc.Create(context.Background(), h.manager, in)
 	if err != nil {
@@ -338,8 +339,10 @@ func TestCreateForcedPlacement(t *testing.T) {
 	if !got.Booking.ForcedPlacement || !got.Booking.CreatedByAdmin {
 		t.Fatalf("booking = %+v", got.Booking)
 	}
-	if len(h.links.created) != 0 {
-		t.Fatalf("forced placement must not create table links, got %d", len(h.links.created))
+	// The whole point: a forced booking still holds its seat, so the exclusion
+	// constraint and the availability engine can both see it.
+	if len(h.links.created) != 1 || h.links.created[0].TableID != h.tableSmall.ID {
+		t.Fatalf("forced placement must occupy the named tables, got %+v", h.links.created)
 	}
 
 	// …but a blacklisted guest is still refused, force or not.
@@ -347,8 +350,48 @@ func TestCreateForcedPlacement(t *testing.T) {
 	h2.blacklist.match = &domain.BlacklistEntry{ID: uuid.New(), IsActive: true}
 	in2 := h2.input()
 	in2.Force = true
+	in2.TableIDs = []uuid.UUID{h2.tableSmall.ID}
 	if _, err := h2.uc.Create(context.Background(), h2.manager, in2); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("forced create for a blacklisted guest = %v, want ErrForbidden", err)
+	}
+}
+
+// force without an explicit table list is rejected: such a booking would exist
+// with no booking_tables rows, invisible to the availability engine and to the
+// GiST exclusion constraint, so the very slot the manager overbooked would stay
+// on sale for the next ordinary guest.
+func TestCreateForceWithoutTablesIsRejected(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	in := h.input()
+	in.Force = true
+
+	_, err := h.uc.Create(context.Background(), h.manager, in)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("force without tables = %v, want ErrValidation (HTTP 422)", err)
+	}
+	if len(h.bookings.created) != 0 || len(h.links.created) != 0 {
+		t.Fatal("a rejected forced request must not create a booking")
+	}
+
+	// An explicitly empty (non-nil) slice is the same request, not a different one.
+	in.TableIDs = []uuid.UUID{}
+	if _, err := h.uc.Create(context.Background(), h.manager, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("force with an empty table list = %v, want ErrValidation", err)
+	}
+}
+
+// force does not disarm the double-booking guarantee: the exclusion constraint
+// still rejects the insert when the named table is already taken, and that
+// surfaces as 409, not as a silently accepted overlap.
+func TestCreateForceStillLosesToOccupiedTable(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	h.links.createErr = domain.ErrAlreadyExists // what the constraint does
+	in := h.input()
+	in.Force = true
+	in.TableIDs = []uuid.UUID{h.tableSmall.ID}
+
+	if _, err := h.uc.Create(context.Background(), h.manager, in); !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("forced create over an occupied table = %v, want ErrAlreadyExists", err)
 	}
 }
 

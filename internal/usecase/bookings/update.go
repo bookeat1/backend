@@ -23,6 +23,9 @@ type UpdateUseCase interface {
 // UpdateInput carries only the fields being changed; nil means "leave as is".
 // TableIDs is nil for "keep / recompute", and an explicit (possibly empty)
 // slice for "set exactly these".
+//
+// Force relaxes the opening-hours and capacity checks and therefore REQUIRES a
+// non-empty TableIDs: see Update.
 type UpdateInput struct {
 	StartsAt *time.Time
 	Guests   *int
@@ -70,6 +73,14 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 	}
 	if !acc.staff() {
 		return nil, fmt.Errorf("%w: only the restaurant can amend a booking", domain.ErrForbidden)
+	}
+	// Same invariant as on create: forcing a placement means naming the tables.
+	// Force with no tables would strip the booking of its booking_tables rows
+	// while it still holds a seat, which hides it from the availability engine
+	// and from the exclusion constraint — the slot would silently become
+	// sellable again to an ordinary guest.
+	if in.Force && len(in.TableIDs) == 0 {
+		return nil, fmt.Errorf("%w: forced placement requires the tables to seat the party at", domain.ErrValidation)
 	}
 	// A booking that no longer holds its tables cannot be moved: rescheduling a
 	// cancelled or completed visit would resurrect it without a status change.
@@ -202,9 +213,7 @@ func (u *updateUseCase) resolveLinks(
 		}
 		return build(picked), true, nil
 	}
-	if in.Force {
-		return nil, true, nil // unassigned seating, seated by hand
-	}
+	// in.Force cannot reach here: Update rejects force without tables.
 
 	busy, err := u.links.ListBusy(ctx, b.RestaurantID, from, to)
 	if err != nil {

@@ -12,12 +12,20 @@ import (
 
 // Worker is the background booking janitor (spec §5). Once per tick it:
 //
+//   - closes bookings the venue never answered: pending / waitlist whose visit
+//     window ended more than NoShowGrace ago become cancelled, attributed to
+//     the system. Without this stage such a booking is immortal — no_show is
+//     reachable only from confirmed, so nothing else can ever move it;
 //   - takes bookings still waiting for the venue (pending / waitlist) whose
 //     confirm SLA has expired: auto-confirms them when the venue has
 //     auto_confirm on, otherwise records one escalation event for the venue;
 //   - closes bookings whose visit window ended more than NoShowGrace ago:
 //     arrived → completed, confirmed → no_show (the guest was never marked as
 //     arrived).
+//
+// The abandoned stage runs FIRST on purpose: a request whose visit time has
+// already come and gone must not be auto-confirmed into a booking nobody can
+// honour, only to be marked as the guest's no-show one stage later.
 //
 // Every selection goes through the repository's ClaimDue, which uses
 // SELECT ... FOR UPDATE SKIP LOCKED inside a transaction, so several worker
@@ -91,6 +99,7 @@ func NewWorker(
 type TickResult struct {
 	Confirmed int // pending/waitlist auto-confirmed
 	Escalated int // confirm SLA breached, venue has auto_confirm off
+	Abandoned int // pending/waitlist the venue never answered → cancelled
 	Completed int // arrived → completed
 	NoShow    int // confirmed → no_show
 	Skipped   int // claimed but not actionable (SLA not reached, illegal transition)
@@ -99,8 +108,8 @@ type TickResult struct {
 func (r TickResult) attrs() []any {
 	return []any{
 		slog.Int("confirmed", r.Confirmed), slog.Int("escalated", r.Escalated),
-		slog.Int("completed", r.Completed), slog.Int("no_show", r.NoShow),
-		slog.Int("skipped", r.Skipped),
+		slog.Int("abandoned", r.Abandoned), slog.Int("completed", r.Completed),
+		slog.Int("no_show", r.NoShow), slog.Int("skipped", r.Skipped),
 	}
 }
 
@@ -139,8 +148,16 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	now := w.now()
 	var res TickResult
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
+		r, err := w.processAbandoned(ctx, now)
+		res.Abandoned, res.Skipped = r.Abandoned, r.Skipped
+		return err
+	}); err != nil {
+		return res, fmt.Errorf("abandoned pass: %w", err)
+	}
+	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
 		r, err := w.processConfirmSLA(ctx, now)
-		res.Confirmed, res.Escalated, res.Skipped = r.Confirmed, r.Escalated, r.Skipped
+		res.Confirmed, res.Escalated = r.Confirmed, r.Escalated
+		res.Skipped += r.Skipped
 		return err
 	}); err != nil {
 		return res, fmt.Errorf("confirm sla pass: %w", err)
@@ -167,7 +184,7 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 	var res TickResult
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist},
-		now, w.wcfg.BatchSize)
+		domain.ClaimByCreatedAt, now, w.wcfg.BatchSize)
 	if err != nil {
 		return res, err
 	}
@@ -199,7 +216,7 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 			res.Escalated++
 			continue
 		}
-		ok, err := w.transition(ctx, &b, domain.BookingConfirmed, now, "confirm sla elapsed, venue auto-confirm")
+		ok, err := w.transition(ctx, &b, domain.BookingConfirmed, now, "confirm sla elapsed, venue auto-confirm", nil)
 		if err != nil {
 			return res, err
 		}
@@ -212,6 +229,51 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 	return res, nil
 }
 
+// abandonedReason is written to booking_status_history and to the booking's
+// cancellation_reason so the venue can see in its own list why the request
+// closed itself.
+const abandonedReason = "venue never responded"
+
+// processAbandoned closes requests the venue simply never answered: pending or
+// waitlist bookings whose visit window ended more than NoShowGrace ago.
+//
+// They cannot become no_show (that edge exists only from confirmed — a venue
+// that never accepted the booking has no promise for the guest to break), and
+// nobody is going to open the tablet weeks later to clear them by hand, so the
+// worker cancels them as the system with an explicit reason. Cancelling also
+// releases the table: booking_tables.active is driven by the status trigger,
+// and a dead pending booking must not sit on a slot forever.
+func (w *Worker) processAbandoned(ctx context.Context, now time.Time) (TickResult, error) {
+	var res TickResult
+	cutoff := now.Add(-w.wcfg.NoShowGrace)
+	due, err := w.bookings.ClaimDue(ctx,
+		[]domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist},
+		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
+	if err != nil {
+		return res, err
+	}
+	reason := abandonedReason
+	for i := range due {
+		b := due[i]
+		ok, err := w.transition(ctx, &b, domain.BookingCancelled, now, reason,
+			func(b *domain.Booking, at time.Time) {
+				by := domain.CancelledBySystem
+				b.CancelledBy = &by
+				b.CancelledAt = &at
+				b.CancellationReason = &reason
+			})
+		if err != nil {
+			return res, err
+		}
+		if !ok {
+			res.Skipped++
+			continue
+		}
+		res.Abandoned++
+	}
+	return res, nil
+}
+
 // processExpired closes bookings whose visit window is over: arrived guests are
 // completed, guests never marked as arrived become no_show.
 func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult, error) {
@@ -219,7 +281,7 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 	cutoff := now.Add(-w.wcfg.NoShowGrace)
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingArrived, domain.BookingConfirmed},
-		cutoff, w.wcfg.BatchSize)
+		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
 	if err != nil {
 		return res, err
 	}
@@ -229,7 +291,7 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 		if b.Status == domain.BookingConfirmed {
 			to, reason = domain.BookingNoShow, "guest was never marked as arrived"
 		}
-		ok, err := w.transition(ctx, &b, to, now, reason)
+		ok, err := w.transition(ctx, &b, to, now, reason, nil)
 		if err != nil {
 			return res, err
 		}
@@ -251,13 +313,31 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 // row lock from ClaimDue. Returns false (without an error) when the transition
 // is not legal from the booking's current status — the worker races with the
 // venue's own actions and must not fail the whole pass over one stale row.
-func (w *Worker) transition(ctx context.Context, b *domain.Booking, to domain.BookingStatus, at time.Time, reason string) (bool, error) {
+//
+// apply is an optional hook for the metadata columns UpdateStatus does not
+// own (cancelled_by, cancellation_reason). Mirroring statusUseCase.transition,
+// that metadata is written first and the status last, because the DB trigger
+// that syncs booking_tables.active fires on the status write.
+func (w *Worker) transition(
+	ctx context.Context,
+	b *domain.Booking,
+	to domain.BookingStatus,
+	at time.Time,
+	reason string,
+	apply func(b *domain.Booking, at time.Time),
+) (bool, error) {
 	from := b.Status
 	if err := domain.ValidateTransition(from, to); err != nil {
 		w.log.Warn("booking worker skipped illegal transition",
 			slog.String("booking_id", b.ID.String()),
 			slog.String("from", string(from)), slog.String("to", string(to)))
 		return false, nil
+	}
+	if apply != nil {
+		apply(b, at)
+		if err := w.bookings.Update(ctx, b); err != nil {
+			return false, err
+		}
 	}
 	if err := w.bookings.UpdateStatus(ctx, b.ID, to, at); err != nil {
 		return false, err

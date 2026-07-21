@@ -19,6 +19,7 @@ type updateHarness struct {
 	tx       *fakeTx
 
 	booking      *domain.Booking
+	table        domain.RestaurantTable
 	restaurantID uuid.UUID
 	guest        Actor
 	manager      Actor
@@ -35,12 +36,14 @@ func newUpdateHarness(t *testing.T, status domain.BookingStatus) *updateHarness 
 		PhoneNormalized: "+77071234567", Guests: 2, Status: status,
 		StartsAt: start, EndsAt: start.Add(2 * time.Hour), Source: domain.SourceApp,
 	}
+	table := domain.RestaurantTable{ID: uuid.New(), RestaurantID: rid, Capacity: 4, IsActive: true}
 	h := &updateHarness{
 		bookings:     newFakeBookings(b),
 		links:        &fakeLinks{},
 		outbox:       &fakeOutbox{},
 		tx:           &fakeTx{},
 		booking:      b,
+		table:        table,
 		restaurantID: rid,
 		guest:        Actor{UserID: guestID, Role: domain.RoleUser},
 		manager:      Actor{UserID: uuid.New(), Role: domain.RoleRestaurant},
@@ -49,9 +52,7 @@ func newUpdateHarness(t *testing.T, status domain.BookingStatus) *updateHarness 
 	h.uc = NewUpdateUseCase(
 		h.bookings, h.links, h.outbox,
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
-		&fakeSchedule{tables: []domain.RestaurantTable{
-			{ID: uuid.New(), RestaurantID: rid, Capacity: 4, IsActive: true},
-		}},
+		&fakeSchedule{tables: []domain.RestaurantTable{table}},
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, rid}),
 		h.tx, testConfig(),
 	)
@@ -108,9 +109,15 @@ func TestUpdateTerminalBooking(t *testing.T) {
 func TestUpdateReschedule(t *testing.T) {
 	h := newUpdateHarness(t, domain.BookingConfirmed)
 	newStart := h.booking.StartsAt.Add(time.Hour)
-	out, err := h.uc.Update(context.Background(), h.manager, h.booking.ID, UpdateInput{StartsAt: &newStart, Force: true})
+	out, err := h.uc.Update(context.Background(), h.manager, h.booking.ID, UpdateInput{
+		StartsAt: &newStart, Force: true, TableIDs: []uuid.UUID{h.table.ID},
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	// Forced or not, the booking keeps holding a table.
+	if len(h.links.created) != 1 || h.links.created[0].TableID != h.table.ID {
+		t.Errorf("links = %+v, want the forced table", h.links.created)
 	}
 	if !out.Booking.StartsAt.Equal(newStart) {
 		t.Errorf("starts_at = %v, want %v", out.Booking.StartsAt, newStart)
@@ -139,5 +146,47 @@ func TestUpdateNotesOnlyKeepsTables(t *testing.T) {
 	}
 	if len(h.links.created) != 0 {
 		t.Errorf("links rewritten on a notes-only edit: %+v", h.links.created)
+	}
+}
+
+// Same invariant as on create: force means "seat them on THESE tables", never
+// "seat them nowhere". A forced amendment with no tables would strip the
+// booking of its booking_tables rows while it still holds a seat, putting the
+// slot back on sale behind the exclusion constraint's back.
+func TestUpdateForceWithoutTablesIsRejected(t *testing.T) {
+	h := newUpdateHarness(t, domain.BookingConfirmed)
+	newStart := h.booking.StartsAt.Add(time.Hour)
+
+	for _, tc := range []struct {
+		name string
+		in   UpdateInput
+	}{
+		{"tables omitted", UpdateInput{StartsAt: &newStart, Force: true}},
+		{"tables explicitly empty", UpdateInput{StartsAt: &newStart, Force: true, TableIDs: []uuid.UUID{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.uc.Update(context.Background(), h.manager, h.booking.ID, tc.in)
+			if !errors.Is(err, domain.ErrValidation) {
+				t.Fatalf("= %v, want ErrValidation (HTTP 422)", err)
+			}
+			if len(h.bookings.updated) != 0 || len(h.links.created) != 0 {
+				t.Fatal("a rejected amendment must not touch the booking or its placement")
+			}
+		})
+	}
+}
+
+// The double-booking guarantee survives force on the amendment path too: the
+// exclusion constraint still rejects an overlapping placement, as 409.
+func TestUpdateForceStillLosesToOccupiedTable(t *testing.T) {
+	h := newUpdateHarness(t, domain.BookingConfirmed)
+	h.links.createErr = domain.ErrAlreadyExists // what the constraint does
+	newStart := h.booking.StartsAt.Add(time.Hour)
+
+	_, err := h.uc.Update(context.Background(), h.manager, h.booking.ID, UpdateInput{
+		StartsAt: &newStart, Force: true, TableIDs: []uuid.UUID{h.table.ID},
+	})
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("= %v, want ErrAlreadyExists", err)
 	}
 }

@@ -145,6 +145,23 @@ const rawBookingsQuery = `
 	LEFT JOIN users u ON u.id = b.user_id
 	ORDER BY b.created_at`
 
+// upsertBooking writes the booking core.
+//
+// confirmed_at, arrived_at and cancelled_by are hard-coded NULL, and stay NULL
+// on conflict, because Supabase never recorded them:
+//
+//   - confirmed_at / arrived_at: the legacy schema had the status but not when
+//     it was reached. Back-filling them from created_at or booking_date would
+//     invent an audit trail;
+//   - cancelled_by: cancelled_at and cancellation_reason DO exist, but nothing
+//     says who pressed the button. Defaulting to 'restaurant' was considered
+//     and rejected — that column feeds venue-reliability statistics, so a guess
+//     there is not a harmless placeholder, it is a fabricated accusation
+//     against every venue with cancelled history. NULL honestly means unknown;
+//     bookings created after the migration carry the real actor.
+//
+// cancelled_at, cancellation_reason and cancellation_reason_code ARE carried
+// over, so a human can still see that and why a booking was cancelled.
 const upsertBooking = `
 	INSERT INTO bookings (id, restaurant_id, user_id, name, phone, email, phone_normalized,
 	  guests, starts_at, ends_at, status, source, notes, promotion_id, event_id,

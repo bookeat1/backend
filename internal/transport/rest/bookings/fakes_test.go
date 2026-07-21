@@ -62,6 +62,8 @@ type fakeTx struct{}
 
 func (fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
 
+func (fakeTx) Detach(ctx context.Context) context.Context { return ctx }
+
 // --- idempotency store: an in-memory map with the same uniqueness rule as the
 // (user_id, endpoint, idempotency_key) constraint.
 

@@ -114,6 +114,15 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	if !acc.staff() && (in.Force || len(in.TableIDs) > 0) {
 		return nil, fmt.Errorf("%w: manual placement is restricted to venue staff", domain.ErrForbidden)
 	}
+	// force=true is "seat them anyway, on THESE tables" — never "seat them
+	// nowhere". A forced booking with no booking_tables rows is invisible to
+	// the availability engine and to the exclusion constraint, so the very slot
+	// the manager just double-booked stays sellable to the next guest, and the
+	// second booking is not even recorded as a conflict. Requiring the tables
+	// keeps every booking that holds a seat inside the same guarantee.
+	if in.Force && len(in.TableIDs) == 0 {
+		return nil, fmt.Errorf("%w: forced placement requires the tables to seat the party at", domain.ErrValidation)
+	}
 
 	rest, err := u.restaurants.GetByID(ctx, in.RestaurantID)
 	if err != nil {
@@ -154,7 +163,11 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	if err := u.checkRate(ctx, normalizedPhone); err != nil {
 		return nil, err
 	}
-	if err := u.rateLog.Create(ctx, &domain.BookingRateLogEntry{
+	// Detached on purpose: when the request arrives through the idempotent
+	// decorator there is already an open transaction on ctx, and any later
+	// failure (no free table, lost exclusion race) would roll this row back
+	// with it — so rejected attempts would never count towards the limit.
+	if err := u.rateLog.Create(u.tx.Detach(ctx), &domain.BookingRateLogEntry{
 		ID: uuid.New(), UserID: in.UserID, PhoneNormalized: &normalizedPhone,
 		Email: nullable(email), RestaurantID: &in.RestaurantID,
 		Action: domain.RateLogCreate, CreatedAt: time.Now(),
@@ -328,12 +341,13 @@ func isBookableStart(sched schedule, startsAt time.Time, policy domain.BookingPo
 //
 //   - explicit TableIDs (staff only): validated to belong to the venue and to
 //     be active; capacity is still enforced unless Force is set;
-//   - Force without TableIDs: no links are created at all. The exclusion
-//     constraint is a hard invariant — a forced booking is recorded as
-//     unassigned seating (forced_placement = true) and the manager seats the
-//     party by hand;
 //   - otherwise: the free tables at that slot are picked automatically
 //     (single table, or a combination of up to three).
+//
+// Force never reaches here without TableIDs — Create rejects that combination,
+// see the guarantee argument there. Whatever the path, a booking that holds a
+// seat always gets its booking_tables rows, and the GiST exclusion constraint
+// remains the single source of truth about who occupies what.
 func (u *createUseCase) selectTables(
 	ctx context.Context,
 	in CreateInput,
@@ -364,9 +378,6 @@ func (u *createUseCase) selectTables(
 				domain.ErrValidation, seats, in.Guests)
 		}
 		return picked, nil
-	}
-	if in.Force {
-		return nil, nil // unassigned seating, see doc comment
 	}
 
 	from, to := occupancyWindow(startsAt, policy)

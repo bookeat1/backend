@@ -28,6 +28,16 @@ type Manager struct{ pool *pgxpool.Pool }
 // NewManager builds a transaction manager bound to pool.
 func NewManager(pool *pgxpool.Pool) *Manager { return &Manager{pool: pool} }
 
+// Detach strips the active transaction from ctx: statements run on the pool and
+// are unaffected by a rollback of the surrounding transaction. WithinTx called
+// on a detached context starts a fresh transaction.
+func (m *Manager) Detach(ctx context.Context) context.Context {
+	if ctx.Value(ctxKey{}) == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKey{}, nil)
+}
+
 // WithinTx runs fn inside one transaction. If a tx is already active on ctx it
 // reuses it (fn joins the outer transaction). Commits on nil, rolls back on
 // error. Rollbacks use a background context so cleanup still runs even if ctx

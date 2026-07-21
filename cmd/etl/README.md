@@ -53,6 +53,13 @@ Mapping rules:
   lower-cased.
 - Statuses are copied as-is. `no_show` is **never** back-filled — Supabase has
   no data to tell a no-show from a forgotten booking.
+- `confirmed_at`, `arrived_at` and `cancelled_by` are left **NULL** for every
+  migrated row, deliberately. Supabase stored the status but not when it was
+  reached, and stored `cancelled_at` / `cancellation_reason` but never who
+  cancelled. `cancelled_by` feeds venue-reliability statistics, so defaulting it
+  to `restaurant` would fabricate an accusation against every venue with
+  cancelled history; NULL means "unknown", which is the truth. Only bookings
+  created after the migration carry a real actor.
 - `promotion_id` / `event_id` are copied without a foreign key on purpose.
 
 Rows that cannot be placed are skipped, not fatal: a missing restaurant, a
