@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ type fakeBookings struct {
 	lastFlt  domain.BookingFilter
 	getErr   error
 	createTx error
+	claims   []claimCall
+	claimErr error
 }
 
 type statusWrite struct {
@@ -83,8 +86,48 @@ func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.Bo
 	return nil
 }
 
-func (f *fakeBookings) ClaimDue(context.Context, []domain.BookingStatus, time.Time, int) ([]domain.Booking, error) {
-	return nil, nil
+type claimCall struct {
+	statuses []domain.BookingStatus
+	before   time.Time
+	limit    int
+}
+
+// ClaimDue mirrors the real query: pending/waitlist are due relative to
+// created_at (confirm SLA), everything else relative to ends_at, ordered by
+// starts_at.
+func (f *fakeBookings) ClaimDue(_ context.Context, statuses []domain.BookingStatus, before time.Time, limit int) ([]domain.Booking, error) {
+	f.claims = append(f.claims, claimCall{statuses: statuses, before: before, limit: limit})
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+	wanted := map[domain.BookingStatus]bool{}
+	for _, s := range statuses {
+		wanted[s] = true
+	}
+	var out []domain.Booking
+	for _, b := range f.byID {
+		if !wanted[b.Status] {
+			continue
+		}
+		cutoff := b.EndsAt
+		if b.Status == domain.BookingPending || b.Status == domain.BookingWaitlist {
+			cutoff = b.CreatedAt
+		}
+		if !cutoff.Before(before) {
+			continue
+		}
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].StartsAt.Equal(out[j].StartsAt) {
+			return out[i].StartsAt.Before(out[j].StartsAt)
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 type fakeLinks struct {
@@ -209,6 +252,15 @@ func (f *fakeOutbox) ClaimUnpublished(context.Context, int) ([]domain.BookingOut
 }
 func (f *fakeOutbox) MarkPublished(context.Context, []uuid.UUID, time.Time) error { return nil }
 
+func (f *fakeOutbox) ExistsForBooking(_ context.Context, bookingID uuid.UUID, t domain.BookingEventType) (bool, error) {
+	for _, e := range f.created {
+		if e.BookingID == bookingID && e.EventType == t {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeOutbox) types() []domain.BookingEventType {
 	out := make([]domain.BookingEventType, 0, len(f.created))
 	for _, e := range f.created {
@@ -246,13 +298,17 @@ func (f *fakeRateLog) CountSince(context.Context, string, domain.RateLogAction, 
 }
 
 type fakeRestaurants struct {
-	agg *domain.RestaurantAggregate
-	err error
+	agg  *domain.RestaurantAggregate
+	byID map[uuid.UUID]*domain.RestaurantAggregate
+	err  error
 }
 
-func (f *fakeRestaurants) GetByID(context.Context, uuid.UUID) (*domain.RestaurantAggregate, error) {
+func (f *fakeRestaurants) GetByID(_ context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if a, ok := f.byID[id]; ok {
+		return a, nil
 	}
 	return f.agg, nil
 }

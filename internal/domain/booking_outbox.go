@@ -44,5 +44,10 @@ type BookingOutboxRepository interface {
 	// ClaimUnpublished locks up to limit undelivered events using FOR UPDATE
 	// SKIP LOCKED so parallel workers do not collide.
 	ClaimUnpublished(ctx context.Context, limit int) ([]BookingOutboxEvent, error)
+	// ExistsForBooking reports whether an event of that type was already
+	// recorded for the booking. Used by the background worker to emit
+	// at-most-once events (e.g. the confirm-SLA escalation) without adding a
+	// flag column to bookings.
+	ExistsForBooking(ctx context.Context, bookingID uuid.UUID, eventType BookingEventType) (bool, error)
 	MarkPublished(ctx context.Context, ids []uuid.UUID, at time.Time) error
 }

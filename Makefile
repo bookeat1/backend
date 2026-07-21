@@ -1,7 +1,12 @@
-.PHONY: run build tidy migrate-up migrate-down test test-short fmt vet check etl test-integration swagger
+.PHONY: run worker build tidy migrate-up migrate-down test test-short fmt vet check etl test-integration swagger
 
 run:
 	go run ./cmd/http/main.go
+
+# Background booking worker: confirm-SLA auto-confirm/escalation and
+# completed/no_show closing. Safe to run several instances.
+worker:
+	go run ./cmd/worker/main.go
 
 build:
 	go build ./...

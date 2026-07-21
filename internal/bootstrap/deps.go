@@ -89,22 +89,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingRateLog := bookingrepo.NewRateLog(db)
 	idempotencyKeys := idemrepo.New(db)
 
-	// bookings.Config mirrors BookingConfig field-for-field so the usecase
-	// layer never imports bootstrap (same arrangement as auth.Config).
-	bookingCfg := bookings.Config{
-		DefaultDuration:       cfg.Booking.DefaultDuration,
-		DefaultBuffer:         cfg.Booking.DefaultBuffer,
-		DefaultLead:           cfg.Booking.DefaultLead,
-		DefaultHorizonDays:    cfg.Booking.DefaultHorizonDays,
-		DefaultCancelDeadline: cfg.Booking.DefaultCancelDeadline,
-		DefaultConfirmSLA:     cfg.Booking.DefaultConfirmSLA,
-		DefaultMaxGuests:      cfg.Booking.DefaultMaxGuests,
-		DefaultAutoConfirm:    cfg.Booking.DefaultAutoConfirm,
-		TimezoneFallback:      cfg.Booking.TimezoneFallback,
-		RateWindow:            cfg.Booking.RateWindow,
-		RateLimit:             cfg.Booking.RateLimit,
-		SlotStep:              cfg.Booking.SlotStep,
-	}
+	bookingCfg := newBookingConfig(cfg)
 
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
@@ -130,4 +115,39 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		Issuer:           issuer,
 	}, nil
+}
+
+// newBookingConfig mirrors BookingConfig field-for-field into the usecase
+// layer's own Config so that layer never imports bootstrap (same arrangement as
+// auth.Config).
+func newBookingConfig(cfg Config) bookings.Config {
+	return bookings.Config{
+		DefaultDuration:       cfg.Booking.DefaultDuration,
+		DefaultBuffer:         cfg.Booking.DefaultBuffer,
+		DefaultLead:           cfg.Booking.DefaultLead,
+		DefaultHorizonDays:    cfg.Booking.DefaultHorizonDays,
+		DefaultCancelDeadline: cfg.Booking.DefaultCancelDeadline,
+		DefaultConfirmSLA:     cfg.Booking.DefaultConfirmSLA,
+		DefaultMaxGuests:      cfg.Booking.DefaultMaxGuests,
+		DefaultAutoConfirm:    cfg.Booking.DefaultAutoConfirm,
+		TimezoneFallback:      cfg.Booking.TimezoneFallback,
+		RateWindow:            cfg.Booking.RateWindow,
+		RateLimit:             cfg.Booking.RateLimit,
+		SlotStep:              cfg.Booking.SlotStep,
+	}
+}
+
+// NewBookingWorker wires the background booking worker. It is deliberately
+// separate from NewDeps: the worker needs neither the HTTP stack nor a signing
+// key, and requiring AUTH_JWT_PRIVATE_KEY to start a janitor process would be
+// an operational trap.
+func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.Worker {
+	return bookings.NewWorker(
+		bookingrepo.New(db), bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
+		restrepo.New(db), sqltx.NewManager(db), newBookingConfig(cfg),
+		bookings.WorkerConfig{
+			TickInterval: cfg.Worker.TickInterval,
+			NoShowGrace:  cfg.Worker.NoShowGrace,
+			BatchSize:    cfg.Worker.BatchSize,
+		}, log)
 }

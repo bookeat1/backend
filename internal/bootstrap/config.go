@@ -18,6 +18,7 @@ type Config struct {
 	DB      DBConfig
 	Auth    AuthConfig
 	Booking BookingConfig
+	Worker  WorkerConfig
 }
 
 type AppConfig struct {
@@ -78,6 +79,16 @@ type BookingConfig struct {
 	// SlotStep is the granularity used to generate bookable start times for a
 	// venue that publishes opening hours but no explicit time slots.
 	SlotStep time.Duration // env: BOOKING_SLOT_STEP_MINUTES
+}
+
+// WorkerConfig configures the background booking worker (cmd/worker): how
+// often it wakes up and how long a finished booking is left alone before it is
+// closed as completed / no_show. The per-venue booking policy is NOT here — it
+// is resolved from BookingConfig plus the restaurant's overrides.
+type WorkerConfig struct {
+	TickInterval time.Duration // env: WORKER_TICK_INTERVAL
+	NoShowGrace  time.Duration // env: WORKER_NO_SHOW_GRACE
+	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
 func (p PostgresConfig) DSN() string {
@@ -141,6 +152,11 @@ func NewConfig() (Config, error) {
 			RateLimit:             getEnvInt("BOOKING_RATE_LIMIT", 10),
 			RateWindow:            getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
 			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+		},
+		Worker: WorkerConfig{
+			TickInterval: getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
+			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
+			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 	}
 

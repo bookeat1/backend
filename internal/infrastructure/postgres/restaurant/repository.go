@@ -34,6 +34,15 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 	kwaaka_restaurant_id, is_active, is_new, is_popular, is_premium,
 	hidden_from_home, display_order, created_at, updated_at`
 
+// policyCols are the venue's booking-policy overrides (all NULLABLE — NULL
+// means "use the global default"). They are read only by GetByID: the policy is
+// resolved per booking, and the catalog listing has no use for them. They are
+// deliberately absent from cols so the Create/Update placeholder numbering
+// stays untouched.
+const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
+	booking_lead_minutes, booking_horizon_days, cancel_deadline_minutes,
+	confirm_sla_minutes, max_guests_per_booking, auto_confirm`
+
 func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	now := time.Now()
 	if m.CreatedAt.IsZero() {
@@ -92,8 +101,8 @@ func (r *Repository) SetActive(ctx context.Context, id uuid.UUID, active bool) e
 }
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
-	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+` FROM restaurants WHERE id=$1`, id)
-	base, err := scanRestaurant(row)
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+`, `+policyCols+` FROM restaurants WHERE id=$1`, id)
+	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
@@ -210,6 +219,36 @@ func scanRestaurant(row scanner) (*domain.Restaurant, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	m.City = domain.City(city)
+	m.PriceCategory = domain.PriceCategory(price)
+	m.NameI18n = i18nFromDB(name)
+	m.DescriptionI18n = i18nFromDB(desc)
+	m.CuisineTypeI18n = i18nFromDB(cuisine)
+	m.AddressI18n = i18nFromDB(addr)
+	m.OpeningHoursI18n = i18nFromDB(opening)
+	return &m, nil
+}
+
+// scanRestaurantWithPolicy scans the base columns plus the booking-policy
+// overrides. Without it every venue would silently fall back to the env
+// defaults and restaurant-level auto_confirm / SLA settings would be ignored.
+func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
+	var m domain.Restaurant
+	var city, price string
+	var name, desc, cuisine, addr, opening []byte
+	p := &m.BookingPolicy
+	if err := row.Scan(
+		&m.ID, &m.CategoryID, &m.Name, &name, &m.Description, &desc,
+		&m.CuisineType, &cuisine, &m.Address, &addr, &m.OpeningHours, &opening,
+		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
+		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
+		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
+		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
+		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
+		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm,
 	); err != nil {
 		return nil, err
 	}

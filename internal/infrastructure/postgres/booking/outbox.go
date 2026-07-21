@@ -71,6 +71,19 @@ func (r *Outbox) ClaimUnpublished(ctx context.Context, limit int) ([]domain.Book
 	return out, rows.Err()
 }
 
+// ExistsForBooking reports whether an event of that type already exists for the
+// booking (served by idx_booking_outbox_booking).
+func (r *Outbox) ExistsForBooking(ctx context.Context, bookingID uuid.UUID, eventType domain.BookingEventType) (bool, error) {
+	var exists bool
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM booking_outbox WHERE booking_id=$1 AND event_type=$2)`,
+		bookingID, string(eventType)).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check outbox event: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *Outbox) MarkPublished(ctx context.Context, ids []uuid.UUID, at time.Time) error {
 	if len(ids) == 0 {
 		return nil
