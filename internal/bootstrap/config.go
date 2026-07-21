@@ -69,6 +69,15 @@ type BookingConfig struct {
 	DefaultMaxGuests      int           // env: BOOKING_DEFAULT_MAX_GUESTS
 	DefaultAutoConfirm    bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM
 	TimezoneFallback      string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
+
+	// Anti-fraud: at most RateLimit booking attempts per normalized phone
+	// within RateWindow (booking_rate_log).
+	RateLimit  int           // env: BOOKING_RATE_LIMIT
+	RateWindow time.Duration // env: BOOKING_RATE_WINDOW
+
+	// SlotStep is the granularity used to generate bookable start times for a
+	// venue that publishes opening hours but no explicit time slots.
+	SlotStep time.Duration // env: BOOKING_SLOT_STEP_MINUTES
 }
 
 func (p PostgresConfig) DSN() string {
@@ -129,6 +138,9 @@ func NewConfig() (Config, error) {
 			DefaultMaxGuests:      getEnvInt("BOOKING_DEFAULT_MAX_GUESTS", 20),
 			DefaultAutoConfirm:    getEnvBool("BOOKING_DEFAULT_AUTO_CONFIRM", true),
 			TimezoneFallback:      getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
+			RateLimit:             getEnvInt("BOOKING_RATE_LIMIT", 10),
+			RateWindow:            getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
+			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
 		},
 	}
 

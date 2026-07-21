@@ -15,6 +15,7 @@ import (
 
 	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
+	bookingsrest "backend-core/internal/transport/rest/bookings"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -65,6 +66,16 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)
 
+	bookingHandler := bookingsrest.NewHandler(deps.BookingsFacade, deps.BookingCreate,
+		deps.BookingIdempotent, deps.BookingStatus, deps.BookingUpdate,
+		deps.BookingAvail, deps.BookingBlacklist)
+	// The availability calendar is public — the storefront needs it before login.
+	bookingHandler.RegisterPublic(api)
+	// Booking-scoped routes carry a booking id, not a restaurant id, so
+	// RequireRestaurantManager cannot gate them: the guest/manager/admin split is
+	// resolved inside the usecases from the booking itself.
+	bookingHandler.RegisterRoutes(authed)
+
 	// Global admin-only routes (no single-restaurant scope).
 	adminGlobal := authed.Group("")
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
@@ -81,6 +92,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	menuScoped := authed.Group("")
 	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
 	menuHandler.RegisterScoped(menuScoped)
+
+	// Venue cabinet: the calendar, manual bookings and the guest stop list.
+	bookingScoped := authed.Group("")
+	bookingScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	bookingHandler.RegisterRestaurantScoped(bookingScoped)
 
 	return r
 }
