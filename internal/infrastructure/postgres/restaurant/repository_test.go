@@ -3,6 +3,7 @@ package restaurant
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -69,7 +70,9 @@ func TestRepositoryUpdate(t *testing.T) {
 	if err := repo.Create(ctx, m); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	createdAt := m.CreatedAt
+	// Postgres timestamptz keeps microseconds, Go time.Time keeps nanoseconds:
+	// compare against the value as the database stores it.
+	createdAt := m.CreatedAt.Truncate(time.Microsecond)
 
 	upd := &domain.Restaurant{
 		ID: m.ID, Name: "Updated Name", City: domain.CityAstana,
