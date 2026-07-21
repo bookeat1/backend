@@ -343,6 +343,14 @@ type WebhookEvent struct {
 	Provider          PaymentProvider
 	ProviderEventID   string
 	ProviderPaymentID string
+	// MerchantPaymentID is OUR payment id, echoed back by the acquirer
+	// (TipTopPay `InvoiceId`, FreedomPay `pg_order_id`). It exists because the
+	// acquirer-side id is not always known when the guest starts paying — a
+	// hosted payment page is created first and only produces a transaction id
+	// once the card is charged. Resolving a callback by our own id is what
+	// makes "a webhook never creates a payment from thin air" (spec §7)
+	// implementable for both providers.
+	MerchantPaymentID string
 	ProviderRefundID  string
 	Type              WebhookEventType
 	Status            PaymentStatus

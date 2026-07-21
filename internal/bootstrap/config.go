@@ -123,7 +123,9 @@ type PaymentsConfig struct {
 
 	// HoldTTL is how long an authorization is expected to stay valid. The
 	// acquirer has the final say; this drives payments.expires_at and the
-	// reconciliation worker.
+	// reconciliation worker. Kept below FreedomPay's 5-day auto-clearing of an
+	// uncleared two-stage payment: a hold left past that is charged to the guest
+	// instead of expiring, which is the opposite of what an expiry should do.
 	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
 }
 
@@ -200,7 +202,7 @@ func NewConfig() (Config, error) {
 			ServiceFeeBps:       getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
 			RefundAcquiringBps:  getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
 			DepositDefaultMinor: getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
-			HoldTTL:             getEnvDuration("PAYMENTS_HOLD_TTL", 168*time.Hour),
+			HoldTTL:             getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
 		},
 	}
 
