@@ -48,6 +48,7 @@ func (f fakeUsers) GetByPhone(context.Context, string) (*domain.User, error) {
 	return nil, domain.ErrNotFound
 }
 func (f fakeUsers) Update(context.Context, *domain.User) error { return nil }
+func (f fakeUsers) Delete(context.Context, uuid.UUID) error    { return nil }
 
 type fakeManagers struct{ manages bool }
 

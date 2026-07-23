@@ -165,9 +165,25 @@ definitions:
       avatar_url:
         example: https://cdn.example.com/a/jane.png
         type: string
+      birth_date:
+        description: BirthDate is a plain date, "YYYY-MM-DD".
+        example: "1998-05-04"
+        type: string
       city:
         example: almaty
         type: string
+      country_code:
+        description: CountryCode is an ISO 3166-1 alpha-2 code, e.g. "KZ".
+        example: KZ
+        type: string
+      cuisine_category_ids:
+        description: |-
+          CuisineCategoryIDs replaces the foodie profile's picked cuisines when
+          present (including an empty array, which clears all picks). Omit the
+          field entirely to leave existing picks unchanged.
+        items:
+          type: string
+        type: array
       full_name:
         example: Jane Doe
         type: string
@@ -180,12 +196,25 @@ definitions:
       avatar_url:
         example: https://cdn.example.com/a/jane.png
         type: string
+      birth_date:
+        example: "1998-05-04"
+        type: string
       city:
         example: almaty
+        type: string
+      country_code:
+        example: KZ
         type: string
       created_at:
         example: "2026-01-15T08:30:00Z"
         type: string
+      cuisine_category_ids:
+        description: |-
+          CuisineCategoryIDs is the foodie profile: ids from the restaurants' own
+          category dictionary (restaurant_categories) the user picked.
+        items:
+          type: string
+        type: array
       email:
         example: user@example.com
         type: string
@@ -696,6 +725,27 @@ paths:
       tags:
       - payments
   /api/v1/users/me:
+    delete:
+      description: |-
+        Soft-deletes and anonymizes the authenticated user's account.
+        Bookings/payments keep their reference to the (now anonymized)
+        user id; they are never deleted or altered. Idempotent.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Delete current user's account
+      tags:
+      - users
     get:
       description: Returns the profile of the authenticated user.
       produces:

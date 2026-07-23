@@ -799,6 +799,35 @@
                     }
                 }
             },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Soft-deletes and anonymizes the authenticated user's account.\nBookings/payments keep their reference to the (now anonymized)\nuser id; they are never deleted or altered. Idempotent.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Delete current user's account",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
             "patch": {
                 "security": [
                     {
@@ -1198,9 +1227,26 @@
                     "type": "string",
                     "example": "https://cdn.example.com/a/jane.png"
                 },
+                "birth_date": {
+                    "description": "BirthDate is a plain date, \"YYYY-MM-DD\".",
+                    "type": "string",
+                    "example": "1998-05-04"
+                },
                 "city": {
                     "type": "string",
                     "example": "almaty"
+                },
+                "country_code": {
+                    "description": "CountryCode is an ISO 3166-1 alpha-2 code, e.g. \"KZ\".",
+                    "type": "string",
+                    "example": "KZ"
+                },
+                "cuisine_category_ids": {
+                    "description": "CuisineCategoryIDs replaces the foodie profile's picked cuisines when\npresent (including an empty array, which clears all picks). Omit the\nfield entirely to leave existing picks unchanged.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "full_name": {
                     "type": "string",
@@ -1219,13 +1265,28 @@
                     "type": "string",
                     "example": "https://cdn.example.com/a/jane.png"
                 },
+                "birth_date": {
+                    "type": "string",
+                    "example": "1998-05-04"
+                },
                 "city": {
                     "type": "string",
                     "example": "almaty"
                 },
+                "country_code": {
+                    "type": "string",
+                    "example": "KZ"
+                },
                 "created_at": {
                     "type": "string",
                     "example": "2026-01-15T08:30:00Z"
+                },
+                "cuisine_category_ids": {
+                    "description": "CuisineCategoryIDs is the foodie profile: ids from the restaurants' own\ncategory dictionary (restaurant_categories) the user picked.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "email": {
                     "type": "string",

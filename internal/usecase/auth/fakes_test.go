@@ -55,6 +55,20 @@ func (f *fakeUsers) Update(_ context.Context, u *domain.User) error {
 	f.byID[u.ID] = &cp
 	return nil
 }
+func (f *fakeUsers) Delete(_ context.Context, id uuid.UUID) error {
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if u.DeletedAt != nil {
+		return nil
+	}
+	now := time.Now()
+	u.DeletedAt = &now
+	u.Email, u.Phone, u.FullName, u.AvatarURL, u.City, u.CountryCode, u.BirthDate = nil, nil, "", nil, nil, nil, nil
+	u.IsActive = false
+	return nil
+}
 
 type fakeCreds struct{ byUser map[uuid.UUID]string }
 
@@ -91,6 +105,15 @@ func (f *fakeRefresh) Revoke(_ context.Context, id uuid.UUID) error {
 	for _, t := range f.byHash {
 		if t.ID == id {
 			now := time.Now()
+			t.RevokedAt = &now
+		}
+	}
+	return nil
+}
+func (f *fakeRefresh) RevokeAllByUser(_ context.Context, userID uuid.UUID) error {
+	now := time.Now()
+	for _, t := range f.byHash {
+		if t.UserID == userID && t.RevokedAt == nil {
 			t.RevokedAt = &now
 		}
 	}
@@ -140,6 +163,15 @@ func (f *fakeOTP) CountSince(_ context.Context, phone string, ts time.Time) (int
 		}
 	}
 	return n, nil
+}
+func (f *fakeOTP) InvalidateActiveByPhone(_ context.Context, phone string) error {
+	now := time.Now()
+	for _, c := range f.codes {
+		if c.Phone == phone && c.UsedAt == nil && c.ExpiresAt.After(now) {
+			c.UsedAt = &now
+		}
+	}
+	return nil
 }
 
 // noTx runs fn directly (no real transaction) — fine for unit tests.

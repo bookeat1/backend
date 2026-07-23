@@ -23,6 +23,7 @@ import (
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
+	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/usecase/auth"
@@ -89,6 +90,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	credsRepo := credrepo.New(db)
 	refreshRepo := rtrepo.New(db)
 	otpRepo := otprepo.New(db)
+	userCuisineRepo := usercuisinerepo.New(db)
 
 	authCfg := auth.Config{
 		RefreshTTL:   cfg.Auth.RefreshTokenTTL,
@@ -158,7 +160,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	return &Deps{
 		AuthFacade:         authFacade,
 		AuthOTP:            authOTP,
-		UsersFacade:        users.NewFacade(usersRepo),
+		UsersFacade:        users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:          usersRepo,
 		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
 		RestaurantManagers: restaurantManagers,

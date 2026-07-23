@@ -50,6 +50,15 @@ func (f *fakeUserRepo) Update(ctx context.Context, u *domain.User) error {
 	return nil
 }
 
+func (f *fakeUserRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	u, ok := f.users[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	u.IsActive = false
+	return nil
+}
+
 func runOptionalAuthMiddleware(t *testing.T, issuer *token.RSAIssuer, users domain.UserRepository, authHeader string) (*httptest.ResponseRecorder, bool, bool) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
