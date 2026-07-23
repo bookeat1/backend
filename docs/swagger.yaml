@@ -695,6 +695,83 @@ paths:
       summary: Release a booking's held payment
       tags:
       - payments
+  /api/v1/favorites:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: List my favorite restaurants
+      tags:
+      - favorites
+  /api/v1/favorites/{restaurantId}:
+    delete:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: restaurantId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid restaurant id
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Remove a restaurant from my favorites
+      tags:
+      - favorites
+    put:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: restaurantId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "404":
+          description: restaurant not found
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid restaurant id
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Add a restaurant to my favorites
+      tags:
+      - favorites
   /api/v1/payments/{id}:
     get:
       description: The payment's own owner, venue staff/admin of its restaurant, or
