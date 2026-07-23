@@ -404,3 +404,45 @@ var errTimeout = errAcquirerTimeout{}
 type errAcquirerTimeout struct{}
 
 func (errAcquirerTimeout) Error() string { return "acquirer: request timed out" }
+
+// Regression guard for the pre-launch payments review finding: every claim in
+// the reconciler (ClaimStale / ClaimExpiredHolds on both payments and refunds)
+// must run inside a TxManager transaction. Their FOR UPDATE SKIP LOCKED lock is
+// released the instant an auto-committed SELECT ends, so an unwrapped claim lets
+// two concurrent reconciler passes (a second cmd/worker replica) grab the same
+// stuck row and fire duplicate acquirer calls. A Tick invokes every reconcile
+// pass regardless of data, so an empty harness is enough to prove each claim
+// path is wrapped.
+func TestReconciler_ClaimsRunInsideTransaction(t *testing.T) {
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: 10 * time.Minute, BatchSize: 10, MaxAttempts: 3}
+	h := newReconcilerHarness(t, cfg, nil, nil)
+
+	if _, err := h.r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	// A Tick runs reconcileCapturing, reconcileVoiding and reconcileLostWebhook
+	// (all three call payments.ClaimStale), reconcileExpiredHolds
+	// (ClaimExpiredHolds) and reconcileRefunds (refunds.ClaimStale). Assert
+	// every one of those calls actually happened AND none ran outside a
+	// transaction — counting outside-tx per call site (not a shared bool)
+	// catches a regression that un-wraps any single pass, not just the last.
+	if h.payments.claimStaleCalls < 3 {
+		t.Fatalf("payments.ClaimStale called %d times, want >=3 (capturing, voiding, lostWebhook)", h.payments.claimStaleCalls)
+	}
+	if h.payments.claimExpiredCalls < 1 {
+		t.Fatalf("payments.ClaimExpiredHolds called %d times, want >=1", h.payments.claimExpiredCalls)
+	}
+	if h.refunds.claimStaleCalls < 1 {
+		t.Fatalf("refunds.ClaimStale called %d times, want >=1", h.refunds.claimStaleCalls)
+	}
+	if h.payments.claimStaleOutsideTx != 0 {
+		t.Errorf("%d payments.ClaimStale call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.payments.claimStaleOutsideTx)
+	}
+	if h.payments.claimExpiredOutsideTx != 0 {
+		t.Errorf("%d payments.ClaimExpiredHolds call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.payments.claimExpiredOutsideTx)
+	}
+	if h.refunds.claimStaleOutsideTx != 0 {
+		t.Errorf("%d refunds.ClaimStale call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.refunds.claimStaleOutsideTx)
+	}
+}
