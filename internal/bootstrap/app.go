@@ -34,14 +34,28 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
+	// Only trust X-Forwarded-For/X-Real-IP from cfg.App.TrustedProxies
+	// (empty by default — see AppConfig.TrustedProxies's doc). gin.New()
+	// otherwise trusts EVERY proxy by default, which would let any caller
+	// spoof its own ClientIP() (used both by AccessLog's "ip" field and by
+	// middleware.RateLimit's per-IP bucket key) with a forged header. A
+	// misconfigured value here is an ops mistake, not a reason to refuse to
+	// serve traffic, so the error is logged and otherwise ignored.
+	if err := r.SetTrustedProxies(cfg.App.TrustedProxies); err != nil {
+		log.Warn("invalid APP_TRUSTED_PROXIES, falling back to trusting nobody", slog.String("error", err.Error()))
+	}
 	// Order matters: RequestID must run first so every later middleware and
 	// handler can log through a context that already carries request_id.
 	// AccessLog wraps Recovery so a panic converted to a 500 downstream is
-	// still measured and logged as one request line, not lost.
+	// still measured and logged as one request line, not lost. RateLimit
+	// runs after CORS so a rejected request still carries CORS headers, and
+	// before any route/auth work so a throttled caller never reaches a DB
+	// lookup.
 	r.Use(middleware.RequestID())
 	r.Use(middleware.AccessLog())
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
+	r.Use(middleware.RateLimit(cfg.RateLimit.RateLimitConfig, middleware.NewInMemoryLimiter(cfg.RateLimit.IdleTTL, cfg.RateLimit.SweepEvery)))
 
 	// /health is a liveness probe (process is up). /health/ready is a readiness
 	// probe (dependencies reachable) and pings the database.

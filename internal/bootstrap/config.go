@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"backend-core/internal/transport/rest/middleware"
 )
 
 // Config is the whole application configuration, built from environment
@@ -30,6 +32,26 @@ type Config struct {
 	// see team-memory's payments-usecase notes). Wiring RunWorker to start it
 	// is the next step once that adapter lands.
 	PaymentsReconciler PaymentsReconcilerConfig
+
+	// RateLimit configures middleware.RateLimit and the in-memory limiter
+	// backing it (per-client-IP request budgets, one per route tier — see
+	// that middleware's doc comment for which routes fall into which tier
+	// and why webhooks get their own profile).
+	RateLimit RateLimiterConfig
+}
+
+// RateLimiterConfig bundles middleware.RateLimit's own config (budgets, one
+// per tier) with the memory-bound settings for the InMemoryLimiter backing
+// it in bootstrap.NewApp. Kept as one section because both are read from the
+// same RATE_LIMIT_* env prefix and always constructed together.
+type RateLimiterConfig struct {
+	middleware.RateLimitConfig
+
+	// IdleTTL/SweepEvery bound the limiter's memory: a bucket untouched for
+	// longer than IdleTTL is evicted, checked at most once per SweepEvery.
+	// See middleware.NewInMemoryLimiter.
+	IdleTTL    time.Duration // env: RATE_LIMIT_IDLE_TTL
+	SweepEvery time.Duration // env: RATE_LIMIT_SWEEP_INTERVAL
 }
 
 type AppConfig struct {
@@ -39,6 +61,22 @@ type AppConfig struct {
 	LogLevel           string
 	LogFormat          string // env: APP_LOG_FORMAT — "json" (default) or "text"
 	CORSAllowedOrigins []string
+
+	// TrustedProxies lists the IPs/CIDRs allowed to set X-Forwarded-For /
+	// X-Real-IP and have gin's Context.ClientIP() believe them (env:
+	// APP_TRUSTED_PROXIES, comma-separated). Empty (the default) means trust
+	// nobody — ClientIP() falls back to the raw TCP peer address, which in
+	// the deploy topology (Caddy is the only public listener, `app` has no
+	// published port — see deploy/docker-compose.yml) is Caddy's own
+	// container address, so nothing breaks, it is just not per-real-client.
+	// Set this to Caddy's address on the compose network (see
+	// deploy/.env.example) so ClientIP() — and therefore
+	// middleware.RateLimit's per-IP buckets — resolve the actual caller
+	// instead of Caddy. Defaulting to "trust nobody" rather than guessing a
+	// docker-compose subnet is deliberate: an unverified guess here would be
+	// worse than the safe-but-imprecise default (see NewApp's
+	// SetTrustedProxies call for how this feeds gin).
+	TrustedProxies []string
 }
 
 type DBConfig struct {
@@ -202,6 +240,7 @@ func NewConfig() (Config, error) {
 			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
 			LogFormat:          getEnv("APP_LOG_FORMAT", "json"),
 			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
+			TrustedProxies:     getEnvList("APP_TRUSTED_PROXIES", ""),
 		},
 		DB: DBConfig{
 			Postgres: PostgresConfig{
@@ -264,6 +303,49 @@ func NewConfig() (Config, error) {
 			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
 			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
+		},
+		RateLimit: RateLimiterConfig{
+			RateLimitConfig: middleware.RateLimitConfig{
+				Enabled: getEnvBool("RATE_LIMIT_ENABLED", true),
+				// Strict: OTP send, booking/payment creation, guest checkout
+				// settle. 5 requests/minute per IP per route is deliberately
+				// tight — a real user retries a couple of times at most; a
+				// script left running overnight is exactly what this exists
+				// to stop (see the task that motivated this middleware).
+				// This is IN ADDITION TO, not instead of, usecase/auth's own
+				// per-phone OTP limiter (1/min, 5/hour) — that one guards
+				// the SMS bill per phone number, this one guards the
+				// endpoint per source IP regardless of which phone numbers
+				// it cycles through.
+				Strict: middleware.RateLimitBudget{
+					Limit:  getEnvInt("RATE_LIMIT_STRICT_LIMIT", 5),
+					Window: getEnvDuration("RATE_LIMIT_STRICT_WINDOW", time.Minute),
+				},
+				// Soft: public listings/menus/availability. Generous —
+				// legitimate browsing easily bursts above 5/min.
+				Soft: middleware.RateLimitBudget{
+					Limit:  getEnvInt("RATE_LIMIT_SOFT_LIMIT", 60),
+					Window: getEnvDuration("RATE_LIMIT_SOFT_WINDOW", time.Minute),
+				},
+				// Webhook: acquirer callbacks. Wide on purpose — see
+				// middleware.RateLimit's doc for why this is not the strict
+				// profile; this budget only exists to bound an unrelated
+				// flood at this public route, not to throttle the
+				// acquirer's own retry behaviour.
+				Webhook: middleware.RateLimitBudget{
+					Limit:  getEnvInt("RATE_LIMIT_WEBHOOK_LIMIT", 120),
+					Window: getEnvDuration("RATE_LIMIT_WEBHOOK_WINDOW", time.Minute),
+				},
+				// Default: every authenticated route not explicitly
+				// classified (staff capture/void, admin CRUD, /me, booking
+				// messages, …) — moderate floor, not a wall.
+				Default: middleware.RateLimitBudget{
+					Limit:  getEnvInt("RATE_LIMIT_DEFAULT_LIMIT", 30),
+					Window: getEnvDuration("RATE_LIMIT_DEFAULT_WINDOW", time.Minute),
+				},
+			},
+			IdleTTL:    getEnvDuration("RATE_LIMIT_IDLE_TTL", 10*time.Minute),
+			SweepEvery: getEnvDuration("RATE_LIMIT_SWEEP_INTERVAL", time.Minute),
 		},
 	}
 

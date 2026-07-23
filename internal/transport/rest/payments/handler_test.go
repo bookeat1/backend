@@ -468,30 +468,21 @@ func TestSettlePayment_GuestCancelBeforeDeadlineRefundsOnce(t *testing.T) {
 	}
 
 	// Retry with the SAME idempotency key, routed by booking id (the only
-	// route this transport exposes for Settle).
-	//
-	// KNOWN GAP found while building this transport, NOT worked around here
-	// per the task's instruction to report an inconvenient usecase interface
-	// rather than paper over it in transport: RefundUseCase.Settle's type doc
-	// comment promises retry-safety is "enforced by Payment.SettledAt... not
-	// merely by GetLiveByBookingID no longer returning it", but Settle's OWN
-	// first line unconditionally calls GetLiveByBookingID before ever
-	// consulting SettledAt. For the REFUND outcome specifically (this test:
-	// guest-cancel before the deadline), a full settlement moves the payment
-	// to `refunded`, which idx_payments_live_per_booking does not count as
-	// "live" — so a byte-for-byte retry of the exact same request (e.g. after
-	// a client timeout with no response) 404s instead of resuming with 200 and
-	// the same payment. No money is at risk (payment_refunds' own idempotency
-	// index still prevents a second real refund if the retry DID reach the
-	// gateway call), but the promised idempotent-replay contract is silently
-	// unreachable via a booking-scoped lookup for this one outcome. A
-	// paymentID-scoped Settle route (GetByID instead of
-	// GetLiveByBookingID) would not have this gap — see the final report.
+	// route this transport exposes for Settle). RefundUseCase.Settle resolves
+	// the payment via domain.PaymentRepository.GetSettleableByBookingID
+	// (report/bug fix: it used to call GetLiveByBookingID, which stops
+	// finding a payment the moment it becomes `refunded` — see that method's
+	// doc comment), so this retry must resume idempotently: same 200, the
+	// same already-refunded payment, and — checked below — no second row in
+	// payment_refunds.
 	w2 := doJSON(r, http.MethodPost, "/api/v1/bookings/"+b.ID.String()+"/payment/settle", settleBody, settleHeaders)
-	if w2.Code != http.StatusNotFound {
-		t.Errorf("retried settle (routed by booking id, after full settlement) status = %d, want 404 — "+
-			"if this starts returning 200, the KNOWN GAP documented above has been fixed upstream; "+
-			"update this test's expectation and the report", w2.Code)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retried settle (same idempotency key, after full settlement) status = %d, want 200 (idempotent resume): %s", w2.Code, w2.Body.String())
+	}
+	var settled2 paymentResponse
+	decodeData(t, w2, &settled2)
+	if settled2.ID != settled1.ID || settled2.Status != string(domain.PaymentRefunded) {
+		t.Errorf("retried settle returned %+v, want the same refunded payment as the first call", settled2)
 	}
 
 	var refundCount int
