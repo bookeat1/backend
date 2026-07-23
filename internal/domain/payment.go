@@ -17,8 +17,39 @@ const (
 	PaymentCreated PaymentStatus = "created"
 	// PaymentAuthorized is a hold: the guest's funds are blocked but not taken.
 	PaymentAuthorized PaymentStatus = "authorized"
+	// PaymentCapturing is a claimed-but-not-yet-confirmed capture attempt: the
+	// venue seated the guest and this usecase call won the CAS claim on the
+	// hold, but the acquirer has not answered yet. It exists purely to make
+	// two concurrent CaptureOnSeating calls for the SAME booking race-safe
+	// (report item #5): only the CAS winner may call the acquirer; the loser
+	// gets ErrAlreadyExists and must not call Capture too. It is always
+	// transient — CaptureOnSeating resolves it to `captured` on a definite
+	// acquirer answer (success or an explicit decline, domain.ErrProviderDeclined)
+	// but, per the second review (item #1), is deliberately LEFT here when the
+	// acquirer's answer is unknown (domain.ErrProviderOutcomeUnknown) — see
+	// the KNOWN GAP note on PaymentVoiding below, which applies here too.
+	PaymentCapturing PaymentStatus = "capturing"
 	// PaymentCaptured is money actually taken from the guest.
 	PaymentCaptured PaymentStatus = "captured"
+	// PaymentVoiding is a claimed-but-not-yet-confirmed hold release: the venue
+	// rejected the seating and this usecase call won the CAS claim on the
+	// hold, but the acquirer has not answered yet. Symmetric to
+	// PaymentCapturing and exists for the same reason (payments review
+	// 2026-07-23, non-blocking item #1): two concurrent VoidOnRejection calls
+	// for the SAME booking must not both call gw.Void — only the CAS winner
+	// may call the acquirer. It is always transient — VoidOnRejection
+	// resolves it to `voided` on acquirer success or releases it back to
+	// `authorized` on a definite acquirer decline, never leaving a payment
+	// parked here on purpose.
+	//
+	// KNOWN GAP: neither this nor PaymentCapturing has an automatic way out
+	// when the acquirer's answer is genuinely unknown (a timeout / 5xx) — the
+	// payment is deliberately left here pending manual or
+	// reconciliation-worker resolution. The reconciliation worker is a
+	// separate, not-yet-built task (see the payments review report); DO NOT
+	// run this code in production before it exists, or a lost acquirer answer
+	// strands a payment here with no automatic recovery.
+	PaymentVoiding PaymentStatus = "voiding"
 	// PaymentVoided is a released hold — the guest was never charged.
 	PaymentVoided PaymentStatus = "voided"
 	// PaymentPartiallyRefunded means part of a captured payment went back.
@@ -34,15 +65,19 @@ const (
 // paymentTransitions is the allowed payment status transition table. A status
 // present with an empty set is valid but terminal.
 //
-//	created ──authorize──▶ authorized ──capture──▶ captured
-//	   │                       │                      │
-//	   │                       ├──void──▶ voided      ├──refund(part)──▶ partially_refunded
-//	   │                       ├──expire──▶ expired   └──refund(full)──▶ refunded
+//	created ──authorize──▶ authorized ──capture──▶ capturing ──▶ captured
+//	   │                       │                                    │
+//	   │                       ├──void──▶ voiding ──▶ voided        ├──refund(part)──▶ partially_refunded
+//	   │                       ├──expire──▶ expired                 └──refund(full)──▶ refunded
 //	   └──fail──▶ failed       └──fail──▶ failed      partially_refunded ──▶ refunded
 //
 // Notes that are easy to get wrong:
 //   - authorized → failed exists because an acquirer can reject a capture on an
 //     otherwise valid hold (issuer declines, hold already consumed);
+//   - authorized → captured and authorized → voided (skipping the
+//     capturing/voiding claim) exist because a webhook may report the
+//     acquirer's own outcome directly, without ever going through this
+//     usecase's local claim;
 //   - a second partial refund does NOT change the status, so it is not a
 //     transition at all — the usecase only calls ValidatePaymentTransition when
 //     the status actually changes;
@@ -56,10 +91,25 @@ var paymentTransitions = map[PaymentStatus]map[PaymentStatus]struct{}{
 		PaymentExpired:    {},
 	},
 	PaymentAuthorized: {
-		PaymentCaptured: {},
-		PaymentVoided:   {},
-		PaymentExpired:  {},
-		PaymentFailed:   {},
+		PaymentCapturing: {},
+		PaymentCaptured:  {}, // a webhook may report capture directly, without going through the local `capturing` claim
+		PaymentVoiding:   {},
+		PaymentVoided:    {}, // a webhook may report void directly, without going through the local `voiding` claim
+		PaymentExpired:   {},
+		PaymentFailed:    {},
+	},
+	PaymentCapturing: {
+		PaymentCaptured:   {}, // acquirer gave a definite answer: confirmed
+		PaymentAuthorized: {}, // acquirer declined outright: release the claim, the hold is unchanged
+		// NOTE: there is deliberately no transition OUT of `capturing` for an
+		// UNKNOWN acquirer outcome (report item #1) — the usecase simply does
+		// not call CompareAndSwapStatus in that case, so the payment stays
+		// here until a human or the reconciliation worker resolves it.
+	},
+	PaymentVoiding: {
+		PaymentVoided:     {}, // acquirer confirmed the release
+		PaymentAuthorized: {}, // acquirer declined outright: release the claim, the hold is unchanged
+		// Same NOTE as PaymentCapturing above applies symmetrically.
 	},
 	PaymentCaptured: {
 		PaymentPartiallyRefunded: {},
@@ -86,10 +136,13 @@ func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 
 // HoldsMoney reports whether a payment in this status is holding or has taken
 // the guest's money. Used to decide whether a cancellation has to reach the
 // acquirer at all, and mirrors the partial unique index
-// idx_payments_live_per_booking in migrations/0007_payments.sql — keep both in
-// sync.
+// idx_payments_live_per_booking (as recreated by migrations/0009, on top of
+// 0007/0008) — keep both in sync. PaymentVoiding counts as holding money too:
+// the hold is still in place until the acquirer confirms its release, so a
+// second payment must not be allowed to start for the same booking while one
+// is mid-void, exactly like mid-capture.
 func (s PaymentStatus) HoldsMoney() bool {
-	return s == PaymentAuthorized || s == PaymentCaptured
+	return s == PaymentAuthorized || s == PaymentCapturing || s == PaymentVoiding || s == PaymentCaptured
 }
 
 // Refundable reports whether money can still be sent back for this status.
@@ -161,6 +214,56 @@ type Payment struct {
 	ExpiresAt         *time.Time // when the hold lapses
 	FailureCode       *string
 	FailureMessage    *string
+	// SettledAt is the terminal settlement marker (report item #7): it is set
+	// exactly once, by RefundUseCase.Settle, regardless of which outcome fired
+	// (a guest refund, a venue-cancel refund, or a late-cancellation/no-show
+	// that moves no money and leaves Status == captured). Its purpose is
+	// narrow but critical: a late-cancellation/no-show settlement legitimately
+	// does NOT change Status away from captured (see the deviations note), so
+	// Status alone cannot answer "has this payment already been settled?" —
+	// without this field a second Settle call with a different trigger and a
+	// different idempotency key would sail through the `Status == captured`
+	// check and refund the guest a second time on top of what the venue
+	// already kept. SettledAt is the CAS anchor for PaymentRepository.
+	// ClaimSettlement: nil means "not yet settled", set means "settled, and
+	// SettlementIdempotencyKey says which request settled it".
+	SettledAt *time.Time
+	// SettledTrigger records which outcome fired, for audit.
+	SettledTrigger *RefundTrigger
+	// SettlementIdempotencyKey is the key of the Settle call that won the
+	// claim, so a legitimate retry (same key) can be told apart from a second,
+	// different settlement attempt (different key) after SettledAt is already
+	// non-nil.
+	SettlementIdempotencyKey *string
+	// StatusChangedAt is the lease clock the reconciliation worker relies on
+	// (migration 0010): stamped every time Status actually changes, by
+	// UpdateStatus and CompareAndSwapStatus alike. created_at cannot serve
+	// this purpose — a payment that has sat in `authorized` for days and only
+	// just moved into `capturing` looks identical to one stuck in `capturing`
+	// for days, if the only clock available is created_at. A transient state
+	// (capturing/voiding) only counts as "stuck" once it has held that status
+	// longer than the worker's configured threshold, measured from here.
+	StatusChangedAt time.Time
+	// ReconcileAttempts counts consecutive times the reconciliation worker
+	// asked the acquirer about this payment and got back an outcome it could
+	// not act on (domain.ErrProviderOutcomeUnknown, a transport error, or an
+	// acquirer status this build does not recognise). It is reset to 0 by any
+	// real CompareAndSwapStatus/UpdateStatus transition — a payment that
+	// moved on its own no longer needs the count that was building up while
+	// it was stuck.
+	ReconcileAttempts int
+	// LastReconcileAttemptAt is when ReconcileAttempts was last bumped. Used
+	// to back off exponentially between attempts instead of re-asking the
+	// acquirer every single tick for a payment that keeps coming back
+	// unknown.
+	LastReconcileAttemptAt *time.Time
+	// NeedsManualReview is set once ReconcileAttempts reaches the worker's
+	// configured maximum. It is a terminal flag for the WORKER, not for the
+	// payment's own state machine: the worker stops calling the acquirer for
+	// this row (avalanche protection) and only logs it once per tick, until a
+	// human resolves it out of band. It is cleared automatically the moment a
+	// real status transition succeeds (same reset as ReconcileAttempts).
+	NeedsManualReview bool
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -197,17 +300,76 @@ type PaymentRepository interface {
 	// GetLiveByBookingID returns the booking's authorized or captured payment,
 	// backed by idx_payments_live_per_booking.
 	GetLiveByBookingID(ctx context.Context, bookingID uuid.UUID) (*Payment, error)
+	// GetByIdempotencyKey resolves our own retry token, backed by
+	// idx_payments_idempotency (UNIQUE (provider, idempotency_key)). This is
+	// what makes "create payment" idempotent (usecase/payments): a retry with
+	// the same key looks its own row up here and replays it instead of
+	// authorizing a second hold. Returns ErrNotFound when unused.
+	GetByIdempotencyKey(ctx context.Context, provider PaymentProvider, idempotencyKey string) (*Payment, error)
 	// List returns payments matching f plus the total count, newest first.
 	List(ctx context.Context, f PaymentFilter) ([]Payment, int, error)
 	// UpdateStatus writes the new status and its timestamp column. Call inside
 	// a TxManager together with the ledger and outbox inserts — a status change
-	// that is not accompanied by both is a hole in the audit trail.
+	// that is not accompanied by both is a hole in the audit trail. Prefer
+	// CompareAndSwapStatus for any transition a concurrent request could also
+	// be making; UpdateStatus alone is a blind write.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status PaymentStatus, at time.Time) error
-	// ClaimStale locks up to limit payments in the given statuses whose
-	// created_at is older than before, using FOR UPDATE SKIP LOCKED, oldest
-	// first. This is the reconciliation worker's input: a webhook may never
-	// arrive, and money must not be lost to a lost HTTP request (spec §5).
+	// CompareAndSwapStatus is UpdateStatus with a precondition on the CURRENT
+	// status, implemented as a single `UPDATE payments SET status = $to, ...
+	// WHERE id = $id AND status = $from` — the database-level guard the team
+	// convention requires for anything that moves money ("unique constraints
+	// instead of мы проверили перед вставкой"). It returns ErrAlreadyExists
+	// when zero rows matched, which covers two cases the caller must treat
+	// identically: a concurrent transition already moved the row away from
+	// `from`, or another payment for the same booking already won
+	// idx_payments_live_per_booking. Both mean "this transition lost the race"
+	// — the caller compensates (e.g. Void the loser's hold), it never retries
+	// blindly.
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to PaymentStatus, at time.Time) error
+	// ClaimSettlement is the CAS anchor behind Payment.SettledAt: a single
+	// `UPDATE payments SET settled_at = $at, settled_trigger = $trigger,
+	// settlement_idempotency_key = $key WHERE id = $id AND settled_at IS
+	// NULL`. It returns ErrAlreadyExists when zero rows matched — the payment
+	// was already settled, by this same request (replay, same key: read the
+	// stored row and treat as success) or by a different one (a real conflict,
+	// report item #7).
+	ClaimSettlement(ctx context.Context, id uuid.UUID, idempotencyKey string, trigger RefundTrigger, at time.Time) error
+	// ClaimStale selects up to limit payments in the given statuses whose
+	// StatusChangedAt is older than before, oldest first. This is the
+	// reconciliation worker's input (usecase/payments.Reconciler): a webhook
+	// may never arrive, or a process may die between claiming a transient
+	// state (capturing/voiding) and resolving it, and money must not be lost
+	// to a lost HTTP request or a lost process (spec §5).
+	//
+	// A real Postgres implementation may use FOR UPDATE SKIP LOCKED to avoid
+	// two worker instances doing duplicate acquirer reads for the same row in
+	// the same instant, but MUST NOT hold that lock (or any transaction)
+	// across the acquirer call the worker makes next — the hard rule that an
+	// external call never runs inside a DB transaction applies here exactly
+	// like everywhere else in this package. Correctness therefore does not
+	// come from this lock: it comes from every write the worker makes
+	// afterwards being CAS-guarded (CompareAndSwapStatus / RecordReconcileAttempt),
+	// so two callers racing on the same stale row both may read, but only one
+	// may write.
 	ClaimStale(ctx context.Context, statuses []PaymentStatus, before time.Time, limit int) ([]Payment, error)
+	// ClaimExpiredHolds selects up to limit `authorized` payments whose
+	// ExpiresAt is before the given time, oldest first (backed by
+	// idx_payments_expires from migration 0007). Same non-locking-across-the-
+	// acquirer-call caveat as ClaimStale.
+	ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]Payment, error)
+	// RecordReconcileAttempt is the CAS-guarded write behind ReconcileAttempts
+	// / LastReconcileAttemptAt / NeedsManualReview (migration 0010): a single
+	// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1,
+	// last_reconcile_attempt_at = $at,
+	// needs_manual_review = (reconcile_attempts + 1 >= $maxAttempts)
+	// WHERE id = $id AND status = $expectedStatus RETURNING reconcile_attempts,
+	// needs_manual_review`. It returns ErrAlreadyExists when zero rows
+	// matched — the payment's status already moved away from expectedStatus
+	// (resolved by a webhook, another worker pass, or a direct call) between
+	// the worker's read and this write, so there is nothing to bump; the
+	// caller treats that as "already resolved", not as a reconciliation
+	// failure.
+	RecordReconcileAttempt(ctx context.Context, id uuid.UUID, expectedStatus PaymentStatus, at time.Time, maxAttempts int) (attempts int, needsManualReview bool, err error)
 }
 
 // PaymentSettings is the resolved payment policy for one restaurant: the global

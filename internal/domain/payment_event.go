@@ -42,7 +42,23 @@ type PaymentEventRepository interface {
 	// SKIP LOCKED, oldest first. The HTTP handler answers the acquirer in
 	// milliseconds; the business logic runs from here (spec §7).
 	ClaimUnprocessed(ctx context.Context, limit int) ([]PaymentEvent, error)
-	// MarkProcessed closes an event. A non-empty processErr records why it
-	// could not be applied without pretending it was.
+	// MarkProcessed closes an event ONLY when it was actually applied. A
+	// non-empty processErr records why it could not be applied — but the
+	// caller must not call this on an application failure (report item #9):
+	// doing so would take the event out of ClaimUnprocessed's scan forever,
+	// silently dropping money-moving evidence. Call this only after a
+	// successful apply, or after a deliberate, permanent "never applicable"
+	// decision (e.g. spec §7's "unknown payment").
 	MarkProcessed(ctx context.Context, id uuid.UUID, at time.Time, processErr string) error
+	// RecordProcessingError stores why an apply attempt failed WITHOUT
+	// closing the event (report item #9): processed_at is left NULL, so
+	// ClaimUnprocessed keeps offering this event to the next attempt (a
+	// retried webhook delivery, or the reconciliation worker) instead of it
+	// silently falling out of the unprocessed scan forever.
+	RecordProcessingError(ctx context.Context, id uuid.UUID, processErr string) error
+	// SetPaymentID backfills the payment this event turned out to belong to,
+	// once resolved — filled in even when apply() then fails, so the
+	// idx_payment_events_payment index can find every event for a payment
+	// during reconciliation (report item #16, minor).
+	SetPaymentID(ctx context.Context, id uuid.UUID, paymentID uuid.UUID) error
 }
