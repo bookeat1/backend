@@ -66,6 +66,13 @@ type MenuItemRepository interface {
 	Update(ctx context.Context, m *MenuItem) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	SetAvailable(ctx context.Context, id uuid.UUID, available bool) error
+	// SetAvailableBulk flips is_available for every item in ids that belongs to
+	// restaurantID, in ONE statement. The restaurant_id filter is the tenant
+	// guard: ids belonging to another restaurant are silently skipped, never
+	// mutated, so a caller cannot stop-list a competitor's menu by guessing item
+	// ids. Returns the number of rows actually changed. This is the fast "we ran
+	// out" path (stop list); a nil/empty ids slice is a no-op returning 0.
+	SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, ids []uuid.UUID, available bool) (int, error)
 	// ReplaceTags deletes the item's tags and inserts items (call within a tx).
 	ReplaceTags(ctx context.Context, menuItemID uuid.UUID, tags []MenuItemTag) error
 }

@@ -167,4 +167,53 @@ func TestMenuCategoryCRUD(t *testing.T) {
 	}
 }
 
+// TestSetAvailableBulk exercises the stop-list fast path AND its tenant guard:
+// an item id belonging to another restaurant must be silently skipped, never
+// flipped, so a caller cannot stop-list a competitor's menu.
+func TestSetAvailableBulk(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "menu_items", "restaurants")
+	ctx := context.Background()
+
+	ridA, ridB := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'A','Алматы','₸'),($2,'B','Алматы','₸')`,
+		ridA, ridB); err != nil {
+		t.Fatalf("seed restaurants: %v", err)
+	}
+	repo := New(pool)
+	a1 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridA, Name: "a1", Price: "1", IsAvailable: true}
+	a2 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridA, Name: "a2", Price: "1", IsAvailable: true}
+	b1 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridB, Name: "b1", Price: "1", IsAvailable: true}
+	for _, m := range []*domain.MenuItem{a1, a2, b1} {
+		if err := repo.Create(ctx, m); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+
+	// Stop-list a1 + a2 + b1, but scoped to restaurant A: b1 (another venue)
+	// must be ignored.
+	n, err := repo.SetAvailableBulk(ctx, ridA, []uuid.UUID{a1.ID, a2.ID, b1.ID}, false)
+	if err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("rows changed = %d, want 2 (b1 belongs to another venue)", n)
+	}
+	for _, id := range []uuid.UUID{a1.ID, a2.ID} {
+		got, _ := repo.GetByID(ctx, id)
+		if got.IsAvailable {
+			t.Errorf("item %s still available after stop-list", id)
+		}
+	}
+	if got, _ := repo.GetByID(ctx, b1.ID); !got.IsAvailable {
+		t.Error("cross-tenant item b1 was wrongly stop-listed")
+	}
+
+	// Empty ids is a no-op.
+	if n, err := repo.SetAvailableBulk(ctx, ridA, nil, true); err != nil || n != 0 {
+		t.Fatalf("empty bulk = (%d,%v), want (0,nil)", n, err)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }

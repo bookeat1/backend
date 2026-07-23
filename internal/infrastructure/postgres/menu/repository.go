@@ -177,6 +177,23 @@ func (r *Repository) SetAvailable(ctx context.Context, id uuid.UUID, available b
 	return nil
 }
 
+// SetAvailableBulk flips is_available for the given ids that belong to
+// restaurantID in one UPDATE. The restaurant_id predicate is the tenant guard:
+// any id in the list that belongs to another venue matches zero rows and is
+// left untouched. An empty ids slice short-circuits (no statement, no error).
+func (r *Repository) SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, ids []uuid.UUID, available bool) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE menu_items SET is_available=$3, updated_at=now()
+		 WHERE restaurant_id=$1 AND id = ANY($2)`, restaurantID, ids, available)
+	if err != nil {
+		return 0, fmt.Errorf("set available bulk: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (r *Repository) ReplaceTags(ctx context.Context, itemID uuid.UUID, tags []domain.MenuItemTag) error {
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`DELETE FROM menu_item_tags WHERE menu_item_id=$1`, itemID); err != nil {

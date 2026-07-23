@@ -15,17 +15,20 @@ import (
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
+	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
+	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/token"
+	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
 	"backend-core/internal/usecase/favorites"
@@ -53,6 +56,7 @@ type Deps struct {
 	BookingAvail       bookings.AvailabilityUseCase
 	BookingBlacklist   bookings.BlacklistUseCase
 	BookingPolicy      bookings.PolicyUseCase
+	AdminPanel         *admin.UseCase
 	Issuer             *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
@@ -157,26 +161,44 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		paymentGateways, txm)
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 
+	// Named facade/usecase variables so both the Deps struct and the admin
+	// panel below share the SAME instances (rather than re-constructing them).
+	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm)
+	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
+	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
+		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm)
+	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
+		restRepo, restaurantManagers, txm, bookingCfg)
+
+	// Restaurant admin panel (Ф1): an RBAC-guarded orchestration over the
+	// existing building blocks. It reuses restaurantManagers for the RBAC
+	// permission lookup, the restaurant/menu facades for profile+menu, the
+	// booking facade/status usecase for the calendar+transitions (never an
+	// ad-hoc status write), and dedicated schedule-override + guest read repos.
+	adminPanel := admin.NewUseCase(
+		restaurantManagers, restaurantsFacade, menuFacade, restRelated,
+		schedulerepo.New(db), guestrepo.New(db), bookingsFacade, bookingStatus,
+	)
+
 	return &Deps{
 		AuthFacade:         authFacade,
 		AuthOTP:            authOTP,
 		UsersFacade:        users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:          usersRepo,
-		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
+		RestaurantsFacade:  restaurantsFacade,
 		RestaurantManagers: restaurantManagers,
 		FavoritesFacade:    favoritesFacade,
-		MenuFacade:         menu.NewFacade(menuItems, menuCategories, txm),
-		BookingsFacade: bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
-			bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm),
-		BookingCreate:     bookingCreate,
-		BookingIdempotent: bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
-		BookingStatus: bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
-			restRepo, restaurantManagers, txm, bookingCfg),
+		MenuFacade:         menuFacade,
+		BookingsFacade:     bookingsFacade,
+		BookingCreate:      bookingCreate,
+		BookingIdempotent:  bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
+		BookingStatus:      bookingStatus,
 		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingOutbox,
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
 		BookingAvail:     bookings.NewAvailabilityUseCase(bookingLinks, restRepo, restRelated, bookingCfg),
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
+		AdminPanel:       adminPanel,
 		Issuer:           issuer,
 
 		PaymentsRepo:         paymentsRepo,
