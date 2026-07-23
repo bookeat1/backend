@@ -502,6 +502,19 @@ func TestGetTranslatesTheGatewayView(t *testing.T) {
 			wantAmount: domain.KZT(103000),
 		},
 		{
+			// Sandbox 2026-07-22, payment 1814868833: after a partial refund
+			// status_v2 returns the refunded sum NEGATIVE, from the merchant's
+			// point of view. It must still count as a refund.
+			name: "refund reported as a negative amount",
+			fields: map[string]string{
+				"pg_status": "ok", "pg_payment_status": "success", "pg_captured": "1",
+				"pg_amount": "100", "pg_refund_amount": "-40", "pg_currency": "KZT",
+				"pg_payment_id": "1814868833",
+			},
+			wantStatus: domain.PaymentPartiallyRefunded,
+			wantAmount: domain.KZT(10000),
+		},
+		{
 			name: "fully refunded",
 			fields: map[string]string{
 				"pg_status": "ok", "pg_payment_status": "success", "pg_captured": "1",

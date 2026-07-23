@@ -301,7 +301,15 @@ func (g *Gateway) status(ctx context.Context, params url.Values) (*domain.Gatewa
 	}
 	// A refund recorded against the payment outranks the raw status word: the
 	// ledger cares about money that came back, not about a gateway's wording.
-	if refunded, err := payment.ParseMinor(values.Get("pg_refund_amount")); err == nil && refunded > 0 {
+	//
+	// Verified on the sandbox 2026-07-22 (payment 1814868833, 40.00 of 100.00
+	// refunded): status_v2 reports the refunded sum as a NEGATIVE number
+	// ("pg_refund_amount=-40"), from the merchant's point of view. Take the
+	// magnitude — a refund of -40 and of 40 mean the same money leaving us.
+	if refunded, err := payment.ParseMinor(values.Get("pg_refund_amount")); err == nil && refunded != 0 {
+		if refunded < 0 {
+			refunded = -refunded
+		}
 		if total, err := payment.ParseMinor(values.Get("pg_amount")); err == nil && total > 0 {
 			if refunded >= total {
 				status = domain.PaymentRefunded

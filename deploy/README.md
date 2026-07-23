@@ -40,6 +40,12 @@ server and images were built locally with `IMAGE_TAG=local`.
    ```
    (server timezone must be `Asia/Almaty` — `timedatectl set-timezone Asia/Almaty`
    — so 02:30 in the crontab means 02:30 Almaty time.) See "Backups" below.
+8. Enable the off-box (cloud) copy: install `rclone` (pinned version, not the
+   distro package — see "Backups" below for why), write
+   `/opt/bookeat/backups/environment` containing exactly `prod` or `test`,
+   and `/opt/bookeat/backups/rclone.conf` (chmod 600) pointing at the shared
+   `r2` bucket. Credentials come from `/home/tai/.bookeat/r2.env` (off-server,
+   ask whoever holds it) — never commit them.
 
 ## Deploy (manual, from a checked-out repo or CI runner)
 
@@ -221,10 +227,112 @@ docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
   -c "DROP DATABASE bookeat_restore_test;"
 ```
 
-**Known gap (not closed by this task):** dumps live on the same disk/volume
-as the database they back up. This protects against "dropped a table by
-mistake" but not against losing the whole server (disk failure, host
-deletion, ransomware). Next step would be shipping a copy off-box — S3-
-compatible object storage (e.g. `rclone`/`restic` to a bucket) or syncing to
-the other server — but that needs credentials/an account we don't have yet;
-not set up here.
+**Off-box copy (2026-07-23): done.** Every dump (daily always, weekly on
+Sundays) is also uploaded to Cloudflare R2 (S3-compatible object storage,
+bucket `book-eat`) right after the local integrity check, via `rclone`. This
+closes the gap above — a lost/corrupted/ransomed server no longer means a
+lost backup.
+
+- Layout in the bucket: `<environment>/daily/<file>.dump` and
+  `<environment>/weekly/<file>.dump`, where `<environment>` is `prod` or
+  `test` (read from `/opt/bookeat/backups/environment` on each server — a
+  one-word marker file, independent of `APP_ENV`).
+- `rclone` binary: `/usr/local/bin/rclone` **v1.68.2**, installed from the
+  official `downloads.rclone.org` zip, not the Ubuntu 24.04 apt package
+  (`1.60.1`, from 2022) — the apt version returns a `501 Not Implemented` on
+  the first upload attempt against R2 (silently retries and succeeds, but
+  it's noise worth avoiding; the modern binary doesn't do this). Same exact
+  version pinned on both servers.
+- `rclone` config: `/opt/bookeat/backups/rclone.conf` (chmod 600, remote name
+  `r2`, S3 provider `Cloudflare`). Credentials also kept as plain env vars at
+  `/opt/bookeat/backups/r2.env` (chmod 600) for reference/rotation — not read
+  by the backup script itself, only used to (re)generate `rclone.conf`.
+- **Upload is verified, not assumed**: after `rclone copyto`, the script
+  compares (a) size via `rclone size --json` against the local file's
+  `stat -c%s`, and (b) checksum via `rclone check --include <file> --one-way`
+  (MD5 — the hash R2's S3 API actually exposes). Either mismatch, or the
+  upload command itself failing, makes the whole backup run exit non-zero
+  and log a line starting `FAIL: CLOUD_UPLOAD_FAILED` or
+  `FAIL: CLOUD_UPLOAD_VERIFY_FAILED` — grep either string in
+  `/opt/bookeat/backups/backup.log` (or cron's mail/journal output) to alert
+  on it. A local-only dump is **not** treated as a completed backup anymore.
+- Cloud retention: 30 days for `*/daily/*`, 90 days for `*/weekly/*`, enforced
+  by R2 **bucket lifecycle rules** (age-based, prefix-scoped) set via the
+  Cloudflare API — not by the script. The script never deletes anything in
+  the bucket. Local disk retention (7 daily / 4 weekly) is unchanged.
+- Nothing here changes the local backup path or its 02:30 Asia/Almaty
+  schedule — the cloud upload is an additional step in the same script, same
+  cron entry.
+
+### Restoring from the cloud copy (3am-with-shaking-hands version)
+
+Use this when the server that made the backup is gone, or you specifically
+need to prove the cloud copy (not just the local disk copy) is good. If the
+box and its local `backups/daily/` still exist, the faster path is the local
+restore steps above — this section is for when they don't.
+
+You need: SSH access to *any* box with `rclone` configured against the `r2`
+remote (either bookeat server, or your laptop with a copy of
+`rclone.conf`), and SSH/docker access to whatever Postgres you're restoring
+into.
+
+```bash
+# 1. See what's available for the environment you need (prod or test):
+RCLONE_CONFIG=/opt/bookeat/backups/rclone.conf rclone lsl \
+  r2:book-eat/prod/daily/          # or prod/weekly/, test/daily/, test/weekly/
+
+# 2. Pick a file (most recent = last line, sorted by name = sorted by
+#    timestamp since the filename is bookeat-YYYYMMDD-HHMMSS.dump), download it:
+RCLONE_CONFIG=/opt/bookeat/backups/rclone.conf rclone copyto \
+  r2:book-eat/prod/daily/bookeat-20260723-020000.dump \
+  /tmp/restore-from-cloud.dump
+
+# 3. Sanity-check the download before touching any database:
+ls -la /tmp/restore-from-cloud.dump   # non-zero size
+docker run --rm --network none -v /tmp:/backups:ro postgres:16.6-alpine \
+  pg_restore --list /backups/restore-from-cloud.dump | head
+#   ^ should print a long list of catalog entries, not an error
+
+# 4. Get the file into the target Postgres container and restore into a NEW
+#    database — never restore over the live one directly:
+cd /opt/bookeat/deploy   # wherever the target compose stack lives
+docker compose cp /tmp/restore-from-cloud.dump postgres:/tmp/restore-from-cloud.dump
+docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
+  -c "CREATE DATABASE bookeat_restored OWNER $DB_USERNAME;"
+docker compose exec -T postgres pg_restore -U "$DB_USERNAME" \
+  -d bookeat_restored --no-owner /tmp/restore-from-cloud.dump
+
+# 5. Check it looks right before doing anything drastic (row counts,
+#    a couple of known rows, `information_schema.tables` count).
+
+# 6a. If this is a genuine disaster recovery (old DB is gone/corrupt) and
+#     bookeat_restored looks right, promote it:
+docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
+  -c "ALTER DATABASE bookeat RENAME TO bookeat_old_broken;"
+docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
+  -c "ALTER DATABASE bookeat_restored RENAME TO bookeat;"
+docker compose restart app worker   # they hold a connection pool to the old name
+curl -fsS http://127.0.0.1/health
+#   Only drop bookeat_old_broken once you're sure — keep it a day, not a minute.
+
+# 6b. If this was just a drill/verification, clean up instead:
+docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
+  -c "DROP DATABASE bookeat_restored;"
+docker compose exec -T postgres rm -f /tmp/restore-from-cloud.dump
+rm -f /tmp/restore-from-cloud.dump
+```
+
+This was rehearsed for real on the test server on 2026-07-23: downloaded a
+dump from `r2:book-eat/test/daily/...` (not the local copy), restored into a
+throwaway `bookeat_cloud_restore_test` database, compared table count (36 vs
+36) and per-table row counts (`information_schema.tables` cross-check,
+`diff` came back empty — identical) against the live `bookeat` database, then
+dropped the throwaway database. See the deploy report for the exact
+transcript.
+
+**Rotating R2 credentials:** update `/home/tai/.bookeat/r2.env` locally
+first, then push the same file to `/opt/bookeat/backups/r2.env` (chmod 600)
+on both servers, regenerate `/opt/bookeat/backups/rclone.conf` from the new
+values (same file, `access_key_id`/`secret_access_key`/`endpoint` lines), and
+run the backup script once by hand to confirm the new credentials work
+end-to-end before leaving it to cron.
