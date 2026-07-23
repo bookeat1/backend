@@ -20,6 +20,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	g := rg.Group("/users")
 	g.GET("/me", h.me)
 	g.PATCH("/me", h.updateMe)
+	g.DELETE("/me", h.deleteMe)
 }
 
 // me returns the authenticated user's profile.
@@ -42,7 +43,12 @@ func (h *Handler) me(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, fromDomain(u))
+	cuisineIDs, err := h.facade.CuisinePreferences(c.Request.Context(), au.ID)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, fromDomain(u, cuisineIDs))
 }
 
 // updateMe applies a partial update to the authenticated user's profile.
@@ -69,10 +75,45 @@ func (h *Handler) updateMe(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	u, err := h.facade.UpdateMe(c.Request.Context(), au.ID, req.toInput())
+	in, err := req.toInput()
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, fromDomain(u))
+	u, err := h.facade.UpdateMe(c.Request.Context(), au.ID, in)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	cuisineIDs, err := h.facade.CuisinePreferences(c.Request.Context(), au.ID)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, fromDomain(u, cuisineIDs))
+}
+
+// deleteMe soft-deletes and anonymizes the authenticated user's own account.
+// Idempotent: calling it again on an already-deleted account still returns 200.
+// @Summary     Delete current user's account
+// @Description Soft-deletes and anonymizes the authenticated user's account.
+// @Description Bookings/payments keep their reference to the (now anonymized)
+// @Description user id; they are never deleted or altered. Idempotent.
+// @Tags        users
+// @Produce     json
+// @Security    BearerAuth
+// @Success     200 {object} response.Envelope
+// @Failure     401 {object} response.Envelope "unauthorized"
+// @Router      /api/v1/users/me [delete]
+func (h *Handler) deleteMe(c *gin.Context) {
+	au, ok := middleware.GetAuthUser(c.Request.Context())
+	if !ok {
+		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := h.facade.DeleteMe(c.Request.Context(), au.ID); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, gin.H{"status": "deleted"})
 }

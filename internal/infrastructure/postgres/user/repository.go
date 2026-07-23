@@ -25,12 +25,12 @@ var _ domain.UserRepository = (*Repository)(nil)
 const uniqueViolation = "23505"
 
 const columns = `id, email, phone, full_name, role, is_active, avatar_url,
-	preferred_language, city, email_verified_at, phone_verified_at,
-	created_at, updated_at`
+	preferred_language, city, country_code, birth_date, email_verified_at,
+	phone_verified_at, deleted_at, created_at, updated_at`
 
 func (r *Repository) Create(ctx context.Context, u *domain.User) error {
 	q := `INSERT INTO users (` + columns + `)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`
 	now := time.Now()
 	if u.CreatedAt.IsZero() {
 		u.CreatedAt = now
@@ -38,8 +38,8 @@ func (r *Repository) Create(ctx context.Context, u *domain.User) error {
 	u.UpdatedAt = now
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx, q,
 		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
-		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt,
-		u.CreatedAt, u.UpdatedAt)
+		u.PreferredLanguage, u.City, u.CountryCode, u.BirthDate, u.EmailVerifiedAt,
+		u.PhoneVerifiedAt, u.DeletedAt, u.CreatedAt, u.UpdatedAt)
 	if err != nil {
 		// The email and phone columns are UNIQUE; a concurrent insert of the same
 		// identity surfaces here as a unique_violation. Map it to ErrAlreadyExists
@@ -83,10 +83,12 @@ func (r *Repository) Update(ctx context.Context, u *domain.User) error {
 	u.UpdatedAt = time.Now()
 	q := `UPDATE users SET email=$2, phone=$3, full_name=$4, role=$5,
 		is_active=$6, avatar_url=$7, preferred_language=$8, city=$9,
-		email_verified_at=$10, phone_verified_at=$11, updated_at=$12 WHERE id=$1`
+		country_code=$10, birth_date=$11, email_verified_at=$12,
+		phone_verified_at=$13, updated_at=$14 WHERE id=$1`
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q,
 		u.ID, u.Email, u.Phone, u.FullName, string(u.Role), u.IsActive, u.AvatarURL,
-		u.PreferredLanguage, u.City, u.EmailVerifiedAt, u.PhoneVerifiedAt, u.UpdatedAt)
+		u.PreferredLanguage, u.City, u.CountryCode, u.BirthDate, u.EmailVerifiedAt,
+		u.PhoneVerifiedAt, u.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -100,6 +102,46 @@ func (r *Repository) Update(ctx context.Context, u *domain.User) error {
 	return nil
 }
 
+// Delete soft-deletes and anonymizes the user in one UPDATE, scoped to
+// deleted_at IS NULL so a repeat call is a harmless zero-row no-op rather than
+// re-anonymizing already-scrubbed data. Email and phone are set to NULL, not
+// to a placeholder string: both columns are UNIQUE, and Postgres treats NULL
+// as distinct from every other NULL, so the freed phone/email can be reused by
+// a brand-new signup immediately (see team-memory note on this decision).
+func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
+	q := `UPDATE users SET
+		deleted_at = now(),
+		email = NULL,
+		phone = NULL,
+		full_name = '',
+		avatar_url = NULL,
+		city = NULL,
+		country_code = NULL,
+		birth_date = NULL,
+		is_active = false,
+		updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL`
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// Zero rows is ambiguous: missing id vs. already deleted. One follow-up
+	// read (never gating a decision to write — the write already ran above)
+	// tells them apart, same convention as payments' classifyMiss.
+	_, err = r.GetByID(ctx, id)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+	// User exists and deleted_at is already set: idempotent no-op success.
+	return nil
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -108,8 +150,9 @@ func scan(row scanner) (*domain.User, error) {
 	var u domain.User
 	var role string
 	if err := row.Scan(&u.ID, &u.Email, &u.Phone, &u.FullName, &role,
-		&u.IsActive, &u.AvatarURL, &u.PreferredLanguage, &u.City, &u.EmailVerifiedAt,
-		&u.PhoneVerifiedAt, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		&u.IsActive, &u.AvatarURL, &u.PreferredLanguage, &u.City, &u.CountryCode,
+		&u.BirthDate, &u.EmailVerifiedAt, &u.PhoneVerifiedAt, &u.DeletedAt,
+		&u.CreatedAt, &u.UpdatedAt); err != nil {
 		return nil, err
 	}
 	u.Role = domain.Role(role)
