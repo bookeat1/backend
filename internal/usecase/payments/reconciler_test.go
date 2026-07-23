@@ -404,3 +404,30 @@ var errTimeout = errAcquirerTimeout{}
 type errAcquirerTimeout struct{}
 
 func (errAcquirerTimeout) Error() string { return "acquirer: request timed out" }
+
+// Regression guard for the pre-launch payments review finding: every claim in
+// the reconciler (ClaimStale / ClaimExpiredHolds on both payments and refunds)
+// must run inside a TxManager transaction. Their FOR UPDATE SKIP LOCKED lock is
+// released the instant an auto-committed SELECT ends, so an unwrapped claim lets
+// two concurrent reconciler passes (a second cmd/worker replica) grab the same
+// stuck row and fire duplicate acquirer calls. A Tick invokes every reconcile
+// pass regardless of data, so an empty harness is enough to prove each claim
+// path is wrapped.
+func TestReconciler_ClaimsRunInsideTransaction(t *testing.T) {
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: 10 * time.Minute, BatchSize: 10, MaxAttempts: 3}
+	h := newReconcilerHarness(t, cfg, nil, nil)
+
+	if _, err := h.r.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	if !h.payments.claimStaleInTx {
+		t.Error("payments.ClaimStale ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	}
+	if !h.payments.claimExpiredInTx {
+		t.Error("payments.ClaimExpiredHolds ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	}
+	if !h.refunds.claimStaleInTx {
+		t.Error("refunds.ClaimStale ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	}
+}

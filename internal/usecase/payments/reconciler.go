@@ -220,9 +220,18 @@ func (r *Reconciler) Tick(ctx context.Context) (ReconcileResult, error) {
 // ---------------------------------------------------------------------------
 
 func (r *Reconciler) reconcileCapturing(ctx context.Context, now time.Time, res *ReconcileResult) error {
-	due, err := r.payments.ClaimStale(ctx, []domain.PaymentStatus{domain.PaymentCapturing},
-		now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
-	if err != nil {
+	// The claim runs inside a transaction so FOR UPDATE SKIP LOCKED actually
+	// holds its lock (see ClaimStale's contract): auto-committed, the lock
+	// releases the instant the SELECT ends and a second reconciler pass can
+	// re-claim the same row. Processing (the acquirer call) happens outside the
+	// tx — the lock is never held across the network round-trip.
+	var due []domain.Payment
+	if err := r.tx.WithinTx(ctx, func(ctx context.Context) error {
+		var e error
+		due, e = r.payments.ClaimStale(ctx, []domain.PaymentStatus{domain.PaymentCapturing},
+			now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
+		return e
+	}); err != nil {
 		return err
 	}
 	for i := range due {
@@ -234,9 +243,15 @@ func (r *Reconciler) reconcileCapturing(ctx context.Context, now time.Time, res 
 }
 
 func (r *Reconciler) reconcileVoiding(ctx context.Context, now time.Time, res *ReconcileResult) error {
-	due, err := r.payments.ClaimStale(ctx, []domain.PaymentStatus{domain.PaymentVoiding},
-		now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
-	if err != nil {
+	// Claim inside a tx so the FOR UPDATE SKIP LOCKED lock is held (see
+	// reconcileCapturing / ClaimStale's contract); acquirer call is outside it.
+	var due []domain.Payment
+	if err := r.tx.WithinTx(ctx, func(ctx context.Context) error {
+		var e error
+		due, e = r.payments.ClaimStale(ctx, []domain.PaymentStatus{domain.PaymentVoiding},
+			now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
+		return e
+	}); err != nil {
 		return err
 	}
 	for i := range due {
@@ -372,9 +387,15 @@ func (r *Reconciler) releaseTransient(ctx context.Context, id uuid.UUID, from do
 // ---------------------------------------------------------------------------
 
 func (r *Reconciler) reconcileRefunds(ctx context.Context, now time.Time, res *ReconcileResult) error {
-	due, err := r.refunds.ClaimStale(ctx, []domain.RefundStatus{domain.RefundInFlight, domain.RefundPending},
-		now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
-	if err != nil {
+	// Claim inside a tx so the FOR UPDATE SKIP LOCKED lock is held (see
+	// reconcileCapturing / ClaimStale's contract); acquirer call is outside it.
+	var due []domain.PaymentRefund
+	if err := r.tx.WithinTx(ctx, func(ctx context.Context) error {
+		var e error
+		due, e = r.refunds.ClaimStale(ctx, []domain.RefundStatus{domain.RefundInFlight, domain.RefundPending},
+			now.Add(-r.cfg.StuckAfter), r.cfg.BatchSize)
+		return e
+	}); err != nil {
 		return err
 	}
 	for i := range due {
@@ -541,10 +562,16 @@ func (r *Reconciler) bumpRefundAttempt(ctx context.Context, rf *domain.PaymentRe
 // ---------------------------------------------------------------------------
 
 func (r *Reconciler) reconcileLostWebhook(ctx context.Context, now time.Time, res *ReconcileResult) error {
-	due, err := r.payments.ClaimStale(ctx,
-		[]domain.PaymentStatus{domain.PaymentCreated, domain.PaymentAuthorized},
-		now.Add(-r.cfg.LostWebhookAfter), r.cfg.BatchSize)
-	if err != nil {
+	// Claim inside a tx so the FOR UPDATE SKIP LOCKED lock is held (see
+	// reconcileCapturing / ClaimStale's contract); acquirer call is outside it.
+	var due []domain.Payment
+	if err := r.tx.WithinTx(ctx, func(ctx context.Context) error {
+		var e error
+		due, e = r.payments.ClaimStale(ctx,
+			[]domain.PaymentStatus{domain.PaymentCreated, domain.PaymentAuthorized},
+			now.Add(-r.cfg.LostWebhookAfter), r.cfg.BatchSize)
+		return e
+	}); err != nil {
 		return err
 	}
 	for i := range due {
@@ -597,8 +624,14 @@ func (r *Reconciler) resolveLostWebhook(ctx context.Context, gw domain.PaymentGa
 // ---------------------------------------------------------------------------
 
 func (r *Reconciler) reconcileExpiredHolds(ctx context.Context, now time.Time, res *ReconcileResult) error {
-	due, err := r.payments.ClaimExpiredHolds(ctx, now, r.cfg.BatchSize)
-	if err != nil {
+	// Claim inside a tx so the FOR UPDATE SKIP LOCKED lock is held (see
+	// reconcileCapturing / ClaimStale's contract); acquirer call is outside it.
+	var due []domain.Payment
+	if err := r.tx.WithinTx(ctx, func(ctx context.Context) error {
+		var e error
+		due, e = r.payments.ClaimExpiredHolds(ctx, now, r.cfg.BatchSize)
+		return e
+	}); err != nil {
 		return err
 	}
 	for i := range due {
