@@ -36,12 +36,25 @@ func TestProvidersListAndGetByCode(t *testing.T) {
 	pool, ctx := setupProviders(t)
 	repo := NewProviders(pool)
 
+	// Every provider the build knows about is seeded by the migrations, so the
+	// count follows the registry rather than a literal: adding a fourth acquirer
+	// must not make this test fail for the wrong reason. What the test actually
+	// pins is the ordering — List promises priority order, and the settlement
+	// code picks the first enabled one.
 	all, err := repo.List(ctx)
-	if err != nil || len(all) != 2 {
-		t.Fatalf("list: %d rows, err=%v, want 2", len(all), err)
+	if err != nil {
+		t.Fatalf("list: err=%v", err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("list: %d rows, want at least freedompay and tiptoppay", len(all))
 	}
 	if all[0].Provider != domain.ProviderFreedomPay || all[1].Provider != domain.ProviderTipTopPay {
-		t.Fatalf("list order by priority = %+v, want freedompay then tiptoppay", all)
+		t.Fatalf("list order by priority = %+v, want freedompay then tiptoppay first", all)
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i-1].Priority > all[i].Priority {
+			t.Fatalf("list is not ordered by priority: %+v", all)
+		}
 	}
 
 	got, err := repo.GetByCode(ctx, domain.ProviderFreedomPay)
