@@ -1,0 +1,163 @@
+# BookEat backend — app + Postgres 16 + Caddy, one server = one stack.
+#
+# Usage: see deploy/README.md. All secrets and per-host tuning come from
+# ./.env (chmod 600, never committed) next to this file.
+#
+# Image: IMAGE_REPO/IMAGE_TAG is a GHCR image built by CI. For the very first,
+# manual bring-up on a fresh box we build locally instead (see README) — set
+# IMAGE_TAG=local and `docker compose build app worker`.
+
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-bookeat}
+      POSTGRES_USER: ${DB_USERNAME:-bookeat}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Tuning is host-specific (see .env.example: PG_SHARED_BUFFERS etc.) —
+    # prod (15GB RAM) and test (3GB RAM) get different values via .env, same
+    # compose file. Defaults below are safe for the small `test` box.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-8MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-100}
+      - -c
+      - log_min_duration_statement=500
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-bookeat} -d ${DB_DATABASE:-bookeat}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: ${PG_MEM_LIMIT:-1g}
+    # Not exposed to the host on purpose: only `app`/`worker`/`migrate` (same
+    # compose network) talk to it. Use `docker compose exec postgres psql ...`
+    # to connect manually (see README).
+
+  migrate:
+    image: ${IMAGE_REPO:-bookeat-backend}:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/app/migrate"]
+    command: ["up"]
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    # Run explicitly as a deploy step: `docker compose run --rm migrate`.
+    # Not started by `docker compose up`.
+    profiles: ["tools"]
+
+  app:
+    image: ${IMAGE_REPO:-bookeat-backend}:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      APP_URL: 0.0.0.0:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Real GET, not --spider (HEAD): gin's r.GET() doesn't auto-answer HEAD,
+      # so a spider check 404s even though the route works fine.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: ${APP_MEM_LIMIT:-512m}
+    # No published ports: only Caddy talks to `app` over the compose network.
+
+  worker:
+    image: ${IMAGE_REPO:-bookeat-backend}:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    entrypoint: ["/app/worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The worker does not serve HTTP — override the image's HEALTHCHECK
+    # (built for the `app` binary listening on :8080) with a trivial
+    # always-pass check; process liveness is covered by `restart:
+    # unless-stopped` + Docker's own container state.
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEM_LIMIT:-256m}
+
+  caddy:
+    image: caddy:2.9-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # http://:80 = serve plain HTTP on the bare IP, no TLS (current state,
+      # DNS not delegated yet). Flip to the real hostname
+      # (e.g. backend.book-eat.com) once DNS resolves to this host and Caddy
+      # will obtain a Let's Encrypt cert automatically. See deploy/README.md.
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://:80}
+    depends_on:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

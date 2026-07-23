@@ -1,0 +1,30 @@
+# Reverse proxy for the BookEat backend.
+#
+# {$SITE_ADDRESS} comes from docker-compose.yml's `environment:` (sourced
+# from .env). Today, with DNS not yet delegated, it is `http://:80` — Caddy
+# serves plain HTTP on port 80, answering on the server's bare IP, no TLS.
+#
+# When DNS is delegated, the ONLY change needed is the SITE_ADDRESS value in
+# .env:
+#   prod:  SITE_ADDRESS=backend.book-eat.com
+#   test:  SITE_ADDRESS=test.backend.book-eat.com
+# then `docker compose up -d caddy` (or `docker compose restart caddy`).
+# Caddy will request/renew a Let's Encrypt certificate automatically and start
+# terminating TLS on :443, redirecting :80 to :443 — no other file changes.
+
+{$SITE_ADDRESS:http://:80} {
+	encode gzip zstd
+
+	log {
+		output stdout
+		format json
+	}
+
+	# Liveness check does not need to go through the app's readiness path;
+	# Caddy just proxies everything, including /health and /health/ready.
+	reverse_proxy app:8080 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+}
