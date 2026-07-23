@@ -627,5 +627,52 @@ func TestSettle_CrossTenantStaffIsRejected(t *testing.T) {
 	}
 }
 
+// TestSettle_HostessCannotRefund is the hard rule named explicitly by the
+// owner: a hostess is staff of the restaurant (Manages == true, so capture
+// and booking actions work for them) but must never be able to settle a
+// refund — only a manager or an owner may.
+func TestSettle_HostessCannotRefund(t *testing.T) {
+	p := capturedTestPayment(uuid.New())
+	h := newRefundHarness(p, 100)
+	hostessID := uuid.New()
+	managers := newFakeManagerChecker()
+	managers.set(hostessID, p.RestaurantID, true) // staff of this restaurant
+	managers.setPermission(hostessID, p.RestaurantID, domain.PermPaymentRefund, false)
+	h.u = NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox,
+		newFakeGatewayResolver(h.gw), managers, h.bookings, h.deadline,
+		&fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds},
+		Config{RefundAcquiringBps: 100})
+
+	_, err := h.u.Settle(context.Background(), Actor{UserID: &hostessID, Role: domain.RoleRestaurant}, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerNoShow, IdempotencyKey: "settle-1",
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess Settle error = %v, want ErrForbidden", err)
+	}
+}
+
+// TestSettle_ManagerCanRefund is the same setup as the hostess test above but
+// with the refund permission granted, confirming the permission check (not
+// just the restaurant-membership check) actually gates the call.
+func TestSettle_ManagerCanRefund(t *testing.T) {
+	p := capturedTestPayment(uuid.New())
+	h := newRefundHarness(p, 100)
+	managerID := uuid.New()
+	managers := newFakeManagerChecker()
+	managers.set(managerID, p.RestaurantID, true)
+	managers.setPermission(managerID, p.RestaurantID, domain.PermPaymentRefund, true)
+	h.u = NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox,
+		newFakeGatewayResolver(h.gw), managers, h.bookings, h.deadline,
+		&fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds},
+		Config{RefundAcquiringBps: 100})
+
+	_, err := h.u.Settle(context.Background(), Actor{UserID: &managerID, Role: domain.RoleRestaurant}, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerNoShow, IdempotencyKey: "settle-1",
+	})
+	if err != nil {
+		t.Fatalf("manager Settle error = %v, want nil", err)
+	}
+}
+
 func strPtrTest(s string) *string    { return &s }
 func timePtr(t time.Time) *time.Time { return &t }

@@ -128,31 +128,114 @@ func (f *fakePartners) Create(_ context.Context, p *domain.PartnershipRequest) e
 	return nil
 }
 
+// fakeManagers is a hand-written domain.RestaurantManagerRepository backed by
+// a single mutable slice, close enough to the real table to exercise
+// ManagerUseCase's authorization logic (List/Assign/SetRole/Remove all
+// resolve a row by id or filter by user/restaurant, same as Postgres would).
 type fakeManagers struct {
-	byUser  []domain.RestaurantManager
-	created *domain.RestaurantManager
-	delErr  error
+	rows       []domain.RestaurantManager
+	created    *domain.RestaurantManager
+	getErr     error
+	createErr  error
+	updRoleErr error
+	delErr     error
 }
 
-func (f *fakeManagers) ListByRestaurant(context.Context, uuid.UUID) ([]domain.RestaurantManager, error) {
-	return nil, nil
+func (f *fakeManagers) ListByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.RestaurantManager, error) {
+	var out []domain.RestaurantManager
+	for _, m := range f.rows {
+		if m.RestaurantID == rid {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
-func (f *fakeManagers) ListByUser(context.Context, uuid.UUID) ([]domain.RestaurantManager, error) {
-	return f.byUser, nil
+
+func (f *fakeManagers) ListByUser(_ context.Context, uid uuid.UUID) ([]domain.RestaurantManager, error) {
+	var out []domain.RestaurantManager
+	for _, m := range f.rows {
+		if m.UserID == uid {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
+
+func (f *fakeManagers) GetByID(_ context.Context, id uuid.UUID) (*domain.RestaurantManager, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			m := f.rows[i]
+			return &m, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
 func (f *fakeManagers) Create(_ context.Context, m *domain.RestaurantManager) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	if m.ID == uuid.Nil {
+		m.ID = uuid.New()
+	}
 	f.created = m
+	f.rows = append(f.rows, *m)
 	return nil
 }
-func (f *fakeManagers) Delete(context.Context, uuid.UUID) error { return f.delErr }
 
-type fakeUsers struct{ err error }
+func (f *fakeManagers) UpdateRole(_ context.Context, id uuid.UUID, role domain.StaffRole) error {
+	if f.updRoleErr != nil {
+		return f.updRoleErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			f.rows[i].Role = role
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+func (f *fakeManagers) Delete(_ context.Context, id uuid.UUID) error {
+	if f.delErr != nil {
+		return f.delErr
+	}
+	for i, m := range f.rows {
+		if m.ID == id {
+			f.rows = append(f.rows[:i], f.rows[i+1:]...)
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+// fakeUsers is a hand-written userRepo.
+type fakeUsers struct {
+	err       error
+	updateErr error
+	user      *domain.User // optional override for GetByID's result
+	updated   *domain.User
+}
 
 func (f *fakeUsers) GetByID(_ context.Context, id uuid.UUID) (*domain.User, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &domain.User{ID: id}, nil
+	if f.user != nil {
+		return f.user, nil
+	}
+	return &domain.User{ID: id, Role: domain.RoleUser}, nil
+}
+
+func (f *fakeUsers) Update(_ context.Context, u *domain.User) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.updated = u
+	return nil
 }
 
 // inlineTx runs fn directly (no real transaction) for unit tests.

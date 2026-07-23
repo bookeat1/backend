@@ -3,6 +3,7 @@ package restaurant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -127,7 +128,7 @@ func TestManagersCreateAndList(t *testing.T) {
 		t.Fatalf("insert user: %v", err)
 	}
 
-	mn := &domain.RestaurantManager{RestaurantID: rid, UserID: uid}
+	mn := &domain.RestaurantManager{RestaurantID: rid, UserID: uid, Role: domain.StaffRoleHostess}
 	if err := mgrs.Create(ctx, mn); err != nil {
 		t.Fatalf("create manager: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestManagersCreateAndList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list by restaurant: %v", err)
 	}
-	if len(byRestaurant) != 1 || byRestaurant[0].UserID != uid {
+	if len(byRestaurant) != 1 || byRestaurant[0].UserID != uid || byRestaurant[0].Role != domain.StaffRoleHostess {
 		t.Errorf("list by restaurant = %+v", byRestaurant)
 	}
 
@@ -149,5 +150,42 @@ func TestManagersCreateAndList(t *testing.T) {
 	}
 	if len(byUser) != 1 || byUser[0].RestaurantID != rid {
 		t.Errorf("list by user = %+v", byUser)
+	}
+
+	got, err := mgrs.GetByID(ctx, mn.ID)
+	if err != nil {
+		t.Fatalf("get by id: %v", err)
+	}
+	if got.RestaurantID != rid || got.UserID != uid || got.Role != domain.StaffRoleHostess {
+		t.Errorf("get by id = %+v", got)
+	}
+
+	if _, err := mgrs.GetByID(ctx, uuid.New()); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("get by id (missing) err = %v, want ErrNotFound", err)
+	}
+
+	if err := mgrs.UpdateRole(ctx, mn.ID, domain.StaffRoleManager); err != nil {
+		t.Fatalf("update role: %v", err)
+	}
+	got, err = mgrs.GetByID(ctx, mn.ID)
+	if err != nil {
+		t.Fatalf("get by id after update: %v", err)
+	}
+	if got.Role != domain.StaffRoleManager {
+		t.Errorf("role after update = %s, want manager", got.Role)
+	}
+
+	if err := mgrs.UpdateRole(ctx, uuid.New(), domain.StaffRoleManager); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("update role (missing) err = %v, want ErrNotFound", err)
+	}
+
+	// Re-assigning the SAME (restaurant, user) pair must hit the unique
+	// index and surface as domain.ErrAlreadyExists (→ HTTP 409), never a
+	// bare/opaque error that response.HandleError would classify as a 500.
+	// SetRole (tested above) is the only intended path to change an
+	// existing member's role.
+	dup := &domain.RestaurantManager{RestaurantID: rid, UserID: uid, Role: domain.StaffRoleManager}
+	if err := mgrs.Create(ctx, dup); !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Errorf("duplicate (restaurant, user) create err = %v, want ErrAlreadyExists", err)
 	}
 }

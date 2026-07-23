@@ -111,7 +111,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	menuItems := menurepo.New(db)
 	menuCategories := menurepo.NewCategories(db)
 
-	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo)
+	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	favoritesRepo := favoriterepo.New(db)
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
 

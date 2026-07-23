@@ -369,15 +369,17 @@ func (m *Managers) scanRows(rows pgx.Rows) ([]domain.RestaurantManager, error) {
 	var out []domain.RestaurantManager
 	for rows.Next() {
 		var mn domain.RestaurantManager
-		if err := rows.Scan(&mn.ID, &mn.RestaurantID, &mn.UserID, &mn.CreatedBy, &mn.WhatsappOptIn, &mn.WhatsappPhone, &mn.CreatedAt); err != nil {
+		var role string
+		if err := rows.Scan(&mn.ID, &mn.RestaurantID, &mn.UserID, &role, &mn.CreatedBy, &mn.WhatsappOptIn, &mn.WhatsappPhone, &mn.CreatedAt); err != nil {
 			return nil, err
 		}
+		mn.Role = domain.StaffRole(role)
 		out = append(out, mn)
 	}
 	return out, rows.Err()
 }
 
-const mgrCols = `id, restaurant_id, user_id, created_by, whatsapp_opt_in, whatsapp_phone, created_at`
+const mgrCols = `id, restaurant_id, user_id, role, created_by, whatsapp_opt_in, whatsapp_phone, created_at`
 
 func (m *Managers) ListByRestaurant(ctx context.Context, rid uuid.UUID) ([]domain.RestaurantManager, error) {
 	rows, err := sqltx.From(ctx, m.pool).Query(ctx,
@@ -397,16 +399,44 @@ func (m *Managers) ListByUser(ctx context.Context, uid uuid.UUID) ([]domain.Rest
 	return m.scanRows(rows)
 }
 
+func (m *Managers) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantManager, error) {
+	row := sqltx.From(ctx, m.pool).QueryRow(ctx,
+		`SELECT `+mgrCols+` FROM restaurant_managers WHERE id=$1`, id)
+	var mn domain.RestaurantManager
+	var role string
+	err := row.Scan(&mn.ID, &mn.RestaurantID, &mn.UserID, &role, &mn.CreatedBy, &mn.WhatsappOptIn, &mn.WhatsappPhone, &mn.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get manager: %w", err)
+	}
+	mn.Role = domain.StaffRole(role)
+	return &mn, nil
+}
+
 func (m *Managers) Create(ctx context.Context, mn *domain.RestaurantManager) error {
 	if mn.ID == uuid.Nil {
 		mn.ID = uuid.New()
 	}
 	mn.CreatedAt = time.Now()
 	_, err := sqltx.From(ctx, m.pool).Exec(ctx,
-		`INSERT INTO restaurant_managers (`+mgrCols+`) VALUES ($1,$2,$3,$4,$5,$6,now())`,
-		mn.ID, mn.RestaurantID, mn.UserID, mn.CreatedBy, mn.WhatsappOptIn, mn.WhatsappPhone)
+		`INSERT INTO restaurant_managers (`+mgrCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
+		mn.ID, mn.RestaurantID, mn.UserID, string(mn.Role), mn.CreatedBy, mn.WhatsappOptIn, mn.WhatsappPhone)
 	if err != nil {
 		return mapWrite(err, "create manager")
+	}
+	return nil
+}
+
+func (m *Managers) UpdateRole(ctx context.Context, id uuid.UUID, role domain.StaffRole) error {
+	tag, err := sqltx.From(ctx, m.pool).Exec(ctx,
+		`UPDATE restaurant_managers SET role=$2 WHERE id=$1`, id, string(role))
+	if err != nil {
+		return mapWrite(err, "update manager role")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
 	}
 	return nil
 }

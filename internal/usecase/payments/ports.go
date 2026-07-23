@@ -82,6 +82,35 @@ func authorizeStaffForRestaurant(ctx context.Context, managers managerChecker, a
 	}
 }
 
+// authorizeStaffPermission is authorizeStaffForRestaurant's stricter sibling:
+// RoleAdmin still may act on any restaurant, but a RoleRestaurant actor must
+// additionally hold perm at THIS restaurant per their domain.StaffRole (the
+// RBAC matrix — see internal/domain/rbac.go), not merely be staff of it at
+// all. Used by RefundUseCase.Settle (domain.PermPaymentRefund): the owner's
+// spec is explicit that a hostess must never be able to settle a refund,
+// even though a hostess passes the plain "is this staff of the restaurant"
+// check that capture/void/create/status still use.
+func authorizeStaffPermission(ctx context.Context, managers managerChecker, actor Actor, restaurantID uuid.UUID, perm domain.Permission) error {
+	switch actor.Role {
+	case domain.RoleAdmin:
+		return nil
+	case domain.RoleRestaurant:
+		if actor.UserID == nil {
+			return fmt.Errorf("%w: no authenticated staff actor", domain.ErrUnauthorized)
+		}
+		ok, err := managers.HasPermission(ctx, *actor.UserID, restaurantID, perm)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: this staff role cannot %s at this restaurant", domain.ErrForbidden, perm)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: only venue staff can do this", domain.ErrForbidden)
+	}
+}
+
 // gatewayResolver is the minimal slice of infrastructure/payment.Registry this
 // package needs: pick the adapter for a NEW payment (Resolve, which falls back
 // when the venue's preferred provider is disabled) and the adapter for an
@@ -121,12 +150,15 @@ type restaurantPaymentSettings interface {
 	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
 }
 
-// managerChecker answers whether a user manages a restaurant — the same port
-// shape as usecase/bookings.managerChecker, bound to the same
-// restaurants.ManagerUseCase in bootstrap/deps.go. See
-// authorizeStaffForRestaurant (report item #13).
+// managerChecker answers whether a user manages a restaurant (Manages, the
+// same port shape as usecase/bookings.managerChecker) and, additionally,
+// whether they hold a specific domain.Permission there (HasPermission, RBAC
+// foundation — see authorizeStaffPermission below). Both are bound to the
+// same restaurants.ManagerUseCase in bootstrap/deps.go. See
+// authorizeStaffForRestaurant (report item #13) for Manages' history.
 type managerChecker interface {
 	Manages(ctx context.Context, userID, restaurantID uuid.UUID) (bool, error)
+	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
 // cancelDeadlineResolver derives the real, server-computed cancel-before
