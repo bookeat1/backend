@@ -83,10 +83,15 @@ type FloorPlan struct {
 	UpdatedAt    time.Time
 }
 
+// RestaurantManager is one row of a restaurant's staff roster: a user with a
+// StaffRole (owner/manager/hostess) at this specific restaurant (migration
+// 0012 added Role; older rows were backfilled to StaffRoleManager, see the
+// migration's comment for why that default is safe).
 type RestaurantManager struct {
 	ID            uuid.UUID
 	RestaurantID  uuid.UUID
 	UserID        uuid.UUID
+	Role          StaffRole
 	CreatedBy     *uuid.UUID
 	WhatsappOptIn bool
 	WhatsappPhone *string
@@ -149,7 +154,17 @@ type RestaurantCategoryRepository interface {
 type RestaurantManagerRepository interface {
 	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]RestaurantManager, error)
 	ListByUser(ctx context.Context, userID uuid.UUID) ([]RestaurantManager, error)
+	// GetByID returns ErrNotFound when absent. It exists so a caller acting
+	// on a manager row by id alone (SetRole, Remove) can first resolve WHICH
+	// restaurant that row belongs to and authorize against THAT restaurant —
+	// never trust a path parameter for the restaurant id when the mutation
+	// target is identified by its own id (avoids the cross-tenant IDOR the
+	// old admin-only gate on these routes used to rely on entirely).
+	GetByID(ctx context.Context, id uuid.UUID) (*RestaurantManager, error)
 	Create(ctx context.Context, m *RestaurantManager) error
+	// UpdateRole changes an existing staff member's role in place. Returns
+	// ErrNotFound when id is absent.
+	UpdateRole(ctx context.Context, id uuid.UUID, role StaffRole) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

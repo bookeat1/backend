@@ -31,17 +31,9 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
-// RegisterAdminGlobal mounts admin-only routes: creating a new restaurant, and
-// all restaurant-manager management (list/assign/remove). Manager management is
-// intentionally admin-only, not gated by restaurant ownership: removeManager
-// deletes a manager record by managerID alone, so scoping this by "is a manager
-// of :id" would let a manager of restaurant A delete a manager record belonging
-// to restaurant B (cross-tenant IDOR). Mount on a RequireRole(admin) group.
+// RegisterAdminGlobal mounts admin-only routes: creating a new restaurant.
 func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
-	rg.GET("/restaurants/:id/managers", h.listManagers)
-	rg.POST("/restaurants/:id/managers", h.assignManager)
-	rg.DELETE("/restaurants/:id/managers/:managerID", h.removeManager)
 }
 
 // RegisterRestaurantScoped mounts mutations on an existing restaurant's own
@@ -50,6 +42,35 @@ func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
 	rg.PATCH("/restaurants/:id", h.update)
 	rg.DELETE("/restaurants/:id", h.deactivate)
+}
+
+// RegisterStaffRoutes mounts staff-roster management (list/assign/set
+// role/remove). Authorization is NOT done by transport middleware here — it
+// is fully resolved inside usecase/restaurants.ManagerUseCase (which role may
+// touch which restaurant's roster, per the RBAC matrix), so this only needs
+// to run after middleware.Auth (any authenticated caller may reach the
+// handler; the usecase itself returns ErrForbidden for anyone who isn't the
+// target restaurant's own owner or a superadmin). This deliberately replaces
+// the old admin-only gate: removeManager/setRole used to be admin-only
+// specifically because deleting/re-roling by a bare manager id had no other
+// way to resolve which restaurant it belonged to — ManagerUseCase now
+// resolves that itself before authorizing (see its doc comments).
+func (h *Handler) RegisterStaffRoutes(rg *gin.RouterGroup) {
+	rg.GET("/restaurants/:id/managers", h.listManagers)
+	rg.POST("/restaurants/:id/managers", h.assignManager)
+	rg.PATCH("/restaurants/:id/managers/:managerID", h.setManagerRole)
+	rg.DELETE("/restaurants/:id/managers/:managerID", h.removeManager)
+}
+
+// staffActorFrom builds the usecase/restaurants.Actor from the authenticated
+// principal, writing 401 when the request never passed middleware.Auth.
+func staffActorFrom(c *gin.Context) (uc.Actor, bool) {
+	au, ok := middleware.GetAuthUser(c.Request.Context())
+	if !ok {
+		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
+		return uc.Actor{}, false
+	}
+	return uc.Actor{UserID: au.ID, Role: domain.Role(au.Role)}, true
 }
 
 func (h *Handler) list(c *gin.Context) {
@@ -213,12 +234,16 @@ func (h *Handler) deactivate(c *gin.Context) {
 }
 
 func (h *Handler) listManagers(c *gin.Context) {
+	actor, ok := staffActorFrom(c)
+	if !ok {
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid id")
 		return
 	}
-	ms, err := h.managers.List(c.Request.Context(), id)
+	ms, err := h.managers.List(c.Request.Context(), actor, id)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -231,6 +256,10 @@ func (h *Handler) listManagers(c *gin.Context) {
 }
 
 func (h *Handler) assignManager(c *gin.Context) {
+	actor, ok := staffActorFrom(c)
+	if !ok {
+		return
+	}
 	rid, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid id")
@@ -246,12 +275,14 @@ func (h *Handler) assignManager(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid user_id")
 		return
 	}
-	var createdBy *uuid.UUID
-	if au, ok := middleware.GetAuthUser(c.Request.Context()); ok {
-		createdBy = &au.ID
+	role := domain.StaffRole(req.Role)
+	if !role.Valid() {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "role must be one of: owner, manager, hostess")
+		return
 	}
-	m, err := h.managers.Assign(c.Request.Context(), uc.AssignManagerInput{
-		RestaurantID: rid, UserID: uid, CreatedBy: createdBy,
+	createdBy := &actor.UserID
+	m, err := h.managers.Assign(c.Request.Context(), actor, uc.AssignManagerInput{
+		RestaurantID: rid, UserID: uid, Role: role, CreatedBy: createdBy,
 		WhatsappOptIn: req.WhatsappOptIn, WhatsappPhone: req.WhatsappPhone,
 	})
 	if err != nil {
@@ -261,13 +292,45 @@ func (h *Handler) assignManager(c *gin.Context) {
 	response.Created(c.Writer, managerToResponse(*m))
 }
 
-func (h *Handler) removeManager(c *gin.Context) {
+func (h *Handler) setManagerRole(c *gin.Context) {
+	actor, ok := staffActorFrom(c)
+	if !ok {
+		return
+	}
 	mid, err := uuid.Parse(c.Param("managerID"))
 	if err != nil {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid manager id")
 		return
 	}
-	if err := h.managers.Remove(c.Request.Context(), mid); err != nil {
+	var req setManagerRoleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	role := domain.StaffRole(req.Role)
+	if !role.Valid() {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "role must be one of: owner, manager, hostess")
+		return
+	}
+	m, err := h.managers.SetRole(c.Request.Context(), actor, mid, role)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, managerToResponse(*m))
+}
+
+func (h *Handler) removeManager(c *gin.Context) {
+	actor, ok := staffActorFrom(c)
+	if !ok {
+		return
+	}
+	mid, err := uuid.Parse(c.Param("managerID"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid manager id")
+		return
+	}
+	if err := h.managers.Remove(c.Request.Context(), actor, mid); err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}

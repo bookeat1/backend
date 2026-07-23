@@ -67,6 +67,10 @@ func (f fakeManagerChecker) Manages(context.Context, uuid.UUID, uuid.UUID) (bool
 	return f.manages, nil
 }
 
+func (f fakeManagerChecker) HasPermission(context.Context, uuid.UUID, uuid.UUID, domain.Permission) (bool, error) {
+	return f.manages, nil
+}
+
 // fakeCancelDeadline is the tiny cancelDeadlineResolver port: a booking may
 // always be cancelled up to deadline, regardless of its own StartsAt — good
 // enough for handler-level tests, which never assert on the exact settlement

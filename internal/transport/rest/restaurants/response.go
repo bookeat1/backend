@@ -63,6 +63,7 @@ type managerResponse struct {
 	ID            string  `json:"id"`
 	RestaurantID  string  `json:"restaurant_id"`
 	UserID        string  `json:"user_id"`
+	Role          string  `json:"role"`
 	WhatsappOptIn bool    `json:"whatsapp_opt_in"`
 	WhatsappPhone *string `json:"whatsapp_phone"`
 }
@@ -117,6 +118,7 @@ func categoryToResponse(c domain.RestaurantCategory) categoryResponse {
 func managerToResponse(m domain.RestaurantManager) managerResponse {
 	return managerResponse{
 		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(), UserID: m.UserID.String(),
+		Role:          string(m.Role),
 		WhatsappOptIn: m.WhatsappOptIn, WhatsappPhone: m.WhatsappPhone,
 	}
 }

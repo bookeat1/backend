@@ -573,21 +573,22 @@ func (u *refundUseCase) claimAndCallGateway(ctx context.Context, p *domain.Payme
 // as authorizeCreate); a venue-caused cancellation or a no-show is a staff
 // call only — a guest must never be able to mark themselves a no-show to
 // dodge the late-cancellation forfeit. Every staff path is additionally
-// scoped to the payment's own restaurant (report item #13): a manager of
-// venue A must not be able to settle venue B's payment just by knowing its
-// booking id.
+// gated by domain.PermPaymentRefund (RBAC foundation, spec: "оформляет
+// возврат платежа" — manager and owner only, NOT a hostess), and scoped to
+// the payment's own restaurant (report item #13): a manager of venue A must
+// not be able to settle venue B's payment just by knowing its booking id.
 func authorizeSettle(ctx context.Context, managers managerChecker, actor Actor, trigger domain.RefundTrigger, p *domain.Payment) error {
 	switch trigger {
 	case domain.RefundTriggerGuestCancel:
 		if actor.staff() {
-			return authorizeStaffForRestaurant(ctx, managers, actor, p.RestaurantID)
+			return authorizeStaffPermission(ctx, managers, actor, p.RestaurantID, domain.PermPaymentRefund)
 		}
 		if p.UserID != nil && !actor.isUser(p.UserID) {
 			return fmt.Errorf("%w: payment belongs to another guest", domain.ErrForbidden)
 		}
 		return nil
 	case domain.RefundTriggerVenueCancel, domain.RefundTriggerNoShow:
-		return authorizeStaffForRestaurant(ctx, managers, actor, p.RestaurantID)
+		return authorizeStaffPermission(ctx, managers, actor, p.RestaurantID, domain.PermPaymentRefund)
 	default:
 		return fmt.Errorf("%w: unknown refund trigger %q", domain.ErrValidation, trigger)
 	}

@@ -746,15 +746,24 @@ func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restauran
 type fakeManagerChecker struct {
 	mu      sync.Mutex
 	managed map[uuid.UUID]map[uuid.UUID]bool // userID -> restaurantID -> manages
+	// permissions overrides HasPermission for a specific (user, restaurant,
+	// perm) triple — tests that care about the manager-vs-hostess RBAC split
+	// (e.g. TestSettle_HostessCannotRefund) register a narrower truth here;
+	// everything else falls back to allowAllByDefault, same as Manages.
+	permissions map[uuid.UUID]map[uuid.UUID]map[domain.Permission]bool
 	// allowAllByDefault mirrors "staff of any single venue" test setups that
-	// never register anything: true means every (user, restaurant) pair
-	// manages, matching the pre-item-#13 behaviour for tests that are not
-	// specifically about tenant scoping.
+	// never register anything: true means every (user, restaurant[, perm])
+	// combination is allowed, matching the pre-item-#13 behaviour for tests
+	// that are not specifically about tenant scoping or the RBAC split.
 	allowAllByDefault bool
 }
 
 func newFakeManagerChecker() *fakeManagerChecker {
-	return &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: true}
+	return &fakeManagerChecker{
+		managed:           map[uuid.UUID]map[uuid.UUID]bool{},
+		permissions:       map[uuid.UUID]map[uuid.UUID]map[domain.Permission]bool{},
+		allowAllByDefault: true,
+	}
 }
 
 func (f *fakeManagerChecker) set(userID, restaurantID uuid.UUID, manages bool) {
@@ -766,12 +775,39 @@ func (f *fakeManagerChecker) set(userID, restaurantID uuid.UUID, manages bool) {
 	f.managed[userID][restaurantID] = manages
 }
 
+// setPermission registers an explicit HasPermission answer for (userID,
+// restaurantID, perm), overriding allowAllByDefault for that one triple.
+func (f *fakeManagerChecker) setPermission(userID, restaurantID uuid.UUID, perm domain.Permission, allowed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.permissions[userID] == nil {
+		f.permissions[userID] = map[uuid.UUID]map[domain.Permission]bool{}
+	}
+	if f.permissions[userID][restaurantID] == nil {
+		f.permissions[userID][restaurantID] = map[domain.Permission]bool{}
+	}
+	f.permissions[userID][restaurantID][perm] = allowed
+}
+
 func (f *fakeManagerChecker) Manages(_ context.Context, userID, restaurantID uuid.UUID) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if byRestaurant, ok := f.managed[userID]; ok {
 		if v, ok := byRestaurant[restaurantID]; ok {
 			return v, nil
+		}
+	}
+	return f.allowAllByDefault, nil
+}
+
+func (f *fakeManagerChecker) HasPermission(_ context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if byRestaurant, ok := f.permissions[userID]; ok {
+		if byPerm, ok := byRestaurant[restaurantID]; ok {
+			if v, ok := byPerm[perm]; ok {
+				return v, nil
+			}
 		}
 	}
 	return f.allowAllByDefault, nil

@@ -127,6 +127,11 @@ func (r partnershipRequest) toInput() uc.PartnershipInput {
 
 type assignManagerRequest struct {
 	UserID        string  `json:"user_id"`
+	Role          string  `json:"role"` // one of: owner, manager, hostess
 	WhatsappOptIn bool    `json:"whatsapp_opt_in"`
 	WhatsappPhone *string `json:"whatsapp_phone"`
+}
+
+type setManagerRoleRequest struct {
+	Role string `json:"role"` // one of: owner, manager, hostess
 }

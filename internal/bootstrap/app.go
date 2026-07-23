@@ -104,6 +104,16 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restHandler.RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
 
+	// Staff-roster management (list/assign/set role/remove a restaurant's own
+	// manager/hostess accounts): NOT gated by RequireRole/RequireRestaurantManager
+	// here — the RBAC matrix (who may manage which restaurant's staff) is
+	// resolved entirely inside usecase/restaurants.ManagerUseCase, which needs
+	// to look the target restaurant up per-call anyway (SetRole/Remove resolve
+	// it from the manager row itself, not the URL). Any authenticated caller
+	// may reach the handler; the usecase returns ErrForbidden for anyone who
+	// isn't that restaurant's own owner or a superadmin.
+	restHandler.RegisterStaffRoutes(authed)
+
 	// Restaurant-scoped mutations: admin OR the restaurant's own manager.
 	// Every route under /restaurants/:… uses the ":id" param (gin forbids mixing
 	// ":id" and ":restaurantId" at the same position), so both gates read "id".

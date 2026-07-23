@@ -245,45 +245,5 @@ func TestSubmitPartnershipValidates(t *testing.T) {
 	}
 }
 
-func TestManagerAssignChecksUserExists(t *testing.T) {
-	u := NewManagerUseCase(&fakeManagers{}, &fakeUsers{err: domain.ErrNotFound})
-	if _, err := u.Assign(context.Background(), AssignManagerInput{UserID: uuid.New(), RestaurantID: uuid.New()}); !errors.Is(err, domain.ErrNotFound) {
-		t.Errorf("assign missing user err = %v, want ErrNotFound", err)
-	}
-}
-
-func TestManagerAssignSuccess(t *testing.T) {
-	rid, uid := uuid.New(), uuid.New()
-	fm := &fakeManagers{}
-	u := NewManagerUseCase(fm, &fakeUsers{})
-
-	m, err := u.Assign(context.Background(), AssignManagerInput{
-		RestaurantID: rid, UserID: uid, WhatsappOptIn: true,
-	})
-	if err != nil {
-		t.Fatalf("assign: %v", err)
-	}
-	if m == nil {
-		t.Fatal("expected non-nil manager")
-	}
-	if fm.created == nil {
-		t.Fatal("expected manager created")
-	}
-	if fm.created.RestaurantID != rid || fm.created.UserID != uid || !fm.created.WhatsappOptIn {
-		t.Errorf("created = %+v, want RestaurantID=%v UserID=%v WhatsappOptIn=true", fm.created, rid, uid)
-	}
-}
-
-func TestManagerManages(t *testing.T) {
-	rid := uuid.New()
-	fm := &fakeManagers{byUser: []domain.RestaurantManager{{RestaurantID: rid}}}
-	u := NewManagerUseCase(fm, &fakeUsers{})
-	ok, err := u.Manages(context.Background(), uuid.New(), rid)
-	if err != nil || !ok {
-		t.Errorf("Manages = %v, %v; want true, nil", ok, err)
-	}
-	ok, _ = u.Manages(context.Background(), uuid.New(), uuid.New())
-	if ok {
-		t.Error("Manages = true for unrelated restaurant, want false")
-	}
-}
+// Manager/staff-role tests moved to managers_test.go (RBAC is a big enough
+// surface to deserve its own file, separate from the catalog facade above).
