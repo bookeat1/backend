@@ -78,3 +78,5 @@ func (t *inlineTx) WithinTx(ctx context.Context, fn func(context.Context) error)
 }
 
 func strp(s string) *string { return &s }
+
+func (t *inlineTx) Detach(ctx context.Context) context.Context { return ctx }

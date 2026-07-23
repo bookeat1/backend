@@ -14,9 +14,11 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App  AppConfig
-	DB   DBConfig
-	Auth AuthConfig
+	App     AppConfig
+	DB      DBConfig
+	Auth    AuthConfig
+	Booking BookingConfig
+	Worker  WorkerConfig
 }
 
 type AppConfig struct {
@@ -53,6 +55,40 @@ type AuthConfig struct {
 	OTPRateLimitPerMin  int           // env: AUTH_OTP_RATE_PER_MIN
 	OTPRateLimitPerHour int           // env: AUTH_OTP_RATE_PER_HOUR
 	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
+}
+
+// BookingConfig holds the global (level-1) booking policy. A restaurant may
+// override any of these per venue (restaurants.booking_* columns, all NULLABLE
+// — NULL means "use the value from here"). Resolution: usecase/bookings.
+type BookingConfig struct {
+	DefaultDuration       time.Duration // env: BOOKING_DEFAULT_DURATION_MINUTES
+	DefaultBuffer         time.Duration // env: BOOKING_DEFAULT_BUFFER_MINUTES — cleanup gap added on both sides of the occupied slot
+	DefaultLead           time.Duration // env: BOOKING_DEFAULT_LEAD_MINUTES — minimum distance from now to starts_at
+	DefaultHorizonDays    int           // env: BOOKING_DEFAULT_HORIZON_DAYS — furthest bookable day ahead
+	DefaultCancelDeadline time.Duration // env: BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES — guest may cancel until starts_at minus this
+	DefaultConfirmSLA     time.Duration // env: BOOKING_DEFAULT_CONFIRM_SLA_MINUTES — pending auto-confirm / escalation deadline
+	DefaultMaxGuests      int           // env: BOOKING_DEFAULT_MAX_GUESTS
+	DefaultAutoConfirm    bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM
+	TimezoneFallback      string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
+
+	// Anti-fraud: at most RateLimit booking attempts per normalized phone
+	// within RateWindow (booking_rate_log).
+	RateLimit  int           // env: BOOKING_RATE_LIMIT
+	RateWindow time.Duration // env: BOOKING_RATE_WINDOW
+
+	// SlotStep is the granularity used to generate bookable start times for a
+	// venue that publishes opening hours but no explicit time slots.
+	SlotStep time.Duration // env: BOOKING_SLOT_STEP_MINUTES
+}
+
+// WorkerConfig configures the background booking worker (cmd/worker): how
+// often it wakes up and how long a finished booking is left alone before it is
+// closed as completed / no_show. The per-venue booking policy is NOT here — it
+// is resolved from BookingConfig plus the restaurant's overrides.
+type WorkerConfig struct {
+	TickInterval time.Duration // env: WORKER_TICK_INTERVAL
+	NoShowGrace  time.Duration // env: WORKER_NO_SHOW_GRACE
+	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
 func (p PostgresConfig) DSN() string {
@@ -103,6 +139,25 @@ func NewConfig() (Config, error) {
 			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
 			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
 		},
+		Booking: BookingConfig{
+			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 90),
+			DefaultBuffer:         getEnvMinutes("BOOKING_DEFAULT_BUFFER_MINUTES", 0),
+			DefaultLead:           getEnvMinutes("BOOKING_DEFAULT_LEAD_MINUTES", 60),
+			DefaultHorizonDays:    getEnvInt("BOOKING_DEFAULT_HORIZON_DAYS", 60),
+			DefaultCancelDeadline: getEnvMinutes("BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES", 180),
+			DefaultConfirmSLA:     getEnvMinutes("BOOKING_DEFAULT_CONFIRM_SLA_MINUTES", 120),
+			DefaultMaxGuests:      getEnvInt("BOOKING_DEFAULT_MAX_GUESTS", 20),
+			DefaultAutoConfirm:    getEnvBool("BOOKING_DEFAULT_AUTO_CONFIRM", true),
+			TimezoneFallback:      getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
+			RateLimit:             getEnvInt("BOOKING_RATE_LIMIT", 10),
+			RateWindow:            getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
+			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+		},
+		Worker: WorkerConfig{
+			TickInterval: getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
+			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
+			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
+		},
 	}
 
 	return cfg, nil
@@ -126,6 +181,17 @@ func getEnvInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// getEnvMinutes returns the environment variable named by key interpreted as a
+// whole number of minutes, or defMinutes when unset or unparseable. Negative
+// values fall back to the default (a negative buffer or lead is meaningless).
+func getEnvMinutes(key string, defMinutes int) time.Duration {
+	n := getEnvInt(key, defMinutes)
+	if n < 0 {
+		n = defMinutes
+	}
+	return time.Duration(n) * time.Minute
 }
 
 // getEnvDuration returns the duration value of the environment variable named

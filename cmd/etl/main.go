@@ -41,6 +41,8 @@ func main() {
 		runErr = runRestaurants(context.Background(), db, log)
 	case "menu":
 		runErr = runMenu(context.Background(), db, log)
+	case "bookings":
+		runErr = runBookings(context.Background(), db, cfg.Booking, log)
 	default:
 		log.Error("unknown etl target", slog.String("target", target))
 		os.Exit(1)
