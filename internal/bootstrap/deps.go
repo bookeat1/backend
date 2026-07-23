@@ -22,8 +22,8 @@ import (
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
-	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
+	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
@@ -60,6 +60,7 @@ type Deps struct {
 	BookingBlacklist   bookings.BlacklistUseCase
 	BookingPolicy      bookings.PolicyUseCase
 	AdminPanel         *admin.UseCase
+	BookingExternal    bookings.ExternalReservationUseCase
 	Issuer             *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
@@ -132,6 +133,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingOutbox := bookingrepo.NewOutbox(db)
 	bookingBlacklist := bookingrepo.NewBlacklist(db)
 	bookingRateLog := bookingrepo.NewRateLog(db)
+	bookingExternal := bookingrepo.NewExternalReservations(db)
 	idempotencyKeys := idemrepo.New(db)
 
 	bookingCfg := newBookingConfig(cfg)
@@ -204,7 +206,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
 		AdminPanel:       adminPanel,
-		Issuer:           issuer,
+		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
+			restRelated, restaurantManagers, txm),
+		Issuer: issuer,
 
 		PaymentsRepo:         paymentsRepo,
 		PaymentRefundsRepo:   paymentRefundsRepo,

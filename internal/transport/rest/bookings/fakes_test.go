@@ -275,3 +275,33 @@ func (f *fakePolicy) viewOrDefault() *uc.PolicyView {
 	}
 	return &uc.PolicyView{Effective: domain.BookingPolicy{Timezone: "Asia/Almaty"}}
 }
+
+// fakeExternal is a stub ExternalReservationUseCase for the handler tests.
+type fakeExternal struct {
+	err    error
+	create *domain.ExternalReservation
+	list   []domain.ExternalReservation
+}
+
+func (f *fakeExternal) Create(_ context.Context, _ uc.Actor, restaurantID uuid.UUID, in uc.ExternalHoldInput) (*domain.ExternalReservation, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.create != nil {
+		return f.create, nil
+	}
+	source := in.Source
+	if source == "" {
+		source = domain.ExtSourceManual
+	}
+	return &domain.ExternalReservation{
+		ID: uuid.New(), RestaurantID: restaurantID, TableID: in.TableID,
+		StartsAt: in.StartsAt, EndsAt: in.EndsAt, Source: source, Active: true,
+	}, nil
+}
+
+func (f *fakeExternal) Delete(_ context.Context, _ uc.Actor, _, _ uuid.UUID) error { return f.err }
+
+func (f *fakeExternal) List(_ context.Context, _ uc.Actor, _ uuid.UUID, _, _ time.Time) ([]domain.ExternalReservation, error) {
+	return f.list, f.err
+}
