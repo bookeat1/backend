@@ -17,6 +17,8 @@ type fakeRestaurantRepo struct {
 	total    int
 	activeID uuid.UUID
 	active   bool
+	policyID uuid.UUID
+	policy   domain.BookingPolicyOverride
 }
 
 func (f *fakeRestaurantRepo) Create(_ context.Context, r *domain.Restaurant) error {
@@ -35,6 +37,10 @@ func (f *fakeRestaurantRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.R
 		return &domain.RestaurantAggregate{}, nil
 	}
 	return f.agg, nil
+}
+func (f *fakeRestaurantRepo) UpdateBookingPolicy(_ context.Context, id uuid.UUID, o domain.BookingPolicyOverride) error {
+	f.policyID, f.policy = id, o
+	return nil
 }
 func (f *fakeRestaurantRepo) ListActive(_ context.Context, _ domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
 	return f.list, f.total, nil
@@ -156,3 +162,5 @@ func (t *inlineTx) WithinTx(ctx context.Context, fn func(context.Context) error)
 	t.called = true
 	return fn(ctx)
 }
+
+func (t *inlineTx) Detach(ctx context.Context) context.Context { return ctx }

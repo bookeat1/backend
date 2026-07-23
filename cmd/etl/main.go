@@ -21,7 +21,7 @@ func main() {
 		slog.Error("load config", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	log := logger.New(cfg.App.LogLevel)
+	log := logger.New(cfg.App.LogLevel, cfg.App.LogFormat)
 	db, err := bootstrap.NewSQLDB(cfg.DB.Postgres)
 	if err != nil {
 		log.Error("connect db", slog.String("error", err.Error()))
@@ -41,6 +41,8 @@ func main() {
 		runErr = runRestaurants(context.Background(), db, log)
 	case "menu":
 		runErr = runMenu(context.Background(), db, log)
+	case "bookings":
+		runErr = runBookings(context.Background(), db, cfg.Booking, log)
 	default:
 		log.Error("unknown etl target", slog.String("target", target))
 		os.Exit(1)

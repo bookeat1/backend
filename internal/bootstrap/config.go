@@ -14,9 +14,22 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App  AppConfig
-	DB   DBConfig
-	Auth AuthConfig
+	App      AppConfig
+	DB       DBConfig
+	Auth     AuthConfig
+	Booking  BookingConfig
+	Worker   WorkerConfig
+	Payments PaymentsConfig
+	// PaymentsReconciler configures the background payments reconciliation
+	// worker (usecase/payments.Reconciler). KNOWN GAP, disclosed: this
+	// config is read and validated here, but cmd/worker does not construct
+	// the reconciler yet — that needs a real Postgres implementation of
+	// domain.PaymentRepository / PaymentRefundRepository / PaymentLedgerRepository
+	// / PaymentOutboxRepository, which does not exist in this branch (only
+	// in-memory test fakes do, same KNOWN GAP as the rest of usecase/payments —
+	// see team-memory's payments-usecase notes). Wiring RunWorker to start it
+	// is the next step once that adapter lands.
+	PaymentsReconciler PaymentsReconcilerConfig
 }
 
 type AppConfig struct {
@@ -24,6 +37,7 @@ type AppConfig struct {
 	Environment        string
 	URL                string
 	LogLevel           string
+	LogFormat          string // env: APP_LOG_FORMAT — "json" (default) or "text"
 	CORSAllowedOrigins []string
 }
 
@@ -55,6 +69,104 @@ type AuthConfig struct {
 	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
 }
 
+// BookingConfig holds the global (level-1) booking policy. A restaurant may
+// override any of these per venue (restaurants.booking_* columns, all NULLABLE
+// — NULL means "use the value from here"). Resolution: usecase/bookings.
+type BookingConfig struct {
+	DefaultDuration       time.Duration // env: BOOKING_DEFAULT_DURATION_MINUTES
+	DefaultBuffer         time.Duration // env: BOOKING_DEFAULT_BUFFER_MINUTES — cleanup gap added on both sides of the occupied slot
+	DefaultLead           time.Duration // env: BOOKING_DEFAULT_LEAD_MINUTES — minimum distance from now to starts_at
+	DefaultHorizonDays    int           // env: BOOKING_DEFAULT_HORIZON_DAYS — furthest bookable day ahead
+	DefaultCancelDeadline time.Duration // env: BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES — guest may cancel until starts_at minus this
+	DefaultConfirmSLA     time.Duration // env: BOOKING_DEFAULT_CONFIRM_SLA_MINUTES — pending auto-confirm / escalation deadline
+	DefaultMaxGuests      int           // env: BOOKING_DEFAULT_MAX_GUESTS
+	DefaultAutoConfirm    bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM
+	TimezoneFallback      string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
+
+	// Anti-fraud: at most RateLimit booking attempts per normalized phone
+	// within RateWindow (booking_rate_log).
+	RateLimit  int           // env: BOOKING_RATE_LIMIT
+	RateWindow time.Duration // env: BOOKING_RATE_WINDOW
+
+	// SlotStep is the granularity used to generate bookable start times for a
+	// venue that publishes opening hours but no explicit time slots.
+	SlotStep time.Duration // env: BOOKING_SLOT_STEP_MINUTES
+}
+
+// WorkerConfig configures the background booking worker (cmd/worker): how
+// often it wakes up and how long a finished booking is left alone before it is
+// closed as completed / no_show. The per-venue booking policy is NOT here — it
+// is resolved from BookingConfig plus the restaurant's overrides.
+type WorkerConfig struct {
+	TickInterval time.Duration // env: WORKER_TICK_INTERVAL
+	NoShowGrace  time.Duration // env: WORKER_NO_SHOW_GRACE
+	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
+}
+
+// PaymentsConfig holds the global (level-1) payment settings. A restaurant may
+// override most of them per venue (restaurants.payments_enabled /
+// deposit_* / preorder_payment_required / service_fee_bps / payment_provider,
+// all NULLABLE — NULL means "use the value from here"). Resolution:
+// usecase/payments.
+//
+// Acquirer credentials are deliberately NOT part of this struct: each adapter
+// reads its own keys from env, and they never reach the database (spec §8).
+type PaymentsConfig struct {
+	Enabled bool // env: PAYMENTS_ENABLED — master switch, off by default
+
+	// DefaultProvider is the acquirer used when the venue has no preference or
+	// its preferred one is disabled in the payment_providers registry.
+	DefaultProvider string // env: PAYMENTS_DEFAULT_PROVIDER
+
+	// ServiceFeeBps is the BookEat service fee charged to the guest, in basis
+	// points (350 = 3.5%). Basis points, not a float percentage: 3.5% in a
+	// float is a rounding error in somebody else's wallet.
+	ServiceFeeBps int // env: PAYMENTS_SERVICE_FEE_BPS
+
+	// RefundAcquiringBps is what is withheld from a refund to cover the cost of
+	// moving money back, in basis points of the total (100 = 1%). It is a cost
+	// booked to the `acquirer` ledger account, not platform revenue.
+	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
+
+	// DepositDefaultMinor is the deposit charged per booking, in tiyn, when the
+	// venue requires one but sets no amount of its own.
+	DepositDefaultMinor int64 // env: PAYMENTS_DEPOSIT_DEFAULT_MINOR
+
+	// DepositRequired and PreorderPaymentRequired are the GLOBAL fallback for
+	// restaurants.deposit_required / preorder_payment_required when a venue
+	// sets neither override (payments review 2026-07-23, item #10): without
+	// these, usecase/payments.resolveAmount always found "no payment
+	// required" for any restaurant running on the global defaults, so
+	// CreateForBooking rejected every checkout with ErrValidation. A venue's
+	// own override (NULLABLE columns from migration 0007) still wins when set.
+	DepositRequired         bool // env: PAYMENTS_DEPOSIT_REQUIRED
+	PreorderPaymentRequired bool // env: PAYMENTS_PREORDER_PAYMENT_REQUIRED
+
+	// HoldTTL is how long an authorization is expected to stay valid. The
+	// acquirer has the final say; this drives payments.expires_at and the
+	// reconciliation worker. Kept below FreedomPay's 5-day auto-clearing of an
+	// uncleared two-stage payment: a hold left past that is charged to the guest
+	// instead of expiring, which is the opposite of what an expiry should do.
+	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
+}
+
+// PaymentsReconcilerConfig configures the background payments reconciliation
+// worker: how often it wakes up, how long a transient claim (capturing /
+// voiding / a refund in_flight or pending) may sit before it counts as stuck,
+// how long a created/authorized payment may go without a status change
+// before its acquirer status is read directly (in case a webhook was lost),
+// how many rows one pass claims per stage, how many consecutive unresolved
+// attempts flag a row for manual review, and the minimum spacing between two
+// acquirer calls (the avalanche guard).
+type PaymentsReconcilerConfig struct {
+	TickInterval     time.Duration // env: PAYMENTS_RECONCILE_TICK_INTERVAL
+	StuckAfter       time.Duration // env: PAYMENTS_RECONCILE_STUCK_AFTER
+	LostWebhookAfter time.Duration // env: PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER
+	BatchSize        int           // env: PAYMENTS_RECONCILE_BATCH_SIZE
+	MaxAttempts      int           // env: PAYMENTS_RECONCILE_MAX_ATTEMPTS
+	ProviderMinGap   time.Duration // env: PAYMENTS_RECONCILE_PROVIDER_MIN_GAP
+}
+
 func (p PostgresConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -77,6 +189,7 @@ func NewConfig() (Config, error) {
 			Environment:        getEnv("APP_ENV", "development"),
 			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
 			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
+			LogFormat:          getEnv("APP_LOG_FORMAT", "json"),
 			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
 		},
 		DB: DBConfig{
@@ -103,6 +216,43 @@ func NewConfig() (Config, error) {
 			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
 			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
 		},
+		Booking: BookingConfig{
+			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 90),
+			DefaultBuffer:         getEnvMinutes("BOOKING_DEFAULT_BUFFER_MINUTES", 0),
+			DefaultLead:           getEnvMinutes("BOOKING_DEFAULT_LEAD_MINUTES", 60),
+			DefaultHorizonDays:    getEnvInt("BOOKING_DEFAULT_HORIZON_DAYS", 60),
+			DefaultCancelDeadline: getEnvMinutes("BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES", 180),
+			DefaultConfirmSLA:     getEnvMinutes("BOOKING_DEFAULT_CONFIRM_SLA_MINUTES", 120),
+			DefaultMaxGuests:      getEnvInt("BOOKING_DEFAULT_MAX_GUESTS", 20),
+			DefaultAutoConfirm:    getEnvBool("BOOKING_DEFAULT_AUTO_CONFIRM", true),
+			TimezoneFallback:      getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
+			RateLimit:             getEnvInt("BOOKING_RATE_LIMIT", 10),
+			RateWindow:            getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
+			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+		},
+		Worker: WorkerConfig{
+			TickInterval: getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
+			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
+			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
+		},
+		Payments: PaymentsConfig{
+			Enabled:                 getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:         getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:           getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:      getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
+			DepositDefaultMinor:     getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
+			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
+			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+		},
+		PaymentsReconciler: PaymentsReconcilerConfig{
+			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),
+			StuckAfter:       getEnvDuration("PAYMENTS_RECONCILE_STUCK_AFTER", 10*time.Minute),
+			LostWebhookAfter: getEnvDuration("PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER", time.Hour),
+			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
+			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
+			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
+		},
 	}
 
 	return cfg, nil
@@ -122,6 +272,29 @@ func getEnv(key, def string) string {
 func getEnvInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// getEnvMinutes returns the environment variable named by key interpreted as a
+// whole number of minutes, or defMinutes when unset or unparseable. Negative
+// values fall back to the default (a negative buffer or lead is meaningless).
+func getEnvMinutes(key string, defMinutes int) time.Duration {
+	n := getEnvInt(key, defMinutes)
+	if n < 0 {
+		n = defMinutes
+	}
+	return time.Duration(n) * time.Minute
+}
+
+// getEnvInt64 returns the 64-bit integer value of the environment variable
+// named by key, or def when the variable is unset or not a valid integer. Money
+// amounts are int64 (tiyn) everywhere, so they need their own reader.
+func getEnvInt64(key string, def int64) int64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 			return n
 		}
 	}

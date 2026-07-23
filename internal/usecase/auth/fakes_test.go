@@ -147,6 +147,8 @@ type noTx struct{}
 
 func (noTx) WithinTx(ctx context.Context, fn func(context.Context) error) error { return fn(ctx) }
 
+func (noTx) Detach(ctx context.Context) context.Context { return ctx }
+
 // stubSender records nothing and returns channel "test".
 type stubSender struct{ lastCode string }
 
