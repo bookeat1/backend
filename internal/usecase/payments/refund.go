@@ -18,13 +18,23 @@ import (
 // into its final split across guest / restaurant / platform / acquirer
 // (spec §9.1, scenarios 5 and 6). It is a ONE-SHOT, whole-payment settlement:
 // a payment can be settled exactly once — enforced by Payment.SettledAt (see
-// domain.Payment's doc comment and report item #7), not merely by
-// GetLiveByBookingID no longer returning it (that alone only holds for the
-// refund outcome; a late-cancellation/no-show settlement deliberately leaves
-// Status == captured, so it stays "live" forever without the SettledAt
-// guard). Refunding a single pre-ordered line while the rest of the booking
-// stands is a different operation and is explicitly out of scope here (spec
-// §6) — see the report for the KNOWN GAP this leaves.
+// domain.Payment's doc comment and report item #7), not by whether the
+// payment can still be looked up at all. That distinction matters because
+// Settle resolves the payment via GetSettleableByBookingID, not
+// GetLiveByBookingID: GetLiveByBookingID stops finding a payment the moment
+// it leaves the "live" set (authorized/capturing/voiding/captured), which
+// happens for the refund outcome — Settle moves the payment to `refunded`
+// — the exact moment a retried Settle call (same booking, same idempotency
+// key, e.g. after a client-side timeout with no response) would need to find
+// it again to resume idempotently instead of 404ing. GetSettleableByBookingID
+// additionally covers refunded/partially_refunded for exactly this reason.
+// (A late-cancellation/no-show settlement deliberately leaves Status ==
+// captured, so it was already found by GetLiveByBookingID too — the
+// SettledAt guard below is still what actually decides "was this settled
+// already", both lookups exist only to make sure Settle can find the row in
+// the first place.) Refunding a single pre-ordered line while the rest of
+// the booking stands is a different operation and is explicitly out of
+// scope here (spec §6) — see the report for the KNOWN GAP this leaves.
 type RefundUseCase interface {
 	Settle(ctx context.Context, actor Actor, bookingID uuid.UUID, in SettleInput) (*domain.Payment, error)
 }
@@ -114,14 +124,27 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 		return nil, fmt.Errorf("%w: only venue staff or admin may override the cancellation time", domain.ErrForbidden)
 	}
 
-	p, err := u.payments.GetLiveByBookingID(ctx, bookingID)
+	// GetSettleableByBookingID, not GetLiveByBookingID: see the type doc
+	// comment above for why the refund outcome specifically needs the wider
+	// lookup to make a retried Settle call idempotent instead of a 404.
+	p, err := u.payments.GetSettleableByBookingID(ctx, bookingID)
 	if err != nil {
 		return nil, err
 	}
 	if err := authorizeSettle(ctx, u.managers, actor, in.Trigger, p); err != nil {
 		return nil, err
 	}
-	if p.Status != domain.PaymentCaptured {
+	// The "must be captured" precondition only applies to a payment Settle
+	// has never touched (SettledAt == nil): that's the one genuinely invalid
+	// call this guards against (e.g. settling an authorized-but-never-captured
+	// hold). Once SettledAt is set, Status legitimately differs — `refunded`
+	// after a full-refund settlement, still `captured` after a no-refund one
+	// (see the type doc comment) — and the SettledAt/sameSettlementAttempt
+	// check right below is what actually decides whether THIS call may
+	// resume it. Requiring Status == captured unconditionally here is exactly
+	// what used to turn a legitimate retry of the refund outcome into a 422
+	// instead of an idempotent 200.
+	if p.Status != domain.PaymentCaptured && p.SettledAt == nil {
 		return nil, fmt.Errorf(
 			"%w: payment is %s, settle only applies to a captured payment (an authorized hold is voided, not settled)",
 			domain.ErrInvalidStatus, p.Status)
@@ -146,6 +169,24 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 	if p.SettledAt != nil {
 		if !sameSettlementAttempt(p, in) {
 			return nil, fmt.Errorf("%w: payment %s was already settled", domain.ErrAlreadyExists, p.ID)
+		}
+		// Bug fix (report): a legitimate resume of the SAME settlement whose
+		// Status has already left `captured` (only the with-refund outcome
+		// does this, moving it to `refunded` — see settleWithRefund) is
+		// already fully done: the acquirer call happened, the ledger and the
+		// status change were already committed. Recomputing from here would
+		// be wrong on two counts — domain.SettleRefund hard-requires
+		// Status == captured, and settleWithRefund's ledger/CAS commit below
+		// is not written to run a second time — so this returns the current,
+		// already-final row as-is instead of falling through. A resume whose
+		// Status is STILL captured (the no-refund outcome always stays there
+		// by design, and a with-refund outcome whose final commit has not
+		// happened yet also does) correctly falls through below: the
+		// no-refund path resumes via the outbox check in settleWithNoRefund,
+		// and the with-refund path resumes via the refund row's own status in
+		// settleWithRefund/claimAndCallGateway.
+		if p.Status != domain.PaymentCaptured {
+			return p, nil
 		}
 	}
 
