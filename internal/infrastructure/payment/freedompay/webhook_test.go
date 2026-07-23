@@ -390,7 +390,7 @@ func TestMapOperationStatus(t *testing.T) {
 		{"success", domain.RefundSucceeded, true},
 		{"OK", domain.RefundSucceeded, true},
 		{"1", domain.RefundSucceeded, true},
-		{"pending", domain.RefundCreated, true},
+		{"pending", domain.RefundPending, true},
 		{"failed", domain.RefundFailed, true},
 		{"", domain.RefundFailed, true},
 		{"unheard-of", domain.RefundFailed, false},

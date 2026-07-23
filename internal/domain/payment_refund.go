@@ -9,23 +9,51 @@ import (
 )
 
 // RefundStatus is the lifecycle state of a single refund, stored as VARCHAR.
-// Refunds have their own, much shorter machine than payments: they are created,
-// then they either land or they do not.
+//
+//	created ──claim──▶ in_flight ──acquirer call──┬──▶ succeeded  (explicit OK)
+//	                                                ├──▶ failed     (explicit decline, a code came back)
+//	                                                └──▶ pending    (timeout / 5xx / malformed — outcome UNKNOWN)
+//
+// `created` and `in_flight` exist to make the acquirer call itself race-safe
+// (report item #2): two concurrent Settle calls for the SAME idempotency key
+// both insert-or-find the same `created` row, but only the one that wins the
+// created→in_flight CAS may call the acquirer — the loser gets ErrAlreadyExists
+// and must not call it a second time.
+//
+// `pending` exists because a network timeout or a 5xx is NOT the same fact as
+// an explicit decline (report item #1): retrying the acquirer call for a
+// `pending` refund would be retrying an operation whose first attempt may have
+// already succeeded at the provider, i.e. a second real-world refund. A refund
+// in `pending` may only be resolved by reading the acquirer's own state
+// (PaymentGateway.Get) or by a future webhook — never by calling Refund again.
 type RefundStatus string
 
 const (
 	RefundCreated   RefundStatus = "created"
+	RefundInFlight  RefundStatus = "in_flight"
 	RefundSucceeded RefundStatus = "succeeded"
 	RefundFailed    RefundStatus = "failed"
+	// RefundPending is the uncertain-outcome state: the acquirer call ended in
+	// a timeout, a 5xx, or an unparsable answer. See the type doc comment.
+	RefundPending RefundStatus = "pending"
 )
 
 // Valid reports whether s is a known refund status.
 func (s RefundStatus) Valid() bool {
 	switch s {
-	case RefundCreated, RefundSucceeded, RefundFailed:
+	case RefundCreated, RefundInFlight, RefundSucceeded, RefundFailed, RefundPending:
 		return true
 	}
 	return false
+}
+
+// RetryableAtAcquirer reports whether the caller may call PaymentGateway.Refund
+// again for a refund in this status. Only `created` may retry-from-scratch (it
+// never reached the acquirer); `in_flight` is reserved for whoever won the CAS
+// currently making the call; `pending` explicitly may NOT retry (report item
+// #1) — it can only be resolved by reading the acquirer's own status.
+func (s RefundStatus) RetryableAtAcquirer() bool {
+	return s == RefundCreated
 }
 
 // PaymentRefund is one refund against a payment. Refunds are partial and
@@ -42,8 +70,18 @@ type PaymentRefund struct {
 	IdempotencyKey   string
 	FailureCode      *string
 	FailureMessage   *string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// StatusChangedAt is the reconciliation lease clock, same purpose as
+	// Payment.StatusChangedAt (migration 0010): stamped every time Status
+	// actually changes, so "how long has this refund been in_flight/pending"
+	// can be measured without confusing it with CreatedAt.
+	StatusChangedAt time.Time
+	// ReconcileAttempts / LastReconcileAttemptAt / NeedsManualReview mirror
+	// Payment's fields of the same name, applied to one refund attempt.
+	ReconcileAttempts      int
+	LastReconcileAttemptAt *time.Time
+	NeedsManualReview      bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // Amount returns the refund amount as Money.
@@ -56,11 +94,41 @@ type PaymentRefundRepository interface {
 	Create(ctx context.Context, r *PaymentRefund) error
 	Update(ctx context.Context, r *PaymentRefund) error
 	GetByID(ctx context.Context, id uuid.UUID) (*PaymentRefund, error)
+	// GetByIdempotencyKey resolves our own retry token for one payment, backed
+	// by idx_payment_refunds_idempotency (UNIQUE (payment_id, idempotency_key)).
+	// A retry of the same cancellation/settlement request replays this row
+	// instead of asking the acquirer to refund twice. Returns ErrNotFound when
+	// unused.
+	GetByIdempotencyKey(ctx context.Context, paymentID uuid.UUID, idempotencyKey string) (*PaymentRefund, error)
 	ListByPaymentID(ctx context.Context, paymentID uuid.UUID) ([]PaymentRefund, error)
 	// SucceededTotal is the sum of successful refunds for a payment. It is the
 	// left-hand side of "never refund more than what is left" and must be read
 	// inside the same transaction as the refund insert (spec §8).
 	SucceededTotal(ctx context.Context, paymentID uuid.UUID) (int64, error)
+	// CompareAndSwapStatus is the same DB-level guard as
+	// PaymentRepository.CompareAndSwapStatus, applied to one refund row: a
+	// single `UPDATE payment_refunds SET status = $to, updated_at = $at WHERE
+	// id = $id AND status = $from`. It returns ErrAlreadyExists when zero rows
+	// matched. This is what makes the created→in_flight claim exclusive
+	// (report item #2): the loser of a concurrent Settle race for the same
+	// idempotency key must never reach the acquirer call.
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to RefundStatus, at time.Time) error
+	// ClaimStale selects up to limit refunds in the given statuses whose
+	// StatusChangedAt is older than before, oldest first — the reconciliation
+	// worker's input for a refund left in_flight/pending after a crash or a
+	// timeout (usecase/payments.Reconciler). Same non-locking-across-the-
+	// acquirer-call caveat as PaymentRepository.ClaimStale.
+	ClaimStale(ctx context.Context, statuses []RefundStatus, before time.Time, limit int) ([]PaymentRefund, error)
+	// RecordReconcileAttempt is the CAS-guarded write behind
+	// ReconcileAttempts / LastReconcileAttemptAt / NeedsManualReview, same
+	// contract as PaymentRepository.RecordReconcileAttempt: `UPDATE
+	// payment_refunds SET reconcile_attempts = reconcile_attempts + 1,
+	// last_reconcile_attempt_at = $at,
+	// needs_manual_review = (reconcile_attempts + 1 >= $maxAttempts) WHERE
+	// id = $id AND status = $expectedStatus RETURNING reconcile_attempts,
+	// needs_manual_review`. ErrAlreadyExists means the refund's status
+	// already moved on — nothing to bump.
+	RecordReconcileAttempt(ctx context.Context, id uuid.UUID, expectedStatus RefundStatus, at time.Time, maxAttempts int) (attempts int, needsManualReview bool, err error)
 }
 
 // ---------------------------------------------------------------------------

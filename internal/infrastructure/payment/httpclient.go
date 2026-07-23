@@ -16,7 +16,6 @@ package payment
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,13 +37,20 @@ const maxResponseBytes = 1 << 20
 var (
 	// ErrProviderUnavailable is a network failure, a timeout or a 5xx that
 	// survived every retry. The payment status is UNKNOWN after this — the
-	// caller must reconcile, never assume "not charged".
-	ErrProviderUnavailable = errors.New("payment provider unavailable")
+	// caller must reconcile, never assume "not charged". It wraps
+	// domain.ErrProviderOutcomeUnknown so usecase/payments (which never
+	// imports this package) can recognise "do not retry the money-moving call
+	// blindly" without a type from here (report item #1).
+	ErrProviderUnavailable = fmt.Errorf("payment provider unavailable: %w", domain.ErrProviderOutcomeUnknown)
 	// ErrProviderRejected is a well-formed answer that says no (4xx, or a
-	// provider-level error envelope).
-	ErrProviderRejected = fmt.Errorf("payment provider rejected the request: %w", domain.ErrValidation)
-	// ErrProviderMalformed is an answer we could not parse.
-	ErrProviderMalformed = errors.New("payment provider returned a malformed response")
+	// provider-level error envelope) — a DEFINITE decline, not an unknown
+	// outcome. Wraps both domain.ErrValidation (existing HTTP-mapping
+	// behaviour) and domain.ErrProviderDeclined (report item #1).
+	ErrProviderRejected = fmt.Errorf("payment provider rejected the request: %w: %w", domain.ErrValidation, domain.ErrProviderDeclined)
+	// ErrProviderMalformed is an answer we could not parse. Wraps
+	// domain.ErrProviderOutcomeUnknown: we sent the request, we simply could
+	// not read the confirmation, so whether money moved is unknown.
+	ErrProviderMalformed = fmt.Errorf("payment provider returned a malformed response: %w", domain.ErrProviderOutcomeUnknown)
 )
 
 // Config tunes the shared HTTP client. Zero fields fall back to DefaultConfig.
