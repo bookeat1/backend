@@ -22,6 +22,7 @@ import (
 	"backend-core/internal/transport/rest/middleware"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	restrest "backend-core/internal/transport/rest/restaurants"
+	reviewsrest "backend-core/internal/transport/rest/reviews"
 	"backend-core/internal/transport/rest/swaggerui"
 	usersrest "backend-core/internal/transport/rest/users"
 )
@@ -96,6 +97,17 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)
+
+	// Reviews & ratings. Public: a restaurant's published reviews + aggregate
+	// rating (no auth). Guest own-review + staff reply/moderation mount on the
+	// authenticated group — the staff RBAC check (PermStaffManage at the
+	// review's own restaurant) is resolved inside usecase/reviews, so these
+	// routes need no RequireRestaurantManager gate (the review id, not a
+	// restaurant id, identifies the staff-action target).
+	reviewsHandler := reviewsrest.NewHandler(deps.ReviewsFacade)
+	reviewsHandler.RegisterPublic(api)
+	reviewsHandler.RegisterGuestRoutes(authed)
+	reviewsHandler.RegisterStaffRoutes(authed)
 
 	bookingHandler := bookingsrest.NewHandler(deps.BookingsFacade, deps.BookingCreate,
 		deps.BookingIdempotent, deps.BookingStatus, deps.BookingUpdate,
