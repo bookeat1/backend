@@ -27,6 +27,7 @@ type AppConfig struct {
 	Environment        string
 	URL                string
 	LogLevel           string
+	LogFormat          string // env: APP_LOG_FORMAT — "json" (default) or "text"
 	CORSAllowedOrigins []string
 }
 
@@ -151,6 +152,7 @@ func NewConfig() (Config, error) {
 			Environment:        getEnv("APP_ENV", "development"),
 			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
 			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
+			LogFormat:          getEnv("APP_LOG_FORMAT", "json"),
 			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
 		},
 		DB: DBConfig{
