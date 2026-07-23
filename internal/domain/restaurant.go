@@ -19,6 +19,12 @@ const (
 // Valid reports whether c is a known city.
 func (c City) Valid() bool { return c == CityAstana || c == CityAlmaty }
 
+// Cities lists every known city enum value, in a stable display order. There
+// is no separate cities table (spec: reuse the existing city column/enum
+// values, do not reinvent) — this is the single source of truth for a
+// "which cities are available" endpoint.
+func Cities() []City { return []City{CityAstana, CityAlmaty} }
+
 // PriceCategory is a restaurant's price tier, stored as VARCHAR.
 type PriceCategory string
 
@@ -36,6 +42,41 @@ func (p PriceCategory) Valid() bool {
 // I18n is a localized field of shape {"ru":...,"kk":...,"en":...}. Nil when the
 // column is NULL.
 type I18n map[string]string
+
+// SupportedLocales lists the language codes the catalog can serve translated
+// text in. ru is the permanent default (the base scalar columns, e.g. `name`,
+// are themselves Russian text) — see LocaleRU.
+var SupportedLocales = []string{"ru", "kk", "en"}
+
+const (
+	LocaleRU = "ru"
+	LocaleKK = "kk"
+	LocaleEN = "en"
+)
+
+// IsSupportedLocale reports whether lang is one of SupportedLocales.
+func IsSupportedLocale(lang string) bool {
+	for _, l := range SupportedLocales {
+		if l == lang {
+			return true
+		}
+	}
+	return false
+}
+
+// Resolve returns i[lang] when it exists and is non-empty, otherwise falls
+// back to base. Never invents a translation: base is always the value
+// actually stored in the plain (non-i18n) column. An empty lang or a nil map
+// (column was NULL) both fall back to base directly.
+func (i I18n) Resolve(lang, base string) string {
+	if lang == "" || i == nil {
+		return base
+	}
+	if v, ok := i[lang]; ok && v != "" {
+		return v
+	}
+	return base
+}
 
 // Restaurant is a venue in the catalog. ID equals the original Supabase id.
 type Restaurant struct {
