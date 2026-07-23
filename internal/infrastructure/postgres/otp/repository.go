@@ -72,3 +72,12 @@ func (r *Repository) CountSince(ctx context.Context, phone string, ts time.Time)
 	}
 	return n, nil
 }
+
+func (r *Repository) InvalidateActiveByPhone(ctx context.Context, phone string) error {
+	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE otp_codes SET used_at = now() WHERE phone = $1 AND used_at IS NULL AND expires_at > now()`, phone)
+	if err != nil {
+		return fmt.Errorf("invalidate active otp: %w", err)
+	}
+	return nil
+}

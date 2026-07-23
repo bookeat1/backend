@@ -42,3 +42,35 @@ func TestCreateLatestActiveAndUse(t *testing.T) {
 		t.Fatalf("CountSince = %d, %v", n, err)
 	}
 }
+
+func TestInvalidateActiveByPhone(t *testing.T) {
+	db := testdb.Connect(t)
+	testdb.Truncate(t, db, "otp_codes")
+	repo := New(db)
+	ctx := context.Background()
+
+	active := &domain.OTPCode{ID: uuid.New(), Phone: "+77070000001", CodeHash: "h1", Channel: "stub", ExpiresAt: time.Now().Add(5 * time.Minute)}
+	expired := &domain.OTPCode{ID: uuid.New(), Phone: "+77070000001", CodeHash: "h2", Channel: "stub", ExpiresAt: time.Now().Add(-time.Minute)}
+	otherPhone := &domain.OTPCode{ID: uuid.New(), Phone: "+77070000002", CodeHash: "h3", Channel: "stub", ExpiresAt: time.Now().Add(5 * time.Minute)}
+	for _, c := range []*domain.OTPCode{active, expired, otherPhone} {
+		if err := repo.Create(ctx, c); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+
+	if err := repo.InvalidateActiveByPhone(ctx, "+77070000001"); err != nil {
+		t.Fatalf("InvalidateActiveByPhone: %v", err)
+	}
+
+	if _, err := repo.LatestActiveByPhone(ctx, "+77070000001"); err == nil {
+		t.Error("expected no active code left for the invalidated phone")
+	}
+	if _, err := repo.LatestActiveByPhone(ctx, "+77070000002"); err != nil {
+		t.Errorf("another phone's active code must be untouched: %v", err)
+	}
+
+	// Idempotent: nothing left to invalidate is a no-op success.
+	if err := repo.InvalidateActiveByPhone(ctx, "+77070000001"); err != nil {
+		t.Fatalf("second InvalidateActiveByPhone: %v", err)
+	}
+}

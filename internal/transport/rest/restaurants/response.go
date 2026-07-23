@@ -32,6 +32,11 @@ type restaurantResponse struct {
 	Tags          []tagResponse     `json:"tags,omitempty"`
 	SocialLinks   []socialResponse  `json:"social_links,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
+	// IsFavorite is nil for an anonymous caller (omitted from the JSON
+	// entirely) and an explicit true/false for an authenticated one — a
+	// pointer so "not favorited" and "we don't know because you're not
+	// logged in" are never confused with each other.
+	IsFavorite *bool `json:"is_favorite,omitempty"`
 }
 
 type imageResponse struct {
@@ -68,30 +73,53 @@ type managerResponse struct {
 	WhatsappPhone *string `json:"whatsapp_phone"`
 }
 
-func baseFromDomain(r domain.Restaurant) restaurantResponse {
+// baseFromDomain builds the response shape shared by the list/detail routes.
+// lang is the resolved caller locale ("" when the caller asked for nothing —
+// see resolveLocale). When lang is non-empty, the scalar fields fall back to
+// the i18n column's translation for lang, or to the base value when that
+// translation is missing (domain.I18n.Resolve); when lang is empty, the
+// scalar fields are the base value exactly as before, so a caller that never
+// asks for a language sees byte-identical output to before this feature.
+func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 	var cat *string
 	if r.CategoryID != nil {
 		s := r.CategoryID.String()
 		cat = &s
 	}
 	return restaurantResponse{
-		ID: r.ID.String(), CategoryID: cat, Name: r.Name, NameI18n: r.NameI18n,
-		Description: r.Description, CuisineType: r.CuisineType, Address: r.Address,
-		OpeningHours: r.OpeningHours, City: string(r.City), PriceCategory: string(r.PriceCategory),
+		ID: r.ID.String(), CategoryID: cat,
+		Name:         r.NameI18n.Resolve(lang, r.Name),
+		NameI18n:     r.NameI18n,
+		Description:  r.DescriptionI18n.Resolve(lang, r.Description),
+		CuisineType:  r.CuisineTypeI18n.Resolve(lang, r.CuisineType),
+		Address:      r.AddressI18n.Resolve(lang, r.Address),
+		OpeningHours: r.OpeningHoursI18n.Resolve(lang, r.OpeningHours),
+		City:         string(r.City), PriceCategory: string(r.PriceCategory),
 		Email: r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
 		IsActive: r.IsActive, IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium,
 		DisplayOrder: r.DisplayOrder, CreatedAt: r.CreatedAt,
 	}
 }
 
-func listItemToResponse(it domain.RestaurantListItem) restaurantResponse {
-	resp := baseFromDomain(it.Restaurant)
+func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantResponse {
+	resp := baseFromDomain(it.Restaurant, lang)
 	resp.PrimaryImage = it.PrimaryImage
 	return resp
 }
 
-func aggregateToResponse(a *domain.RestaurantAggregate) restaurantResponse {
-	resp := baseFromDomain(a.Restaurant)
+// PublicListItem builds the same public JSON shape the catalog listing uses,
+// for a domain.RestaurantListItem read from elsewhere (the favorites
+// transport package reads a user's bookmarked restaurants through
+// favorites.Facade.List and must serialize them identically to the main
+// catalog listing). Returned as the concrete response value (not a pointer)
+// so json.Marshal/gin's c.JSON serialize it exactly like every other route in
+// this package.
+func PublicListItem(it domain.RestaurantListItem, lang string) any {
+	return listItemToResponse(it, lang)
+}
+
+func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantResponse {
+	resp := baseFromDomain(a.Restaurant, lang)
 	for _, i := range a.Images {
 		resp.Images = append(resp.Images, imageResponse{ID: i.ID.String(), ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
 		if i.IsPrimary && resp.PrimaryImage == nil {

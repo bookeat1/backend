@@ -16,6 +16,7 @@ import (
 	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	favoritesrest "backend-core/internal/transport/rest/favorites"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	paymentsrest "backend-core/internal/transport/rest/payments"
@@ -77,13 +78,20 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
 
-	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers)
-	restHandler.RegisterPublic(api)
+	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers, deps.FavoritesFacade)
+	// OptionalAuth (not Auth): the catalog itself is public, but a logged-in
+	// caller gets an "is_favorite" flag on each item — see
+	// restrest.Handler.attachFavorites. A missing/invalid token behaves
+	// exactly like no token at all, never a 401 on a public route.
+	restPublic := api.Group("")
+	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
+	restHandler.RegisterPublic(restPublic)
 
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	authed.Use(middleware.LogUserContext())
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
+	favoritesrest.NewHandler(deps.FavoritesFacade).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)
