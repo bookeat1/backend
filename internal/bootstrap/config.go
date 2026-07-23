@@ -20,6 +20,16 @@ type Config struct {
 	Booking  BookingConfig
 	Worker   WorkerConfig
 	Payments PaymentsConfig
+	// PaymentsReconciler configures the background payments reconciliation
+	// worker (usecase/payments.Reconciler). KNOWN GAP, disclosed: this
+	// config is read and validated here, but cmd/worker does not construct
+	// the reconciler yet — that needs a real Postgres implementation of
+	// domain.PaymentRepository / PaymentRefundRepository / PaymentLedgerRepository
+	// / PaymentOutboxRepository, which does not exist in this branch (only
+	// in-memory test fakes do, same KNOWN GAP as the rest of usecase/payments —
+	// see team-memory's payments-usecase notes). Wiring RunWorker to start it
+	// is the next step once that adapter lands.
+	PaymentsReconciler PaymentsReconcilerConfig
 }
 
 type AppConfig struct {
@@ -140,6 +150,23 @@ type PaymentsConfig struct {
 	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
 }
 
+// PaymentsReconcilerConfig configures the background payments reconciliation
+// worker: how often it wakes up, how long a transient claim (capturing /
+// voiding / a refund in_flight or pending) may sit before it counts as stuck,
+// how long a created/authorized payment may go without a status change
+// before its acquirer status is read directly (in case a webhook was lost),
+// how many rows one pass claims per stage, how many consecutive unresolved
+// attempts flag a row for manual review, and the minimum spacing between two
+// acquirer calls (the avalanche guard).
+type PaymentsReconcilerConfig struct {
+	TickInterval     time.Duration // env: PAYMENTS_RECONCILE_TICK_INTERVAL
+	StuckAfter       time.Duration // env: PAYMENTS_RECONCILE_STUCK_AFTER
+	LostWebhookAfter time.Duration // env: PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER
+	BatchSize        int           // env: PAYMENTS_RECONCILE_BATCH_SIZE
+	MaxAttempts      int           // env: PAYMENTS_RECONCILE_MAX_ATTEMPTS
+	ProviderMinGap   time.Duration // env: PAYMENTS_RECONCILE_PROVIDER_MIN_GAP
+}
+
 func (p PostgresConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -217,6 +244,14 @@ func NewConfig() (Config, error) {
 			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
 			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+		},
+		PaymentsReconciler: PaymentsReconcilerConfig{
+			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),
+			StuckAfter:       getEnvDuration("PAYMENTS_RECONCILE_STUCK_AFTER", 10*time.Minute),
+			LostWebhookAfter: getEnvDuration("PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER", time.Hour),
+			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
+			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
+			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
 		},
 	}
 

@@ -235,8 +235,37 @@ type Payment struct {
 	// different settlement attempt (different key) after SettledAt is already
 	// non-nil.
 	SettlementIdempotencyKey *string
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
+	// StatusChangedAt is the lease clock the reconciliation worker relies on
+	// (migration 0010): stamped every time Status actually changes, by
+	// UpdateStatus and CompareAndSwapStatus alike. created_at cannot serve
+	// this purpose — a payment that has sat in `authorized` for days and only
+	// just moved into `capturing` looks identical to one stuck in `capturing`
+	// for days, if the only clock available is created_at. A transient state
+	// (capturing/voiding) only counts as "stuck" once it has held that status
+	// longer than the worker's configured threshold, measured from here.
+	StatusChangedAt time.Time
+	// ReconcileAttempts counts consecutive times the reconciliation worker
+	// asked the acquirer about this payment and got back an outcome it could
+	// not act on (domain.ErrProviderOutcomeUnknown, a transport error, or an
+	// acquirer status this build does not recognise). It is reset to 0 by any
+	// real CompareAndSwapStatus/UpdateStatus transition — a payment that
+	// moved on its own no longer needs the count that was building up while
+	// it was stuck.
+	ReconcileAttempts int
+	// LastReconcileAttemptAt is when ReconcileAttempts was last bumped. Used
+	// to back off exponentially between attempts instead of re-asking the
+	// acquirer every single tick for a payment that keeps coming back
+	// unknown.
+	LastReconcileAttemptAt *time.Time
+	// NeedsManualReview is set once ReconcileAttempts reaches the worker's
+	// configured maximum. It is a terminal flag for the WORKER, not for the
+	// payment's own state machine: the worker stops calling the acquirer for
+	// this row (avalanche protection) and only logs it once per tick, until a
+	// human resolves it out of band. It is cleared automatically the moment a
+	// real status transition succeeds (same reset as ReconcileAttempts).
+	NeedsManualReview bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // Total returns the full amount charged to the guest.
@@ -305,11 +334,42 @@ type PaymentRepository interface {
 	// stored row and treat as success) or by a different one (a real conflict,
 	// report item #7).
 	ClaimSettlement(ctx context.Context, id uuid.UUID, idempotencyKey string, trigger RefundTrigger, at time.Time) error
-	// ClaimStale locks up to limit payments in the given statuses whose
-	// created_at is older than before, using FOR UPDATE SKIP LOCKED, oldest
-	// first. This is the reconciliation worker's input: a webhook may never
-	// arrive, and money must not be lost to a lost HTTP request (spec §5).
+	// ClaimStale selects up to limit payments in the given statuses whose
+	// StatusChangedAt is older than before, oldest first. This is the
+	// reconciliation worker's input (usecase/payments.Reconciler): a webhook
+	// may never arrive, or a process may die between claiming a transient
+	// state (capturing/voiding) and resolving it, and money must not be lost
+	// to a lost HTTP request or a lost process (spec §5).
+	//
+	// A real Postgres implementation may use FOR UPDATE SKIP LOCKED to avoid
+	// two worker instances doing duplicate acquirer reads for the same row in
+	// the same instant, but MUST NOT hold that lock (or any transaction)
+	// across the acquirer call the worker makes next — the hard rule that an
+	// external call never runs inside a DB transaction applies here exactly
+	// like everywhere else in this package. Correctness therefore does not
+	// come from this lock: it comes from every write the worker makes
+	// afterwards being CAS-guarded (CompareAndSwapStatus / RecordReconcileAttempt),
+	// so two callers racing on the same stale row both may read, but only one
+	// may write.
 	ClaimStale(ctx context.Context, statuses []PaymentStatus, before time.Time, limit int) ([]Payment, error)
+	// ClaimExpiredHolds selects up to limit `authorized` payments whose
+	// ExpiresAt is before the given time, oldest first (backed by
+	// idx_payments_expires from migration 0007). Same non-locking-across-the-
+	// acquirer-call caveat as ClaimStale.
+	ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]Payment, error)
+	// RecordReconcileAttempt is the CAS-guarded write behind ReconcileAttempts
+	// / LastReconcileAttemptAt / NeedsManualReview (migration 0010): a single
+	// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1,
+	// last_reconcile_attempt_at = $at,
+	// needs_manual_review = (reconcile_attempts + 1 >= $maxAttempts)
+	// WHERE id = $id AND status = $expectedStatus RETURNING reconcile_attempts,
+	// needs_manual_review`. It returns ErrAlreadyExists when zero rows
+	// matched — the payment's status already moved away from expectedStatus
+	// (resolved by a webhook, another worker pass, or a direct call) between
+	// the worker's read and this write, so there is nothing to bump; the
+	// caller treats that as "already resolved", not as a reconciliation
+	// failure.
+	RecordReconcileAttempt(ctx context.Context, id uuid.UUID, expectedStatus PaymentStatus, at time.Time, maxAttempts int) (attempts int, needsManualReview bool, err error)
 }
 
 // PaymentSettings is the resolved payment policy for one restaurant: the global

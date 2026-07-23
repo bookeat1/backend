@@ -70,8 +70,18 @@ type PaymentRefund struct {
 	IdempotencyKey   string
 	FailureCode      *string
 	FailureMessage   *string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// StatusChangedAt is the reconciliation lease clock, same purpose as
+	// Payment.StatusChangedAt (migration 0010): stamped every time Status
+	// actually changes, so "how long has this refund been in_flight/pending"
+	// can be measured without confusing it with CreatedAt.
+	StatusChangedAt time.Time
+	// ReconcileAttempts / LastReconcileAttemptAt / NeedsManualReview mirror
+	// Payment's fields of the same name, applied to one refund attempt.
+	ReconcileAttempts      int
+	LastReconcileAttemptAt *time.Time
+	NeedsManualReview      bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // Amount returns the refund amount as Money.
@@ -103,6 +113,22 @@ type PaymentRefundRepository interface {
 	// (report item #2): the loser of a concurrent Settle race for the same
 	// idempotency key must never reach the acquirer call.
 	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to RefundStatus, at time.Time) error
+	// ClaimStale selects up to limit refunds in the given statuses whose
+	// StatusChangedAt is older than before, oldest first — the reconciliation
+	// worker's input for a refund left in_flight/pending after a crash or a
+	// timeout (usecase/payments.Reconciler). Same non-locking-across-the-
+	// acquirer-call caveat as PaymentRepository.ClaimStale.
+	ClaimStale(ctx context.Context, statuses []RefundStatus, before time.Time, limit int) ([]PaymentRefund, error)
+	// RecordReconcileAttempt is the CAS-guarded write behind
+	// ReconcileAttempts / LastReconcileAttemptAt / NeedsManualReview, same
+	// contract as PaymentRepository.RecordReconcileAttempt: `UPDATE
+	// payment_refunds SET reconcile_attempts = reconcile_attempts + 1,
+	// last_reconcile_attempt_at = $at,
+	// needs_manual_review = (reconcile_attempts + 1 >= $maxAttempts) WHERE
+	// id = $id AND status = $expectedStatus RETURNING reconcile_attempts,
+	// needs_manual_review`. ErrAlreadyExists means the refund's status
+	// already moved on — nothing to bump.
+	RecordReconcileAttempt(ctx context.Context, id uuid.UUID, expectedStatus RefundStatus, at time.Time, maxAttempts int) (attempts int, needsManualReview bool, err error)
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ package payments
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,6 +32,9 @@ func newFakePaymentRepo(ps ...*domain.Payment) *fakePaymentRepo {
 	f := &fakePaymentRepo{byID: map[uuid.UUID]*domain.Payment{}}
 	for _, p := range ps {
 		cp := *p
+		if cp.StatusChangedAt.IsZero() {
+			cp.StatusChangedAt = cp.CreatedAt
+		}
 		f.byID[p.ID] = &cp
 	}
 	return f
@@ -180,10 +184,82 @@ func stampStatusTime(p *domain.Payment, status domain.PaymentStatus, at time.Tim
 	case domain.PaymentFailed:
 		p.FailedAt = &at
 	}
+	// A real status transition resets the reconciliation lease clock and
+	// attempt counter (migration 0010): a payment that moved on its own no
+	// longer needs the stale-attempt bookkeeping that was building up while
+	// it was stuck.
+	p.StatusChangedAt = at
+	p.ReconcileAttempts = 0
+	p.LastReconcileAttemptAt = nil
+	p.NeedsManualReview = false
 }
 
-func (f *fakePaymentRepo) ClaimStale(context.Context, []domain.PaymentStatus, time.Time, int) ([]domain.Payment, error) {
-	return nil, nil
+// ClaimStale mimics `SELECT ... WHERE status = ANY($statuses) AND
+// status_changed_at < $before ORDER BY status_changed_at LIMIT $limit`.
+func (f *fakePaymentRepo) ClaimStale(_ context.Context, statuses []domain.PaymentStatus, before time.Time, limit int) ([]domain.Payment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := map[domain.PaymentStatus]struct{}{}
+	for _, s := range statuses {
+		want[s] = struct{}{}
+	}
+	var out []domain.Payment
+	for _, p := range f.byID {
+		if _, ok := want[p.Status]; !ok {
+			continue
+		}
+		if !p.StatusChangedAt.Before(before) {
+			continue
+		}
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StatusChangedAt.Before(out[j].StatusChangedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ClaimExpiredHolds mimics `SELECT ... WHERE status = 'authorized' AND
+// expires_at IS NOT NULL AND expires_at < $before ORDER BY expires_at LIMIT
+// $limit` (idx_payments_expires).
+func (f *fakePaymentRepo) ClaimExpiredHolds(_ context.Context, before time.Time, limit int) ([]domain.Payment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Payment
+	for _, p := range f.byID {
+		if p.Status != domain.PaymentAuthorized || p.ExpiresAt == nil {
+			continue
+		}
+		if !p.ExpiresAt.Before(before) {
+			continue
+		}
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ExpiresAt.Before(*out[j].ExpiresAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// RecordReconcileAttempt mimics the CAS-guarded
+// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1, ...
+// WHERE id = $id AND status = $expectedStatus`.
+func (f *fakePaymentRepo) RecordReconcileAttempt(_ context.Context, id uuid.UUID, expectedStatus domain.PaymentStatus, at time.Time, maxAttempts int) (int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byID[id]
+	if !ok {
+		return 0, false, domain.ErrNotFound
+	}
+	if p.Status != expectedStatus {
+		return 0, false, domain.ErrAlreadyExists
+	}
+	p.ReconcileAttempts++
+	p.LastReconcileAttemptAt = &at
+	p.NeedsManualReview = p.ReconcileAttempts >= maxAttempts
+	return p.ReconcileAttempts, p.NeedsManualReview, nil
 }
 
 // ClaimSettlement mimics `UPDATE payments SET settled_at=$at,
@@ -463,6 +539,9 @@ func (f *fakeRefundRepo) Create(_ context.Context, r *domain.PaymentRefund) erro
 		}
 	}
 	cp := *r
+	if cp.StatusChangedAt.IsZero() {
+		cp.StatusChangedAt = cp.CreatedAt
+	}
 	f.byID[r.ID] = &cp
 	return nil
 }
@@ -527,7 +606,56 @@ func (f *fakeRefundRepo) CompareAndSwapStatus(_ context.Context, id uuid.UUID, f
 	}
 	r.Status = to
 	r.UpdatedAt = at
+	// Same reset as payments' stampStatusTime: a real transition clears the
+	// stale-attempt bookkeeping.
+	r.StatusChangedAt = at
+	r.ReconcileAttempts = 0
+	r.LastReconcileAttemptAt = nil
+	r.NeedsManualReview = false
 	return nil
+}
+
+// ClaimStale mimics `SELECT ... WHERE status = ANY($statuses) AND
+// status_changed_at < $before ORDER BY status_changed_at LIMIT $limit`.
+func (f *fakeRefundRepo) ClaimStale(_ context.Context, statuses []domain.RefundStatus, before time.Time, limit int) ([]domain.PaymentRefund, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := map[domain.RefundStatus]struct{}{}
+	for _, s := range statuses {
+		want[s] = struct{}{}
+	}
+	var out []domain.PaymentRefund
+	for _, r := range f.byID {
+		if _, ok := want[r.Status]; !ok {
+			continue
+		}
+		if !r.StatusChangedAt.Before(before) {
+			continue
+		}
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StatusChangedAt.Before(out[j].StatusChangedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// RecordReconcileAttempt mirrors fakePaymentRepo.RecordReconcileAttempt.
+func (f *fakeRefundRepo) RecordReconcileAttempt(_ context.Context, id uuid.UUID, expectedStatus domain.RefundStatus, at time.Time, maxAttempts int) (int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.byID[id]
+	if !ok {
+		return 0, false, domain.ErrNotFound
+	}
+	if r.Status != expectedStatus {
+		return 0, false, domain.ErrAlreadyExists
+	}
+	r.ReconcileAttempts++
+	r.LastReconcileAttemptAt = &at
+	r.NeedsManualReview = r.ReconcileAttempts >= maxAttempts
+	return r.ReconcileAttempts, r.NeedsManualReview, nil
 }
 
 func (f *fakeRefundRepo) SucceededTotal(_ context.Context, paymentID uuid.UUID) (int64, error) {
@@ -694,6 +822,16 @@ type fakeGateway struct {
 	refundResp *domain.GatewayRefund
 	refundN    int
 
+	// getDelay/getErr/getResp/getN drive Get(), the reconciliation read
+	// (usecase/payments.Reconciler) — same convention as capture/void/refund
+	// above. getFn, when set, overrides getResp/getErr entirely so a test can
+	// answer differently call by call (e.g. "still unknown" then "resolved").
+	getDelay time.Duration
+	getErr   error
+	getResp  *domain.GatewayPayment
+	getN     int
+	getFn    func(providerPaymentID string, callN int) (*domain.GatewayPayment, error)
+
 	verifyFn func([]byte, map[string]string) (*domain.WebhookEvent, error)
 }
 
@@ -761,6 +899,22 @@ func (f *fakeGateway) Refund(_ context.Context, providerPaymentID string, amount
 }
 
 func (f *fakeGateway) Get(_ context.Context, providerPaymentID string) (*domain.GatewayPayment, error) {
+	if f.getDelay > 0 {
+		time.Sleep(f.getDelay)
+	}
+	f.mu.Lock()
+	f.getN++
+	n := f.getN
+	f.mu.Unlock()
+	if f.getFn != nil {
+		return f.getFn(providerPaymentID, n)
+	}
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.getResp != nil {
+		return f.getResp, nil
+	}
 	return &domain.GatewayPayment{ProviderPaymentID: providerPaymentID}, nil
 }
 
@@ -785,6 +939,8 @@ func (f *fakeGateway) callCount(op string) int {
 		return f.voidN
 	case "refund":
 		return f.refundN
+	case "get":
+		return f.getN
 	}
 	return 0
 }

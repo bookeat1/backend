@@ -30,4 +30,16 @@ const (
 	EventPaymentWebhookReceived = "payment.webhook_received"
 	EventPaymentWebhookInvalid  = "payment.webhook_invalid" // signature verification failed
 	EventPaymentAntifraudReject = "payment.antifraud_rejected"
+	EventPaymentExpired         = "payment.expired" // hold TTL lapsed, no capture ever happened
+
+	// Reconciliation worker (internal/usecase/payments.Reconciler). These are
+	// what an alert is built on: EventPaymentReconcileTick's counts say
+	// whether the worker is finding and clearing stuck payments/refunds at a
+	// healthy rate, and EventPaymentReconcileManualReview is the one to page
+	// on — it means N consecutive attempts could not tell what happened to
+	// real money.
+	EventPaymentReconcileTick         = "payment.reconcile_tick"          // one pass summary: found / resolved / still unknown
+	EventPaymentReconcileResolved     = "payment.reconcile_resolved"      // one stuck payment/refund reached a terminal-for-now state
+	EventPaymentReconcileUnknown      = "payment.reconcile_unknown"       // acquirer answer still does not let us decide
+	EventPaymentReconcileManualReview = "payment.reconcile_manual_review" // attempts exhausted, needs a human
 )

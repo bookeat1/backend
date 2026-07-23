@@ -468,7 +468,7 @@ func (u *webhookUseCase) applyExpired(ctx context.Context, p *domain.Payment, ev
 	if err != nil {
 		return err
 	}
-	logging.FromContext(ctx).Info("payment.expired", slog.String("payment_id", p.ID.String()))
+	logging.FromContext(ctx).Info(logging.EventPaymentExpired, slog.String("payment_id", p.ID.String()))
 	return nil
 }
 
