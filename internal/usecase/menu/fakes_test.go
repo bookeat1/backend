@@ -47,6 +47,17 @@ func (f *fakeItems) SetAvailable(_ context.Context, id uuid.UUID, a bool) error 
 	f.availID, f.avail = id, a
 	return nil
 }
+func (f *fakeItems) SetAvailableBulk(_ context.Context, restaurantID uuid.UUID, ids []uuid.UUID, a bool) (int, error) {
+	n := 0
+	for _, id := range ids {
+		if m, ok := f.store[id]; ok && m.RestaurantID == restaurantID {
+			m.IsAvailable = a
+			n++
+		}
+	}
+	f.avail = a
+	return n, nil
+}
 func (f *fakeItems) ReplaceTags(_ context.Context, itemID uuid.UUID, tags []domain.MenuItemTag) error {
 	f.replaceCall++
 	f.tagsFor[itemID] = tags

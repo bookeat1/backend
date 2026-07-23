@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
+	adminrest "backend-core/internal/transport/rest/admin"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
@@ -137,6 +138,16 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	bookingScoped := authed.Group("")
 	bookingScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
 	bookingHandler.RegisterRestaurantScoped(bookingScoped)
+
+	// Restaurant admin panel (/admin/restaurants/:id/…): profile, menu,
+	// stop-list, schedule, bookings, guests. Mounted behind
+	// RequireRestaurantManager as defense-in-depth (a non-staff caller never
+	// reaches a handler); the fine-grained owner/manager/hostess gate lives in
+	// usecase/admin's RBAC matrix (e.g. a hostess may run the stop list but not
+	// edit the menu or the profile).
+	adminScoped := authed.Group("")
+	adminScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	adminrest.NewHandler(deps.AdminPanel).RegisterRoutes(adminScoped)
 
 	paymentHandler := paymentsrest.NewHandler(deps.PaymentCreate, deps.PaymentCapture, deps.PaymentVoid,
 		deps.PaymentRefund, deps.PaymentWebhook, deps.PaymentStatus, deps.PaymentGateways, deps.PaymentsPublicBaseURL)

@@ -19,6 +19,11 @@ type Facade interface {
 	Update(ctx context.Context, restaurantID, itemID uuid.UUID, in ItemInput) (*domain.MenuItem, error)
 	Delete(ctx context.Context, restaurantID, itemID uuid.UUID) error
 	SetAvailable(ctx context.Context, restaurantID, itemID uuid.UUID, available bool) error
+	// SetAvailableBulk flips availability for a set of items in one statement,
+	// scoped to restaurantID (the tenant guard is enforced in SQL — items of
+	// another venue are silently skipped). Returns the count actually changed.
+	// This is the fast "we ran out" stop-list path.
+	SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID, available bool) (int, error)
 
 	CreateCategory(ctx context.Context, in CategoryInput) (*domain.MenuCategory, error)
 	UpdateCategory(ctx context.Context, id uuid.UUID, in CategoryInput) (*domain.MenuCategory, error)
@@ -139,6 +144,10 @@ func (f *facade) SetAvailable(ctx context.Context, restaurantID, itemID uuid.UUI
 	return f.ownedThen(ctx, restaurantID, itemID, func(ctx context.Context) error {
 		return f.items.SetAvailable(ctx, itemID, available)
 	})
+}
+
+func (f *facade) SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID, available bool) (int, error) {
+	return f.items.SetAvailableBulk(ctx, restaurantID, itemIDs, available)
 }
 
 // ownedThen verifies itemID belongs to restaurantID (IDOR) then runs fn.

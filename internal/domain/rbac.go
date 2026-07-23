@@ -78,6 +78,23 @@ const (
 	// restaurant's own manager/hostess accounts (spec: "создаёт и удаляет
 	// менеджеров и хостес"). Owner only among restaurant staff roles.
 	PermStaffManage Permission = "staff.manage"
+
+	// PermRestaurantManage covers the venue's own back-office cabinet
+	// configuration: editing the restaurant profile (name/description/address/
+	// contacts/opening hours), managing its menu items, setting regular working
+	// hours + special-day overrides, and reading its guest list. It is the
+	// "run my venue's settings" permission (admin panel, Ф1). Owner and manager
+	// hold it; a hostess does NOT — a hostess works the floor (bookings + the
+	// fast stop list) but does not reconfigure the venue.
+	PermRestaurantManage Permission = "restaurant.manage"
+
+	// PermMenuStopList covers ONLY the fast "we ran out" bulk availability
+	// toggle over a set of menu items — the one menu action a hostess on the
+	// floor legitimately needs mid-service, without granting the full menu-edit
+	// surface (PermRestaurantManage). Granted to every staff role, same reach as
+	// PermBookingManage: it is an operational, non-destructive flag flip, never
+	// a change to what the menu contains.
+	PermMenuStopList Permission = "menu.stoplist"
 )
 
 // staffPermissions is the ENTIRE role→permission matrix. Deliberately a Go
@@ -87,17 +104,22 @@ var staffPermissions = map[StaffRole]map[Permission]bool{
 	StaffRoleHostess: {
 		PermBookingManage:  true,
 		PermPaymentCapture: true,
+		PermMenuStopList:   true,
 	},
 	StaffRoleManager: {
-		PermBookingManage:  true,
-		PermPaymentCapture: true,
-		PermPaymentRefund:  true,
+		PermBookingManage:    true,
+		PermPaymentCapture:   true,
+		PermPaymentRefund:    true,
+		PermRestaurantManage: true,
+		PermMenuStopList:     true,
 	},
 	StaffRoleOwner: {
-		PermBookingManage:  true,
-		PermPaymentCapture: true,
-		PermPaymentRefund:  true,
-		PermStaffManage:    true,
+		PermBookingManage:    true,
+		PermPaymentCapture:   true,
+		PermPaymentRefund:    true,
+		PermStaffManage:      true,
+		PermRestaurantManage: true,
+		PermMenuStopList:     true,
 	},
 }
 

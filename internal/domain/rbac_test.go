@@ -6,26 +6,33 @@ import "testing"
 // the owner: each staff role can do exactly what it should, and nothing
 // more. Any change to staffPermissions must update this table deliberately.
 func TestStaffPermissionMatrix(t *testing.T) {
-	allPerms := []Permission{PermBookingManage, PermPaymentCapture, PermPaymentRefund, PermStaffManage}
+	allPerms := []Permission{PermBookingManage, PermPaymentCapture, PermPaymentRefund,
+		PermStaffManage, PermRestaurantManage, PermMenuStopList}
 
 	want := map[StaffRole]map[Permission]bool{
 		StaffRoleHostess: {
-			PermBookingManage:  true,
-			PermPaymentCapture: true,
-			PermPaymentRefund:  false,
-			PermStaffManage:    false,
+			PermBookingManage:    true,
+			PermPaymentCapture:   true,
+			PermPaymentRefund:    false,
+			PermStaffManage:      false,
+			PermRestaurantManage: false, // a hostess does not reconfigure the venue
+			PermMenuStopList:     true,  // but may flip the fast "we ran out" stop list
 		},
 		StaffRoleManager: {
-			PermBookingManage:  true,
-			PermPaymentCapture: true,
-			PermPaymentRefund:  true,
-			PermStaffManage:    false,
+			PermBookingManage:    true,
+			PermPaymentCapture:   true,
+			PermPaymentRefund:    true,
+			PermStaffManage:      false,
+			PermRestaurantManage: true,
+			PermMenuStopList:     true,
 		},
 		StaffRoleOwner: {
-			PermBookingManage:  true,
-			PermPaymentCapture: true,
-			PermPaymentRefund:  true,
-			PermStaffManage:    true,
+			PermBookingManage:    true,
+			PermPaymentCapture:   true,
+			PermPaymentRefund:    true,
+			PermStaffManage:      true,
+			PermRestaurantManage: true,
+			PermMenuStopList:     true,
 		},
 	}
 
