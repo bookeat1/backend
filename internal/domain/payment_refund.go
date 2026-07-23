@@ -56,6 +56,12 @@ type PaymentRefundRepository interface {
 	Create(ctx context.Context, r *PaymentRefund) error
 	Update(ctx context.Context, r *PaymentRefund) error
 	GetByID(ctx context.Context, id uuid.UUID) (*PaymentRefund, error)
+	// GetByIdempotencyKey resolves our own retry token for one payment, backed
+	// by idx_payment_refunds_idempotency (UNIQUE (payment_id, idempotency_key)).
+	// A retry of the same cancellation/settlement request replays this row
+	// instead of asking the acquirer to refund twice. Returns ErrNotFound when
+	// unused.
+	GetByIdempotencyKey(ctx context.Context, paymentID uuid.UUID, idempotencyKey string) (*PaymentRefund, error)
 	ListByPaymentID(ctx context.Context, paymentID uuid.UUID) ([]PaymentRefund, error)
 	// SucceededTotal is the sum of successful refunds for a payment. It is the
 	// left-hand side of "never refund more than what is left" and must be read

@@ -19,16 +19,15 @@ const (
 	// Anti-fraud, currently only the booking-creation rate limit (spec §4.4).
 	EventAntifraudRejected = "antifraud.rejected"
 
-	// Payments. Not wired to a usecase yet on this branch — see
-	// conventions/bookeat-backend.md: only internal/domain and the acquirer
-	// adapters (internal/infrastructure/payment/*) exist so far, there is no
-	// internal/usecase/payments orchestration layer to call them from. Kept
-	// here so that layer logs under these exact names from day one instead of
-	// each author inventing their own string.
+	// Payments, wired from internal/usecase/payments.
 	EventPaymentCreated         = "payment.created"
 	EventPaymentAuthorized      = "payment.authorized" // two-stage hold placed
 	EventPaymentCaptured        = "payment.captured"   // hold converted to a charge
+	EventPaymentVoided          = "payment.voided"     // hold released, guest never charged
+	EventPaymentFailed          = "payment.failed"     // acquirer rejected, or lost a same-booking race
 	EventPaymentRefunded        = "payment.refunded"
+	EventPaymentSettled         = "payment.settled" // cancellation/no-show resolved with no money movement
 	EventPaymentWebhookReceived = "payment.webhook_received"
+	EventPaymentWebhookInvalid  = "payment.webhook_invalid" // signature verification failed
 	EventPaymentAntifraudReject = "payment.antifraud_rejected"
 )

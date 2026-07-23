@@ -197,12 +197,32 @@ type PaymentRepository interface {
 	// GetLiveByBookingID returns the booking's authorized or captured payment,
 	// backed by idx_payments_live_per_booking.
 	GetLiveByBookingID(ctx context.Context, bookingID uuid.UUID) (*Payment, error)
+	// GetByIdempotencyKey resolves our own retry token, backed by
+	// idx_payments_idempotency (UNIQUE (provider, idempotency_key)). This is
+	// what makes "create payment" idempotent (usecase/payments): a retry with
+	// the same key looks its own row up here and replays it instead of
+	// authorizing a second hold. Returns ErrNotFound when unused.
+	GetByIdempotencyKey(ctx context.Context, provider PaymentProvider, idempotencyKey string) (*Payment, error)
 	// List returns payments matching f plus the total count, newest first.
 	List(ctx context.Context, f PaymentFilter) ([]Payment, int, error)
 	// UpdateStatus writes the new status and its timestamp column. Call inside
 	// a TxManager together with the ledger and outbox inserts — a status change
-	// that is not accompanied by both is a hole in the audit trail.
+	// that is not accompanied by both is a hole in the audit trail. Prefer
+	// CompareAndSwapStatus for any transition a concurrent request could also
+	// be making; UpdateStatus alone is a blind write.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status PaymentStatus, at time.Time) error
+	// CompareAndSwapStatus is UpdateStatus with a precondition on the CURRENT
+	// status, implemented as a single `UPDATE payments SET status = $to, ...
+	// WHERE id = $id AND status = $from` — the database-level guard the team
+	// convention requires for anything that moves money ("unique constraints
+	// instead of мы проверили перед вставкой"). It returns ErrAlreadyExists
+	// when zero rows matched, which covers two cases the caller must treat
+	// identically: a concurrent transition already moved the row away from
+	// `from`, or another payment for the same booking already won
+	// idx_payments_live_per_booking. Both mean "this transition lost the race"
+	// — the caller compensates (e.g. Void the loser's hold), it never retries
+	// blindly.
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to PaymentStatus, at time.Time) error
 	// ClaimStale locks up to limit payments in the given statuses whose
 	// created_at is older than before, using FOR UPDATE SKIP LOCKED, oldest
 	// first. This is the reconciliation worker's input: a webhook may never
