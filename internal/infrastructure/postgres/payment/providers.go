@@ -25,9 +25,18 @@ var _ domain.PaymentProviderRepository = (*Providers)(nil)
 
 const providerCols = `provider, is_enabled, is_default, priority, created_at, updated_at`
 
+// orderByPriority is shared by List/ListEnabled. priority alone is not a
+// unique key (two providers may be tied deliberately, e.g. both disabled at
+// their default value), so a tie is broken on the provider code itself —
+// otherwise the row order for equal priorities is whatever Postgres happens
+// to return, which is not guaranteed stable across plans/runs and made
+// TestProvidersListAndGetByCode flaky once a third provider (partnerspay)
+// shared tiptoppay's priority.
+const orderByPriority = ` ORDER BY priority, provider`
+
 func (r *Providers) List(ctx context.Context) ([]domain.PaymentProviderSetting, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT `+providerCols+` FROM payment_providers ORDER BY priority`)
+		`SELECT `+providerCols+` FROM payment_providers`+orderByPriority)
 	if err != nil {
 		return nil, fmt.Errorf("list payment providers: %w", err)
 	}
@@ -37,7 +46,7 @@ func (r *Providers) List(ctx context.Context) ([]domain.PaymentProviderSetting, 
 
 func (r *Providers) ListEnabled(ctx context.Context) ([]domain.PaymentProviderSetting, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT `+providerCols+` FROM payment_providers WHERE is_enabled ORDER BY priority`)
+		`SELECT `+providerCols+` FROM payment_providers WHERE is_enabled`+orderByPriority)
 	if err != nil {
 		return nil, fmt.Errorf("list enabled payment providers: %w", err)
 	}
