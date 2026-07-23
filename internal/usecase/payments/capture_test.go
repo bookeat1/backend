@@ -3,7 +3,9 @@ package payments
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,13 +18,15 @@ func newCaptureHarness(p *domain.Payment) (CaptureUseCase, VoidUseCase, *fakePay
 	outbox := newFakePaymentOutbox()
 	gw := newFakeGateway(domain.ProviderFreedomPay)
 	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox}
-	capture := NewCaptureUseCase(repo, ledger, outbox, resolver, tx)
-	void := NewVoidUseCase(repo, outbox, resolver, tx)
+	capture := NewCaptureUseCase(repo, ledger, outbox, resolver, managers, tx)
+	void := NewVoidUseCase(repo, outbox, resolver, managers, tx)
 	return capture, void, repo, ledger, outbox, gw
 }
 
-var staffActor = Actor{Role: domain.RoleRestaurant}
+var staffUserID = uuid.New()
+var staffActor = Actor{UserID: &staffUserID, Role: domain.RoleRestaurant}
 
 func TestCaptureOnSeating_HappyPath(t *testing.T) {
 	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
@@ -150,6 +154,102 @@ func TestVoidOnRejection_HappyPath(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("outbox events = %v, want payment.voided", outbox.types())
+	}
+}
+
+// TestCaptureOnSeating_ConcurrentCallsOnlyOneCallsGateway is report item #5:
+// two concurrent CaptureOnSeating calls for the SAME booking (a double click,
+// a retried request) must not both call gw.Capture — the loser must lose the
+// `authorized -> capturing` CAS before ever reaching the acquirer.
+func TestCaptureOnSeating_ConcurrentCallsOnlyOneCallsGateway(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	capture, _, repo, _, _, gw := newCaptureHarness(p)
+	gw.captureDelay = 20 * time.Millisecond
+	ctx := context.Background()
+
+	const n = 5
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start.Wait()
+			_, errs[i] = capture.CaptureOnSeating(ctx, staffActor, p.BookingID)
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successes = %d across %d concurrent calls, want exactly 1: errs=%v", successes, n, errs)
+	}
+	if gw.callCount("capture") != 1 {
+		t.Fatalf("capture called %d times, want 1 (the CAS claim must stop every loser before the acquirer call)", gw.callCount("capture"))
+	}
+	stored, _ := repo.GetByID(ctx, p.ID)
+	if stored.Status != domain.PaymentCaptured {
+		t.Fatalf("status = %s, want captured", stored.Status)
+	}
+}
+
+// TestCaptureOnSeating_LostClaimButAlreadyCapturedIsSuccess is report item
+// #6: losing the `authorized -> capturing` CAS because a webhook already
+// completed the capture must be reported as success, not as a false-alarm
+// conflict that would provoke a manual retry (and a second real capture).
+func TestCaptureOnSeating_LostClaimButAlreadyCapturedIsSuccess(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	capture, _, repo, _, _, gw := newCaptureHarness(p)
+	ctx := context.Background()
+
+	// Simulate a webhook that already finished the capture between this
+	// staff request reading the payment and it attempting to claim the CAS.
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentAuthorized, domain.PaymentCaptured, time.Now()); err != nil {
+		t.Fatalf("setup CAS error = %v", err)
+	}
+
+	got, err := capture.CaptureOnSeating(ctx, staffActor, p.BookingID)
+	if err != nil {
+		t.Fatalf("CaptureOnSeating() error = %v, want nil (already captured by the webhook)", err)
+	}
+	if got.Status != domain.PaymentCaptured {
+		t.Fatalf("status = %s, want captured", got.Status)
+	}
+	if gw.callCount("capture") != 0 {
+		t.Fatalf("capture called %d times, want 0 (must not re-call the acquirer)", gw.callCount("capture"))
+	}
+}
+
+// TestCaptureOnSeating_CrossTenantStaffIsRejected is report item #13: staff
+// of a DIFFERENT restaurant must not be able to capture this payment's hold
+// merely by knowing its booking id.
+func TestCaptureOnSeating_CrossTenantStaffIsRejected(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	repo := newFakePaymentRepo(p)
+	ledger := newFakeLedgerRepo()
+	outbox := newFakePaymentOutbox()
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	resolver := newFakeGatewayResolver(gw)
+	strangerStaff := uuid.New()
+	managers := &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: false}
+	managers.set(strangerStaff, p.RestaurantID, false)
+	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox}
+	capture := NewCaptureUseCase(repo, ledger, outbox, resolver, managers, tx)
+
+	_, err := capture.CaptureOnSeating(context.Background(), Actor{UserID: &strangerStaff, Role: domain.RoleRestaurant}, p.BookingID)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want ErrForbidden (staff of a different restaurant)", err)
+	}
+	if gw.callCount("capture") != 0 {
+		t.Fatalf("capture called %d times, want 0", gw.callCount("capture"))
 	}
 }
 

@@ -186,6 +186,27 @@ func (f *fakePaymentRepo) ClaimStale(context.Context, []domain.PaymentStatus, ti
 	return nil, nil
 }
 
+// ClaimSettlement mimics `UPDATE payments SET settled_at=$at,
+// settled_trigger=$trigger, settlement_idempotency_key=$key WHERE id=$id AND
+// settled_at IS NULL`.
+func (f *fakePaymentRepo) ClaimSettlement(_ context.Context, id uuid.UUID, idempotencyKey string, trigger domain.RefundTrigger, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if p.SettledAt != nil {
+		return domain.ErrAlreadyExists
+	}
+	p.SettledAt = &at
+	trig := trigger
+	p.SettledTrigger = &trig
+	key := idempotencyKey
+	p.SettlementIdempotencyKey = &key
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // ledger
 // ---------------------------------------------------------------------------
@@ -375,6 +396,34 @@ func (f *fakeEventRepo) MarkProcessed(_ context.Context, id uuid.UUID, at time.T
 	return domain.ErrNotFound
 }
 
+// RecordProcessingError stores why an apply attempt failed WITHOUT setting
+// ProcessedAt — mirrors domain.PaymentEventRepository.RecordProcessingError
+// (report item #9): the event must stay in the "unprocessed" set.
+func (f *fakeEventRepo) RecordProcessingError(_ context.Context, id uuid.UUID, processErr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.byID {
+		if e.ID == id {
+			e.ProcessError = &processErr
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+// SetPaymentID backfills PaymentID once resolved (report item #16, minor).
+func (f *fakeEventRepo) SetPaymentID(_ context.Context, id uuid.UUID, paymentID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.byID {
+		if e.ID == id {
+			e.PaymentID = &paymentID
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
 // ---------------------------------------------------------------------------
 // refunds
 // ---------------------------------------------------------------------------
@@ -464,6 +513,23 @@ func (f *fakeRefundRepo) ListByPaymentID(_ context.Context, paymentID uuid.UUID)
 	return out, nil
 }
 
+// CompareAndSwapStatus mimics `UPDATE payment_refunds SET status=$to,
+// updated_at=$at WHERE id=$id AND status=$from`.
+func (f *fakeRefundRepo) CompareAndSwapStatus(_ context.Context, id uuid.UUID, from, to domain.RefundStatus, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if r.Status != from {
+		return domain.ErrAlreadyExists
+	}
+	r.Status = to
+	r.UpdatedAt = at
+	return nil
+}
+
 func (f *fakeRefundRepo) SucceededTotal(_ context.Context, paymentID uuid.UUID) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -530,6 +596,64 @@ func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restauran
 }
 
 // ---------------------------------------------------------------------------
+// manager checker (tenant scoping, report item #13) + cancel deadline
+// ---------------------------------------------------------------------------
+
+// fakeManagerChecker is a hand-written managerChecker: by default every user
+// manages every restaurant (so existing tests that never cared about tenant
+// scoping keep passing unchanged); tests that DO care register a narrower
+// truth via managed.
+type fakeManagerChecker struct {
+	mu      sync.Mutex
+	managed map[uuid.UUID]map[uuid.UUID]bool // userID -> restaurantID -> manages
+	// allowAllByDefault mirrors "staff of any single venue" test setups that
+	// never register anything: true means every (user, restaurant) pair
+	// manages, matching the pre-item-#13 behaviour for tests that are not
+	// specifically about tenant scoping.
+	allowAllByDefault bool
+}
+
+func newFakeManagerChecker() *fakeManagerChecker {
+	return &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: true}
+}
+
+func (f *fakeManagerChecker) set(userID, restaurantID uuid.UUID, manages bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.managed[userID] == nil {
+		f.managed[userID] = map[uuid.UUID]bool{}
+	}
+	f.managed[userID][restaurantID] = manages
+}
+
+func (f *fakeManagerChecker) Manages(_ context.Context, userID, restaurantID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if byRestaurant, ok := f.managed[userID]; ok {
+		if v, ok := byRestaurant[restaurantID]; ok {
+			return v, nil
+		}
+	}
+	return f.allowAllByDefault, nil
+}
+
+// fakeCancelDeadlineResolver is a hand-written cancelDeadlineResolver: it
+// always answers with a fixed deadline, set by the test, regardless of the
+// booking passed in — real resolution (policy + starts_at) lives in
+// usecase/bookings and is out of scope for these unit tests.
+type fakeCancelDeadlineResolver struct {
+	deadline time.Time
+	err      error
+}
+
+func (f *fakeCancelDeadlineResolver) CancelDeadlineFor(context.Context, domain.Booking) (time.Time, error) {
+	if f.err != nil {
+		return time.Time{}, f.err
+	}
+	return f.deadline, nil
+}
+
+// ---------------------------------------------------------------------------
 // gateway + resolver
 // ---------------------------------------------------------------------------
 
@@ -552,9 +676,12 @@ type fakeGateway struct {
 	authorizeResp *domain.GatewayPayment
 	authorizeN    int
 
-	captureErr  error
-	captureResp *domain.GatewayPayment
-	captureN    int
+	// captureDelay forces concurrent CaptureOnSeating callers to actually
+	// overlap, same reasoning as authorizeDelay.
+	captureDelay time.Duration
+	captureErr   error
+	captureResp  *domain.GatewayPayment
+	captureN     int
 
 	voidErr error
 	voidN   int
@@ -591,6 +718,9 @@ func (f *fakeGateway) Authorize(_ context.Context, req domain.AuthorizeRequest) 
 }
 
 func (f *fakeGateway) Capture(_ context.Context, providerPaymentID string, amount domain.Money) (*domain.GatewayPayment, error) {
+	if f.captureDelay > 0 {
+		time.Sleep(f.captureDelay)
+	}
 	f.mu.Lock()
 	f.captureN++
 	f.mu.Unlock()

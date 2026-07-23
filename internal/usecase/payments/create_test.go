@@ -36,8 +36,9 @@ func newCreateHarness(t *testing.T, b *domain.Booking, deposit int64, feeBps int
 	}
 	gw := newFakeGateway(domain.ProviderFreedomPay)
 	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: payments, outbox: outbox}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, tx, Config{}).(*createUseCase)
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{}).(*createUseCase)
 	return u, payments, outbox, gw
 }
 
@@ -219,13 +220,52 @@ func TestCreateForBooking_NoPaymentRequired(t *testing.T) {
 	settings := newFakeRestaurantSettings() // no override: deposit not required
 	gw := newFakeGateway(domain.ProviderFreedomPay)
 	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: payments, outbox: outbox}
 	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(true)}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, tx, Config{})
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{})
 
 	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("error = %v, want ErrValidation", err)
+	}
+}
+
+// TestCreateForBooking_GlobalDepositRequiredWithNoOverride is report item
+// #10: a restaurant that never sets ITS OWN deposit_required override must
+// still be payable when the GLOBAL config requires a deposit — before the
+// fix, Config had no DepositRequired/PreorderPaymentRequired field at all, so
+// resolveSettings always produced DepositRequired=false/
+// PreorderPaymentRequired=false for every restaurant running on defaults,
+// and CreateForBooking rejected every checkout with "this booking requires
+// no payment". This test only sets PaymentsEnabled on the override (the one
+// column every OTHER test in this file also sets) and drives
+// DepositRequired/DepositDefaultMinor purely from Config, unlike every other
+// test in this file which sets the override directly.
+func TestCreateForBooking_GlobalDepositRequiredWithNoOverride(t *testing.T) {
+	b := testBooking(uuid.New())
+	payments := newFakePaymentRepo()
+	outbox := newFakePaymentOutbox()
+	bookings := newFakeBookingReader(b)
+	items := newFakeItemReader()
+	settings := newFakeRestaurantSettings()
+	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(true)}
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
+	tx := &fakeTx{payments: payments, outbox: outbox}
+	cfg := Config{DepositRequired: true, DepositDefaultMinor: 500_000, ServiceFeeBps: 350}
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, cfg)
+
+	p, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
+	if err != nil {
+		t.Fatalf("CreateForBooking() error = %v, want nil (global DepositRequired must apply with no venue override)", err)
+	}
+	if p.Purpose != domain.PurposeDeposit {
+		t.Fatalf("purpose = %s, want deposit", p.Purpose)
+	}
+	if p.BaseAmountMinor != 500_000 {
+		t.Fatalf("base = %d, want the global DepositDefaultMinor of 500000", p.BaseAmountMinor)
 	}
 }
 
@@ -241,6 +281,38 @@ func TestCreateForBooking_RejectsAnotherGuestsBooking(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("error = %v, want ErrForbidden", err)
+	}
+}
+
+// TestCreateForBooking_CrossTenantStaffIsRejected is report item #13: staff
+// of a DIFFERENT restaurant must not be able to start a payment link for
+// this booking merely by knowing its id.
+func TestCreateForBooking_CrossTenantStaffIsRejected(t *testing.T) {
+	b := testBooking(uuid.New())
+	payments := newFakePaymentRepo()
+	outbox := newFakePaymentOutbox()
+	bookings := newFakeBookingReader(b)
+	items := newFakeItemReader()
+	settings := newFakeRestaurantSettings()
+	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{
+		PaymentsEnabled: boolPtr(true), DepositRequired: boolPtr(true), DepositAmountMinor: int64Ptr(1_000_000),
+	}
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	resolver := newFakeGatewayResolver(gw)
+	strangerStaff := uuid.New()
+	managers := &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: false}
+	managers.set(strangerStaff, b.RestaurantID, false)
+	tx := &fakeTx{payments: payments, outbox: outbox}
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{})
+
+	_, err := u.CreateForBooking(context.Background(), Actor{UserID: &strangerStaff, Role: domain.RoleRestaurant}, CreateInput{
+		BookingID: b.ID, IdempotencyKey: "k",
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want ErrForbidden (staff of a different restaurant)", err)
+	}
+	if gw.callCount("authorize") != 0 {
+		t.Fatalf("authorize called %d times, want 0", gw.callCount("authorize"))
 	}
 }
 

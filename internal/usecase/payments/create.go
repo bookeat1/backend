@@ -43,6 +43,7 @@ type createUseCase struct {
 	items       bookingItemReader
 	restaurants restaurantPaymentSettings
 	gateways    gatewayResolver
+	managers    managerChecker
 	tx          domain.TxManager
 	cfg         Config
 }
@@ -55,12 +56,13 @@ func NewCreateUseCase(
 	items bookingItemReader,
 	restaurants restaurantPaymentSettings,
 	gateways gatewayResolver,
+	managers managerChecker,
 	tx domain.TxManager,
 	cfg Config,
 ) CreateUseCase {
 	return &createUseCase{
 		payments: payments, outbox: outbox, bookings: bookings, items: items,
-		restaurants: restaurants, gateways: gateways, tx: tx, cfg: cfg.withDefaults(),
+		restaurants: restaurants, gateways: gateways, managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
 }
 
@@ -94,7 +96,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	if err != nil {
 		return nil, err
 	}
-	if err := authorizeCreate(actor, booking); err != nil {
+	if err := authorizeCreate(ctx, u.managers, actor, booking); err != nil {
 		return nil, err
 	}
 	if booking.Status != domain.BookingPending && booking.Status != domain.BookingConfirmed {
@@ -125,9 +127,15 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	}
 	provider := gw.Name()
 
-	// Scoped to the booking so a client's key collision across two different
-	// bookings is caught explicitly below rather than silently reused.
-	dbKey := in.BookingID.String() + ":" + in.IdempotencyKey
+	// Scoped to the booking AND the actor (report item, minor): scoping to
+	// the booking alone caught a collision across two different bookings,
+	// but not across two different ACTORS on the SAME booking (e.g. venue
+	// staff creating a payment link, and the guest paying independently) who
+	// happen to pick the same client-chosen idempotency string — that used
+	// to silently collapse into one payment, replaying whichever actor's
+	// call landed first as if it were the other's. actorKey makes that an
+	// explicit, distinct key instead.
+	dbKey := in.BookingID.String() + ":" + actorKey(actor) + ":" + in.IdempotencyKey
 
 	if existing, err := u.replay(ctx, provider, dbKey, in.BookingID); err != nil || existing != nil {
 		return existing, err
@@ -243,14 +251,14 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 }
 
 // authorizeCreate decides who may start a payment for a booking: the venue's
-// own staff (creating a payment link on a guest's behalf), the booking's
-// owner, or — for a guest booking with no account — anyone who reached this
-// call with the booking id (the transport layer only exposes it after the
-// booking's own contact verification; there is no separate account to check
-// ownership against).
-func authorizeCreate(actor Actor, b *domain.Booking) error {
+// own staff (creating a payment link on a guest's behalf, scoped to their OWN
+// restaurant — report item #13), the booking's owner, or — for a guest
+// booking with no account — anyone who reached this call with the booking id
+// (the transport layer only exposes it after the booking's own contact
+// verification; there is no separate account to check ownership against).
+func authorizeCreate(ctx context.Context, managers managerChecker, actor Actor, b *domain.Booking) error {
 	if actor.staff() {
-		return nil
+		return authorizeStaffForRestaurant(ctx, managers, actor, b.RestaurantID)
 	}
 	if b.UserID == nil {
 		return nil
@@ -259,6 +267,19 @@ func authorizeCreate(actor Actor, b *domain.Booking) error {
 		return fmt.Errorf("%w: booking belongs to another guest", domain.ErrForbidden)
 	}
 	return nil
+}
+
+// actorKey is a stable, distinct discriminator for the idempotency-key scope
+// (report item, minor): a staff actor is keyed by their own user id, a
+// logged-in guest by theirs, and an account-less guest checkout collapses to
+// one shared bucket per booking (there is no further identity to distinguish
+// between account-less guests on the same booking, and none is needed — spec
+// §6 only ever has one account-less guest per booking).
+func actorKey(actor Actor) string {
+	if actor.UserID != nil {
+		return actor.UserID.String()
+	}
+	return "guest"
 }
 
 // descriptionFor is the guest-facing payment description. Service wording

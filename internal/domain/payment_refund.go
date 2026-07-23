@@ -9,23 +9,51 @@ import (
 )
 
 // RefundStatus is the lifecycle state of a single refund, stored as VARCHAR.
-// Refunds have their own, much shorter machine than payments: they are created,
-// then they either land or they do not.
+//
+//	created ──claim──▶ in_flight ──acquirer call──┬──▶ succeeded  (explicit OK)
+//	                                                ├──▶ failed     (explicit decline, a code came back)
+//	                                                └──▶ pending    (timeout / 5xx / malformed — outcome UNKNOWN)
+//
+// `created` and `in_flight` exist to make the acquirer call itself race-safe
+// (report item #2): two concurrent Settle calls for the SAME idempotency key
+// both insert-or-find the same `created` row, but only the one that wins the
+// created→in_flight CAS may call the acquirer — the loser gets ErrAlreadyExists
+// and must not call it a second time.
+//
+// `pending` exists because a network timeout or a 5xx is NOT the same fact as
+// an explicit decline (report item #1): retrying the acquirer call for a
+// `pending` refund would be retrying an operation whose first attempt may have
+// already succeeded at the provider, i.e. a second real-world refund. A refund
+// in `pending` may only be resolved by reading the acquirer's own state
+// (PaymentGateway.Get) or by a future webhook — never by calling Refund again.
 type RefundStatus string
 
 const (
 	RefundCreated   RefundStatus = "created"
+	RefundInFlight  RefundStatus = "in_flight"
 	RefundSucceeded RefundStatus = "succeeded"
 	RefundFailed    RefundStatus = "failed"
+	// RefundPending is the uncertain-outcome state: the acquirer call ended in
+	// a timeout, a 5xx, or an unparsable answer. See the type doc comment.
+	RefundPending RefundStatus = "pending"
 )
 
 // Valid reports whether s is a known refund status.
 func (s RefundStatus) Valid() bool {
 	switch s {
-	case RefundCreated, RefundSucceeded, RefundFailed:
+	case RefundCreated, RefundInFlight, RefundSucceeded, RefundFailed, RefundPending:
 		return true
 	}
 	return false
+}
+
+// RetryableAtAcquirer reports whether the caller may call PaymentGateway.Refund
+// again for a refund in this status. Only `created` may retry-from-scratch (it
+// never reached the acquirer); `in_flight` is reserved for whoever won the CAS
+// currently making the call; `pending` explicitly may NOT retry (report item
+// #1) — it can only be resolved by reading the acquirer's own status.
+func (s RefundStatus) RetryableAtAcquirer() bool {
+	return s == RefundCreated
 }
 
 // PaymentRefund is one refund against a payment. Refunds are partial and
@@ -67,6 +95,14 @@ type PaymentRefundRepository interface {
 	// left-hand side of "never refund more than what is left" and must be read
 	// inside the same transaction as the refund insert (spec §8).
 	SucceededTotal(ctx context.Context, paymentID uuid.UUID) (int64, error)
+	// CompareAndSwapStatus is the same DB-level guard as
+	// PaymentRepository.CompareAndSwapStatus, applied to one refund row: a
+	// single `UPDATE payment_refunds SET status = $to, updated_at = $at WHERE
+	// id = $id AND status = $from`. It returns ErrAlreadyExists when zero rows
+	// matched. This is what makes the created→in_flight claim exclusive
+	// (report item #2): the loser of a concurrent Settle race for the same
+	// idempotency key must never reach the acquirer call.
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to RefundStatus, at time.Time) error
 }
 
 // ---------------------------------------------------------------------------

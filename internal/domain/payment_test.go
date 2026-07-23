@@ -101,7 +101,7 @@ func TestPaymentStatusPredicates(t *testing.T) {
 // HoldsMoney must mirror the partial unique index idx_payments_live_per_booking
 // in migrations/0007_payments.sql: exactly the statuses listed there.
 func TestHoldsMoneyMirrorsLiveIndex(t *testing.T) {
-	live := map[PaymentStatus]bool{PaymentAuthorized: true, PaymentCaptured: true}
+	live := map[PaymentStatus]bool{PaymentAuthorized: true, PaymentCapturing: true, PaymentCaptured: true}
 	for status := range paymentTransitions {
 		if got := status.HoldsMoney(); got != live[status] {
 			t.Errorf("%q.HoldsMoney() = %v, index says %v", status, got, live[status])

@@ -11,13 +11,27 @@ import (
 
 // Config is the global (level-1) payment policy, mirroring
 // bootstrap.PaymentsConfig so this package stays free of a bootstrap import.
+//
+// Report item #10: DepositRequired and PreorderPaymentRequired used to exist
+// ONLY as a restaurant override (domain.PaymentSettingsOverride), with no
+// global fallback anywhere in Config. Since GlobalOnlySettings is the only
+// restaurantPaymentSettings implementation wired so far (KNOWN GAP, see
+// ports.go), every restaurant that never explicitly set these two override
+// columns got Enabled=Enabled-from-env but DepositRequired=false and
+// PreorderPaymentRequired=false unconditionally — resolveAmount then always
+// hit "this booking requires no payment", i.e. payment creation was
+// completely broken for every restaurant on the global defaults. These two
+// fields close that: they are the same env-driven global default every other
+// Config field already has.
 type Config struct {
-	Enabled             bool
-	DefaultProvider     domain.PaymentProvider
-	ServiceFeeBps       int
-	RefundAcquiringBps  int
-	DepositDefaultMinor int64
-	HoldTTL             time.Duration
+	Enabled                 bool
+	DefaultProvider         domain.PaymentProvider
+	ServiceFeeBps           int
+	RefundAcquiringBps      int
+	DepositDefaultMinor     int64
+	DepositRequired         bool
+	PreorderPaymentRequired bool
+	HoldTTL                 time.Duration
 }
 
 // Package-level fallbacks, applied to any zero-valued Config field — same
@@ -61,10 +75,12 @@ func (GlobalOnlySettings) GetPaymentOverride(context.Context, uuid.UUID) (domain
 // global config — same resolution shape as bookings.resolvePolicy.
 func resolveSettings(o domain.PaymentSettingsOverride, cfg Config) domain.PaymentSettings {
 	s := domain.PaymentSettings{
-		Enabled:            cfg.Enabled,
-		DepositAmountMinor: cfg.DepositDefaultMinor,
-		ServiceFeeBps:      cfg.ServiceFeeBps,
-		Provider:           cfg.DefaultProvider,
+		Enabled:                 cfg.Enabled,
+		DepositAmountMinor:      cfg.DepositDefaultMinor,
+		DepositRequired:         cfg.DepositRequired,
+		PreorderPaymentRequired: cfg.PreorderPaymentRequired,
+		ServiceFeeBps:           cfg.ServiceFeeBps,
+		Provider:                cfg.DefaultProvider,
 	}
 	if o.PaymentsEnabled != nil {
 		s.Enabled = *o.PaymentsEnabled

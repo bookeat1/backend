@@ -260,3 +260,110 @@ func (v *fakeGatewayView) VerifyWebhook(raw []byte, headers map[string]string) (
 	return v.verify(raw, headers)
 }
 func (v *fakeGatewayView) Name() domain.PaymentProvider { return v.base.Name() }
+
+// TestHandleWebhook_ResumesAfterCrashBetweenInsertAndProcess is report item
+// #8: if a previous delivery inserted the payment_events row and then
+// crashed BEFORE processing it (processed_at still NULL), a redelivery must
+// resume processing — not silently acknowledge and lose the event forever.
+func TestHandleWebhook_ResumesAfterCrashBetweenInsertAndProcess(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentCreated, "gw-1")
+	u, repo, events, _, outbox, gw := newWebhookHarness(p)
+	ev := &domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-1", ProviderPaymentID: "gw-1",
+		Type: domain.WebhookPaymentAuthorized, Status: domain.PaymentAuthorized, SignatureValid: true,
+	}
+	gw.verifyFn = verifyOK(ev)
+
+	// Simulate the crash: the row exists (a previous request's Create
+	// committed), but it was never marked processed.
+	if err := events.Create(context.Background(), &domain.PaymentEvent{
+		ID: uuid.New(), Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-1",
+		ProviderPaymentID: strPtrTest("gw-1"), EventType: &ev.Type, Payload: []byte(`{}`),
+		SignatureValid: true, ReceivedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("setup Create error = %v", err)
+	}
+
+	// Before the fix, this branch returned nil unconditionally on
+	// ErrAlreadyExists, and the payment would stay `created` forever.
+	if err := u.HandleWebhook(context.Background(), domain.ProviderFreedomPay, []byte("body"), nil); err != nil {
+		t.Fatalf("HandleWebhook() error = %v", err)
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentAuthorized {
+		t.Fatalf("status = %s, want authorized (the redelivery must have resumed processing)", stored.Status)
+	}
+	found := false
+	for _, ty := range outbox.types() {
+		if ty == domain.EventPaymentAuthorized {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("outbox events = %v, want payment.authorized", outbox.types())
+	}
+	stored2, err := events.GetByProviderEventID(context.Background(), domain.ProviderFreedomPay, "evt-1")
+	if err != nil || stored2.ProcessedAt == nil {
+		t.Fatalf("event ProcessedAt = %v (err=%v), want set after a successful resume", stored2, err)
+	}
+}
+
+// TestHandleWebhook_ApplyFailureLeavesEventUnprocessed is report item #9: an
+// apply() failure must NOT set processed_at — the event must remain in the
+// unprocessed set so a later delivery or the reconciliation worker gets
+// another chance, instead of it silently falling out of ClaimUnprocessed's
+// scan forever.
+func TestHandleWebhook_ApplyFailureLeavesEventUnprocessed(t *testing.T) {
+	// `created` payment, told it is `captured`: created -> captured is not an
+	// allowed transition (report item #14's out-of-order scenario — captured
+	// arriving before authorized).
+	p := testPayment(uuid.New(), domain.PaymentCreated, "gw-1")
+	u, repo, events, _, outbox, gw := newWebhookHarness(p)
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-1", ProviderPaymentID: "gw-1",
+		Type: domain.WebhookPaymentCaptured, Status: domain.PaymentCaptured, SignatureValid: true,
+	})
+
+	err := u.HandleWebhook(context.Background(), domain.ProviderFreedomPay, []byte("body"), nil)
+	if err == nil {
+		t.Fatalf("expected an error from an out-of-order transition")
+	}
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("error = %v, want ErrInvalidStatus", err)
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentCreated {
+		t.Fatalf("status = %s, want unchanged created", stored.Status)
+	}
+	if len(outbox.types()) != 0 {
+		t.Fatalf("outbox got %d events from a failed apply, want 0", len(outbox.types()))
+	}
+	storedEvent, gerr := events.GetByProviderEventID(context.Background(), domain.ProviderFreedomPay, "evt-1")
+	if gerr != nil {
+		t.Fatalf("event lookup error = %v", gerr)
+	}
+	if storedEvent.ProcessedAt != nil {
+		t.Fatalf("ProcessedAt = %v, want nil (report item #9: a failed apply must not close the event)", storedEvent.ProcessedAt)
+	}
+	if storedEvent.ProcessError == nil || *storedEvent.ProcessError == "" {
+		t.Fatalf("ProcessError not recorded")
+	}
+	if storedEvent.PaymentID == nil || *storedEvent.PaymentID != p.ID {
+		t.Fatalf("PaymentID = %v, want %s (report item #16: backfilled even on a failed apply)", storedEvent.PaymentID, p.ID)
+	}
+
+	// A later redelivery (the authorization webhook finally arrives) must
+	// still be able to apply cleanly against the SAME event row's dedup key
+	// being irrelevant here — this simulates the reconciliation worker
+	// retrying the SAME captured event once the payment is authorized.
+	if err := repo.CompareAndSwapStatus(context.Background(), p.ID, domain.PaymentCreated, domain.PaymentAuthorized, time.Now()); err != nil {
+		t.Fatalf("setup authorize error = %v", err)
+	}
+	if err := u.HandleWebhook(context.Background(), domain.ProviderFreedomPay, []byte("body-retry"), nil); err != nil {
+		t.Fatalf("retried HandleWebhook() error = %v", err)
+	}
+	stored, _ = repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentCaptured {
+		t.Fatalf("status = %s, want captured after the retry succeeds", stored.Status)
+	}
+}

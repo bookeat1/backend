@@ -122,6 +122,16 @@ type PaymentsConfig struct {
 	// venue requires one but sets no amount of its own.
 	DepositDefaultMinor int64 // env: PAYMENTS_DEPOSIT_DEFAULT_MINOR
 
+	// DepositRequired and PreorderPaymentRequired are the GLOBAL fallback for
+	// restaurants.deposit_required / preorder_payment_required when a venue
+	// sets neither override (payments review 2026-07-23, item #10): without
+	// these, usecase/payments.resolveAmount always found "no payment
+	// required" for any restaurant running on the global defaults, so
+	// CreateForBooking rejected every checkout with ErrValidation. A venue's
+	// own override (NULLABLE columns from migration 0007) still wins when set.
+	DepositRequired         bool // env: PAYMENTS_DEPOSIT_REQUIRED
+	PreorderPaymentRequired bool // env: PAYMENTS_PREORDER_PAYMENT_REQUIRED
+
 	// HoldTTL is how long an authorization is expected to stay valid. The
 	// acquirer has the final say; this drives payments.expires_at and the
 	// reconciliation worker. Kept below FreedomPay's 5-day auto-clearing of an
@@ -199,12 +209,14 @@ func NewConfig() (Config, error) {
 			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 		Payments: PaymentsConfig{
-			Enabled:             getEnvBool("PAYMENTS_ENABLED", false),
-			DefaultProvider:     getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
-			ServiceFeeBps:       getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
-			RefundAcquiringBps:  getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
-			DepositDefaultMinor: getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
-			HoldTTL:             getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			Enabled:                 getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:         getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:           getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:      getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
+			DepositDefaultMinor:     getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
+			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
+			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
 		},
 	}
 

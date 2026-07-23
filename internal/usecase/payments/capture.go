@@ -2,6 +2,7 @@ package payments
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -29,6 +30,7 @@ type captureVoidUseCase struct {
 	ledger   domain.PaymentLedgerRepository
 	outbox   domain.PaymentOutboxRepository
 	gateways gatewayResolver
+	managers managerChecker
 	tx       domain.TxManager
 }
 
@@ -43,9 +45,10 @@ func NewCaptureUseCase(
 	ledger domain.PaymentLedgerRepository,
 	outbox domain.PaymentOutboxRepository,
 	gateways gatewayResolver,
+	managers managerChecker,
 	tx domain.TxManager,
 ) CaptureUseCase {
-	return &captureVoidUseCase{payments: payments, ledger: ledger, outbox: outbox, gateways: gateways, tx: tx}
+	return &captureVoidUseCase{payments: payments, ledger: ledger, outbox: outbox, gateways: gateways, managers: managers, tx: tx}
 }
 
 // NewVoidUseCase constructs the hold-release usecase.
@@ -53,9 +56,10 @@ func NewVoidUseCase(
 	payments domain.PaymentRepository,
 	outbox domain.PaymentOutboxRepository,
 	gateways gatewayResolver,
+	managers managerChecker,
 	tx domain.TxManager,
 ) VoidUseCase {
-	return &captureVoidUseCase{payments: payments, outbox: outbox, gateways: gateways, tx: tx}
+	return &captureVoidUseCase{payments: payments, outbox: outbox, gateways: gateways, managers: managers, tx: tx}
 }
 
 // CaptureOnSeating captures the booking's live hold in full. It is
@@ -65,12 +69,28 @@ func NewVoidUseCase(
 // "does a repeated clearing clear twice?" unconfirmed, so this usecase never
 // calls Capture a second time for the same payment; it trusts its own local
 // state instead of re-asking the acquirer).
+//
+// Two race hazards, both fixed by a DB-level CAS claim BEFORE the acquirer
+// call, never a check-then-write (report items #5 and #6):
+//
+//  1. two concurrent CaptureOnSeating calls for the SAME booking (a double
+//     click, a retried request) must not both call gw.Capture — only the
+//     winner of the `authorized -> capturing` CAS may call the acquirer; the
+//     loser's CAS fails with ErrAlreadyExists and it must not proceed;
+//  2. a genuine race between this call and a webhook that already applied the
+//     capture (webhook.go's applyCaptured) must NOT be reported to staff as
+//     "capture failed, please retry manually" — that false alarm is exactly
+//     what used to provoke a second, manual capture attempt. Losing the CAS
+//     because the payment is ALREADY `captured` is success, not conflict.
 func (u *captureVoidUseCase) CaptureOnSeating(ctx context.Context, actor Actor, bookingID uuid.UUID) (*domain.Payment, error) {
 	if !actor.staff() {
 		return nil, fmt.Errorf("%w: only venue staff can capture a hold", domain.ErrForbidden)
 	}
 	p, err := u.payments.GetLiveByBookingID(ctx, bookingID)
 	if err != nil {
+		return nil, err
+	}
+	if err := authorizeStaffForRestaurant(ctx, u.managers, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
 	if p.Status == domain.PaymentCaptured {
@@ -83,14 +103,34 @@ func (u *captureVoidUseCase) CaptureOnSeating(ctx context.Context, actor Actor, 
 		return nil, fmt.Errorf("payment %s has no provider payment id: %w", p.ID, domain.ErrValidation)
 	}
 
+	claimedAt := time.Now()
+	if err := u.payments.CompareAndSwapStatus(ctx, p.ID, domain.PaymentAuthorized, domain.PaymentCapturing, claimedAt); err != nil {
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			return nil, err
+		}
+		// Lost the claim. Re-read to tell "a webhook already captured this
+		// payment" (success, item #6) apart from "someone else is capturing
+		// it right now" or "it moved to a different terminal state" (a real
+		// conflict — do not retry blindly).
+		current, rerr := u.payments.GetByID(ctx, p.ID)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if current.Status == domain.PaymentCaptured {
+			return current, nil
+		}
+		return nil, fmt.Errorf("%w: payment %s is %s, another capture attempt is already in flight",
+			domain.ErrAlreadyExists, p.ID, current.Status)
+	}
+
 	gw, err := u.gateways.ForRefund(p.Provider)
 	if err != nil {
-		return nil, err
+		return nil, u.releaseCaptureClaim(ctx, p, err)
 	}
 
 	// External call, deliberately outside any DB transaction.
 	if _, err := gw.Capture(ctx, *p.ProviderPaymentID, p.Total()); err != nil {
-		return nil, fmt.Errorf("capture with %s: %w", p.Provider, err)
+		return nil, u.releaseCaptureClaim(ctx, p, fmt.Errorf("capture with %s: %w", p.Provider, err))
 	}
 
 	now := time.Now()
@@ -100,7 +140,7 @@ func (u *captureVoidUseCase) CaptureOnSeating(ctx context.Context, actor Actor, 
 	}
 
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
-		if err := u.payments.CompareAndSwapStatus(ctx, p.ID, domain.PaymentAuthorized, domain.PaymentCaptured, now); err != nil {
+		if err := u.payments.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCapturing, domain.PaymentCaptured, now); err != nil {
 			return err
 		}
 		if err := u.ledger.CreateBatch(ctx, entries); err != nil {
@@ -129,6 +169,20 @@ func (u *captureVoidUseCase) CaptureOnSeating(ctx context.Context, actor Actor, 
 	return p, nil
 }
 
+// releaseCaptureClaim reverts the `capturing` claim back to `authorized` when
+// the acquirer call itself never happened or failed — the hold is unchanged,
+// so a later retry (or a Void) must find the payment back in `authorized`,
+// not stuck in a transient state forever. Returns origErr (wrapped, never
+// swallowed) regardless of whether the release itself succeeds.
+func (u *captureVoidUseCase) releaseCaptureClaim(ctx context.Context, p *domain.Payment, origErr error) error {
+	releasedAt := time.Now()
+	if err := u.payments.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCapturing, domain.PaymentAuthorized, releasedAt); err != nil {
+		logging.FromContext(ctx).Error("payment.capture_claim_release_failed",
+			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+	}
+	return origErr
+}
+
 // VoidOnRejection releases the booking's live hold. Idempotent for the same
 // reason as CaptureOnSeating: calling it twice on an already-voided payment
 // is a no-op.
@@ -138,6 +192,9 @@ func (u *captureVoidUseCase) VoidOnRejection(ctx context.Context, actor Actor, b
 	}
 	p, err := u.payments.GetLiveByBookingID(ctx, bookingID)
 	if err != nil {
+		return nil, err
+	}
+	if err := authorizeStaffForRestaurant(ctx, u.managers, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
 	if p.Status == domain.PaymentVoided {

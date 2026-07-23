@@ -19,11 +19,12 @@ type StatusUseCase interface {
 
 type statusUseCase struct {
 	payments domain.PaymentRepository
+	managers managerChecker
 }
 
 // NewStatusUseCase constructs the read-only payment status usecase.
-func NewStatusUseCase(payments domain.PaymentRepository) StatusUseCase {
-	return &statusUseCase{payments: payments}
+func NewStatusUseCase(payments domain.PaymentRepository, managers managerChecker) StatusUseCase {
+	return &statusUseCase{payments: payments, managers: managers}
 }
 
 // Get reads one payment by its own id.
@@ -32,7 +33,7 @@ func (u *statusUseCase) Get(ctx context.Context, actor Actor, paymentID uuid.UUI
 	if err != nil {
 		return nil, err
 	}
-	if err := authorizeRead(actor, p); err != nil {
+	if err := authorizeRead(ctx, u.managers, actor, p); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -48,20 +49,23 @@ func (u *statusUseCase) GetForBooking(ctx context.Context, actor Actor, bookingI
 	if err != nil {
 		return nil, err
 	}
-	if err := authorizeRead(actor, p); err != nil {
+	if err := authorizeRead(ctx, u.managers, actor, p); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
-// authorizeRead allows venue staff/admin to see any payment, the payment's
-// own owner to see theirs, and — for a guest checkout with no account — an
+// authorizeRead allows venue staff/admin to see any payment belonging to
+// THEIR OWN restaurant (report item #13 — the same tenant scoping every
+// money-moving action gets, applied here too so a manager cannot browse
+// another venue's payment by guessing a booking id), the payment's own owner
+// to see theirs, and — for a guest checkout with no account — an
 // unauthenticated actor to see it too, same reasoning as authorizeCreate: the
 // payment id itself is the thing the transport layer only ever hands to the
 // guest who is paying it.
-func authorizeRead(actor Actor, p *domain.Payment) error {
+func authorizeRead(ctx context.Context, managers managerChecker, actor Actor, p *domain.Payment) error {
 	if actor.staff() {
-		return nil
+		return authorizeStaffForRestaurant(ctx, managers, actor, p.RestaurantID)
 	}
 	if p.UserID == nil {
 		return nil

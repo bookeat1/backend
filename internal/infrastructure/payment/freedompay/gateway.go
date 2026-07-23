@@ -165,12 +165,19 @@ func (g *Gateway) Capture(ctx context.Context, providerPaymentID string, amount 
 	// whether a partial clearing is accepted at all on the KZ terminal.
 	params.Set("pg_amount", payment.FormatMinor(amount.AmountMinor))
 
-	// Clearing is retryable: /g2g/clearing on an already cleared payment is
-	// expected to answer with an error envelope rather than clear twice.
-	// TODO(verify): confirm that a repeated clearing is a no-op error and not
-	// a second capture. Until then this call is retried only on transport
-	// failures and 5xx, never on a 4xx answer.
-	values, raw, err := g.call(ctx, "clearing", pathClearing, params, true)
+	// Clearing is NOT retried by the shared HTTP client (report item #4):
+	// whether a repeated /g2g/clearing on an already-cleared payment is a
+	// no-op error or a second capture is UNCONFIRMED (see the TODO(verify)
+	// below and docs/payments/freedompay-sandbox-checklist.md item #7). A
+	// client-level retry on a 5xx/timeout would resend this exact request
+	// without any usecase-level idempotency guard in between, which is the
+	// double-capture risk the review flagged. The usecase layer
+	// (CaptureOnSeating) is itself idempotent by trusting its OWN local
+	// status instead of re-asking the acquirer, which is the safe substitute.
+	// TODO(verify): confirm on the sandbox whether a repeated clearing is
+	// rejected as a no-op or clears again; if confirmed as a safe no-op,
+	// idempotent may be set back to true here.
+	values, raw, err := g.call(ctx, "clearing", pathClearing, params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +213,11 @@ func (g *Gateway) Void(ctx context.Context, providerPaymentID string) error {
 	params := url.Values{}
 	params.Set("pg_payment_id", providerPaymentID)
 
-	values, _, err := g.call(ctx, "cancel", pathCancel, params, true)
+	// Not retried by the shared HTTP client (report item #4): a repeated
+	// /g2g/cancel on an already-voided hold could be a no-op or could be
+	// rejected outright, and neither is confirmed on the sandbox. Same
+	// reasoning as Capture above.
+	values, _, err := g.call(ctx, "cancel", pathCancel, params, false)
 	if err != nil {
 		return err
 	}
@@ -238,7 +249,18 @@ func (g *Gateway) Refund(ctx context.Context, providerPaymentID string, amount d
 	params.Set("pg_amount", payment.FormatMinor(amount.AmountMinor))
 	params.Set("pg_currency", string(amount.Currency))
 
-	values, raw, err := g.call(ctx, "refund", pathRefund, params, true)
+	// NOT retried by the shared HTTP client (report item #4): unlike
+	// init_payment/status_v2, there is no confirmed per-request idempotency
+	// token honoured by FreedomPay for /g2g/refund — the only guard against a
+	// duplicate refund is usecase/payments.RefundUseCase's OWN idempotency key
+	// (payment_refunds.idempotency_key), which lives entirely on our side and
+	// is checked BEFORE this call is ever made. If the shared client retried a
+	// 502 here, it would resend the exact same refund request a second time
+	// with no local state in between to stop it — a refund that already
+	// landed at the acquirer but whose response was lost would be issued
+	// again. See refund.go's comment on what this idempotency key actually
+	// protects (report item #3: it is NOT sent to FreedomPay).
+	values, raw, err := g.call(ctx, "refund", pathRefund, params, false)
 	if err != nil {
 		return nil, err
 	}

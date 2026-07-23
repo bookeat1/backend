@@ -21,6 +21,8 @@ package payments
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -37,12 +39,47 @@ type Actor struct {
 	Role   domain.Role
 }
 
-// staff reports whether the actor acts on behalf of a venue or admin.
+// staff reports whether the actor acts on behalf of a venue or admin. This
+// alone is NOT authorization for a money-moving action scoped to one
+// restaurant — see authorizeStaffForRestaurant, which additionally checks
+// which restaurant. Kept for the read-only / "is this a staff caller at all"
+// checks where that is enough (see status.go doc comment).
 func (a Actor) staff() bool { return a.Role == domain.RoleRestaurant || a.Role == domain.RoleAdmin }
 
 // isUser reports whether uid is this actor's own user id.
 func (a Actor) isUser(uid *uuid.UUID) bool {
 	return a.UserID != nil && uid != nil && *a.UserID == *uid
+}
+
+// authorizeStaffForRestaurant is the venue-scoped staff gate used by every
+// money-moving action (capture, void, settle): RoleAdmin may act on any
+// restaurant; RoleRestaurant may act ONLY on a restaurant it manages.
+//
+// Report item #13: before this, `actor.staff()` alone was the whole check —
+// it verifies the ROLE but never the TENANT, so any authenticated restaurant
+// staff account could capture, void or settle a hold belonging to a DIFFERENT
+// venue's booking just by knowing (or guessing) its booking id. This closes
+// that hole the same way usecase/bookings.authorize does, via the same
+// managerChecker port bound to restaurants.ManagerUseCase.
+func authorizeStaffForRestaurant(ctx context.Context, managers managerChecker, actor Actor, restaurantID uuid.UUID) error {
+	switch actor.Role {
+	case domain.RoleAdmin:
+		return nil
+	case domain.RoleRestaurant:
+		if actor.UserID == nil {
+			return fmt.Errorf("%w: no authenticated staff actor", domain.ErrUnauthorized)
+		}
+		ok, err := managers.Manages(ctx, *actor.UserID, restaurantID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: not staff of this restaurant", domain.ErrForbidden)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: only venue staff can do this", domain.ErrForbidden)
+	}
 }
 
 // gatewayResolver is the minimal slice of infrastructure/payment.Registry this
@@ -82,4 +119,23 @@ type bookingItemReader interface {
 // is the only implementation, and every venue runs on the env defaults.
 type restaurantPaymentSettings interface {
 	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
+}
+
+// managerChecker answers whether a user manages a restaurant — the same port
+// shape as usecase/bookings.managerChecker, bound to the same
+// restaurants.ManagerUseCase in bootstrap/deps.go. See
+// authorizeStaffForRestaurant (report item #13).
+type managerChecker interface {
+	Manages(ctx context.Context, userID, restaurantID uuid.UUID) (bool, error)
+}
+
+// cancelDeadlineResolver derives the real, server-computed cancel-before
+// deadline for a booking, instead of trusting a caller-supplied value (report
+// item #15): a booking's cancel deadline is `starts_at - policy.CancelDeadline`,
+// where the policy is the venue's resolved booking policy — a computation
+// that already lives in usecase/bookings and must not be duplicated (and
+// possibly drift) here. Bound in bootstrap to a small adapter over that
+// resolution.
+type cancelDeadlineResolver interface {
+	CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error)
 }

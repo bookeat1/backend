@@ -17,6 +17,16 @@ const (
 	PaymentCreated PaymentStatus = "created"
 	// PaymentAuthorized is a hold: the guest's funds are blocked but not taken.
 	PaymentAuthorized PaymentStatus = "authorized"
+	// PaymentCapturing is a claimed-but-not-yet-confirmed capture attempt: the
+	// venue seated the guest and this usecase call won the CAS claim on the
+	// hold, but the acquirer has not answered yet. It exists purely to make
+	// two concurrent CaptureOnSeating calls for the SAME booking race-safe
+	// (report item #5): only the CAS winner may call the acquirer; the loser
+	// gets ErrAlreadyExists and must not call Capture too. It is always
+	// transient — CaptureOnSeating resolves it to `captured` on acquirer
+	// success or releases it back to `authorized` on acquirer failure, never
+	// leaving a payment parked here.
+	PaymentCapturing PaymentStatus = "capturing"
 	// PaymentCaptured is money actually taken from the guest.
 	PaymentCaptured PaymentStatus = "captured"
 	// PaymentVoided is a released hold — the guest was never charged.
@@ -56,10 +66,15 @@ var paymentTransitions = map[PaymentStatus]map[PaymentStatus]struct{}{
 		PaymentExpired:    {},
 	},
 	PaymentAuthorized: {
-		PaymentCaptured: {},
-		PaymentVoided:   {},
-		PaymentExpired:  {},
-		PaymentFailed:   {},
+		PaymentCapturing: {},
+		PaymentCaptured:  {}, // a webhook may report capture directly, without going through the local `capturing` claim
+		PaymentVoided:    {},
+		PaymentExpired:   {},
+		PaymentFailed:    {},
+	},
+	PaymentCapturing: {
+		PaymentCaptured:   {}, // acquirer confirmed
+		PaymentAuthorized: {}, // acquirer call failed: release the claim, the hold is unchanged
 	},
 	PaymentCaptured: {
 		PaymentPartiallyRefunded: {},
@@ -89,7 +104,7 @@ func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 
 // idx_payments_live_per_booking in migrations/0007_payments.sql — keep both in
 // sync.
 func (s PaymentStatus) HoldsMoney() bool {
-	return s == PaymentAuthorized || s == PaymentCaptured
+	return s == PaymentAuthorized || s == PaymentCapturing || s == PaymentCaptured
 }
 
 // Refundable reports whether money can still be sent back for this status.
@@ -161,8 +176,29 @@ type Payment struct {
 	ExpiresAt         *time.Time // when the hold lapses
 	FailureCode       *string
 	FailureMessage    *string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	// SettledAt is the terminal settlement marker (report item #7): it is set
+	// exactly once, by RefundUseCase.Settle, regardless of which outcome fired
+	// (a guest refund, a venue-cancel refund, or a late-cancellation/no-show
+	// that moves no money and leaves Status == captured). Its purpose is
+	// narrow but critical: a late-cancellation/no-show settlement legitimately
+	// does NOT change Status away from captured (see the deviations note), so
+	// Status alone cannot answer "has this payment already been settled?" —
+	// without this field a second Settle call with a different trigger and a
+	// different idempotency key would sail through the `Status == captured`
+	// check and refund the guest a second time on top of what the venue
+	// already kept. SettledAt is the CAS anchor for PaymentRepository.
+	// ClaimSettlement: nil means "not yet settled", set means "settled, and
+	// SettlementIdempotencyKey says which request settled it".
+	SettledAt *time.Time
+	// SettledTrigger records which outcome fired, for audit.
+	SettledTrigger *RefundTrigger
+	// SettlementIdempotencyKey is the key of the Settle call that won the
+	// claim, so a legitimate retry (same key) can be told apart from a second,
+	// different settlement attempt (different key) after SettledAt is already
+	// non-nil.
+	SettlementIdempotencyKey *string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 // Total returns the full amount charged to the guest.
@@ -223,6 +259,14 @@ type PaymentRepository interface {
 	// — the caller compensates (e.g. Void the loser's hold), it never retries
 	// blindly.
 	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to PaymentStatus, at time.Time) error
+	// ClaimSettlement is the CAS anchor behind Payment.SettledAt: a single
+	// `UPDATE payments SET settled_at = $at, settled_trigger = $trigger,
+	// settlement_idempotency_key = $key WHERE id = $id AND settled_at IS
+	// NULL`. It returns ErrAlreadyExists when zero rows matched — the payment
+	// was already settled, by this same request (replay, same key: read the
+	// stored row and treat as success) or by a different one (a real conflict,
+	// report item #7).
+	ClaimSettlement(ctx context.Context, id uuid.UUID, idempotencyKey string, trigger RefundTrigger, at time.Time) error
 	// ClaimStale locks up to limit payments in the given statuses whose
 	// created_at is older than before, using FOR UPDATE SKIP LOCKED, oldest
 	// first. This is the reconciliation worker's input: a webhook may never

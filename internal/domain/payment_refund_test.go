@@ -136,10 +136,22 @@ func TestSettleRefundRejectsBadInput(t *testing.T) {
 
 func TestRefundStatusValid(t *testing.T) {
 	for s, want := range map[RefundStatus]bool{
-		RefundCreated: true, RefundSucceeded: true, RefundFailed: true, "pending": false, "": false,
+		RefundCreated: true, RefundInFlight: true, RefundSucceeded: true,
+		RefundFailed: true, RefundPending: true, "unknown": false, "": false,
 	} {
 		if got := s.Valid(); got != want {
 			t.Errorf("RefundStatus(%q).Valid() = %v, want %v", s, got, want)
+		}
+	}
+}
+
+func TestRefundStatusRetryableAtAcquirer(t *testing.T) {
+	for s, want := range map[RefundStatus]bool{
+		RefundCreated: true, RefundInFlight: false, RefundSucceeded: false,
+		RefundFailed: false, RefundPending: false,
+	} {
+		if got := s.RetryableAtAcquirer(); got != want {
+			t.Errorf("RefundStatus(%q).RetryableAtAcquirer() = %v, want %v", s, got, want)
 		}
 	}
 }
