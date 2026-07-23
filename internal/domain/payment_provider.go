@@ -13,11 +13,17 @@ type PaymentProvider string
 const (
 	ProviderFreedomPay PaymentProvider = "freedompay"
 	ProviderTipTopPay  PaymentProvider = "tiptoppay"
+	// ProviderPartnersPay is a registered acquirer code with a template adapter
+	// behind it (infrastructure/payment/partnerspay). It is seeded DISABLED in
+	// the registry migration and its adapter's every method currently returns
+	// "not implemented until the API contract is known" — see that package's
+	// doc comment for what is still missing.
+	ProviderPartnersPay PaymentProvider = "partnerspay"
 )
 
 // Valid reports whether p is a known provider code.
 func (p PaymentProvider) Valid() bool {
-	return p == ProviderFreedomPay || p == ProviderTipTopPay
+	return p == ProviderFreedomPay || p == ProviderTipTopPay || p == ProviderPartnersPay
 }
 
 // PaymentProviderSetting is a row of the acquirer registry, managed from the

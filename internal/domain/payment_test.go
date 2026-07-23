@@ -126,7 +126,8 @@ func TestPaymentPurposeAndProviderValid(t *testing.T) {
 		}
 	}
 	for provider, want := range map[PaymentProvider]bool{
-		ProviderFreedomPay: true, ProviderTipTopPay: true, "FreedomPay": false, "stripe": false, "": false,
+		ProviderFreedomPay: true, ProviderTipTopPay: true, ProviderPartnersPay: true,
+		"FreedomPay": false, "stripe": false, "": false,
 	} {
 		if got := provider.Valid(); got != want {
 			t.Errorf("PaymentProvider(%q).Valid() = %v, want %v", provider, got, want)
