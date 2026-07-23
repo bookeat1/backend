@@ -198,7 +198,26 @@ func (u *webhookUseCase) resolvePayment(ctx context.Context, provider domain.Pay
 	}
 	if event.MerchantPaymentID != "" {
 		if id, perr := uuid.Parse(event.MerchantPaymentID); perr == nil {
-			return u.payments.GetByID(ctx, id)
+			p, err := u.payments.GetByID(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			// Non-blocking item #3 (second review): GetByID resolves by OUR
+			// primary key alone, with no idea which acquirer sent the
+			// callback. Without this check, a FreedomPay webhook whose
+			// MerchantPaymentID happens to parse as a UUID that belongs to a
+			// TipTopPay payment (or vice versa — a coincidence, a
+			// misconfigured endpoint, or an attacker probing the callback
+			// URL of the wrong provider) would be applied to a payment that
+			// acquirer never touched. VerifyWebhook already proved the
+			// SIGNATURE is authentic for `provider`; that says nothing about
+			// which payment it is authentic FOR.
+			if p.Provider != provider {
+				return nil, fmt.Errorf(
+					"%w: webhook from %s resolved to payment %s which belongs to %s",
+					domain.ErrNotFound, provider, p.ID, p.Provider)
+			}
+			return p, nil
 		}
 	}
 	return nil, domain.ErrNotFound
@@ -331,6 +350,26 @@ func (u *webhookUseCase) applyCaptured(ctx context.Context, p *domain.Payment, e
 	}
 	if err := domain.ValidatePaymentTransition(p.Status, domain.PaymentCaptured); err != nil {
 		return fmt.Errorf("webhook captured on payment %s (currently %s): %w", p.ID, p.Status, err)
+	}
+	// Non-blocking item #4 (second review): captureLedgerEntries books the
+	// payment's OWN full total, not whatever the acquirer actually reports
+	// it cleared. If the acquirer only captures part of the hold (a partial
+	// clearing FreedomPay's own docs show as possible, see mapPaymentStatus's
+	// TODO(verify) on `partial`), booking the full amount here would make the
+	// ledger silently disagree with what the bank actually moved. Refuse to
+	// apply silently on a mismatch: log it and leave the event unprocessed
+	// (resolveAndApply's caller does NOT call MarkProcessed on a non-nil
+	// error) so it stays visible to a human / the reconciliation worker
+	// instead of a wrong number quietly entering the books.
+	if event.Amount.AmountMinor != 0 && event.Amount.AmountMinor != p.AmountMinor {
+		logging.FromContext(ctx).Error("payment.webhook_captured_amount_mismatch",
+			slog.String("payment_id", p.ID.String()),
+			slog.Int64("payment_amount_minor", p.AmountMinor),
+			slog.Int64("webhook_amount_minor", event.Amount.AmountMinor),
+		)
+		return fmt.Errorf(
+			"webhook captured amount %d minor for payment %s does not match the payment's own total %d minor — a partial capture is not supported yet, needs reconciliation",
+			event.Amount.AmountMinor, p.ID, p.AmountMinor)
 	}
 	from := p.Status
 	now := time.Now()

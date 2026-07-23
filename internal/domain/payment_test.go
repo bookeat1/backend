@@ -16,9 +16,15 @@ func TestValidatePaymentTransition(t *testing.T) {
 		{"created → failed", PaymentCreated, PaymentFailed, nil},
 		{"created → expired (checkout abandoned)", PaymentCreated, PaymentExpired, nil},
 		{"authorized → captured", PaymentAuthorized, PaymentCaptured, nil},
+		{"authorized → capturing (claim)", PaymentAuthorized, PaymentCapturing, nil},
 		{"authorized → voided", PaymentAuthorized, PaymentVoided, nil},
+		{"authorized → voiding (claim)", PaymentAuthorized, PaymentVoiding, nil},
 		{"authorized → expired (hold lapsed)", PaymentAuthorized, PaymentExpired, nil},
 		{"authorized → failed (capture declined)", PaymentAuthorized, PaymentFailed, nil},
+		{"capturing → captured (acquirer confirmed)", PaymentCapturing, PaymentCaptured, nil},
+		{"capturing → authorized (release claim)", PaymentCapturing, PaymentAuthorized, nil},
+		{"voiding → voided (acquirer confirmed)", PaymentVoiding, PaymentVoided, nil},
+		{"voiding → authorized (release claim)", PaymentVoiding, PaymentAuthorized, nil},
 		{"captured → partially_refunded", PaymentCaptured, PaymentPartiallyRefunded, nil},
 		{"captured → refunded", PaymentCaptured, PaymentRefunded, nil},
 		{"partially_refunded → refunded", PaymentPartiallyRefunded, PaymentRefunded, nil},
@@ -70,6 +76,8 @@ func TestPaymentStatusPredicates(t *testing.T) {
 	}{
 		{PaymentCreated, true, false, false, false},
 		{PaymentAuthorized, true, false, true, false},
+		{PaymentCapturing, true, false, true, false},
+		{PaymentVoiding, true, false, true, false},
 		{PaymentCaptured, true, false, true, true},
 		{PaymentPartiallyRefunded, true, false, false, true},
 		{PaymentRefunded, true, true, false, false},
@@ -101,7 +109,7 @@ func TestPaymentStatusPredicates(t *testing.T) {
 // HoldsMoney must mirror the partial unique index idx_payments_live_per_booking
 // in migrations/0007_payments.sql: exactly the statuses listed there.
 func TestHoldsMoneyMirrorsLiveIndex(t *testing.T) {
-	live := map[PaymentStatus]bool{PaymentAuthorized: true, PaymentCapturing: true, PaymentCaptured: true}
+	live := map[PaymentStatus]bool{PaymentAuthorized: true, PaymentCapturing: true, PaymentVoiding: true, PaymentCaptured: true}
 	for status := range paymentTransitions {
 		if got := status.HoldsMoney(); got != live[status] {
 			t.Errorf("%q.HoldsMoney() = %v, index says %v", status, got, live[status])

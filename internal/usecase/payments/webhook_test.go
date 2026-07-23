@@ -139,6 +139,75 @@ func TestHandleWebhook_UnknownPaymentNeverCreatesOne(t *testing.T) {
 	}
 }
 
+// TestHandleWebhook_MerchantIDResolvesOnlyOwnProvider is non-blocking item #3
+// (second review): a payment is resolved by our own primary key
+// (MerchantPaymentID) with no idea, from GetByID alone, which acquirer the
+// callback actually came from. A TipTopPay callback whose MerchantPaymentID
+// happens to name a FreedomPay payment (coincidence, misconfiguration, or an
+// attacker probing the wrong provider's endpoint) must be treated as unknown,
+// never applied to the wrong acquirer's payment.
+func TestHandleWebhook_MerchantIDResolvesOnlyOwnProvider(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentCreated, "gw-1")
+	p.Provider = domain.ProviderFreedomPay
+	u, repo, events, _, outbox, gw := newWebhookHarness(p)
+	// No ProviderPaymentID match (a hosted-page callback before the acquirer
+	// side id is known) — only MerchantPaymentID resolves it, and this
+	// webhook claims to be from a DIFFERENT provider than the payment's own.
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderTipTopPay, ProviderEventID: "evt-cross-provider",
+		MerchantPaymentID: p.ID.String(),
+		Type:              domain.WebhookPaymentAuthorized, Status: domain.PaymentAuthorized, SignatureValid: true,
+	})
+	tiptop := newFakeGateway(domain.ProviderTipTopPay)
+	tiptop.verifyFn = gw.verifyFn
+	resolver := newFakeGatewayResolver(gw, tiptop)
+	u.gateways = resolver
+
+	if err := u.HandleWebhook(context.Background(), domain.ProviderTipTopPay, []byte("body"), nil); err != nil {
+		t.Fatalf("HandleWebhook() error = %v, want nil (acknowledged as unknown, not applied)", err)
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentCreated {
+		t.Fatalf("status = %s, want unchanged created — a cross-provider callback must never touch this payment", stored.Status)
+	}
+	if len(outbox.types()) != 0 {
+		t.Fatalf("outbox got %d events, want 0", len(outbox.types()))
+	}
+	if len(events.byID) != 1 {
+		t.Fatalf("payment_events got %d rows, want 1 (still recorded as evidence)", len(events.byID))
+	}
+}
+
+// TestHandleWebhook_CapturedAmountMismatchIsNotAppliedSilently is
+// non-blocking item #4 (second review): applyCaptured must not blindly book
+// the payment's OWN full total when the acquirer's callback reports a
+// DIFFERENT amount — a partial capture must not be silently recorded as a
+// full one.
+func TestHandleWebhook_CapturedAmountMismatchIsNotAppliedSilently(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	u, repo, _, ledger, outbox, gw := newWebhookHarness(p)
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-partial", ProviderPaymentID: "gw-1",
+		Type: domain.WebhookPaymentCaptured, Status: domain.PaymentCaptured, SignatureValid: true,
+		Amount: domain.Money{AmountMinor: p.AmountMinor / 2, Currency: p.Currency},
+	})
+
+	err := u.HandleWebhook(context.Background(), domain.ProviderFreedomPay, []byte("body"), nil)
+	if err == nil {
+		t.Fatalf("HandleWebhook() error = nil, want an amount-mismatch error")
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentAuthorized {
+		t.Fatalf("status = %s, want unchanged authorized — a mismatched amount must not be applied", stored.Status)
+	}
+	if len(ledger.entries) != 0 {
+		t.Fatalf("ledger got %d entries from a mismatched capture, want 0", len(ledger.entries))
+	}
+	if len(outbox.types()) != 0 {
+		t.Fatalf("outbox got %d events from a mismatched capture, want 0", len(outbox.types()))
+	}
+}
+
 func TestHandleWebhook_UnknownStatusNeverReadAsPaid(t *testing.T) {
 	p := testPayment(uuid.New(), domain.PaymentCreated, "gw-1")
 	u, repo, _, _, outbox, gw := newWebhookHarness(p)

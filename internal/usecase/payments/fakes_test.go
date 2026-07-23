@@ -683,9 +683,12 @@ type fakeGateway struct {
 	captureResp  *domain.GatewayPayment
 	captureN     int
 
-	voidErr error
-	voidN   int
-	voided  []string
+	// voidDelay forces concurrent VoidOnRejection callers to actually
+	// overlap, same reasoning as captureDelay.
+	voidDelay time.Duration
+	voidErr   error
+	voidN     int
+	voided    []string
 
 	refundErr  error
 	refundResp *domain.GatewayRefund
@@ -734,6 +737,9 @@ func (f *fakeGateway) Capture(_ context.Context, providerPaymentID string, amoun
 }
 
 func (f *fakeGateway) Void(_ context.Context, providerPaymentID string) error {
+	if f.voidDelay > 0 {
+		time.Sleep(f.voidDelay)
+	}
 	f.mu.Lock()
 	f.voidN++
 	f.voided = append(f.voided, providerPaymentID)

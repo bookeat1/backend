@@ -245,7 +245,25 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 	}
 	if settings.DepositRequired {
 		m, err := domain.NewMoney(settings.DepositAmountMinor, domain.CurrencyKZT)
-		return domain.PurposeDeposit, m, err
+		if err != nil {
+			return "", domain.Money{}, err
+		}
+		// Non-blocking item #6 (second review): domain.NewMoney only rejects
+		// a NEGATIVE amount — zero is, by design, a valid Money value
+		// elsewhere in this domain (e.g. a zero service fee at 0 bps). It is
+		// NOT valid here: DepositRequired with a misconfigured or unset
+		// DepositAmountMinor (restaurant override left at its NULL/default
+		// and the global env default never set) would silently create a
+		// real payment row, place a real (zero-amount) hold at the acquirer,
+		// and let the booking proceed as if a deposit had been taken.
+		// Reject explicitly instead of trusting "deposit required" to imply
+		// "deposit amount is sane".
+		if m.IsZero() {
+			return "", domain.Money{}, fmt.Errorf(
+				"%w: this restaurant requires a deposit but its configured deposit amount is zero — payment settings are misconfigured",
+				domain.ErrValidation)
+		}
+		return domain.PurposeDeposit, m, nil
 	}
 	return "", domain.Money{}, fmt.Errorf("%w: this booking requires no payment", domain.ErrValidation)
 }
@@ -270,14 +288,35 @@ func authorizeCreate(ctx context.Context, managers managerChecker, actor Actor, 
 }
 
 // actorKey is a stable, distinct discriminator for the idempotency-key scope
-// (report item, minor): a staff actor is keyed by their own user id, a
-// logged-in guest by theirs, and an account-less guest checkout collapses to
-// one shared bucket per booking (there is no further identity to distinguish
-// between account-less guests on the same booking, and none is needed — spec
-// §6 only ever has one account-less guest per booking).
+// (report item, minor): a STAFF actor is keyed by their own user id — venue
+// staff creating a payment link is a genuinely different flow from the guest
+// paying independently, and the two must never collapse into one payment
+// just because they picked the same client-chosen idempotency string.
+//
+// Every non-staff actor collapses into one shared "guest" bucket per booking,
+// REGARDLESS of whether they are logged in (report item #5, second review):
+// spec §6 only ever has one guest (with or without an account) per booking,
+// so there is no further identity to distinguish between them, and — this is
+// the part the previous version of this function got wrong — keying by
+// UserID meant the SAME physical client retrying a checkout first
+// anonymously and then, having logged in mid-flow, again as an authenticated
+// user produced TWO DIFFERENT dbKeys. GetLiveByBookingID only reports
+// authorized/captured payments as "live" (a `created` payment is deliberately
+// not live, see idx_payments_live_per_booking's comment — a guest may abandon
+// a checkout), so a second call with a different actorKey arriving before the
+// first hold's webhook confirmation would sail past both the idempotency
+// replay AND the live-payment check and authorize a second hold. Keying every
+// non-staff actor identically closes that window without touching the
+// intentional "created is not live" design.
 func actorKey(actor Actor) string {
-	if actor.UserID != nil {
-		return actor.UserID.String()
+	if actor.staff() {
+		// RoleAdmin may act without its own UserID being relevant to THIS
+		// check (authorizeStaffForRestaurant admits any admin regardless);
+		// guard the nil case rather than assume every staff actor carries one.
+		if actor.UserID != nil {
+			return "staff:" + actor.UserID.String()
+		}
+		return "staff"
 	}
 	return "guest"
 }

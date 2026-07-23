@@ -91,7 +91,15 @@ func mapOperationStatus(s string) (domain.RefundStatus, bool) {
 	case "success", "ok", "1":
 		return domain.RefundSucceeded, true
 	case "pending", "process", "processing":
-		return domain.RefundCreated, true
+		// Non-blocking item #7 (second review): these words mean the
+		// acquirer accepted the request but has not confirmed the outcome
+		// yet — an in-progress, unknown-until-resolved state, exactly what
+		// domain.RefundPending exists for. Mapping them to RefundCreated was
+		// wrong: RefundStatus.RetryableAtAcquirer() reports `created` as
+		// safe to call Refund again from scratch (it never reached the
+		// acquirer), which is false here — this call DID reach the
+		// acquirer and may yet complete as a real refund.
+		return domain.RefundPending, true
 	case "", "failed", "error", "rejected", "0":
 		return domain.RefundFailed, true
 	default:

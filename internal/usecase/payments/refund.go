@@ -129,13 +129,22 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 
 	// Report item #7: a payment already settled (by ANY trigger, including
 	// the no-refund outcomes that never move Status away from captured) must
-	// reject a DIFFERENT settlement attempt outright. The SAME key resumes —
-	// its own idempotency mechanisms below (payment_refunds for the refund
-	// branch, the outbox for the no-refund branch) decide whether it is
-	// truly finished or still needs to continue (e.g. a refund stuck
-	// `pending` after a timeout, report item #1).
+	// reject a DIFFERENT settlement attempt outright. The SAME key AND the
+	// SAME trigger resumes — its own idempotency mechanisms below
+	// (payment_refunds for the refund branch, the outbox for the no-refund
+	// branch) decide whether it is truly finished or still needs to continue
+	// (e.g. a refund stuck `pending` after a timeout, report item #1).
+	//
+	// Second review, blocking item #2: checking the key ALONE used to be
+	// enough to "resume". That let a request carrying the SAME idempotency
+	// key but a DIFFERENT trigger through as if it were a legitimate retry —
+	// e.g. a late cancellation settles first (no refund, the venue keeps the
+	// base, Status stays `captured`), and a second call with the same key
+	// but RefundTriggerVenueCancel then computes and pays out a brand new
+	// full refund on top of what the venue already kept. The trigger must
+	// match too.
 	if p.SettledAt != nil {
-		if p.SettlementIdempotencyKey == nil || *p.SettlementIdempotencyKey != in.IdempotencyKey {
+		if !sameSettlementAttempt(p, in) {
 			return nil, fmt.Errorf("%w: payment %s was already settled", domain.ErrAlreadyExists, p.ID)
 		}
 	}
@@ -157,15 +166,17 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 			if !errors.Is(claimErr, domain.ErrAlreadyExists) {
 				return nil, claimErr
 			}
-			// Lost the claim race. Re-read: the SAME key means a concurrent
-			// identical retry won it first — resume with its row instead of
-			// erroring or settling a second time. A DIFFERENT key means a
-			// genuine conflict.
+			// Lost the claim race. Re-read: the SAME key AND the SAME trigger
+			// means a concurrent identical retry won it first — resume with
+			// its row instead of erroring or settling a second time. Either
+			// one differing means a genuine conflict (report item #2, second
+			// review — see the comment above on why the trigger must match
+			// too, not just the key).
 			current, rerr := u.payments.GetByID(ctx, p.ID)
 			if rerr != nil {
 				return nil, rerr
 			}
-			if current.SettlementIdempotencyKey == nil || *current.SettlementIdempotencyKey != in.IdempotencyKey {
+			if !sameSettlementAttempt(current, in) {
 				return nil, fmt.Errorf("%w: payment %s was already settled", domain.ErrAlreadyExists, p.ID)
 			}
 			p = current
@@ -182,6 +193,22 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 		return u.settleWithNoRefund(ctx, p, settlement, now)
 	}
 	return u.settleWithRefund(ctx, p, settlement, in, now)
+}
+
+// sameSettlementAttempt reports whether in is a legitimate retry of the
+// settlement already recorded on p — the SettledAt / SettledTrigger /
+// SettlementIdempotencyKey already stored — rather than a second, genuinely
+// different settlement attempt (report item #2, second review). Both the
+// idempotency key AND the trigger must match: matching the key alone let a
+// caller resume-and-overwrite a settlement with a DIFFERENT outcome (e.g. a
+// late-cancellation no-refund settlement, followed by a "venue cancelled,
+// full refund" call reusing the same key) as if it were the same request
+// retried.
+func sameSettlementAttempt(p *domain.Payment, in SettleInput) bool {
+	if p.SettlementIdempotencyKey == nil || *p.SettlementIdempotencyKey != in.IdempotencyKey {
+		return false
+	}
+	return p.SettledTrigger != nil && *p.SettledTrigger == in.Trigger
 }
 
 // resolveTiming derives the server-trusted cancellation timing (report item

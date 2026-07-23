@@ -402,6 +402,41 @@ func TestSettle_NoShowThenGuestCancelIsRejected(t *testing.T) {
 	}
 }
 
+// TestSettle_SameKeyDifferentTriggerIsRejected is report item #2 (second
+// review), the exact exploit the review describes: a late cancellation
+// settles first (no refund, the venue keeps the base), and a SECOND Settle
+// call reuses the SAME idempotency key but with a DIFFERENT trigger
+// (venue_cancel, a full refund). Checking the idempotency key ALONE used to
+// treat this as "a legitimate retry, resume it" and pay the guest a full
+// refund on top of what the venue already kept. The trigger must be checked
+// too — a key match with a trigger mismatch is a conflict, not a resume.
+func TestSettle_SameKeyDifferentTriggerIsRejected(t *testing.T) {
+	p := capturedTestPayment(uuid.New())
+	h := newRefundHarness(p, 100)
+	ctx := context.Background()
+	const key = "shared-key-1"
+
+	first, err := h.u.Settle(ctx, staffActor, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerNoShow, IdempotencyKey: key,
+	})
+	if err != nil {
+		t.Fatalf("no-show Settle() error = %v", err)
+	}
+	if first.Status != domain.PaymentCaptured {
+		t.Fatalf("status after no-show = %s, want unchanged captured", first.Status)
+	}
+
+	_, err = h.u.Settle(ctx, staffActor, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerVenueCancel, IdempotencyKey: key,
+	})
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("error = %v, want ErrAlreadyExists (same key, different trigger is a conflict, not a resume)", err)
+	}
+	if h.gw.callCount("refund") != 0 {
+		t.Fatalf("refund called %d times, want 0 — the no-show settlement must not be reopened into a full refund", h.gw.callCount("refund"))
+	}
+}
+
 // TestSettle_NoShowRetrySameKeyIsIdempotent is the companion to the test
 // above: a legitimate retry with the SAME idempotency key (a client retrying
 // a timed-out HTTP call, say) must succeed as a no-op, not be rejected as a

@@ -23,12 +23,33 @@ const (
 	// two concurrent CaptureOnSeating calls for the SAME booking race-safe
 	// (report item #5): only the CAS winner may call the acquirer; the loser
 	// gets ErrAlreadyExists and must not call Capture too. It is always
-	// transient — CaptureOnSeating resolves it to `captured` on acquirer
-	// success or releases it back to `authorized` on acquirer failure, never
-	// leaving a payment parked here.
+	// transient — CaptureOnSeating resolves it to `captured` on a definite
+	// acquirer answer (success or an explicit decline, domain.ErrProviderDeclined)
+	// but, per the second review (item #1), is deliberately LEFT here when the
+	// acquirer's answer is unknown (domain.ErrProviderOutcomeUnknown) — see
+	// the KNOWN GAP note on PaymentVoiding below, which applies here too.
 	PaymentCapturing PaymentStatus = "capturing"
 	// PaymentCaptured is money actually taken from the guest.
 	PaymentCaptured PaymentStatus = "captured"
+	// PaymentVoiding is a claimed-but-not-yet-confirmed hold release: the venue
+	// rejected the seating and this usecase call won the CAS claim on the
+	// hold, but the acquirer has not answered yet. Symmetric to
+	// PaymentCapturing and exists for the same reason (payments review
+	// 2026-07-23, non-blocking item #1): two concurrent VoidOnRejection calls
+	// for the SAME booking must not both call gw.Void — only the CAS winner
+	// may call the acquirer. It is always transient — VoidOnRejection
+	// resolves it to `voided` on acquirer success or releases it back to
+	// `authorized` on a definite acquirer decline, never leaving a payment
+	// parked here on purpose.
+	//
+	// KNOWN GAP: neither this nor PaymentCapturing has an automatic way out
+	// when the acquirer's answer is genuinely unknown (a timeout / 5xx) — the
+	// payment is deliberately left here pending manual or
+	// reconciliation-worker resolution. The reconciliation worker is a
+	// separate, not-yet-built task (see the payments review report); DO NOT
+	// run this code in production before it exists, or a lost acquirer answer
+	// strands a payment here with no automatic recovery.
+	PaymentVoiding PaymentStatus = "voiding"
 	// PaymentVoided is a released hold — the guest was never charged.
 	PaymentVoided PaymentStatus = "voided"
 	// PaymentPartiallyRefunded means part of a captured payment went back.
@@ -44,15 +65,19 @@ const (
 // paymentTransitions is the allowed payment status transition table. A status
 // present with an empty set is valid but terminal.
 //
-//	created ──authorize──▶ authorized ──capture──▶ captured
-//	   │                       │                      │
-//	   │                       ├──void──▶ voided      ├──refund(part)──▶ partially_refunded
-//	   │                       ├──expire──▶ expired   └──refund(full)──▶ refunded
+//	created ──authorize──▶ authorized ──capture──▶ capturing ──▶ captured
+//	   │                       │                                    │
+//	   │                       ├──void──▶ voiding ──▶ voided        ├──refund(part)──▶ partially_refunded
+//	   │                       ├──expire──▶ expired                 └──refund(full)──▶ refunded
 //	   └──fail──▶ failed       └──fail──▶ failed      partially_refunded ──▶ refunded
 //
 // Notes that are easy to get wrong:
 //   - authorized → failed exists because an acquirer can reject a capture on an
 //     otherwise valid hold (issuer declines, hold already consumed);
+//   - authorized → captured and authorized → voided (skipping the
+//     capturing/voiding claim) exist because a webhook may report the
+//     acquirer's own outcome directly, without ever going through this
+//     usecase's local claim;
 //   - a second partial refund does NOT change the status, so it is not a
 //     transition at all — the usecase only calls ValidatePaymentTransition when
 //     the status actually changes;
@@ -68,13 +93,23 @@ var paymentTransitions = map[PaymentStatus]map[PaymentStatus]struct{}{
 	PaymentAuthorized: {
 		PaymentCapturing: {},
 		PaymentCaptured:  {}, // a webhook may report capture directly, without going through the local `capturing` claim
-		PaymentVoided:    {},
+		PaymentVoiding:   {},
+		PaymentVoided:    {}, // a webhook may report void directly, without going through the local `voiding` claim
 		PaymentExpired:   {},
 		PaymentFailed:    {},
 	},
 	PaymentCapturing: {
-		PaymentCaptured:   {}, // acquirer confirmed
-		PaymentAuthorized: {}, // acquirer call failed: release the claim, the hold is unchanged
+		PaymentCaptured:   {}, // acquirer gave a definite answer: confirmed
+		PaymentAuthorized: {}, // acquirer declined outright: release the claim, the hold is unchanged
+		// NOTE: there is deliberately no transition OUT of `capturing` for an
+		// UNKNOWN acquirer outcome (report item #1) — the usecase simply does
+		// not call CompareAndSwapStatus in that case, so the payment stays
+		// here until a human or the reconciliation worker resolves it.
+	},
+	PaymentVoiding: {
+		PaymentVoided:     {}, // acquirer confirmed the release
+		PaymentAuthorized: {}, // acquirer declined outright: release the claim, the hold is unchanged
+		// Same NOTE as PaymentCapturing above applies symmetrically.
 	},
 	PaymentCaptured: {
 		PaymentPartiallyRefunded: {},
@@ -101,10 +136,13 @@ func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 
 // HoldsMoney reports whether a payment in this status is holding or has taken
 // the guest's money. Used to decide whether a cancellation has to reach the
 // acquirer at all, and mirrors the partial unique index
-// idx_payments_live_per_booking in migrations/0007_payments.sql — keep both in
-// sync.
+// idx_payments_live_per_booking (as recreated by migrations/0009, on top of
+// 0007/0008) — keep both in sync. PaymentVoiding counts as holding money too:
+// the hold is still in place until the acquirer confirms its release, so a
+// second payment must not be allowed to start for the same booking while one
+// is mid-void, exactly like mid-capture.
 func (s PaymentStatus) HoldsMoney() bool {
-	return s == PaymentAuthorized || s == PaymentCapturing || s == PaymentCaptured
+	return s == PaymentAuthorized || s == PaymentCapturing || s == PaymentVoiding || s == PaymentCaptured
 }
 
 // Refundable reports whether money can still be sent back for this status.

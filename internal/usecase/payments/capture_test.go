@@ -3,6 +3,7 @@ package payments
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -107,14 +108,17 @@ func TestCaptureOnSeating_RejectsGuestActor(t *testing.T) {
 	}
 }
 
+// TestCaptureOnSeating_ProviderRejectionLeavesPaymentAuthorized covers a
+// DEFINITE decline (domain.ErrProviderDeclined) — the hold is unchanged and
+// must be released back to `authorized` so a retry (or a Void) can proceed.
 func TestCaptureOnSeating_ProviderRejectionLeavesPaymentAuthorized(t *testing.T) {
 	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
 	capture, _, repo, ledger, outbox, gw := newCaptureHarness(p)
-	gw.captureErr = errors.New("acquirer: card declined on clearing")
+	gw.captureErr = fmt.Errorf("acquirer: card declined on clearing: %w", domain.ErrProviderDeclined)
 
 	_, err := capture.CaptureOnSeating(context.Background(), staffActor, p.BookingID)
-	if err == nil {
-		t.Fatalf("expected an error from a provider rejection")
+	if !errors.Is(err, domain.ErrProviderDeclined) {
+		t.Fatalf("error = %v, want ErrProviderDeclined", err)
 	}
 	stored, _ := repo.GetByID(context.Background(), p.ID)
 	if stored.Status != domain.PaymentAuthorized {
@@ -125,6 +129,44 @@ func TestCaptureOnSeating_ProviderRejectionLeavesPaymentAuthorized(t *testing.T)
 	}
 	if len(outbox.types()) != 0 {
 		t.Fatalf("outbox got %d events from a failed capture, want 0", len(outbox.types()))
+	}
+}
+
+// TestCaptureOnSeating_UnknownOutcomeStaysCapturingAndForbidsRetry is report
+// item #1 (second review): a timeout / 5xx / malformed answer from the
+// acquirer is NOT the same fact as a definite decline — the capture may have
+// actually cleared. The payment must be left in `capturing`, and a second
+// CaptureOnSeating call for the same booking must be refused rather than
+// calling gw.Capture again (which would risk a real second charge).
+func TestCaptureOnSeating_UnknownOutcomeStaysCapturingAndForbidsRetry(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	capture, _, repo, ledger, outbox, gw := newCaptureHarness(p)
+	gw.captureErr = fmt.Errorf("acquirer: request timed out: %w", domain.ErrProviderOutcomeUnknown)
+	ctx := context.Background()
+
+	_, err := capture.CaptureOnSeating(ctx, staffActor, p.BookingID)
+	if !errors.Is(err, domain.ErrProviderOutcomeUnknown) {
+		t.Fatalf("first call error = %v, want ErrProviderOutcomeUnknown", err)
+	}
+	stored, _ := repo.GetByID(ctx, p.ID)
+	if stored.Status != domain.PaymentCapturing {
+		t.Fatalf("status = %s, want capturing (parked pending reconciliation)", stored.Status)
+	}
+	if len(ledger.entries) != 0 {
+		t.Fatalf("ledger got %d entries from an unresolved capture, want 0", len(ledger.entries))
+	}
+	if len(outbox.types()) != 0 {
+		t.Fatalf("outbox got %d events from an unresolved capture, want 0", len(outbox.types()))
+	}
+
+	// A second attempt (staff retrying, thinking the first one "failed")
+	// must NOT call the acquirer again.
+	_, err = capture.CaptureOnSeating(ctx, staffActor, p.BookingID)
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("second call error = %v, want ErrInvalidStatus (payment is capturing, cannot capture)", err)
+	}
+	if gw.callCount("capture") != 1 {
+		t.Fatalf("capture called %d times across 2 attempts, want 1 (must not retry an unknown outcome)", gw.callCount("capture"))
 	}
 }
 
@@ -253,26 +295,108 @@ func TestCaptureOnSeating_CrossTenantStaffIsRejected(t *testing.T) {
 	}
 }
 
-// TestCaptureVsVoidRace exercises the DB-level guard on the same payment: a
-// slow capture and a slow void both starting from 'authorized' must not both
-// win. Whichever CompareAndSwapStatus loses reports ErrAlreadyExists rather
-// than silently succeeding.
+// TestCaptureVsVoidRace exercises the real usecases end to end (not the raw
+// CAS in isolation — the QA report flagged the previous version of this test
+// for calling repo.CompareAndSwapStatus directly, which never goes through
+// CaptureOnSeating/VoidOnRejection and so cannot catch a bug in either one,
+// e.g. non-blocking item #1's missing claim in VoidOnRejection): a concurrent
+// CaptureOnSeating and VoidOnRejection for the SAME booking, both starting
+// from 'authorized', must not both win — exactly one of them may reach its
+// acquirer call, and the other must lose the CAS claim and report a conflict
+// instead of silently doing nothing or double-acting.
 func TestCaptureVsVoidRace(t *testing.T) {
 	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
-	repo := newFakePaymentRepo(p)
+	capture, void, repo, _, _, gw := newCaptureHarness(p)
+	gw.captureDelay = 20 * time.Millisecond
+	gw.voidDelay = 20 * time.Millisecond
+	ctx := context.Background()
 
-	now := p.CreatedAt
-	errCapture := repo.CompareAndSwapStatus(context.Background(), p.ID, domain.PaymentAuthorized, domain.PaymentCaptured, now)
-	errVoid := repo.CompareAndSwapStatus(context.Background(), p.ID, domain.PaymentAuthorized, domain.PaymentVoided, now)
+	var captureErr, voidErr error
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		start.Wait()
+		_, captureErr = capture.CaptureOnSeating(ctx, staffActor, p.BookingID)
+	}()
+	go func() {
+		defer wg.Done()
+		start.Wait()
+		_, voidErr = void.VoidOnRejection(ctx, staffActor, p.BookingID, "table not available")
+	}()
+	start.Done()
+	wg.Wait()
 
-	if errCapture != nil {
-		t.Fatalf("first CAS (capture) error = %v, want nil", errCapture)
+	captureWon := captureErr == nil
+	voidWon := voidErr == nil
+	if captureWon == voidWon {
+		t.Fatalf("exactly one of capture/void must win, got captureErr=%v voidErr=%v", captureErr, voidErr)
 	}
-	if !errors.Is(errVoid, domain.ErrAlreadyExists) {
-		t.Fatalf("second CAS (void) error = %v, want ErrAlreadyExists", errVoid)
+	if captureWon && !errors.Is(voidErr, domain.ErrInvalidStatus) && !errors.Is(voidErr, domain.ErrAlreadyExists) {
+		t.Fatalf("void loser error = %v, want ErrInvalidStatus or ErrAlreadyExists", voidErr)
 	}
-	stored, _ := repo.GetByID(context.Background(), p.ID)
-	if stored.Status != domain.PaymentCaptured {
+	if voidWon && !errors.Is(captureErr, domain.ErrInvalidStatus) && !errors.Is(captureErr, domain.ErrAlreadyExists) {
+		t.Fatalf("capture loser error = %v, want ErrInvalidStatus or ErrAlreadyExists", captureErr)
+	}
+	if gw.callCount("capture") > 1 {
+		t.Fatalf("capture called %d times, want at most 1", gw.callCount("capture"))
+	}
+	if gw.callCount("void") > 1 {
+		t.Fatalf("void called %d times, want at most 1", gw.callCount("void"))
+	}
+
+	stored, _ := repo.GetByID(ctx, p.ID)
+	if captureWon && stored.Status != domain.PaymentCaptured {
 		t.Fatalf("status = %s, want captured (the winner)", stored.Status)
+	}
+	if voidWon && stored.Status != domain.PaymentVoided {
+		t.Fatalf("status = %s, want voided (the winner)", stored.Status)
+	}
+}
+
+// TestVoidOnRejection_ConcurrentCallsOnlyOneCallsGateway is the void-side
+// analogue of TestCaptureOnSeating_ConcurrentCallsOnlyOneCallsGateway
+// (non-blocking item #1, second review): two concurrent VoidOnRejection
+// calls for the SAME booking must not both call gw.Void — only the winner of
+// the `authorized -> voiding` CAS may reach the acquirer.
+func TestVoidOnRejection_ConcurrentCallsOnlyOneCallsGateway(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentAuthorized, "gw-1")
+	_, void, repo, _, _, gw := newCaptureHarness(p)
+	gw.voidDelay = 20 * time.Millisecond
+	ctx := context.Background()
+
+	const n = 5
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start.Wait()
+			_, errs[i] = void.VoidOnRejection(ctx, staffActor, p.BookingID, "table not available")
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successes = %d across %d concurrent calls, want exactly 1: errs=%v", successes, n, errs)
+	}
+	if gw.callCount("void") != 1 {
+		t.Fatalf("void called %d times, want 1 (the CAS claim must stop every loser before the acquirer call)", gw.callCount("void"))
+	}
+	stored, _ := repo.GetByID(ctx, p.ID)
+	if stored.Status != domain.PaymentVoided {
+		t.Fatalf("status = %s, want voided", stored.Status)
 	}
 }
