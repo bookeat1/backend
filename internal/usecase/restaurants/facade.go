@@ -12,6 +12,9 @@ import (
 // Facade exposes catalog reads and admin mutations.
 type Facade interface {
 	List(ctx context.Context, f domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error)
+	// Search runs the full-text + fuzzy catalog search (a distinct endpoint
+	// from List, which keeps its existing response shape untouched).
+	Search(ctx context.Context, f domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error)
 	Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error)
 	Categories(ctx context.Context) ([]domain.RestaurantCategory, error)
 	Create(ctx context.Context, in SaveInput) (*domain.RestaurantAggregate, error)
@@ -87,6 +90,10 @@ type PartnershipInput struct {
 
 func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
 	return f.repo.ListActive(ctx, flt)
+}
+
+func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
+	return f.repo.Search(ctx, flt)
 }
 
 func (f *facade) Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {

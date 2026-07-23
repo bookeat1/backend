@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -38,6 +39,7 @@ func NewHandler(f uc.Facade, m uc.ManagerUseCase, favorites favoriteChecker) *Ha
 // RegisterPublic mounts the unauthenticated catalog routes.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/restaurants", h.list)
+	rg.GET("/restaurants/search", h.search)
 	rg.GET("/restaurants/:id", h.get)
 	rg.GET("/restaurant-categories", h.categories)
 	rg.GET("/cities", h.cities)
@@ -111,6 +113,56 @@ func (h *Handler) list(c *gin.Context) {
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
 
 	items, total, err := h.facade.List(c.Request.Context(), f)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	lang := resolveLocale(c)
+	out := make([]restaurantResponse, 0, len(items))
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, it := range items {
+		out = append(out, listItemToResponse(it, lang))
+		ids = append(ids, it.Restaurant.ID)
+	}
+	h.attachFavorites(c.Request.Context(), out, ids)
+	page := f.Page
+	if page <= 0 {
+		page = 1
+	}
+	perPage := f.PerPage
+	if perPage <= 0 {
+		perPage = 20
+	}
+	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// search runs the public full-text + fuzzy catalog search. It is a distinct
+// endpoint from list: the list response shape is frozen (other clients depend
+// on it), so this route returns the same per-item shape but is free to evolve
+// its own query surface (q, cuisine[], price, ranking) independently.
+func (h *Handler) search(c *gin.Context) {
+	f := domain.RestaurantSearchFilter{Query: c.Query("q")}
+	if v := c.Query("city"); v != "" {
+		city := domain.City(v)
+		f.City = &city
+	}
+	// cuisine may repeat (?cuisine=Итальянская&cuisine=Азиатская) or be a single
+	// comma-separated value; both collapse to an OR-set. Blank entries dropped.
+	for _, raw := range c.QueryArray("cuisine") {
+		for _, part := range strings.Split(raw, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				f.Cuisines = append(f.Cuisines, s)
+			}
+		}
+	}
+	if v := c.Query("price"); v != "" {
+		price := domain.PriceCategory(v)
+		f.Price = &price
+	}
+	f.Page, _ = strconv.Atoi(c.Query("page"))
+	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
+
+	items, total, err := h.facade.Search(c.Request.Context(), f)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return

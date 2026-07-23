@@ -270,6 +270,113 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	return items, total, nil
 }
 
+// searchTextExpr is the exact SQL expression the FTS and trigram indexes in
+// migration 0026 are built over (restaurant_search_text applied to the four
+// searchable columns). The query below must reference it verbatim — down to
+// column order — or the planner will not use those GIN indexes. The `r.`
+// alias resolves to the same columns the unqualified index expression names,
+// which is why the index still matches. See the migration's comment for the
+// all-locale rationale.
+const searchTextExpr = `restaurant_search_text(r.name, r.description, r.name_i18n, r.description_i18n)`
+
+// Search implements domain.RestaurantRepository.Search: a full-text +
+// trigram-fuzzy search over the localized name/description of active
+// restaurants, combined with the city / cuisine / price filters.
+func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
+	where := []string{"r.is_active = true"}
+	args := []any{}
+	add := func(cond string, val any) {
+		args = append(args, val)
+		where = append(where, fmt.Sprintf(cond, len(args)))
+	}
+	if f.City != nil {
+		add("r.city = $%d", string(*f.City))
+	}
+	if len(f.Cuisines) > 0 {
+		add("r.cuisine_type = ANY($%d)", f.Cuisines)
+	}
+	if f.Price != nil {
+		add("r.price_category = $%d", string(*f.Price))
+	}
+
+	// qN is the placeholder holding the search text, referenced several times
+	// (WHERE + ORDER BY). It is bound once and reused. An explicit ::text cast on
+	// every use keeps pgx's extended-protocol type inference unambiguous — the
+	// same parameter feeds plainto_tsquery, the <% operator and word_similarity,
+	// and a bare $n reused across differently-typed call sites can trip SQLSTATE
+	// 42P08 (see bugs/bookeat-backend-cas-sql-type-inference.md).
+	q := strings.TrimSpace(f.Query)
+	var qN int
+	if q != "" {
+		args = append(args, q)
+		qN = len(args)
+		// FTS match OR trigram word-similarity (typo tolerance). Both branches
+		// are index-backed (idx_restaurants_search_fts / _trgm), so the planner
+		// can BitmapOr them instead of scanning.
+		where = append(where, fmt.Sprintf(
+			`(to_tsvector('russian', %s) @@ plainto_tsquery('russian', $%d::text)
+			  OR $%d::text <%% %s)`,
+			searchTextExpr, qN, qN, searchTextExpr))
+	}
+	whereSQL := strings.Join(where, " AND ")
+
+	var total int
+	if err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT count(*) FROM restaurants r WHERE `+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count search restaurants: %w", err)
+	}
+
+	page, perPage := f.Page, f.PerPage
+	if page <= 0 {
+		page = 1
+	}
+	if perPage <= 0 {
+		perPage = 20
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+
+	// Ordering: with a text query, rank by FTS relevance then trigram
+	// word-similarity, tie-broken by id so a page boundary is deterministic
+	// (equal-ranked rows never reshuffle between pages). Without a query the
+	// endpoint degrades to a filtered browse ordered like the catalog listing.
+	orderSQL := `ORDER BY r.display_order ASC NULLS LAST, r.name ASC, r.id ASC`
+	if q != "" {
+		orderSQL = fmt.Sprintf(
+			`ORDER BY ts_rank(to_tsvector('russian', %s), plainto_tsquery('russian', $%d::text)) DESC,
+			 word_similarity($%d::text, %s) DESC, r.id ASC`,
+			searchTextExpr, qN, qN, searchTextExpr)
+	}
+
+	args = append(args, perPage, (page-1)*perPage)
+	q2 := `SELECT ` + prefixed(cols, "r") + `,
+		(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
+		 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image
+		FROM restaurants r WHERE ` + whereSQL + `
+		` + orderSQL + `
+		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
+
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q2, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("search restaurants: %w", err)
+	}
+	defer rows.Close()
+
+	var items []domain.RestaurantListItem
+	for rows.Next() {
+		base, primary, err := scanListItem(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, domain.RestaurantListItem{Restaurant: *base, PrimaryImage: primary})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("search restaurants: %w", err)
+	}
+	return items, total, nil
+}
+
 func (r *Repository) args(m *domain.Restaurant) []any {
 	return []any{
 		m.ID, m.CategoryID, m.Name, i18nToDB(m.NameI18n), m.Description,

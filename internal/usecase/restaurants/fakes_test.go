@@ -45,6 +45,9 @@ func (f *fakeRestaurantRepo) UpdateBookingPolicy(_ context.Context, id uuid.UUID
 func (f *fakeRestaurantRepo) ListActive(_ context.Context, _ domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
 	return f.list, f.total, nil
 }
+func (f *fakeRestaurantRepo) Search(_ context.Context, _ domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
+	return f.list, f.total, nil
+}
 func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) error {
 	f.activeID, f.active = id, a
 	return nil
