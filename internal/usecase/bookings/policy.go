@@ -6,6 +6,16 @@ import (
 	"backend-core/internal/domain"
 )
 
+// CancelDeadlineFor is the server-trusted "free cancellation ends at" moment
+// for a booking, exported so other usecase packages (payments) can derive the
+// exact same value cancelDeadline (status.go) computes for the booking's own
+// cancel action, instead of re-resolving the venue's policy — and possibly
+// drifting from it — a second time. See usecase/payments.cancelDeadlineResolver.
+func CancelDeadlineFor(restaurant domain.Restaurant, cfg Config, startsAt time.Time) time.Time {
+	policy := resolvePolicy(restaurant, cfg)
+	return startsAt.Add(-policy.CancelDeadline)
+}
+
 // resolvePolicy merges the two policy levels of spec §4.2: the global env
 // defaults (Config) and the restaurant's optional per-field overrides. A NULL
 // (nil) override falls back to the global value; an override that is present

@@ -18,6 +18,7 @@ import (
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
+	paymentsrest "backend-core/internal/transport/rest/payments"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	"backend-core/internal/transport/rest/swaggerui"
 	usersrest "backend-core/internal/transport/rest/users"
@@ -104,6 +105,23 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	bookingScoped := authed.Group("")
 	bookingScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
 	bookingHandler.RegisterRestaurantScoped(bookingScoped)
+
+	paymentHandler := paymentsrest.NewHandler(deps.PaymentCreate, deps.PaymentCapture, deps.PaymentVoid,
+		deps.PaymentRefund, deps.PaymentWebhook, deps.PaymentStatus, deps.PaymentGateways, deps.PaymentsPublicBaseURL)
+	// Guest checkout + read + settle: a guest may have no account at all (a
+	// payment link opened without ever logging in), so this group runs
+	// OptionalAuth, not Auth — see the payments package doc.
+	paymentGuest := api.Group("")
+	paymentGuest.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
+	paymentHandler.RegisterGuestRoutes(paymentGuest)
+	// Capture/void are venue-only actions on a booking-scoped route (no
+	// restaurant id in the path, same reason bookingHandler.RegisterRoutes
+	// cannot use RequireRestaurantManager); mounted on the standard
+	// authenticated group, restaurant ownership is checked inside the usecase.
+	paymentHandler.RegisterStaffRoutes(authed)
+	// Acquirer webhooks: public, unauthenticated, NOT under /api/v1 (the
+	// acquirer calls the bare route it was configured with).
+	paymentHandler.RegisterWebhooks(r.Group("/"))
 
 	return r
 }

@@ -364,6 +364,399 @@
                 }
             }
         },
+        "/api/v1/bookings/{id}/payment": {
+            "get": {
+                "description": "Returns the booking's live (authorized or captured) payment. Same access rule as reading the payment directly.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Get a booking's current payment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Booking id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Computes the amount server-side, places a hold with the resolved acquirer, and returns a payment link. Works for a logged-in guest, an anonymous guest checkout link, or venue staff creating a payment on a guest's behalf.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Pay for a booking",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Booking id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Where the guest lands after the hosted payment page",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/payments.createPaymentRequest"
+                        }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Client retry token",
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "404": {
+                        "description": "booking not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "409": {
+                        "description": "booking already has an active payment",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "validation failed / payments not enabled for this restaurant",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/bookings/{id}/payment/capture": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Venue staff only. Idempotent: calling it again on an already-captured payment is a no-op.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Capture a booking's held payment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Booking id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid status transition",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/bookings/{id}/payment/settle": {
+            "post": {
+                "description": "Refunds the guest, keeps the venue's share, or both, depending on the trigger and timing (spec §9.1).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Settle a cancelled or no-show booking's payment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Booking id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Trigger + optional reason",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/payments.settleRequest"
+                        }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Client retry token",
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "409": {
+                        "description": "already settled",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "validation failed",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/bookings/{id}/payment/void": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Venue staff only. Idempotent: calling it again on an already-voided payment is a no-op.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Release a booking's held payment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Booking id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Optional reason",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/payments.voidRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid status transition",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/payments/{id}": {
+            "get": {
+                "description": "The payment's own owner, venue staff/admin of its restaurant, or (for a guest checkout with no account) anyone holding the id may read it.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Get a payment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Payment id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Envelope"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/payments.paymentResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/me": {
             "get": {
                 "security": [
@@ -516,6 +909,62 @@
                     }
                 }
             }
+        },
+        "/webhooks/payments/freedompay": {
+            "post": {
+                "description": "Public, unauthenticated — authenticity is the pg_sig signature, verified server-side. Answers a signed XML envelope, never JSON. A bad signature or a processing failure both answer pg_status=error with no further detail, which makes FreedomPay retry every 30 minutes for up to 2 hours (sandbox-confirmed); a successful apply answers pg_status=ok.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "text/xml"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "FreedomPay payment callback",
+                "responses": {
+                    "200": {
+                        "description": "\u003cresponse\u003e\u003cpg_status\u003eok\u003c/pg_status\u003e...\u003c/response\u003e",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/webhooks/payments/tiptoppay/{type}": {
+            "post": {
+                "description": "Public, unauthenticated — authenticity is the Content-HMAC/X-Content-HMAC signature, verified server-side. Always answers {\"code\":0}, the only value TipTopPay's docs describe as \"registered\".",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "TipTopPay payment notification",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "check | pay | fail | confirm | refund | cancel",
+                        "name": "type",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "{\\\"code\\\":0}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -627,6 +1076,109 @@
                 "refresh_token": {
                     "type": "string",
                     "example": "9c8b7a6f-4d3e-2b1a-...-refresh"
+                }
+            }
+        },
+        "payments.createPaymentRequest": {
+            "type": "object",
+            "properties": {
+                "return_url": {
+                    "type": "string"
+                }
+            }
+        },
+        "payments.paymentResponse": {
+            "type": "object",
+            "properties": {
+                "amount_minor": {
+                    "type": "integer"
+                },
+                "authorized_at": {
+                    "type": "string"
+                },
+                "base_amount_minor": {
+                    "type": "integer"
+                },
+                "booking_id": {
+                    "type": "string"
+                },
+                "captured_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "currency": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "failed_at": {
+                    "type": "string"
+                },
+                "failure_code": {
+                    "type": "string"
+                },
+                "failure_message": {
+                    "type": "string"
+                },
+                "fee_minor": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "payment_url": {
+                    "description": "PaymentURL is where the guest is redirected to actually pay. Present\nonce the acquirer answered Authorize; nil for a payment that never got\nthat far (should not normally be observable — CreateForBooking only\never stores a row after a successful Authorize).",
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "purpose": {
+                    "type": "string"
+                },
+                "restaurant_id": {
+                    "type": "string"
+                },
+                "settled_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                },
+                "voided_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "payments.settleRequest": {
+            "type": "object",
+            "properties": {
+                "manual_cancelled_at": {
+                    "description": "ManualCancelledAt overrides the booking's own recorded cancellation time.\nSTAFF/ADMIN ONLY — the usecase itself rejects it from any other actor\n(SettleInput.ManualCancelledAt's doc comment); accepting the field here\nand letting the usecase reject it is simpler and no less safe than\ntrying to strip it in the handler before the actor's role is known.",
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "trigger": {
+                    "type": "string"
+                }
+            }
+        },
+        "payments.voidRequest": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string"
                 }
             }
         },
