@@ -1,0 +1,47 @@
+# Локальная база для разработки. Только Postgres: приложение запускается с хоста
+# через `make run`, так его удобнее отлаживать и перезапускать.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml down        # оставит данные
+#   docker compose -f docker-compose.dev.yml down -v     # удалит данные
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bookeat-dev-db
+    environment:
+      POSTGRES_USER: bookeat
+      POSTGRES_PASSWORD: bookeat
+      POSTGRES_DB: bookeat
+      TZ: Asia/Almaty
+    ports:
+      - "5433:5432" # 5433, чтобы не конфликтовать с локальным Postgres, если он есть
+    volumes:
+      - bookeat_dev_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookeat -d bookeat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Отдельная база под интеграционные тесты: они чистят таблицы, и делать это
+  # на базе, где лежат твои данные для ручных проверок, неприятно.
+  postgres_test:
+    image: postgres:16-alpine
+    container_name: bookeat-test-db
+    environment:
+      POSTGRES_USER: bookeat
+      POSTGRES_PASSWORD: bookeat
+      POSTGRES_DB: bookeat_test
+      TZ: UTC
+    ports:
+      - "5434:5432"
+    tmpfs:
+      - /var/lib/postgresql/data # тестовая база живёт в памяти: быстрее и не копится мусор
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookeat -d bookeat_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  bookeat_dev_pg:
