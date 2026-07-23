@@ -332,3 +332,159 @@ func TestSuperadminBypassesTenantScoping(t *testing.T) {
 		t.Errorf("admin SetRole: %v", err)
 	}
 }
+
+// --- lateral co-owner protection (review finding, blocking) ---
+//
+// Two owners of the SAME restaurant (both legitimately created by a
+// superadmin) must not be able to demote or remove EACH OTHER — only a
+// superadmin may touch an equal-or-higher-ranked row.
+
+func TestSetRoleCannotDemoteCoOwner(t *testing.T) {
+	rid, ownerA, ownerB := uuid.New(), uuid.New(), uuid.New()
+	targetID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: uuid.New(), RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+		{ID: targetID, RestaurantID: rid, UserID: ownerB, Role: domain.StaffRoleOwner},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if _, err := u.SetRole(context.Background(), ownerActor(ownerA), targetID, domain.StaffRoleHostess); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("owner demoting a co-owner err = %v, want ErrForbidden", err)
+	}
+	// Confirm nothing actually changed.
+	got, _ := fm.GetByID(context.Background(), targetID)
+	if got.Role != domain.StaffRoleOwner {
+		t.Errorf("co-owner's role changed despite ErrForbidden: %s", got.Role)
+	}
+}
+
+func TestRemoveCannotRemoveCoOwner(t *testing.T) {
+	rid, ownerA, ownerB := uuid.New(), uuid.New(), uuid.New()
+	targetID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: uuid.New(), RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+		{ID: targetID, RestaurantID: rid, UserID: ownerB, Role: domain.StaffRoleOwner},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if err := u.Remove(context.Background(), ownerActor(ownerA), targetID); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("owner removing a co-owner err = %v, want ErrForbidden", err)
+	}
+	if _, err := fm.GetByID(context.Background(), targetID); err != nil {
+		t.Errorf("co-owner row was deleted despite ErrForbidden: %v", err)
+	}
+}
+
+// A superadmin, unlike an owner, MAY demote/remove an owner-ranked row —
+// this is the intended escape hatch for resolving a co-owner dispute.
+func TestSuperadminCanDemoteAndRemoveOwner(t *testing.T) {
+	rid, ownerA, ownerB := uuid.New(), uuid.New(), uuid.New()
+	setRoleTarget := uuid.New()
+	removeTarget := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: uuid.New(), RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+		{ID: setRoleTarget, RestaurantID: rid, UserID: ownerB, Role: domain.StaffRoleOwner},
+		{ID: removeTarget, RestaurantID: rid, UserID: uuid.New(), Role: domain.StaffRoleOwner},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if _, err := u.SetRole(context.Background(), adminActor(), setRoleTarget, domain.StaffRoleManager); err != nil {
+		t.Errorf("admin SetRole on an owner: %v", err)
+	}
+	if err := u.Remove(context.Background(), adminActor(), removeTarget); err != nil {
+		t.Errorf("admin Remove of an owner: %v", err)
+	}
+}
+
+// --- Remove: self-removal and last-owner protection (review findings) ---
+
+func TestRemoveCannotRemoveSelf(t *testing.T) {
+	rid, ownerA := uuid.New(), uuid.New()
+	selfID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: selfID, RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+		{ID: uuid.New(), RestaurantID: rid, UserID: uuid.New(), Role: domain.StaffRoleHostess},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if err := u.Remove(context.Background(), ownerActor(ownerA), selfID); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("self-remove err = %v, want ErrForbidden", err)
+	}
+	if _, err := fm.GetByID(context.Background(), selfID); err != nil {
+		t.Errorf("self row was deleted despite ErrForbidden: %v", err)
+	}
+}
+
+// TestRemoveCannotRemoveSelfEvenAsAdmin proves the self-removal guard is its
+// own check, not just a side effect of requireOutranksTarget: a superadmin
+// bypasses the rank check entirely, so without a dedicated self-removal
+// guard this call would otherwise succeed.
+func TestRemoveCannotRemoveSelfEvenAsAdmin(t *testing.T) {
+	rid := uuid.New()
+	adminUserID := uuid.New()
+	selfID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: selfID, RestaurantID: rid, UserID: adminUserID, Role: domain.StaffRoleHostess},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	admin := Actor{UserID: adminUserID, Role: domain.RoleAdmin}
+	if err := u.Remove(context.Background(), admin, selfID); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("admin self-remove err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestRemoveCannotRemoveLastOwner(t *testing.T) {
+	rid, ownerA := uuid.New(), uuid.New()
+	lastOwnerID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: lastOwnerID, RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+	}}
+	// Removed by a superadmin (not the owner themselves — otherwise the
+	// self-removal guard above would already reject it) so this test proves
+	// the LAST-OWNER rule specifically, independent of self-removal.
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if err := u.Remove(context.Background(), adminActor(), lastOwnerID); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("remove last owner err = %v, want ErrForbidden", err)
+	}
+	if _, err := fm.GetByID(context.Background(), lastOwnerID); err != nil {
+		t.Errorf("last owner row was deleted despite ErrForbidden: %v", err)
+	}
+}
+
+// A SECOND owner may still be removed by a superadmin — this proves the
+// last-owner check counts correctly and isn't just "never remove an owner".
+func TestRemoveSecondOwnerAllowed(t *testing.T) {
+	rid, ownerA, ownerB := uuid.New(), uuid.New(), uuid.New()
+	targetID := uuid.New()
+	fm := &fakeManagers{rows: []domain.RestaurantManager{
+		{ID: uuid.New(), RestaurantID: rid, UserID: ownerA, Role: domain.StaffRoleOwner},
+		{ID: targetID, RestaurantID: rid, UserID: ownerB, Role: domain.StaffRoleOwner},
+	}}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	if err := u.Remove(context.Background(), adminActor(), targetID); err != nil {
+		t.Fatalf("remove second owner: %v", err)
+	}
+}
+
+// --- Assign: re-assigning an existing (restaurant, user) pair must surface
+// as a client error (409/422), never a 500 ("mapped to conflict, not
+// internal error" — review finding, minor). SetRole is the only path meant
+// to change an existing member's role. ---
+
+func TestAssignDuplicateMapsToAlreadyExists(t *testing.T) {
+	rid, ownerID, existingUser := uuid.New(), uuid.New(), uuid.New()
+	fm := &fakeManagers{
+		rows: []domain.RestaurantManager{
+			{ID: uuid.New(), RestaurantID: rid, UserID: ownerID, Role: domain.StaffRoleOwner},
+			{ID: uuid.New(), RestaurantID: rid, UserID: existingUser, Role: domain.StaffRoleHostess},
+		},
+		// Simulates the real Postgres repository's mapWrite: a duplicate
+		// (restaurant_id, user_id) unique-index hit becomes ErrAlreadyExists,
+		// never a bare/opaque error that response.HandleError would classify
+		// as a 500.
+		createErr: domain.ErrAlreadyExists,
+	}
+	u := NewManagerUseCase(fm, &fakeUsers{}, &inlineTx{})
+	_, err := u.Assign(context.Background(), ownerActor(ownerID), AssignManagerInput{
+		RestaurantID: rid, UserID: existingUser, Role: domain.StaffRoleManager,
+	})
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("re-assign existing pair err = %v, want ErrAlreadyExists", err)
+	}
+}

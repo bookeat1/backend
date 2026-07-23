@@ -178,4 +178,14 @@ func TestManagersCreateAndList(t *testing.T) {
 	if err := mgrs.UpdateRole(ctx, uuid.New(), domain.StaffRoleManager); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("update role (missing) err = %v, want ErrNotFound", err)
 	}
+
+	// Re-assigning the SAME (restaurant, user) pair must hit the unique
+	// index and surface as domain.ErrAlreadyExists (→ HTTP 409), never a
+	// bare/opaque error that response.HandleError would classify as a 500.
+	// SetRole (tested above) is the only intended path to change an
+	// existing member's role.
+	dup := &domain.RestaurantManager{RestaurantID: rid, UserID: uid, Role: domain.StaffRoleManager}
+	if err := mgrs.Create(ctx, dup); !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Errorf("duplicate (restaurant, user) create err = %v, want ErrAlreadyExists", err)
+	}
 }

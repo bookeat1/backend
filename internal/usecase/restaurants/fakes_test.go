@@ -136,6 +136,7 @@ type fakeManagers struct {
 	rows       []domain.RestaurantManager
 	created    *domain.RestaurantManager
 	getErr     error
+	createErr  error
 	updRoleErr error
 	delErr     error
 }
@@ -174,6 +175,9 @@ func (f *fakeManagers) GetByID(_ context.Context, id uuid.UUID) (*domain.Restaur
 }
 
 func (f *fakeManagers) Create(_ context.Context, m *domain.RestaurantManager) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
 	if m.ID == uuid.Nil {
 		m.ID = uuid.New()
 	}

@@ -186,6 +186,30 @@ func (u *managerUseCase) Assign(ctx context.Context, actor Actor, in AssignManag
 	return m, nil
 }
 
+// requireOutranksTarget is the shared lateral-protection guard for SetRole
+// and Remove: a non-admin actor (i.e. this restaurant's own owner) must
+// STRICTLY outrank the row they are about to touch, not merely hold
+// staff.manage on the restaurant. Without this, two co-owners of the same
+// restaurant (both legitimately created by a superadmin) could demote or
+// remove EACH OTHER — a lateral takeover within one venue, since
+// authorizeStaffManage alone only proves "an owner of this restaurant",
+// never "an owner who outranks THIS specific target". Only a superadmin may
+// touch an equal-or-higher-ranked row (e.g. to resolve a dispute between
+// two owners).
+func (u *managerUseCase) requireOutranksTarget(ctx context.Context, actor Actor, target domain.RestaurantManager) error {
+	if actor.Role == domain.RoleAdmin {
+		return nil
+	}
+	actorRole, _, err := u.staffRoleOf(ctx, actor.UserID, target.RestaurantID)
+	if err != nil {
+		return err
+	}
+	if !actorRole.Outranks(target.Role) {
+		return fmt.Errorf("%w: cannot change or remove a staff member at or above your own role", domain.ErrForbidden)
+	}
+	return nil
+}
+
 // SetRole changes an existing staff member's role, under the same
 // authorization and rank rules as Assign. The target row is resolved by id
 // FIRST so the authorization check runs against the row's OWN restaurant,
@@ -200,6 +224,14 @@ func (u *managerUseCase) SetRole(ctx context.Context, actor Actor, id uuid.UUID,
 		return nil, err
 	}
 	if err := u.authorizeStaffManage(ctx, actor, m.RestaurantID); err != nil {
+		return nil, err
+	}
+	// Two separate rank checks, both required, neither redundant: the
+	// target's CURRENT role (requireOutranksTarget — an owner may not touch
+	// an equal-or-higher-ranked peer at all, e.g. a co-owner) and the
+	// REQUESTED role (an owner may not promote anyone, including a peer they
+	// already outrank, up to or above their own rank).
+	if err := u.requireOutranksTarget(ctx, actor, *m); err != nil {
 		return nil, err
 	}
 	if actor.Role != domain.RoleAdmin {
@@ -225,6 +257,17 @@ func (u *managerUseCase) SetRole(ctx context.Context, actor Actor, id uuid.UUID,
 // delete a staff row belonging to venue B just by knowing its id. Resolving
 // the row first and authorizing against ITS restaurant closes that hole, so
 // this can now safely be opened up to a restaurant's own owner too.
+//
+// Three more invariants, all checked before the delete:
+//   - requireOutranksTarget — same lateral-takeover protection as SetRole: an
+//     owner cannot remove an equal-or-higher-ranked peer, only a superadmin
+//     can;
+//   - nobody may remove their own staff row through this call — an
+//     accidental or malicious self-removal must not be able to lock the
+//     caller out of a restaurant they still need to manage;
+//   - the restaurant's LAST owner may never be removed, by anyone — doing so
+//     would leave the venue with no local owner at all (only a superadmin
+//     could then reassign one), which is worse than refusing the call.
 func (u *managerUseCase) Remove(ctx context.Context, actor Actor, id uuid.UUID) error {
 	m, err := u.managers.GetByID(ctx, id)
 	if err != nil {
@@ -232,6 +275,27 @@ func (u *managerUseCase) Remove(ctx context.Context, actor Actor, id uuid.UUID) 
 	}
 	if err := u.authorizeStaffManage(ctx, actor, m.RestaurantID); err != nil {
 		return err
+	}
+	if err := u.requireOutranksTarget(ctx, actor, *m); err != nil {
+		return err
+	}
+	if actor.UserID == m.UserID {
+		return fmt.Errorf("%w: cannot remove yourself from the staff roster", domain.ErrForbidden)
+	}
+	if m.Role == domain.StaffRoleOwner {
+		roster, err := u.managers.ListByRestaurant(ctx, m.RestaurantID)
+		if err != nil {
+			return err
+		}
+		owners := 0
+		for _, r := range roster {
+			if r.Role == domain.StaffRoleOwner {
+				owners++
+			}
+		}
+		if owners <= 1 {
+			return fmt.Errorf("%w: cannot remove the restaurant's last owner", domain.ErrForbidden)
+		}
 	}
 	return u.managers.Delete(ctx, id)
 }
