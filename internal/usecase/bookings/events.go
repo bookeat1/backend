@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 )
 
 // eventForStatus maps a booking status to the outbox event announcing it.
@@ -61,7 +63,48 @@ func recordTransition(
 	}); err != nil {
 		return err
 	}
-	return publish(ctx, outbox, b, eventForStatus(b.Status), at)
+	if err := publish(ctx, outbox, b, eventForStatus(b.Status), at); err != nil {
+		return err
+	}
+	logTransition(ctx, b, from, actorType)
+	return nil
+}
+
+// logTransition writes the single business-event log line for a status
+// transition, named by logging.EventBooking* so it is greppable/alertable on
+// an exact string. It runs after the transaction's own work has succeeded
+// (recordTransition returns nil), so a rolled-back attempt never gets logged
+// as if it happened.
+func logTransition(ctx context.Context, b *domain.Booking, from *domain.BookingStatus, actorType domain.ActorType) {
+	fields := []any{
+		slog.String("booking_id", b.ID.String()),
+		slog.String("restaurant_id", b.RestaurantID.String()),
+		slog.String("to_status", string(b.Status)),
+		slog.String("actor_type", string(actorType)),
+	}
+	if from == nil {
+		// The booking's very first row: log as a creation event, with the
+		// masked contact so support can find "which booking" from a guest's
+		// phone/email without ever seeing the raw value in the log stream.
+		fields = append(fields,
+			slog.String("phone_masked", logging.MaskPhone(b.PhoneNormalized)),
+			slog.Int("guests", b.Guests),
+		)
+		if b.Email != "" {
+			fields = append(fields, slog.String("email_masked", logging.MaskEmail(b.Email)))
+		}
+		logging.FromContext(ctx).Info(logging.EventBookingCreated, fields...)
+		return
+	}
+	fields = append(fields, slog.String("from_status", string(*from)))
+	logging.FromContext(ctx).Info(logging.EventBookingStatusChanged, fields...)
+
+	switch b.Status {
+	case domain.BookingCancelled:
+		logging.FromContext(ctx).Info(logging.EventBookingCancelled, fields...)
+	case domain.BookingNoShow:
+		logging.FromContext(ctx).Info(logging.EventBookingNoShow, fields...)
+	}
 }
 
 // publish inserts one outbox event describing the booking's current state.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"backend-core/internal/auth/phone"
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 )
 
 // CreateUseCase creates bookings. It is the only place that decides which
@@ -264,6 +266,11 @@ func (u *createUseCase) checkRate(ctx context.Context, normalizedPhone string) e
 		return err
 	}
 	if n >= u.cfg.RateLimit {
+		logging.FromContext(ctx).Warn(logging.EventAntifraudRejected,
+			slog.String("phone_masked", logging.MaskPhone(normalizedPhone)),
+			slog.Int("attempts", n),
+			slog.Int("limit", u.cfg.RateLimit),
+		)
 		return fmt.Errorf("%w: too many booking attempts, try again later", domain.ErrValidation)
 	}
 	return nil

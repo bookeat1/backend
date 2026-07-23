@@ -1,0 +1,165 @@
+name: Deploy
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [test, prod]
+      confirm:
+        description: 'For prod only: type exactly "deploy-to-prod" to confirm'
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      repo_lc: ${{ steps.vars.outputs.repo_lc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vars
+        run: |
+          # Short SHA (7 chars): the immutable, human-readable tag for this
+          # build. Full SHA is still unique across repos but 7 chars is
+          # plenty for one repo and much easier to read in `.env`/history.
+          echo "tag=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          echo "repo_lc=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            VERSION=${{ steps.vars.outputs.tag }}
+          tags: |
+            ghcr.io/${{ steps.vars.outputs.repo_lc }}:${{ steps.vars.outputs.tag }}
+            ghcr.io/${{ steps.vars.outputs.repo_lc }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # NOTE: the immutable ${{ steps.vars.outputs.tag }} (short SHA) is the
+      # only tag that matters for what actually runs. `current`/`previous`
+      # are moved in GHCR only after a deploy job below actually confirms the
+      # new image is healthy on a server — see the "promote" step in each
+      # deploy job. Until then this build is just "new", not live anywhere.
+
+  deploy-test:
+    needs: build-and-push
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'test')
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to test over SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ secrets.TEST_SSH_HOST }}
+          SSH_USER: ${{ secrets.TEST_SSH_USER }}
+          IMAGE_REPO: ghcr.io/${{ needs.build-and-push.outputs.repo_lc }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          scp -i ~/.ssh/deploy_key deploy/scripts/remote-deploy.sh "$SSH_USER@$SSH_HOST:/tmp/remote-deploy.sh"
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" \
+            "chmod +x /tmp/remote-deploy.sh && /tmp/remote-deploy.sh '$IMAGE_REPO' '$IMAGE_TAG' '${{ github.actor }}'"
+
+      # Only reachable if remote-deploy.sh exited 0, i.e. the health check on
+      # the server passed and this tag is now genuinely CURRENT there.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote GHCR moving tags (current/previous)
+        env:
+          IMAGE_REPO: ghcr.io/${{ needs.build-and-push.outputs.repo_lc }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Best-effort: retag today's "current" as "previous" (may not exist
+          # on the very first run), then move "current" to what we just
+          # confirmed healthy. Never fails the job — these are convenience
+          # labels for browsing GHCR, not what the servers actually run
+          # (that's IMAGE_TAG in each server's .env, set by remote-deploy.sh).
+          if docker pull "$IMAGE_REPO:current" 2>/dev/null; then
+            docker tag "$IMAGE_REPO:current" "$IMAGE_REPO:previous"
+            docker push "$IMAGE_REPO:previous"
+          fi
+          docker pull "$IMAGE_REPO:$IMAGE_TAG"
+          docker tag "$IMAGE_REPO:$IMAGE_TAG" "$IMAGE_REPO:current"
+          docker push "$IMAGE_REPO:current"
+
+  deploy-prod:
+    needs: build-and-push
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.environment == 'prod' &&
+      inputs.confirm == 'deploy-to-prod'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to prod over SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          IMAGE_REPO: ghcr.io/${{ needs.build-and-push.outputs.repo_lc }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          scp -i ~/.ssh/deploy_key deploy/scripts/remote-deploy.sh "$SSH_USER@$SSH_HOST:/tmp/remote-deploy.sh"
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" \
+            "chmod +x /tmp/remote-deploy.sh && /tmp/remote-deploy.sh '$IMAGE_REPO' '$IMAGE_TAG' '${{ github.actor }}'"
+
+      # Only reachable if remote-deploy.sh exited 0, i.e. the health check on
+      # the server passed and this tag is now genuinely CURRENT there.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote GHCR moving tags (current/previous)
+        env:
+          IMAGE_REPO: ghcr.io/${{ needs.build-and-push.outputs.repo_lc }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if docker pull "$IMAGE_REPO:current" 2>/dev/null; then
+            docker tag "$IMAGE_REPO:current" "$IMAGE_REPO:previous"
+            docker push "$IMAGE_REPO:previous"
+          fi
+          docker pull "$IMAGE_REPO:$IMAGE_TAG"
+          docker tag "$IMAGE_REPO:$IMAGE_TAG" "$IMAGE_REPO:current"
+          docker push "$IMAGE_REPO:current"

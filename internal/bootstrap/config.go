@@ -14,11 +14,22 @@ import (
 // variables. Grow it with new sections (Redis, external services, …) as the
 // domain requires — one struct per concern, wired in NewConfig.
 type Config struct {
-	App     AppConfig
-	DB      DBConfig
-	Auth    AuthConfig
-	Booking BookingConfig
-	Worker  WorkerConfig
+	App      AppConfig
+	DB       DBConfig
+	Auth     AuthConfig
+	Booking  BookingConfig
+	Worker   WorkerConfig
+	Payments PaymentsConfig
+	// PaymentsReconciler configures the background payments reconciliation
+	// worker (usecase/payments.Reconciler). KNOWN GAP, disclosed: this
+	// config is read and validated here, but cmd/worker does not construct
+	// the reconciler yet — that needs a real Postgres implementation of
+	// domain.PaymentRepository / PaymentRefundRepository / PaymentLedgerRepository
+	// / PaymentOutboxRepository, which does not exist in this branch (only
+	// in-memory test fakes do, same KNOWN GAP as the rest of usecase/payments —
+	// see team-memory's payments-usecase notes). Wiring RunWorker to start it
+	// is the next step once that adapter lands.
+	PaymentsReconciler PaymentsReconcilerConfig
 }
 
 type AppConfig struct {
@@ -26,6 +37,7 @@ type AppConfig struct {
 	Environment        string
 	URL                string
 	LogLevel           string
+	LogFormat          string // env: APP_LOG_FORMAT — "json" (default) or "text"
 	CORSAllowedOrigins []string
 }
 
@@ -91,6 +103,70 @@ type WorkerConfig struct {
 	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
+// PaymentsConfig holds the global (level-1) payment settings. A restaurant may
+// override most of them per venue (restaurants.payments_enabled /
+// deposit_* / preorder_payment_required / service_fee_bps / payment_provider,
+// all NULLABLE — NULL means "use the value from here"). Resolution:
+// usecase/payments.
+//
+// Acquirer credentials are deliberately NOT part of this struct: each adapter
+// reads its own keys from env, and they never reach the database (spec §8).
+type PaymentsConfig struct {
+	Enabled bool // env: PAYMENTS_ENABLED — master switch, off by default
+
+	// DefaultProvider is the acquirer used when the venue has no preference or
+	// its preferred one is disabled in the payment_providers registry.
+	DefaultProvider string // env: PAYMENTS_DEFAULT_PROVIDER
+
+	// ServiceFeeBps is the BookEat service fee charged to the guest, in basis
+	// points (350 = 3.5%). Basis points, not a float percentage: 3.5% in a
+	// float is a rounding error in somebody else's wallet.
+	ServiceFeeBps int // env: PAYMENTS_SERVICE_FEE_BPS
+
+	// RefundAcquiringBps is what is withheld from a refund to cover the cost of
+	// moving money back, in basis points of the total (100 = 1%). It is a cost
+	// booked to the `acquirer` ledger account, not platform revenue.
+	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
+
+	// DepositDefaultMinor is the deposit charged per booking, in tiyn, when the
+	// venue requires one but sets no amount of its own.
+	DepositDefaultMinor int64 // env: PAYMENTS_DEPOSIT_DEFAULT_MINOR
+
+	// DepositRequired and PreorderPaymentRequired are the GLOBAL fallback for
+	// restaurants.deposit_required / preorder_payment_required when a venue
+	// sets neither override (payments review 2026-07-23, item #10): without
+	// these, usecase/payments.resolveAmount always found "no payment
+	// required" for any restaurant running on the global defaults, so
+	// CreateForBooking rejected every checkout with ErrValidation. A venue's
+	// own override (NULLABLE columns from migration 0007) still wins when set.
+	DepositRequired         bool // env: PAYMENTS_DEPOSIT_REQUIRED
+	PreorderPaymentRequired bool // env: PAYMENTS_PREORDER_PAYMENT_REQUIRED
+
+	// HoldTTL is how long an authorization is expected to stay valid. The
+	// acquirer has the final say; this drives payments.expires_at and the
+	// reconciliation worker. Kept below FreedomPay's 5-day auto-clearing of an
+	// uncleared two-stage payment: a hold left past that is charged to the guest
+	// instead of expiring, which is the opposite of what an expiry should do.
+	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
+}
+
+// PaymentsReconcilerConfig configures the background payments reconciliation
+// worker: how often it wakes up, how long a transient claim (capturing /
+// voiding / a refund in_flight or pending) may sit before it counts as stuck,
+// how long a created/authorized payment may go without a status change
+// before its acquirer status is read directly (in case a webhook was lost),
+// how many rows one pass claims per stage, how many consecutive unresolved
+// attempts flag a row for manual review, and the minimum spacing between two
+// acquirer calls (the avalanche guard).
+type PaymentsReconcilerConfig struct {
+	TickInterval     time.Duration // env: PAYMENTS_RECONCILE_TICK_INTERVAL
+	StuckAfter       time.Duration // env: PAYMENTS_RECONCILE_STUCK_AFTER
+	LostWebhookAfter time.Duration // env: PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER
+	BatchSize        int           // env: PAYMENTS_RECONCILE_BATCH_SIZE
+	MaxAttempts      int           // env: PAYMENTS_RECONCILE_MAX_ATTEMPTS
+	ProviderMinGap   time.Duration // env: PAYMENTS_RECONCILE_PROVIDER_MIN_GAP
+}
+
 func (p PostgresConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -113,6 +189,7 @@ func NewConfig() (Config, error) {
 			Environment:        getEnv("APP_ENV", "development"),
 			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
 			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
+			LogFormat:          getEnv("APP_LOG_FORMAT", "json"),
 			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
 		},
 		DB: DBConfig{
@@ -158,6 +235,24 @@ func NewConfig() (Config, error) {
 			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
 			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
+		Payments: PaymentsConfig{
+			Enabled:                 getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:         getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:           getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:      getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 100),
+			DepositDefaultMinor:     getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
+			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
+			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+		},
+		PaymentsReconciler: PaymentsReconcilerConfig{
+			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),
+			StuckAfter:       getEnvDuration("PAYMENTS_RECONCILE_STUCK_AFTER", 10*time.Minute),
+			LostWebhookAfter: getEnvDuration("PAYMENTS_RECONCILE_LOST_WEBHOOK_AFTER", time.Hour),
+			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
+			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
+			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
+		},
 	}
 
 	return cfg, nil
@@ -192,6 +287,18 @@ func getEnvMinutes(key string, defMinutes int) time.Duration {
 		n = defMinutes
 	}
 	return time.Duration(n) * time.Minute
+}
+
+// getEnvInt64 returns the 64-bit integer value of the environment variable
+// named by key, or def when the variable is unset or not a valid integer. Money
+// amounts are int64 (tiyn) everywhere, so they need their own reader.
+func getEnvInt64(key string, def int64) int64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 // getEnvDuration returns the duration value of the environment variable named

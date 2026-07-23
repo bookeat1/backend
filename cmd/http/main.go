@@ -14,7 +14,7 @@ func main() {
 		slog.Error("load config", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	log := logger.New(cfg.App.LogLevel)
+	log := logger.New(cfg.App.LogLevel, cfg.App.LogFormat)
 	if err := bootstrap.Run(cfg, log); err != nil {
 		log.Error("server stopped", slog.String("error", err.Error()))
 		os.Exit(1)
