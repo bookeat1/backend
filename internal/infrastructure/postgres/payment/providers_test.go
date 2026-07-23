@@ -23,11 +23,18 @@ func setupProviders(t *testing.T) (*pgxpool.Pool, context.Context) {
 	return pool, context.Background()
 }
 
+// Each provider gets a distinct priority so List's ordering assertions never
+// depend on the tie-break for equal priorities (that tie-break is exercised,
+// and pinned, separately below in TestProvidersListOrderIsDeterministicOnTie).
 func resetProviders(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
 		`UPDATE payment_providers SET is_enabled=false, is_default=false,
-		 priority = CASE provider WHEN 'freedompay' THEN 100 ELSE 200 END`); err != nil {
+		 priority = CASE provider
+		            WHEN 'freedompay' THEN 100
+		            WHEN 'tiptoppay' THEN 200
+		            WHEN 'partnerspay' THEN 300
+		            ELSE 900 END`); err != nil {
 		t.Fatalf("reset payment_providers: %v", err)
 	}
 }
@@ -36,12 +43,25 @@ func TestProvidersListAndGetByCode(t *testing.T) {
 	pool, ctx := setupProviders(t)
 	repo := NewProviders(pool)
 
+	// Every provider the build knows about is seeded by the migrations, so the
+	// count follows the registry rather than a literal: adding a fourth acquirer
+	// must not make this test fail for the wrong reason. What the test actually
+	// pins is the ordering — List promises priority order, and the settlement
+	// code picks the first enabled one.
 	all, err := repo.List(ctx)
-	if err != nil || len(all) != 2 {
-		t.Fatalf("list: %d rows, err=%v, want 2", len(all), err)
+	if err != nil {
+		t.Fatalf("list: err=%v", err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("list: %d rows, want at least freedompay and tiptoppay", len(all))
 	}
 	if all[0].Provider != domain.ProviderFreedomPay || all[1].Provider != domain.ProviderTipTopPay {
-		t.Fatalf("list order by priority = %+v, want freedompay then tiptoppay", all)
+		t.Fatalf("list order by priority = %+v, want freedompay then tiptoppay first", all)
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i-1].Priority > all[i].Priority {
+			t.Fatalf("list is not ordered by priority: %+v", all)
+		}
 	}
 
 	got, err := repo.GetByCode(ctx, domain.ProviderFreedomPay)
@@ -50,6 +70,55 @@ func TestProvidersListAndGetByCode(t *testing.T) {
 	}
 	if _, err := repo.GetByCode(ctx, domain.PaymentProvider("unknown")); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("get by code(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestProvidersListOrderIsDeterministicOnTie pins the actual tie-break rule
+// (secondary ORDER BY on provider code) instead of just avoiding ties in the
+// other tests' fixtures: two providers sharing a priority must always come
+// back in the same relative order, regardless of physical row/insert order,
+// or a caller like the settlement code that picks List()'s first enabled
+// entry would nondeterministically prefer one acquirer over the other.
+func TestProvidersListOrderIsDeterministicOnTie(t *testing.T) {
+	pool, ctx := setupProviders(t)
+	repo := NewProviders(pool)
+
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE payment_providers SET priority=200`); err != nil {
+		t.Fatalf("tie all priorities: %v", err)
+	}
+
+	var want []domain.PaymentProvider
+	for i := 0; i < 5; i++ {
+		all, err := repo.List(ctx)
+		if err != nil {
+			t.Fatalf("list: err=%v", err)
+		}
+		got := make([]domain.PaymentProvider, len(all))
+		for j, s := range all {
+			got[j] = s.Provider
+		}
+		if want == nil {
+			want = got
+			continue
+		}
+		if len(got) != len(want) {
+			t.Fatalf("run %d: got %d rows, want %d", i, len(got), len(want))
+		}
+		for j := range got {
+			if got[j] != want[j] {
+				t.Fatalf("run %d: order = %v, want %v (tie-break must be stable)", i, got, want)
+			}
+		}
+	}
+
+	// The tie-break itself must be the provider code, not merely "some"
+	// stable order — otherwise a future regression to e.g. an unstable sort
+	// key would still pass the repeat-run check above by accident.
+	for i := 1; i < len(want); i++ {
+		if string(want[i-1]) > string(want[i]) {
+			t.Fatalf("tie-break order = %v, want ascending by provider code", want)
+		}
 	}
 }
 

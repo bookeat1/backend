@@ -122,6 +122,52 @@ func TestPaymentCreateDuplicateIdempotencyKeyConflicts(t *testing.T) {
 	}
 }
 
+// TestGetSettleableByBookingID_FindsRefundedWhereLiveDoesNot is the
+// regression test for the bug RefundUseCase.Settle used to hit: once a
+// payment moves to `refunded`, idx_payments_live_per_booking (and therefore
+// GetLiveByBookingID) no longer counts it as "live", but Settle still needs
+// to find it — for a retried settle call to resume idempotently instead of
+// 404ing. GetSettleableByBookingID is the wider lookup that fixes this.
+func TestGetSettleableByBookingID_FindsRefundedWhereLiveDoesNot(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	bid := seedBooking(t, pool, rid)
+	repo := New(pool)
+
+	p := newPayment(bid, rid)
+	if err := repo.Create(ctx, p); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCreated, domain.PaymentAuthorized, time.Now()); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentAuthorized, domain.PaymentCaptured, time.Now()); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+
+	// Still captured: both lookups find it.
+	if live, err := repo.GetLiveByBookingID(ctx, bid); err != nil || live.ID != p.ID {
+		t.Fatalf("get live(captured): %+v, err=%v", live, err)
+	}
+	if settleable, err := repo.GetSettleableByBookingID(ctx, bid); err != nil || settleable.ID != p.ID {
+		t.Fatalf("get settleable(captured): %+v, err=%v", settleable, err)
+	}
+
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCaptured, domain.PaymentRefunded, time.Now()); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+
+	// Refunded: GetLiveByBookingID no longer finds it (the bug's root cause)...
+	if _, err := repo.GetLiveByBookingID(ctx, bid); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("get live(refunded) = %v, want ErrNotFound", err)
+	}
+	// ...but GetSettleableByBookingID still does (the fix).
+	settleable, err := repo.GetSettleableByBookingID(ctx, bid)
+	if err != nil || settleable.ID != p.ID || settleable.Status != domain.PaymentRefunded {
+		t.Fatalf("get settleable(refunded): %+v, err=%v, want the same payment, status refunded", settleable, err)
+	}
+}
+
 // TestPaymentLiveHoldUniquePerBookingConflicts proves the money-safety
 // invariant idx_payments_live_per_booking exists to guard: two payments for
 // the SAME booking can never both be authorized/capturing/voiding/captured

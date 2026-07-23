@@ -25,6 +25,15 @@ type reconcilerHarness struct {
 	now      time.Time
 }
 
+// reconcilerHarnessNow is the frozen instant every reconciler test builds its
+// fixtures relative to. Any fixture that instead anchors itself to the real
+// wall clock (time.Now()) silently stops matching the reconciler's own,
+// injected clock once enough wall-clock time has passed between when the
+// fixture literal was written and when the test actually runs - a payment
+// "changed 20 minutes ago" relative to time.Now() is not "changed 20 minutes
+// ago" relative to h.now() unless they are the same instant.
+var reconcilerHarnessNow = time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+
 func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain.Payment, refunds []*domain.PaymentRefund) *reconcilerHarness {
 	t.Helper()
 	pr := newFakePaymentRepo(payments...)
@@ -43,7 +52,7 @@ func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain
 	cfg.ProviderMinGap = 0 // no real sleeping in unit tests
 	h := &reconcilerHarness{
 		payments: pr, refunds: rr, ledger: ledger, outbox: outbox, gw: gw,
-		now: time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		now: reconcilerHarnessNow,
 	}
 	h.r = NewReconciler(pr, rr, ledger, outbox, resolver, tx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h.r.now = func() time.Time { return h.now }
@@ -284,7 +293,13 @@ func TestReconciler_RefundPending_AcquirerSucceeded_Finishes(t *testing.T) {
 	// A guest-cancel-before-deadline settlement: total 1_035_000, guest gets
 	// back 1_024_600 (1% acquiring withheld = 10_400).
 	p.AmountMinor, p.BaseAmountMinor, p.FeeMinor = 1_035_000, 1_000_000, 35_000
-	now := time.Now()
+	// Anchor every timestamp to the same frozen clock the harness injects into
+	// the reconciler (reconcilerHarnessNow), not to the real wall clock: the
+	// reconciler compares StatusChangedAt against its own now(), never
+	// time.Now(), so a fixture built off time.Now() drifts out of the
+	// "changed StuckAfter ago" window as soon as real time and the frozen
+	// clock diverge (see the bug this test used to have).
+	now := reconcilerHarnessNow
 	settledAt := now
 	trig := domain.RefundTriggerGuestCancel
 	key := "settle-1"

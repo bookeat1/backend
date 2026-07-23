@@ -150,6 +150,19 @@ func (s PaymentStatus) Refundable() bool {
 	return s == PaymentCaptured || s == PaymentPartiallyRefunded
 }
 
+// SettleResolvable reports whether RefundUseCase.Settle should be able to
+// find a payment in this status for its booking at all. This is
+// deliberately WIDER than HoldsMoney: Settle must resolve both a payment it
+// may act on for the first time (HoldsMoney — captured is the only one it
+// will actually accept, the rest it rejects with a precise "invalid status"
+// error) AND a payment it has already fully or partially settled (refunded /
+// partially_refunded), so that a retried Settle call — same booking, same
+// idempotency key — finds its own past result instead of a bare "not found".
+// See GetSettleableByBookingID and RefundUseCase's doc comment.
+func (s PaymentStatus) SettleResolvable() bool {
+	return s.HoldsMoney() || s == PaymentRefunded || s == PaymentPartiallyRefunded
+}
+
 // CanPaymentTransition reports whether from → to is an allowed payment status
 // transition.
 func CanPaymentTransition(from, to PaymentStatus) bool {
@@ -298,8 +311,18 @@ type PaymentRepository interface {
 	// must NOT create anything when it returns ErrNotFound (spec §7).
 	GetByProviderPaymentID(ctx context.Context, provider PaymentProvider, providerPaymentID string) (*Payment, error)
 	// GetLiveByBookingID returns the booking's authorized or captured payment,
-	// backed by idx_payments_live_per_booking.
+	// backed by idx_payments_live_per_booking. Used to decide whether a NEW
+	// payment may still be authorized for this booking (CreateForBooking) —
+	// a refunded/voided/failed payment must NOT count as "still live" there.
 	GetLiveByBookingID(ctx context.Context, bookingID uuid.UUID) (*Payment, error)
+	// GetSettleableByBookingID returns the booking's payment in any status
+	// PaymentStatus.SettleResolvable reports true for — i.e. it also finds an
+	// already fully/partially refunded payment, which GetLiveByBookingID
+	// does not. RefundUseCase.Settle uses this (not GetLiveByBookingID) as
+	// its very first lookup specifically so a retried Settle call for the
+	// "full refund" outcome resumes idempotently instead of 404ing once the
+	// payment has moved to `refunded` (see RefundUseCase's doc comment).
+	GetSettleableByBookingID(ctx context.Context, bookingID uuid.UUID) (*Payment, error)
 	// GetByIdempotencyKey resolves our own retry token, backed by
 	// idx_payments_idempotency (UNIQUE (provider, idempotency_key)). This is
 	// what makes "create payment" idempotent (usecase/payments): a retry with

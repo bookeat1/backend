@@ -208,14 +208,17 @@ func TestSettle_IdempotentReplayNoSecondRefund(t *testing.T) {
 		t.Fatalf("first Settle() status = %s, want refunded", first.Status)
 	}
 	// The payment left the "live" (authorized/captured) set after the first
-	// call succeeded, so GetLiveByBookingID correctly reports ErrNotFound on
-	// a second call — there is nothing left to settle twice. This IS the
-	// idempotency guarantee for the sequential-retry case (spec §8): a caller
-	// that retries after seeing the first call succeed can tell "already
-	// done" apart from "still in progress" by this exact error.
-	_, err = h.u.Settle(ctx, staffActor, p.BookingID, in)
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("second Settle() error = %v, want ErrNotFound (payment no longer live)", err)
+	// call succeeded, but Settle resolves it via GetSettleableByBookingID
+	// (not GetLiveByBookingID — see RefundUseCase's doc comment), which still
+	// finds a refunded payment. A second call with the SAME idempotency key
+	// and the SAME trigger must resume idempotently: same 200-equivalent
+	// result, the same already-refunded payment, no second gateway call.
+	second, err := h.u.Settle(ctx, staffActor, p.BookingID, in)
+	if err != nil {
+		t.Fatalf("second Settle() error = %v, want a resumed success", err)
+	}
+	if second.ID != first.ID || second.Status != domain.PaymentRefunded {
+		t.Fatalf("second Settle() = %+v, want the same refunded payment as the first call", second)
 	}
 	if h.gw.callCount("refund") != 1 {
 		t.Fatalf("refund called %d times across 2 Settle() calls, want 1", h.gw.callCount("refund"))

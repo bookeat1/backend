@@ -116,6 +116,18 @@ func (f *fakePaymentRepo) GetLiveByBookingID(_ context.Context, bookingID uuid.U
 	return nil, domain.ErrNotFound
 }
 
+func (f *fakePaymentRepo) GetSettleableByBookingID(_ context.Context, bookingID uuid.UUID) (*domain.Payment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.byID {
+		if p.BookingID == bookingID && p.Status.SettleResolvable() {
+			cp := *p
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
 func (f *fakePaymentRepo) GetByIdempotencyKey(_ context.Context, provider domain.PaymentProvider, key string) (*domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

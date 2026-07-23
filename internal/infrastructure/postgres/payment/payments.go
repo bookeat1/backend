@@ -37,6 +37,13 @@ var liveStatuses = []string{
 	string(domain.PaymentVoiding), string(domain.PaymentCaptured),
 }
 
+// settleableStatuses mirrors domain.PaymentStatus.SettleResolvable exactly:
+// liveStatuses plus the two outcomes a completed Settle call can leave a
+// payment in (refunded / partially_refunded). Keep both lists and the domain
+// predicate in sync — see GetSettleableByBookingID.
+var settleableStatuses = append(append([]string{}, liveStatuses...),
+	string(domain.PaymentRefunded), string(domain.PaymentPartiallyRefunded))
+
 func (r *Repository) Create(ctx context.Context, p *domain.Payment) error {
 	now := time.Now()
 	if p.CreatedAt.IsZero() {
@@ -128,6 +135,31 @@ func (r *Repository) GetLiveByBookingID(ctx context.Context, bookingID uuid.UUID
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get live payment for booking: %w", err)
+	}
+	return p, nil
+}
+
+// GetSettleableByBookingID returns the booking's payment across the wider
+// settleableStatuses set (see that var's doc) — unlike GetLiveByBookingID,
+// there is no unique index guaranteeing at most one matching row here (only
+// the live subset is covered by idx_payments_live_per_booking), so this
+// orders by created_at DESC and takes the most recent one. In practice a
+// booking never accumulates more than one settleable payment (CreateForBooking
+// refuses to authorize a new payment once the booking has left
+// pending/confirmed, which is exactly the state a settleable payment implies),
+// but the ORDER BY/LIMIT makes the result deterministic instead of an
+// arbitrary row if that invariant is ever violated.
+func (r *Repository) GetSettleableByBookingID(ctx context.Context, bookingID uuid.UUID) (*domain.Payment, error) {
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT `+paymentCols+` FROM payments WHERE booking_id=$1 AND status = ANY($2)
+		 ORDER BY created_at DESC LIMIT 1`,
+		bookingID, settleableStatuses)
+	p, err := scanPayment(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get settleable payment for booking: %w", err)
 	}
 	return p, nil
 }
