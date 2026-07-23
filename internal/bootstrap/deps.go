@@ -14,6 +14,7 @@ import (
 	"backend-core/internal/infrastructure/payment/freedompay"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
@@ -26,6 +27,7 @@ import (
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/restaurants"
@@ -40,6 +42,7 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
+	FavoritesFacade    favorites.Facade
 	MenuFacade         menu.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
@@ -107,6 +110,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	menuCategories := menurepo.NewCategories(db)
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo)
+	favoritesRepo := favoriterepo.New(db)
+	favoritesFacade := favorites.NewFacade(favoritesRepo)
 
 	bookingRepo := bookingrepo.New(db)
 	bookingLinks := bookingrepo.NewTables(db)
@@ -157,6 +162,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersRepo:          usersRepo,
 		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
 		RestaurantManagers: restaurantManagers,
+		FavoritesFacade:    favoritesFacade,
 		MenuFacade:         menu.NewFacade(menuItems, menuCategories, txm),
 		BookingsFacade: bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 			bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm),

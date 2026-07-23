@@ -2,6 +2,8 @@
 package restaurants
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -14,13 +16,23 @@ import (
 	uc "backend-core/internal/usecase/restaurants"
 )
 
-type Handler struct {
-	facade   uc.Facade
-	managers uc.ManagerUseCase
+// favoriteChecker is the minimal slice of the favorites usecase this handler
+// needs to attach an "is_favorite" flag to a listing/detail response for the
+// current caller. A nil favoriteChecker is valid (the flag is then simply
+// never attached, same as for an anonymous caller) so this handler never
+// hard-depends on the favorites feature being wired.
+type favoriteChecker interface {
+	FavoriteSet(ctx context.Context, userID uuid.UUID, restaurantIDs []uuid.UUID) (map[uuid.UUID]bool, error)
 }
 
-func NewHandler(f uc.Facade, m uc.ManagerUseCase) *Handler {
-	return &Handler{facade: f, managers: m}
+type Handler struct {
+	facade    uc.Facade
+	managers  uc.ManagerUseCase
+	favorites favoriteChecker
+}
+
+func NewHandler(f uc.Facade, m uc.ManagerUseCase, favorites favoriteChecker) *Handler {
+	return &Handler{facade: f, managers: m, favorites: favorites}
 }
 
 // RegisterPublic mounts the unauthenticated catalog routes.
@@ -28,6 +40,7 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/restaurants", h.list)
 	rg.GET("/restaurants/:id", h.get)
 	rg.GET("/restaurant-categories", h.categories)
+	rg.GET("/cities", h.cities)
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
@@ -81,10 +94,14 @@ func (h *Handler) list(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	lang := resolveLocale(c)
 	out := make([]restaurantResponse, 0, len(items))
+	ids := make([]uuid.UUID, 0, len(items))
 	for _, it := range items {
-		out = append(out, listItemToResponse(it))
+		out = append(out, listItemToResponse(it, lang))
+		ids = append(ids, it.Restaurant.ID)
 	}
+	h.attachFavorites(c.Request.Context(), out, ids)
 	page := f.Page
 	if page <= 0 {
 		page = 1
@@ -115,7 +132,45 @@ func (h *Handler) get(c *gin.Context) {
 		response.HandleError(c.Writer, domain.ErrNotFound)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg))
+	lang := resolveLocale(c)
+	list := []restaurantResponse{aggregateToResponse(agg, lang)}
+	h.attachFavorites(c.Request.Context(), list, []uuid.UUID{agg.Restaurant.ID})
+	response.OK(c.Writer, list[0])
+}
+
+// attachFavorites sets IsFavorite on each element of out (in place, matched
+// by index against ids) for the current authenticated caller. A no-op for an
+// anonymous caller, a nil favoriteChecker, or when the lookup itself fails —
+// the favorites flag is a secondary enhancement and must never break the
+// catalog response it's attached to.
+func (h *Handler) attachFavorites(ctx context.Context, out []restaurantResponse, ids []uuid.UUID) {
+	if h.favorites == nil || len(out) != len(ids) {
+		return
+	}
+	au, ok := middleware.GetAuthUser(ctx)
+	if !ok {
+		return
+	}
+	set, err := h.favorites.FavoriteSet(ctx, au.ID, ids)
+	if err != nil {
+		slog.Warn("favorite lookup failed, serving catalog without is_favorite", "error", err)
+		return
+	}
+	for i := range out {
+		v := set[ids[i]]
+		out[i].IsFavorite = &v
+	}
+}
+
+// cities lists the catalog's known cities (spec: reuse the existing city
+// enum values, don't reinvent a cities table).
+func (h *Handler) cities(c *gin.Context) {
+	cities := domain.Cities()
+	out := make([]string, 0, len(cities))
+	for _, ct := range cities {
+		out = append(out, string(ct))
+	}
+	response.OK(c.Writer, out)
 }
 
 func (h *Handler) categories(c *gin.Context) {
@@ -160,7 +215,7 @@ func (h *Handler) create(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.Created(c.Writer, aggregateToResponse(agg))
+	response.Created(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -196,7 +251,7 @@ func (h *Handler) update(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg))
+	response.OK(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
 }
 
 func (h *Handler) deactivate(c *gin.Context) {
