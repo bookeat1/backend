@@ -54,6 +54,45 @@ func Auth(issuer auth.TokenIssuer, users domain.UserRepository) gin.HandlerFunc 
 	}
 }
 
+// OptionalAuth is Auth for a route a caller may legitimately reach with no
+// account at all — a guest checkout link opened without ever logging in
+// (spec: "a guest may be without an account"). It attaches an AuthUser on the
+// context when the request carries a valid, active bearer token, exactly like
+// Auth; a missing header, a malformed/expired token, an unknown user or an
+// inactive account is NOT an error here — the request simply proceeds with no
+// AuthUser, and GetAuthUser reports ok=false. The handler downstream then
+// builds its own "anonymous guest" actor.
+//
+// It never widens access on its own: whatever the caller is allowed to do
+// anonymously vs. as their own account is still decided entirely inside the
+// usecase (e.g. usecase/payments.authorizeRead/authorizeCreate), the same as
+// the accounts that DO authenticate on a route gated by Auth. This exists
+// because bookings has no equivalent unauthenticated entry point to copy —
+// every booking route requires Auth — so a guest payment link is a genuinely
+// new case, not a reinvention of an existing mechanism.
+func OptionalAuth(issuer auth.TokenIssuer, users domain.UserRepository) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.GetHeader("Authorization")
+		if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
+			c.Next()
+			return
+		}
+		id, _, err := issuer.ParseAccess(strings.TrimSpace(h[7:]))
+		if err != nil {
+			c.Next()
+			return
+		}
+		u, err := users.GetByID(c.Request.Context(), id)
+		if err != nil || !u.IsActive {
+			c.Next()
+			return
+		}
+		ctx := context.WithValue(c.Request.Context(), authUserKey{}, AuthUser{ID: u.ID, Role: string(u.Role)})
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
 // authUserKey is the private context key under which Auth stores the AuthUser —
 // a typed key (not a string) so lookups are type-safe and decoupled from gin.
 type authUserKey struct{}

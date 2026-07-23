@@ -148,6 +148,17 @@ type PaymentsConfig struct {
 	// uncleared two-stage payment: a hold left past that is charged to the guest
 	// instead of expiring, which is the opposite of what an expiry should do.
 	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
+
+	// PublicBaseURL is this backend's own externally-reachable origin (e.g.
+	// https://api.bookeat.kz), used ONLY to build the webhook CallbackURL
+	// handed to an acquirer at Authorize time. It is never taken from the
+	// client — a client-supplied callback URL would let an attacker redirect
+	// our own webhook delivery. TipTopPay ignores CallbackURL entirely (its
+	// notification endpoints are configured once in its own merchant
+	// dashboard, see tiptoppay.Gateway.Authorize's doc comment), so in
+	// practice this only ever has to be FreedomPay-shaped; it is still built
+	// from a single base URL rather than hardcoding the route twice.
+	PublicBaseURL string // env: PAYMENTS_PUBLIC_BASE_URL
 }
 
 // PaymentsReconcilerConfig configures the background payments reconciliation
@@ -244,6 +255,7 @@ func NewConfig() (Config, error) {
 			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
 			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			PublicBaseURL:           strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
 		},
 		PaymentsReconciler: PaymentsReconcilerConfig{
 			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),

@@ -194,6 +194,5 @@ func (u *statusUseCase) cancelDeadline(ctx context.Context, b *domain.Booking) (
 	if err != nil {
 		return time.Time{}, err
 	}
-	policy := resolvePolicy(rest.Restaurant, u.cfg)
-	return b.StartsAt.Add(-policy.CancelDeadline), nil
+	return CancelDeadlineFor(rest.Restaurant, u.cfg, b.StartsAt), nil
 }

@@ -1,8 +1,10 @@
 package bootstrap
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -49,16 +51,8 @@ type Deps struct {
 	BookingPolicy      bookings.PolicyUseCase
 	Issuer             *token.RSAIssuer
 
-	// Payments repositories. Exposed here (rather than only inside
-	// NewPaymentsReconciler) so an HTTP-facing usecase layer
-	// (CreateUseCase / CaptureUseCase / VoidUseCase / RefundUseCase /
-	// WebhookUseCase / StatusUseCase) can be wired on top of them later
-	// without touching this constructor again. That usecase layer itself is
-	// NOT wired here yet: two of its ports
-	// (restaurantPaymentSettings / cancelDeadlineResolver, see
-	// internal/usecase/payments/ports.go) still have no concrete adapter —
-	// see team-memory's payments-usecase notes for why that is a deliberate,
-	// disclosed gap and not an oversight of this change.
+	// Payments repositories, exposed for anything that still wants direct
+	// access (the reconciler in cmd/worker, ad-hoc tooling).
 	PaymentsRepo         domain.PaymentRepository
 	PaymentRefundsRepo   domain.PaymentRefundRepository
 	PaymentEventsRepo    domain.PaymentEventRepository
@@ -66,6 +60,18 @@ type Deps struct {
 	PaymentOutboxRepo    domain.PaymentOutboxRepository
 	PaymentProvidersRepo domain.PaymentProviderRepository
 	PaymentGateways      *paymentgw.Registry
+
+	// Payments usecases — the guest/staff-facing HTTP surface (transport/rest/payments).
+	PaymentCreate  payments.CreateUseCase
+	PaymentCapture payments.CaptureUseCase
+	PaymentVoid    payments.VoidUseCase
+	PaymentRefund  payments.RefundUseCase
+	PaymentWebhook payments.WebhookUseCase
+	PaymentStatus  payments.StatusUseCase
+	// PaymentsPublicBaseURL is threaded straight through from cfg.Payments so
+	// the transport layer can build the FreedomPay CallbackURL without
+	// importing bootstrap.Config.
+	PaymentsPublicBaseURL string
 }
 
 // NewDeps constructs repositories, infrastructure clients, and usecases.
@@ -129,6 +135,20 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build payment gateway registry: %w", err)
 	}
+	paymentsCfg := newPaymentsConfig(cfg)
+	paymentSettings := restRepo // *restaurant.Repository now also implements restaurantPaymentSettings (GetPaymentOverride)
+	cancelDeadline := cancelDeadlineAdapter{restaurants: restRepo, cfg: bookingCfg}
+
+	paymentCreate := payments.NewCreateUseCase(paymentsRepo, paymentOutboxRepo, bookingRepo, bookingItems,
+		paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
+	paymentCapture := payments.NewCaptureUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, restaurantManagers, txm)
+	paymentVoid := payments.NewVoidUseCase(paymentsRepo, paymentOutboxRepo, paymentGateways, restaurantManagers, txm)
+	paymentRefund := payments.NewRefundUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, txm, paymentsCfg)
+	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, txm)
+	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 
 	return &Deps{
 		AuthFacade:         authFacade,
@@ -158,7 +178,49 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentOutboxRepo:    paymentOutboxRepo,
 		PaymentProvidersRepo: paymentProvidersRepo,
 		PaymentGateways:      paymentGateways,
+
+		PaymentCreate:         paymentCreate,
+		PaymentCapture:        paymentCapture,
+		PaymentVoid:           paymentVoid,
+		PaymentRefund:         paymentRefund,
+		PaymentWebhook:        paymentWebhook,
+		PaymentStatus:         paymentStatus,
+		PaymentsPublicBaseURL: cfg.Payments.PublicBaseURL,
 	}, nil
+}
+
+// newPaymentsConfig mirrors PaymentsConfig field-for-field into the usecase
+// layer's own Config, same arrangement as newBookingConfig.
+func newPaymentsConfig(cfg Config) payments.Config {
+	return payments.Config{
+		Enabled:                 cfg.Payments.Enabled,
+		DefaultProvider:         domain.PaymentProvider(cfg.Payments.DefaultProvider),
+		ServiceFeeBps:           cfg.Payments.ServiceFeeBps,
+		RefundAcquiringBps:      cfg.Payments.RefundAcquiringBps,
+		DepositDefaultMinor:     cfg.Payments.DepositDefaultMinor,
+		DepositRequired:         cfg.Payments.DepositRequired,
+		PreorderPaymentRequired: cfg.Payments.PreorderPaymentRequired,
+		HoldTTL:                 cfg.Payments.HoldTTL,
+	}
+}
+
+// cancelDeadlineAdapter implements usecase/payments' cancelDeadlineResolver
+// port over the same restaurant-policy resolution usecase/bookings already
+// owns (bookings.CancelDeadlineFor) — see the KNOWN GAP note this closes in
+// team-memory's payments-usecase entry: the deadline must come from the
+// venue's real, server-resolved policy, never be recomputed or trusted from a
+// caller.
+type cancelDeadlineAdapter struct {
+	restaurants domain.RestaurantRepository
+	cfg         bookings.Config
+}
+
+func (a cancelDeadlineAdapter) CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error) {
+	rest, err := a.restaurants.GetByID(ctx, booking.RestaurantID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return bookings.CancelDeadlineFor(rest.Restaurant, a.cfg, booking.StartsAt), nil
 }
 
 // newBookingConfig mirrors BookingConfig field-for-field into the usecase
