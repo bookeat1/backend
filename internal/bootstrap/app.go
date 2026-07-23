@@ -33,7 +33,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
-	r.Use(gin.Recovery())
+	// Order matters: RequestID must run first so every later middleware and
+	// handler can log through a context that already carries request_id.
+	// AccessLog wraps Recovery so a panic converted to a 500 downstream is
+	// still measured and logged as one request line, not lost.
+	r.Use(middleware.RequestID())
+	r.Use(middleware.AccessLog())
+	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
 
 	// /health is a liveness probe (process is up). /health/ready is a readiness
@@ -61,6 +67,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
+	authed.Use(middleware.LogUserContext())
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)

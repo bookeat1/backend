@@ -19,7 +19,7 @@ func buildTestApp(t *testing.T) http.Handler {
 	t.Helper()
 	db := testdb.Connect(t)
 	testdb.Truncate(t, db, "users", "otp_codes", "refresh_tokens")
-	log := logger.New("error")
+	log := logger.New("error", "json")
 	cfg := Config{}
 	cfg.App.Environment = "test"
 	cfg.App.CORSAllowedOrigins = []string{"*"} // NewConfig's default; set explicitly since this bypasses it

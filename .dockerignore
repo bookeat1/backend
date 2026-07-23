@@ -1,0 +1,16 @@
+.git
+.gitignore
+.idea
+.vscode
+ai-tasks
+deploy
+.github
+.env
+.env.local
+*.out
+coverage.*
+/main
+/http
+/worker
+/migrate
+*.exe
