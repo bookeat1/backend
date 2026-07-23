@@ -28,6 +28,7 @@ type deps struct {
 	avail      *fakeAvail
 	blacklist  *fakeBlacklist
 	policy     *fakePolicy
+	external   *fakeExternal
 	role       domain.Role
 	manages    bool
 }
@@ -38,7 +39,8 @@ func newDeps() *deps {
 		facade: &fakeFacade{}, create: create,
 		idempotent: uc.NewIdempotentCreateUseCase(create, newFakeKeys(), fakeTx{}),
 		status:     &fakeStatus{}, update: &fakeUpdate{}, avail: &fakeAvail{},
-		blacklist: &fakeBlacklist{}, policy: &fakePolicy{}, role: domain.RoleUser, manages: false,
+		blacklist: &fakeBlacklist{}, policy: &fakePolicy{}, external: &fakeExternal{},
+		role: domain.RoleUser, manages: false,
 	}
 }
 
@@ -48,7 +50,7 @@ func newDeps() *deps {
 func newRouter(d *deps) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist, d.policy)
+	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist, d.policy, d.external)
 
 	api := r.Group("/api/v1")
 	h.RegisterPublic(api)

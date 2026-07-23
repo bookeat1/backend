@@ -50,6 +50,7 @@ type Handler struct {
 	avail      uc.AvailabilityUseCase
 	blacklist  uc.BlacklistUseCase
 	policy     uc.PolicyUseCase
+	external   uc.ExternalReservationUseCase
 }
 
 // NewHandler wires the booking usecases into a handler.
@@ -62,10 +63,12 @@ func NewHandler(
 	avail uc.AvailabilityUseCase,
 	blacklist uc.BlacklistUseCase,
 	policy uc.PolicyUseCase,
+	external uc.ExternalReservationUseCase,
 ) *Handler {
 	return &Handler{
 		facade: facade, create: create, idempotent: idempotent, status: status,
 		update: update, avail: avail, blacklist: blacklist, policy: policy,
+		external: external,
 	}
 }
 
@@ -112,6 +115,13 @@ func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
 	rg.DELETE("/restaurants/:id/blacklist/:entryID", h.removeBlacklist)
 	rg.GET("/restaurants/:id/booking-policy", h.getBookingPolicy)
 	rg.PATCH("/restaurants/:id/booking-policy", h.patchBookingPolicy)
+
+	// External occupancy holds: slots taken through the venue's OTHER funnels
+	// (phone, walk-in, POS/Kwaaka). Staff-facing today, the same seam a future
+	// POS webhook writes into. Enforced by booking.manage inside the usecase.
+	rg.GET("/restaurants/:id/external-reservations", h.listExternalHolds)
+	rg.POST("/restaurants/:id/external-reservations", h.createExternalHold)
+	rg.DELETE("/restaurants/:id/external-reservations/:holdID", h.removeExternalHold)
 }
 
 // getBookingPolicy returns the venue's stored policy overrides plus the

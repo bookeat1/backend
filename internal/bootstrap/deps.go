@@ -53,6 +53,7 @@ type Deps struct {
 	BookingAvail       bookings.AvailabilityUseCase
 	BookingBlacklist   bookings.BlacklistUseCase
 	BookingPolicy      bookings.PolicyUseCase
+	BookingExternal    bookings.ExternalReservationUseCase
 	Issuer             *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
@@ -124,6 +125,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingOutbox := bookingrepo.NewOutbox(db)
 	bookingBlacklist := bookingrepo.NewBlacklist(db)
 	bookingRateLog := bookingrepo.NewRateLog(db)
+	bookingExternal := bookingrepo.NewExternalReservations(db)
 	idempotencyKeys := idemrepo.New(db)
 
 	bookingCfg := newBookingConfig(cfg)
@@ -177,7 +179,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingAvail:     bookings.NewAvailabilityUseCase(bookingLinks, restRepo, restRelated, bookingCfg),
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
-		Issuer:           issuer,
+		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
+			restRelated, restaurantManagers, txm),
+		Issuer: issuer,
 
 		PaymentsRepo:         paymentsRepo,
 		PaymentRefundsRepo:   paymentRefundsRepo,
