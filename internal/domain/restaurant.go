@@ -134,6 +134,23 @@ type RestaurantFilter struct {
 	PerPage   int    // <=0 means default (20), capped at 100
 }
 
+// RestaurantSearchFilter narrows a full-text restaurant search. The zero value
+// (empty Query, no filters) lists every active restaurant, ordered like the
+// catalog listing. Only active restaurants are ever returned.
+type RestaurantSearchFilter struct {
+	// Query is free text matched against the venue's name + description across
+	// ALL locales (base ru columns plus every *_i18n translation). Empty Query
+	// means "no text constraint" — the search degrades to a filtered browse.
+	Query string
+	// City, Cuisines and Price are AND-combined with the text query. Cuisines is
+	// an OR-set (cuisine_type IN (...)); an empty/nil slice means "any cuisine".
+	City     *City
+	Cuisines []string
+	Price    *PriceCategory
+	Page     int // 1-based; <=0 means 1
+	PerPage  int // <=0 means default (20), capped at 100
+}
+
 // RestaurantRepository persists restaurants. Get* return ErrNotFound when absent.
 type RestaurantRepository interface {
 	Create(ctx context.Context, r *Restaurant) error
@@ -142,6 +159,11 @@ type RestaurantRepository interface {
 	// ListActive returns active restaurants matching f plus the total count.
 	// Ordering: display_order (NULLs last), then name. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
+	// Search returns active restaurants matching f's text query and filters plus
+	// the total count. When f.Query is non-empty, results are ranked by full-text
+	// relevance then trigram word-similarity, with a deterministic id tie-break
+	// so pagination is stable; when it is empty, ordering matches ListActive.
+	Search(ctx context.Context, f RestaurantSearchFilter) ([]RestaurantListItem, int, error)
 	SetActive(ctx context.Context, id uuid.UUID, active bool) error
 	// UpdateBookingPolicy patches the venue's booking-policy overrides: only
 	// the non-nil fields of o are written, every other column keeps its current
