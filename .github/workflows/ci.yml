@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    # Postgres for integration tests (internal/infrastructure/postgres/testdb):
+    # they skip themselves in -short mode or without TEST_DATABASE_URL, but CI
+    # runs the full suite, so we give them a real, migrated database.
+    services:
+      postgres:
+        image: postgres:16.6-alpine
+        env:
+          POSTGRES_DB: bookeat_test
+          POSTGRES_USER: bookeat
+          POSTGRES_PASSWORD: bookeat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bookeat -d bookeat_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_DATABASE: bookeat_test
+      DB_USERNAME: bookeat
+      DB_PASSWORD: bookeat
+      DB_SSLMODE: disable
+      TEST_DATABASE_URL: postgres://bookeat:bookeat@localhost:5432/bookeat_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.7"
+          cache: true
+
+      - name: gofmt (must produce no diff)
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "gofmt would reformat:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: migrate the CI database
+        run: go run ./cmd/migrate up
+
+      # -p 1: integration tests under internal/infrastructure/postgres/* share
+      # one physical database and TRUNCATE common tables — running package
+      # test binaries in parallel (Go's default) races between packages and
+      # produces flaky failures that do not reproduce per-package. Verified
+      # locally: full suite is flaky at default parallelism, green at -p 1.
+      - name: go test (unit + integration against the service Postgres)
+        run: go test -p 1 ./...
