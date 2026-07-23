@@ -336,6 +336,20 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 	return &m, nil
 }
 
+// Columns is the ordered restaurant column list (same as the unexported cols
+// used by this file's own statements), exported so a sibling infrastructure
+// package can join through its own table and still scan a full Restaurant row
+// without duplicating this list — see
+// internal/infrastructure/postgres/favorite.Repository.ListByUser.
+const Columns = cols
+
+// ScanListItem scans one row shaped like ListActive's SELECT (Columns plus a
+// trailing primary_image column) into a Restaurant plus its primary image
+// URL. Exported for the same reason as Columns.
+func ScanListItem(row scanner) (*domain.Restaurant, *string, error) {
+	return scanListItem(row)
+}
+
 func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	var m domain.Restaurant
 	var city, price string
