@@ -31,6 +31,15 @@ server and images were built locally with `IMAGE_TAG=local`.
    whenever `IMAGE_TAG=local`).
 6. Start Postgres, wait for its healthcheck, run migrations, then start the
    rest — see "Deploy" below.
+7. Install nightly backups:
+   ```bash
+   mkdir -p /opt/bookeat/backups && chmod 700 /opt/bookeat/backups
+   cp deploy/scripts/pg-backup.sh /opt/bookeat/backups/pg-backup.sh
+   chmod 700 /opt/bookeat/backups/pg-backup.sh
+   ( crontab -l 2>/dev/null; echo "30 2 * * * /opt/bookeat/backups/pg-backup.sh >/dev/null 2>&1" ) | crontab -
+   ```
+   (server timezone must be `Asia/Almaty` — `timedatectl set-timezone Asia/Almaty`
+   — so 02:30 in the crontab means 02:30 Almaty time.) See "Backups" below.
 
 ## Deploy (manual, from a checked-out repo or CI runner)
 
