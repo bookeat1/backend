@@ -421,13 +421,28 @@ func TestReconciler_ClaimsRunInsideTransaction(t *testing.T) {
 		t.Fatalf("Tick() error = %v", err)
 	}
 
-	if !h.payments.claimStaleInTx {
-		t.Error("payments.ClaimStale ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	// A Tick runs reconcileCapturing, reconcileVoiding and reconcileLostWebhook
+	// (all three call payments.ClaimStale), reconcileExpiredHolds
+	// (ClaimExpiredHolds) and reconcileRefunds (refunds.ClaimStale). Assert
+	// every one of those calls actually happened AND none ran outside a
+	// transaction — counting outside-tx per call site (not a shared bool)
+	// catches a regression that un-wraps any single pass, not just the last.
+	if h.payments.claimStaleCalls < 3 {
+		t.Fatalf("payments.ClaimStale called %d times, want >=3 (capturing, voiding, lostWebhook)", h.payments.claimStaleCalls)
 	}
-	if !h.payments.claimExpiredInTx {
-		t.Error("payments.ClaimExpiredHolds ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	if h.payments.claimExpiredCalls < 1 {
+		t.Fatalf("payments.ClaimExpiredHolds called %d times, want >=1", h.payments.claimExpiredCalls)
 	}
-	if !h.refunds.claimStaleInTx {
-		t.Error("refunds.ClaimStale ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held")
+	if h.refunds.claimStaleCalls < 1 {
+		t.Fatalf("refunds.ClaimStale called %d times, want >=1", h.refunds.claimStaleCalls)
+	}
+	if h.payments.claimStaleOutsideTx != 0 {
+		t.Errorf("%d payments.ClaimStale call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.payments.claimStaleOutsideTx)
+	}
+	if h.payments.claimExpiredOutsideTx != 0 {
+		t.Errorf("%d payments.ClaimExpiredHolds call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.payments.claimExpiredOutsideTx)
+	}
+	if h.refunds.claimStaleOutsideTx != 0 {
+		t.Errorf("%d refunds.ClaimStale call(s) ran outside a transaction — FOR UPDATE SKIP LOCKED lock is not held", h.refunds.claimStaleOutsideTx)
 	}
 }

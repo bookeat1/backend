@@ -26,10 +26,13 @@ import (
 type fakePaymentRepo struct {
 	mu   sync.Mutex
 	byID map[uuid.UUID]*domain.Payment
-	// records whether the most recent claim ran inside a transaction, so a
-	// regression test can assert the reconciler holds ClaimStale's lock.
-	claimStaleInTx   bool
-	claimExpiredInTx bool
+	// Per-call-site accounting so a regression test can assert EVERY claim runs
+	// inside a transaction (ClaimStale is called by three different reconcile
+	// passes — a single shared bool would only prove the last writer was
+	// wrapped). *OutsideTx counts claims that ran without a tx on the context;
+	// it must stay zero.
+	claimStaleCalls, claimStaleOutsideTx     int
+	claimExpiredCalls, claimExpiredOutsideTx int
 }
 
 func newFakePaymentRepo(ps ...*domain.Payment) *fakePaymentRepo {
@@ -215,7 +218,10 @@ func stampStatusTime(p *domain.Payment, status domain.PaymentStatus, at time.Tim
 func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.PaymentStatus, before time.Time, limit int) ([]domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.claimStaleInTx = ctxInTx(ctx)
+	f.claimStaleCalls++
+	if !ctxInTx(ctx) {
+		f.claimStaleOutsideTx++
+	}
 	want := map[domain.PaymentStatus]struct{}{}
 	for _, s := range statuses {
 		want[s] = struct{}{}
@@ -243,7 +249,10 @@ func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.Paym
 func (f *fakePaymentRepo) ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.claimExpiredInTx = ctxInTx(ctx)
+	f.claimExpiredCalls++
+	if !ctxInTx(ctx) {
+		f.claimExpiredOutsideTx++
+	}
 	var out []domain.Payment
 	for _, p := range f.byID {
 		if p.Status != domain.PaymentAuthorized || p.ExpiresAt == nil {
@@ -525,8 +534,8 @@ func (f *fakeEventRepo) SetPaymentID(_ context.Context, id uuid.UUID, paymentID 
 type fakeRefundRepo struct {
 	mu   sync.Mutex
 	byID map[uuid.UUID]*domain.PaymentRefund
-	// records whether the most recent ClaimStale ran inside a transaction.
-	claimStaleInTx bool
+	// Per-call accounting; claimStaleOutsideTx must stay zero.
+	claimStaleCalls, claimStaleOutsideTx int
 }
 
 func newFakeRefundRepo() *fakeRefundRepo {
@@ -640,7 +649,10 @@ func (f *fakeRefundRepo) CompareAndSwapStatus(_ context.Context, id uuid.UUID, f
 func (f *fakeRefundRepo) ClaimStale(ctx context.Context, statuses []domain.RefundStatus, before time.Time, limit int) ([]domain.PaymentRefund, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.claimStaleInTx = ctxInTx(ctx)
+	f.claimStaleCalls++
+	if !ctxInTx(ctx) {
+		f.claimStaleOutsideTx++
+	}
 	want := map[domain.RefundStatus]struct{}{}
 	for _, s := range statuses {
 		want[s] = struct{}{}
