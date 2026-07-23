@@ -21,6 +21,7 @@ import (
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
+	reviewrepo "backend-core/internal/infrastructure/postgres/review"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
@@ -32,6 +33,7 @@ import (
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/restaurants"
+	"backend-core/internal/usecase/reviews"
 	"backend-core/internal/usecase/users"
 )
 
@@ -44,6 +46,7 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	FavoritesFacade    favorites.Facade
+	ReviewsFacade      reviews.Facade
 	MenuFacade         menu.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
@@ -116,6 +119,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
 
 	bookingRepo := bookingrepo.New(db)
+	reviewsFacade := reviews.NewFacade(reviewrepo.New(db), bookingRepo, restManagers)
 	bookingLinks := bookingrepo.NewTables(db)
 	bookingItems := bookingrepo.NewItems(db)
 	bookingMessages := bookingrepo.NewMessages(db)
@@ -165,6 +169,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
 		RestaurantManagers: restaurantManagers,
 		FavoritesFacade:    favoritesFacade,
+		ReviewsFacade:      reviewsFacade,
 		MenuFacade:         menu.NewFacade(menuItems, menuCategories, txm),
 		BookingsFacade: bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 			bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm),
