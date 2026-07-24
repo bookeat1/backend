@@ -36,8 +36,14 @@ type bookingResponse struct {
 
 type bookingDetailsResponse struct {
 	bookingResponse
-	Items  []bookingItemResponse  `json:"items"`
-	Tables []bookingTableResponse `json:"tables"`
+	// FreeCancelDeadline is the absolute moment free cancellation ends
+	// (starts_at − the venue's free_cancel_window_minutes). The client renders
+	// a live countdown from it. Null for a booking that can no longer be
+	// cancelled; still present (in the past) once the window has elapsed so the
+	// app can show the "paid cancellation" state. Additive, backward-compatible.
+	FreeCancelDeadline *time.Time             `json:"free_cancel_deadline"`
+	Items              []bookingItemResponse  `json:"items"`
+	Tables             []bookingTableResponse `json:"tables"`
 }
 
 type bookingItemResponse struct {
@@ -146,9 +152,10 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 
 func detailsToResponse(d *uc.BookingDetails) bookingDetailsResponse {
 	out := bookingDetailsResponse{
-		bookingResponse: bookingToResponse(d.Booking),
-		Items:           make([]bookingItemResponse, 0, len(d.Items)),
-		Tables:          make([]bookingTableResponse, 0, len(d.Tables)),
+		bookingResponse:    bookingToResponse(d.Booking),
+		FreeCancelDeadline: d.FreeCancelDeadline,
+		Items:              make([]bookingItemResponse, 0, len(d.Items)),
+		Tables:             make([]bookingTableResponse, 0, len(d.Tables)),
 	}
 	for _, it := range d.Items {
 		out.Items = append(out.Items, bookingItemResponse{

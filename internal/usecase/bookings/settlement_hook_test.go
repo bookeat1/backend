@@ -132,3 +132,37 @@ func TestWorker_NoShowSettlesDeposit(t *testing.T) {
 		t.Fatalf("trigger = %s, want no_show", got)
 	}
 }
+
+// Item 5 (single-window): a guest cancelling LATE (well inside the free-cancel
+// window) is NOT blocked — the booking is cancelled and the deposit settlement
+// still fires with the guest_cancel trigger (the payments layer then captures
+// it to the venue). This is the "cancel always allowed, money depends on the
+// window" behaviour.
+func TestStatus_LateGuestCancelStillSettlesDeposit(t *testing.T) {
+	rid := uuid.New()
+	guestID := uuid.New()
+	b := &domain.Booking{
+		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Name: "G",
+		PhoneNormalized: "+77071234567", Guests: 2, Status: domain.BookingConfirmed,
+		StartsAt: time.Now().Add(20 * time.Minute), EndsAt: time.Now().Add(2 * time.Hour), // minutes away → late
+		Source: domain.SourceApp,
+	}
+	settler := &fakeDepositSettler{}
+	uc := NewStatusUseCase(newFakeBookings(b), &fakeHistory{}, &fakeOutbox{},
+		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
+		newFakeManagers([2]uuid.UUID{uuid.New(), rid}),
+		&fakeTx{}, testConfig(),
+		WithDepositSettler(settler))
+
+	guest := Actor{UserID: guestID, Role: domain.RoleUser}
+	got, err := uc.Cancel(context.Background(), guest, b.ID, CancelInput{})
+	if err != nil {
+		t.Fatalf("late guest Cancel must be allowed, got %v", err)
+	}
+	if got.Status != domain.BookingCancelled {
+		t.Fatalf("status = %s, want cancelled", got.Status)
+	}
+	if trig, ok := settler.triggerFor(b.ID); !ok || trig != domain.RefundTriggerGuestCancel {
+		t.Fatalf("settler trigger = %v (found=%v), want guest_cancel", trig, ok)
+	}
+}

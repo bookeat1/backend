@@ -7,10 +7,16 @@ import (
 )
 
 // CancelDeadlineFor is the server-trusted "free cancellation ends at" moment
-// for a booking, exported so other usecase packages (payments) can derive the
-// exact same value cancelDeadline (status.go) computes for the booking's own
-// cancel action, instead of re-resolving the venue's policy — and possibly
-// drifting from it — a second time. See usecase/payments.cancelDeadlineResolver.
+// for a booking derived from cancel_deadline_minutes.
+//
+// DEPRECATED / SUPERSEDED (owner decision, single-window consolidation): the
+// money-path free-cancellation deadline now comes from
+// restaurants.free_cancel_window_minutes via
+// usecase/payments.FreeCancelDeadlineFor, and the guest self-cancel action is
+// no longer time-gated at all (see status.go authorizeTransition). This helper
+// and the cancel_deadline_minutes column it reads are retained only so existing
+// callers/DTOs keep compiling and no prod migration drops a live column near
+// launch; nothing in the cancel/money path relies on it anymore.
 func CancelDeadlineFor(restaurant domain.Restaurant, cfg Config, startsAt time.Time) time.Time {
 	policy := resolvePolicy(restaurant, cfg)
 	return startsAt.Add(-policy.CancelDeadline)

@@ -238,8 +238,17 @@ func (u *statusUseCase) settleDepositAfterTransition(ctx context.Context, b *dom
 }
 
 // authorizeTransition enforces who may request which transition. Staff may make
-// any legal transition; a guest may only cancel their own booking, and only
-// before the venue's cancellation deadline.
+// any legal transition; a guest may only cancel their OWN booking — but at ANY
+// time.
+//
+// Owner decision (single-window consolidation): there is no longer a hard
+// "too late to cancel" cutoff. The per-restaurant free-cancel window
+// (restaurants.free_cancel_window_minutes) no longer BLOCKS a late cancellation
+// — it only decides whether the money is returned (before the window: deposit
+// voided / pre-order refunded; after: deposit captured / pre-order kept — see
+// usecase/payments deposit settlement). The old hard gate on
+// cancel_deadline_minutes is removed; that column is superseded (see
+// resolvePolicy). The booking's ownership was already checked in authorize().
 func (u *statusUseCase) authorizeTransition(ctx context.Context, acc access, b *domain.Booking, to domain.BookingStatus, staffOnly bool) error {
 	if acc.staff() {
 		return nil
@@ -250,22 +259,7 @@ func (u *statusUseCase) authorizeTransition(ctx context.Context, acc access, b *
 	if to != domain.BookingCancelled {
 		return fmt.Errorf("%w: only the restaurant can set status %s", domain.ErrForbidden, to)
 	}
-	deadline, err := u.cancelDeadline(ctx, b)
-	if err != nil {
-		return err
-	}
-	if !time.Now().Before(deadline) {
-		return fmt.Errorf("%w: free cancellation ended at %s, contact the restaurant",
-			domain.ErrForbidden, deadline.UTC().Format(time.RFC3339))
-	}
+	// A guest may cancel their own booking at any time; the money consequence
+	// (free vs paid) is handled by the payment settlement, not by blocking here.
 	return nil
-}
-
-// cancelDeadline is starts_at minus the venue's cancellation window.
-func (u *statusUseCase) cancelDeadline(ctx context.Context, b *domain.Booking) (time.Time, error) {
-	rest, err := u.restaurants.GetByID(ctx, b.RestaurantID)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return CancelDeadlineFor(rest.Restaurant, u.cfg, b.StartsAt), nil
 }

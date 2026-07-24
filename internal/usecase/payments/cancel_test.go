@@ -20,20 +20,37 @@ import (
 // is exactly what a different per-restaurant window does in production.
 func newCancelHarness(t *testing.T, deadline time.Time) (DepositCancellationUseCase, *domain.Payment, *fakePaymentRepo, *fakeLedgerRepo, *fakeGateway) {
 	t.Helper()
-	bookingID := uuid.New()
-	p := testPayment(bookingID, domain.PaymentAuthorized, "gw-dep")
+	uc, p, repo, ledger, gw, _ := newCancelHarnessFor(t, testPayment(uuid.New(), domain.PaymentAuthorized, "gw-dep"), deadline)
+	return uc, p, repo, ledger, gw
+}
+
+// newCancelHarnessFor builds the settlement usecase over a caller-supplied
+// payment (deposit hold OR captured pre-order), wiring the real RefundUseCase
+// so the pre-order refund path is exercised end-to-end.
+func newCancelHarnessFor(t *testing.T, p *domain.Payment, deadline time.Time) (DepositCancellationUseCase, *domain.Payment, *fakePaymentRepo, *fakeLedgerRepo, *fakeGateway, *fakeRefundRepo) {
+	t.Helper()
 	repo := newFakePaymentRepo(p)
+	refunds := newFakeRefundRepo()
 	ledger := newFakeLedgerRepo()
 	outbox := newFakePaymentOutbox()
 	gw := newFakeGateway(domain.ProviderFreedomPay)
 	resolver := newFakeGatewayResolver(gw)
 	managers := newFakeManagerChecker()
-	booking := &domain.Booking{ID: bookingID, RestaurantID: p.RestaurantID, StartsAt: time.Now().Add(2 * time.Hour)}
+	booking := &domain.Booking{ID: p.BookingID, RestaurantID: p.RestaurantID, StartsAt: time.Now().Add(2 * time.Hour)}
 	bookings := newFakeBookingReader(booking)
 	dl := &fakeCancelDeadlineResolver{deadline: deadline}
-	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox}
-	uc := NewDepositCancellationUseCase(repo, ledger, outbox, resolver, managers, bookings, dl, tx)
-	return uc, p, repo, ledger, gw
+	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox, refunds: refunds}
+	refundUC := NewRefundUseCase(repo, refunds, ledger, outbox, resolver, managers, bookings, dl, tx, Config{}.withDefaults())
+	uc := NewDepositCancellationUseCase(repo, ledger, outbox, resolver, managers, bookings, dl, refundUC, tx)
+	return uc, p, repo, ledger, gw, refunds
+}
+
+// capturedPreorder is a captured pre-order payment for a booking, the state a
+// pre-order is in after its immediate capture on authorization.
+func capturedPreorder(bookingID uuid.UUID) *domain.Payment {
+	p := testPayment(bookingID, domain.PaymentCaptured, "gw-pre")
+	p.Purpose = domain.PurposePreorder
+	return p
 }
 
 // Early guest cancellation (before the free-cancel deadline) releases the hold
@@ -315,5 +332,157 @@ func TestDepositNotCapturedOnAuthorization(t *testing.T) {
 	}
 	if gw.callCount("capture") != 0 {
 		t.Fatalf("capture called %d times for a deposit, want 0", gw.callCount("capture"))
+	}
+}
+
+// A declined pre-order immediate capture must NOT be swallowed: the webhook
+// event is left unprocessed (so it retries), the hold is released back to
+// authorized, and a redelivery captures successfully without double-charging.
+func TestPreorderCapture_DeclineLeavesEventUnprocessed_RetrySucceeds(t *testing.T) {
+	ctx := context.Background()
+	pre := testPayment(uuid.New(), domain.PaymentCreated, "gw-pre-retry")
+	pre.Purpose = domain.PurposePreorder
+	u, repo, events, ledger, _, gw := newWebhookHarness(pre)
+	gw.captureErr = domain.ErrProviderDeclined
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-retry", ProviderPaymentID: "gw-pre-retry",
+		Type: domain.WebhookPaymentAuthorized, Status: domain.PaymentAuthorized, SignatureValid: true,
+	})
+
+	// First delivery: capture declines → the webhook errors and the event is
+	// left UNPROCESSED so it will be retried.
+	if err := u.HandleWebhook(ctx, domain.ProviderFreedomPay, []byte("b"), nil); err == nil {
+		t.Fatalf("expected an error from a declined pre-order capture")
+	}
+	ev := events.byID[eventKey(domain.ProviderFreedomPay, "evt-retry")]
+	if ev == nil || ev.ProcessedAt != nil {
+		t.Fatalf("event must be left UNPROCESSED after a declined capture, got %+v", ev)
+	}
+	if ev.ProcessError == nil {
+		t.Fatalf("processing error not recorded on the unprocessed event")
+	}
+	if stored, _ := repo.GetByID(ctx, pre.ID); stored.Status != domain.PaymentAuthorized {
+		t.Fatalf("payment status = %s, want authorized (hold released after decline)", stored.Status)
+	}
+
+	// Acquirer redelivers the same event; capture now succeeds.
+	gw.captureErr = nil
+	if err := u.HandleWebhook(ctx, domain.ProviderFreedomPay, []byte("b"), nil); err != nil {
+		t.Fatalf("retry HandleWebhook error = %v", err)
+	}
+	if stored, _ := repo.GetByID(ctx, pre.ID); stored.Status != domain.PaymentCaptured {
+		t.Fatalf("payment status = %s, want captured after retry", stored.Status)
+	}
+	if ev := events.byID[eventKey(domain.ProviderFreedomPay, "evt-retry")]; ev.ProcessedAt == nil {
+		t.Fatalf("event still unprocessed after a successful retry")
+	}
+	if gw.callCount("capture") != 2 {
+		t.Fatalf("capture attempted %d times, want 2 (one decline + one success, no double-capture)", gw.callCount("capture"))
+	}
+	if bal, _ := ledger.BalanceByAccount(ctx, pre.ID); bal[domain.AccountRestaurant] != -pre.BaseAmountMinor {
+		t.Fatalf("restaurant credited %d, want exactly one credit of %d", bal[domain.AccountRestaurant], pre.BaseAmountMinor)
+	}
+}
+
+// Early cancel of a PRE-ORDER refunds it to the guest in full (made whole).
+func TestSettlePreorder_EarlyCancel_Refunds(t *testing.T) {
+	ctx := context.Background()
+	pre := capturedPreorder(uuid.New())
+	uc, p, repo, _, gw, refunds := newCancelHarnessFor(t, pre, time.Now().Add(1*time.Hour)) // deadline ahead → early
+	now := time.Now()
+
+	got, err := uc.SettleDepositOnCancel(ctx, Actor{}, p.BookingID, DepositCancelInput{
+		Trigger: domain.RefundTriggerGuestCancel, CancelledAt: &now,
+	})
+	if err != nil {
+		t.Fatalf("SettleDepositOnCancel() error = %v", err)
+	}
+	if got.Status != domain.PaymentRefunded {
+		t.Fatalf("status = %s, want refunded", got.Status)
+	}
+	if gw.callCount("refund") != 1 {
+		t.Fatalf("refund called %d times, want 1", gw.callCount("refund"))
+	}
+	// Full make-whole refund: the guest gets the WHOLE captured total back.
+	var refundedMinor int64
+	for _, r := range refunds.snapshot() {
+		if r.Status == domain.RefundSucceeded {
+			refundedMinor += r.AmountMinor
+		}
+	}
+	if refundedMinor != p.AmountMinor {
+		t.Fatalf("refunded %d, want the full total %d (no loss)", refundedMinor, p.AmountMinor)
+	}
+	if stored, _ := repo.GetByID(ctx, p.ID); stored.Status != domain.PaymentRefunded {
+		t.Fatalf("stored status = %s, want refunded", stored.Status)
+	}
+}
+
+// Venue cancel of a PRE-ORDER also refunds it in full.
+func TestSettlePreorder_VenueCancel_Refunds(t *testing.T) {
+	ctx := context.Background()
+	pre := capturedPreorder(uuid.New())
+	uc, p, _, _, gw, _ := newCancelHarnessFor(t, pre, time.Now().Add(-5*time.Hour)) // late window, still refunds (venue)
+	got, err := uc.SettleDepositOnCancel(ctx, staffActor, p.BookingID, DepositCancelInput{
+		Trigger: domain.RefundTriggerVenueCancel,
+	})
+	if err != nil {
+		t.Fatalf("SettleDepositOnCancel() error = %v", err)
+	}
+	if got.Status != domain.PaymentRefunded {
+		t.Fatalf("status = %s, want refunded", got.Status)
+	}
+	if gw.callCount("refund") != 1 {
+		t.Fatalf("refund called %d times, want 1", gw.callCount("refund"))
+	}
+}
+
+// Late cancel / no-show of a PRE-ORDER is NOT refunded: the food was prepared,
+// the venue keeps it.
+func TestSettlePreorder_LateAndNoShow_NotRefunded(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	cases := []struct {
+		name string
+		in   DepositCancelInput
+		act  Actor
+	}{
+		{"late guest cancel", DepositCancelInput{Trigger: domain.RefundTriggerGuestCancel, CancelledAt: &now}, Actor{}},
+		{"no-show", DepositCancelInput{Trigger: domain.RefundTriggerNoShow}, staffActor},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pre := capturedPreorder(uuid.New())
+			uc, p, _, _, gw, _ := newCancelHarnessFor(t, pre, now.Add(-1*time.Hour)) // deadline passed → late
+			got, err := uc.SettleDepositOnCancel(ctx, tc.act, p.BookingID, tc.in)
+			if err != nil {
+				t.Fatalf("SettleDepositOnCancel() error = %v", err)
+			}
+			if got.Status != domain.PaymentCaptured {
+				t.Fatalf("status = %s, want captured (kept by venue)", got.Status)
+			}
+			if gw.callCount("refund") != 0 {
+				t.Fatalf("refund called %d times, want 0", gw.callCount("refund"))
+			}
+		})
+	}
+}
+
+// A double early-cancel of a PRE-ORDER refunds it exactly once (idempotent).
+func TestSettlePreorder_DoubleCancel_Idempotent(t *testing.T) {
+	ctx := context.Background()
+	pre := capturedPreorder(uuid.New())
+	uc, p, _, _, gw, _ := newCancelHarnessFor(t, pre, time.Now().Add(1*time.Hour))
+	now := time.Now()
+	in := DepositCancelInput{Trigger: domain.RefundTriggerGuestCancel, CancelledAt: &now}
+
+	if _, err := uc.SettleDepositOnCancel(ctx, Actor{}, p.BookingID, in); err != nil {
+		t.Fatalf("first settle error = %v", err)
+	}
+	if _, err := uc.SettleDepositOnCancel(ctx, Actor{}, p.BookingID, in); err != nil {
+		t.Fatalf("second settle error = %v", err)
+	}
+	if gw.callCount("refund") != 1 {
+		t.Fatalf("refund called %d times across two cancels, want 1", gw.callCount("refund"))
 	}
 }

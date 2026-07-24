@@ -172,14 +172,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
 	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
 	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, txm)
+		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
 
 	// Named facade/usecase variables so both the Deps struct and the admin
 	// panel below share the SAME instances (rather than re-constructing them).
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm)
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
-		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm)
+		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
+		bookings.WithFreeCancelDeadlineResolver(cancelDeadline)) // same window as the money path
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
@@ -354,9 +355,14 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	}
 	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), txm)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}
+	paymentsRepo := paymentrepo.New(db)
+	ledgerRepo := paymentrepo.NewLedger(db)
+	outboxRepo := paymentrepo.NewOutbox(db)
+	refundUC := payments.NewRefundUseCase(paymentsRepo, paymentrepo.NewRefunds(db), ledgerRepo, outboxRepo,
+		gateways, restaurantManagers, bookingRepo, cancelDeadline, txm, newPaymentsConfig(cfg))
 	depositCancel := payments.NewDepositCancellationUseCase(
-		paymentrepo.New(db), paymentrepo.NewLedger(db), paymentrepo.NewOutbox(db),
-		gateways, restaurantManagers, bookingRepo, cancelDeadline, txm)
+		paymentsRepo, ledgerRepo, outboxRepo,
+		gateways, restaurantManagers, bookingRepo, cancelDeadline, refundUC, txm)
 
 	return bookings.NewWorker(
 		bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),

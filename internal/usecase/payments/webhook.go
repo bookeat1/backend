@@ -261,8 +261,25 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 // released — this is the saga compensation from spec §6 applied to two
 // concurrent checkouts on one booking instead of a lost table.
 func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
-	if p.Status == domain.PaymentAuthorized {
-		return nil // already applied; a defensive no-op, events.Create already dedups the common case
+	// Idempotency for this callback is PURPOSE-aware. A PRE-ORDER is captured
+	// immediately on authorization (captureIfPreorder), so the authorized →
+	// captured range is all "this callback's work is done or resumable":
+	//   - already captured / refunded → nothing left to do, ack;
+	//   - still only authorized → a previous immediate-capture attempt was
+	//     declined (captureHold released the hold back to authorized) or never
+	//     ran; a redelivery must RESUME the capture, not ack it as done —
+	//     otherwise a failed pre-order capture is never retried and the money
+	//     is left as an uncaptured hold that auto-expires (silent revenue loss).
+	// A DEPOSIT is a plain created → authorized and is done once authorized.
+	if p.Purpose == domain.PurposePreorder {
+		switch p.Status {
+		case domain.PaymentCaptured, domain.PaymentRefunded, domain.PaymentPartiallyRefunded:
+			return nil
+		case domain.PaymentAuthorized:
+			return u.captureIfPreorder(ctx, p)
+		}
+	} else if p.Status == domain.PaymentAuthorized {
+		return nil // deposit already applied; events.Create dedups the common case
 	}
 	if err := domain.ValidatePaymentTransition(p.Status, domain.PaymentAuthorized); err != nil {
 		return fmt.Errorf("webhook authorized on payment %s (currently %s): %w", p.ID, p.Status, err)
@@ -279,8 +296,11 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 	})
 	if txErr == nil {
 		logging.FromContext(ctx).Info(logging.EventPaymentAuthorized, slog.String("payment_id", p.ID.String()))
-		u.captureIfPreorder(ctx, p)
-		return nil
+		// The authorization is durably committed. The immediate pre-order
+		// capture is a follow-on; if it fails, its error is PROPAGATED so
+		// resolveAndApply leaves the webhook event UNPROCESSED (report item #9)
+		// and a redelivery / the reconciler retries it — never swallowed.
+		return u.captureIfPreorder(ctx, p)
 	}
 	if !errors.Is(txErr, domain.ErrAlreadyExists) {
 		return txErr
@@ -292,23 +312,25 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 // kitchen has to prepare the food, so a pre-order is taken at payment time
 // rather than held until seating (a DEPOSIT, by contrast, stays a hold and is
 // only captured on a late cancellation / no-show — see cancel.go). A DEPOSIT is
-// left untouched here.
+// a no-op (returns nil).
 //
 // It reuses CaptureOnSeating's exact CAS-guarded mechanic (captureHold), so it
-// is idempotent: a redelivered authorized webhook whose pre-order was already
-// captured finds status == captured and is a no-op. The authorization is
-// already durably committed by the caller, so a capture failure here (declined
-// or unknown outcome) must NOT fail the whole webhook — it is logged and left
-// for the reconciliation worker, exactly as a CaptureOnSeating failure is.
-func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) {
+// is idempotent: an already-captured pre-order finds status == captured and is
+// a no-op, so a successful retry never double-captures. The capture error is
+// RETURNED (not swallowed): a decline or an unknown outcome must leave the
+// webhook event unprocessed so it is retried, otherwise the food is prepared
+// while the money stays an uncaptured hold that silently auto-expires.
+func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) error {
 	if p.Purpose != domain.PurposePreorder {
-		return
+		return nil
 	}
 	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
 	if _, err := cv.captureHold(ctx, p); err != nil {
 		logging.FromContext(ctx).Error("payment.preorder_immediate_capture_failed",
 			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+		return fmt.Errorf("immediate capture of pre-order payment %s: %w", p.ID, err)
 	}
+	return nil
 }
 
 // compensateLostRace releases the hold this payment placed after it lost the

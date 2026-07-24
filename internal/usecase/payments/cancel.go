@@ -58,10 +58,19 @@ type DepositCancelInput struct {
 type depositCancellationUseCase struct {
 	payments domain.PaymentRepository
 	capvoid  *captureVoidUseCase
+	refunds  RefundUseCase
 	bookings bookingReader
 	managers managerChecker
 	deadline cancelDeadlineResolver
 }
+
+// systemActor performs the money moves that are a CONSEQUENCE of an
+// already-authorized cancel / no-show transition. The outer SettleDepositOnCancel
+// authorizes the real actor for the real trigger ONCE; the inner void / capture
+// (captureHold/voidHold never re-check the actor) and the inner pre-order refund
+// (RefundUseCase.Settle) then run as the system, exactly as the booking worker
+// closes a no-show as the system.
+var systemActor = Actor{Role: domain.RoleAdmin}
 
 // NewDepositCancellationUseCase constructs the deposit cancellation settlement.
 func NewDepositCancellationUseCase(
@@ -72,11 +81,13 @@ func NewDepositCancellationUseCase(
 	managers managerChecker,
 	bookings bookingReader,
 	deadline cancelDeadlineResolver,
+	refunds RefundUseCase,
 	tx domain.TxManager,
 ) DepositCancellationUseCase {
 	return &depositCancellationUseCase{
 		payments: payments,
 		capvoid:  &captureVoidUseCase{payments: payments, ledger: ledger, outbox: outbox, gateways: gateways, managers: managers, tx: tx},
+		refunds:  refunds,
 		bookings: bookings,
 		managers: managers,
 		deadline: deadline,
@@ -105,16 +116,10 @@ func (u *depositCancellationUseCase) SettleDepositOnCancel(ctx context.Context, 
 		return nil, err
 	}
 
-	// A PRE-ORDER is captured immediately at payment time (the kitchen prepares
-	// the food), so it is never a hold this path can void or re-capture. What
-	// happens to a pre-order on an EARLY cancellation is a DELIBERATELY OPEN
-	// question the owner has not answered (see the PR description): the food may
-	// already be in preparation, so an automatic refund is NOT assumed here.
-	// This path leaves the pre-order untouched.
+	// A PRE-ORDER was captured immediately at payment time (kitchen prepares the
+	// food). On cancel it is refunded or kept, never voided/re-captured.
 	if p.Purpose == domain.PurposePreorder {
-		// TODO(owner-decision): does an EARLY cancel refund a captured pre-order?
-		// Do NOT auto-refund without an explicit instruction. See PR body.
-		return p, nil
+		return u.settlePreorder(ctx, p, in)
 	}
 
 	// Idempotent terminal states: the deposit was already settled one way or the
@@ -156,6 +161,63 @@ func (u *depositCancellationUseCase) SettleDepositOnCancel(ctx context.Context, 
 		return nil, err
 	}
 	logging.FromContext(ctx).Info("payment.deposit_released",
+		slog.String("payment_id", p.ID.String()),
+		slog.String("booking_id", p.BookingID.String()),
+		slog.String("trigger", string(in.Trigger)))
+	return out, nil
+}
+
+// settlePreorder settles an already-captured pre-order on cancel / no-show:
+//
+//	guest cancels EARLIER than free_cancel_window, or venue cancels  → FULL refund
+//	guest cancels LATER than free_cancel_window, or no-show          → keep (food prepped)
+//
+// Owner-confirmed: an early cancellation returns EVERYTHING to the guest with
+// no loss. The full make-whole refund is exactly domain.SettleRefund's
+// venue-cancel outcome (guest gets the whole total, service fee included), so
+// the refund is settled through the existing RefundUseCase.Settle with
+// RefundTriggerVenueCancel regardless of whether the guest or the venue
+// initiated it — the money outcome is identical, and a partial (acquiring-
+// withheld) refund would violate "no loss". A late cancel / no-show keeps the
+// pre-order with the venue: the capture already credited it, nothing moves.
+//
+// Idempotent: a refunded pre-order is a no-op; a still-captured one resumes the
+// SAME refund (deterministic idempotency key + trigger) via Settle's own
+// SettledAt / refund-row guards, so a double cancel never refunds twice.
+func (u *depositCancellationUseCase) settlePreorder(ctx context.Context, p *domain.Payment, in DepositCancelInput) (*domain.Payment, error) {
+	if p.Status == domain.PaymentRefunded || p.Status == domain.PaymentPartiallyRefunded {
+		return p, nil // already refunded — nothing more to do
+	}
+	if p.Status != domain.PaymentCaptured {
+		// Still authorized (immediate capture pending/declined) or capturing:
+		// the money is not yet the venue's to refund. The reconciler / capture
+		// retry resolves it first; a later cancel settlement can then act.
+		return nil, fmt.Errorf("%w: pre-order is %s, cannot settle on cancel yet", domain.ErrInvalidStatus, p.Status)
+	}
+
+	forfeit, err := u.shouldCapture(ctx, p, in)
+	if err != nil {
+		return nil, err
+	}
+	if forfeit {
+		// Late cancel / no-show: the food was prepared, the venue keeps the
+		// pre-order. The capture already credited it — no money moves.
+		logging.FromContext(ctx).Info("payment.preorder_kept",
+			slog.String("payment_id", p.ID.String()),
+			slog.String("booking_id", p.BookingID.String()),
+			slog.String("trigger", string(in.Trigger)))
+		return p, nil
+	}
+
+	out, err := u.refunds.Settle(ctx, systemActor, p.BookingID, SettleInput{
+		Trigger:        domain.RefundTriggerVenueCancel, // full make-whole refund (see doc above)
+		IdempotencyKey: p.BookingID.String() + ":preorder-cancel-refund",
+		Reason:         in.Reason,
+	})
+	if err != nil {
+		return nil, err
+	}
+	logging.FromContext(ctx).Info("payment.preorder_refunded",
 		slog.String("payment_id", p.ID.String()),
 		slog.String("booking_id", p.BookingID.String()),
 		slog.String("trigger", string(in.Trigger)))
