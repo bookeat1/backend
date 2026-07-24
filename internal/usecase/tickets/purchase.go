@@ -119,21 +119,28 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 		return nil, err
 	}
 
-	ticket, err := u.reserve(ctx, actor, event, unitPrice, in)
+	ticket, raced, err := u.reserve(ctx, actor, event, unitPrice, in)
 	if err != nil {
 		return nil, err
 	}
-	// A reservation-race replay (the idempotency insert lost to a concurrent
-	// identical retry) is handled through the same ownership-guarded replay.
-	if ticket.Status != domain.TicketPending || ticket.PaymentID != nil {
+	// A RACED ticket belongs to whoever won the idempotency-insert (possibly a
+	// DIFFERENT buyer — the event id is public and the key is client-chosen). It
+	// MUST go through the ownership-guarded replay, which rejects a non-owner
+	// with ErrForbidden before revealing anything, and only repairs / returns the
+	// ticket to its rightful buyer. Falling through to createTicketPayment /
+	// release here would leak the winner's ticket + PII and let an attacker
+	// cancel a paying victim's in-flight ticket — never touch a ticket this
+	// request did not create.
+	if raced {
 		return u.replay(ctx, actor, in, ticket)
 	}
 
 	payment, err := u.createTicketPayment(ctx, actor, in, ticket)
 	if err != nil {
-		// Payment could not be started — release the held seat so it is not
-		// stranded pending forever. Best-effort: a release failure is logged by
-		// the CAS layer; the pending-ticket sweep is the backstop.
+		// Payment could not be started for OUR OWN freshly-reserved ticket —
+		// release the held seat so it is not stranded pending forever.
+		// Best-effort: a release failure is logged by the CAS layer; the
+		// pending-ticket sweep is the backstop.
 		_ = u.release(ctx, ticket)
 		return nil, err
 	}
@@ -168,8 +175,11 @@ func (u *purchaseUseCase) createTicketPayment(ctx context.Context, actor Actor, 
 }
 
 // reserve holds the seats: lock the event, enforce capacity, insert the pending
-// ticket — all in one transaction so two concurrent buyers cannot oversell.
-func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domain.Event, unitPrice int64, in PurchaseInput) (*domain.EventTicket, error) {
+// ticket — all in one transaction so two concurrent buyers cannot oversell. The
+// returned bool is true when this request LOST the idempotency-insert race and
+// the returned ticket is the winner's (possibly a foreign buyer's) — the caller
+// must route that through the ownership-guarded replay, never act on it directly.
+func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domain.Event, unitPrice int64, in PurchaseInput) (*domain.EventTicket, bool, error) {
 	total := unitPrice * int64(in.Quantity)
 	ticket := &domain.EventTicket{
 		ID:                     uuid.New(),
@@ -221,12 +231,12 @@ func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domai
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if raced != nil {
-		return raced, nil
+		return raced, true, nil
 	}
-	return ticket, nil
+	return ticket, false, nil
 }
 
 // replay returns the existing ticket for a retried purchase, but only to its

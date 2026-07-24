@@ -76,7 +76,10 @@ func (s *PendingSweeper) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// A graceful shutdown (SIGINT/SIGTERM cancels the shared context) is
+			// not an error — return nil so cmd/worker exits 0, same as the
+			// booking worker and the notification dispatcher.
+			return nil
 		case <-t.C:
 			if n, err := s.Sweep(ctx); err != nil {
 				s.log.Error("tickets.sweep_failed", slog.String("error", err.Error()))

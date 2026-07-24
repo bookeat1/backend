@@ -33,6 +33,11 @@ type Config struct {
 	// is the next step once that adapter lands.
 	PaymentsReconciler PaymentsReconcilerConfig
 
+	// TicketsSweep configures the pending-event-ticket sweep worker
+	// (usecase/tickets.PendingSweeper): it releases seats held by pending
+	// tickets whose payment never completed (or was never created).
+	TicketsSweep TicketsSweepConfig
+
 	// Push configures the web-push notification channel (VAPID keys) and the
 	// notification dispatcher worker. Absent VAPID keys make the channel a
 	// clean no-op — the dispatcher still runs and drains the outbox, it just
@@ -252,6 +257,16 @@ type LegacySyncConfig struct {
 	BatchSize    int           // env: LEGACY_SYNC_BATCH_SIZE
 }
 
+// TicketsSweepConfig configures the pending-event-ticket sweep worker. The
+// StaleAfter default (100h) deliberately exceeds the payments HoldTTL default
+// (96h) so a ticket whose payment hold is still legitimately in flight is never
+// swept — see usecase/tickets.PendingSweeper.
+type TicketsSweepConfig struct {
+	TickInterval time.Duration // env: TICKETS_SWEEP_TICK_INTERVAL
+	StaleAfter   time.Duration // env: TICKETS_SWEEP_STALE_AFTER
+	BatchSize    int           // env: TICKETS_SWEEP_BATCH_SIZE
+}
+
 // PushConfig holds the web-push channel's VAPID keys and the notification
 // dispatcher's scheduling. The VAPID keys come from env only and are never
 // logged (same discipline as acquirer credentials). When the keys are absent
@@ -362,6 +377,11 @@ func NewConfig() (Config, error) {
 			DatabaseURL:  getEnv("LEGACY_DB_URL", ""),
 			TickInterval: getEnvDuration("LEGACY_SYNC_TICK_INTERVAL", time.Minute),
 			BatchSize:    getEnvInt("LEGACY_SYNC_BATCH_SIZE", 500),
+		},
+		TicketsSweep: TicketsSweepConfig{
+			TickInterval: getEnvDuration("TICKETS_SWEEP_TICK_INTERVAL", 5*time.Minute),
+			StaleAfter:   getEnvDuration("TICKETS_SWEEP_STALE_AFTER", 100*time.Hour),
+			BatchSize:    getEnvInt("TICKETS_SWEEP_BATCH_SIZE", 100),
 		},
 		Push: PushConfig{
 			VAPIDPublicKey:   getEnv("PUSH_VAPID_PUBLIC_KEY", ""),

@@ -202,6 +202,66 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 	})
 }
 
+// TestReserveRaceRejectsForeignBuyer: the TOCTOU reserve-race path (top-level
+// idempotency lookup misses, the insert inside reserve collides with a
+// concurrently-created ticket) must ALSO run authorizeReplay — an attacker who
+// loses the race to a victim's pending, nil-PaymentID ticket gets ErrForbidden
+// and NOTHING of the victim's, and the victim's ticket is left untouched (never
+// cancelled by the attacker's failed request).
+func TestReserveRaceRejectsForeignBuyer(t *testing.T) {
+	t.Run("account victim not cancelled", func(t *testing.T) {
+		event := ticketedEvent(ptr(10), 35000)
+		uc, repo, pay := newPurchaseHarness(t, event)
+		victim := uuid.New()
+		vTicket := &domain.EventTicket{
+			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
+			Status: domain.TicketPending, UserID: &victim, PurchaseIdempotencyKey: "1",
+			GuestName: "Alice", GuestPhone: "+7700victim",
+		}
+		repo.byID[vTicket.ID] = vTicket
+		repo.suppressLookups = 1 // top lookup misses → reserve insert collides
+
+		attacker := uuid.New()
+		_, err := uc.Purchase(context.Background(), Actor{UserID: &attacker, Role: domain.RoleUser}, PurchaseInput{
+			EventID: event.ID, Quantity: 1, IdempotencyKey: "1", CallbackURL: "https://cb",
+		})
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("reserve-race foreign buyer err = %v, want ErrForbidden", err)
+		}
+		// Victim's ticket must be untouched: still pending, no payment created.
+		if repo.byID[vTicket.ID].Status != domain.TicketPending {
+			t.Fatalf("victim ticket was cancelled by attacker: %s", repo.byID[vTicket.ID].Status)
+		}
+		if pay.createN != 0 {
+			t.Fatalf("attacker triggered a payment on the victim's ticket: createN=%d", pay.createN)
+		}
+	})
+
+	t.Run("anonymous victim not leaked", func(t *testing.T) {
+		event := ticketedEvent(ptr(10), 35000)
+		uc, repo, pay := newPurchaseHarness(t, event)
+		vTicket := &domain.EventTicket{
+			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
+			Status: domain.TicketPending, PurchaseIdempotencyKey: "1",
+			GuestName: "Alice", GuestPhone: "+7700victim", GuestEmail: "alice@x.io",
+		}
+		repo.byID[vTicket.ID] = vTicket
+		repo.suppressLookups = 1
+
+		_, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+			EventID: event.ID, Quantity: 1, GuestPhone: "+7999attacker", IdempotencyKey: "1", CallbackURL: "https://cb",
+		})
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("reserve-race foreign phone err = %v, want ErrForbidden", err)
+		}
+		if repo.byID[vTicket.ID].Status != domain.TicketPending || pay.createN != 0 {
+			t.Fatalf("victim leaked/cancelled: status=%s createN=%d", repo.byID[vTicket.ID].Status, pay.createN)
+		}
+	})
+}
+
 // TestPurchaseRejectsNonTicketedAndUnpublished.
 func TestPurchaseRejectsNonTicketedAndUnpublished(t *testing.T) {
 	price := int64(35000)

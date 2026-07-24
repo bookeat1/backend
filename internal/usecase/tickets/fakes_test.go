@@ -17,6 +17,11 @@ type fakeTicketRepo struct {
 	mu        sync.Mutex
 	byID      map[uuid.UUID]*domain.EventTicket
 	createErr error
+	// suppressLookups makes the next N GetByIdempotencyKey calls return
+	// ErrNotFound even when a matching ticket exists, to simulate the TOCTOU
+	// reserve-race: the top-of-Purchase lookup misses, but the insert inside
+	// reserve then collides with a concurrently-created ticket.
+	suppressLookups int
 }
 
 func newFakeTicketRepo() *fakeTicketRepo {
@@ -67,6 +72,10 @@ func (f *fakeTicketRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.Event
 func (f *fakeTicketRepo) GetByIdempotencyKey(_ context.Context, eventID uuid.UUID, key string) (*domain.EventTicket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.suppressLookups > 0 {
+		f.suppressLookups--
+		return nil, domain.ErrNotFound
+	}
 	for _, t := range f.byID {
 		if t.EventID == eventID && t.PurchaseIdempotencyKey == key {
 			cp := *t

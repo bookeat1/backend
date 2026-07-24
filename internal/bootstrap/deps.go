@@ -636,10 +636,21 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 // the backstop the payments reconciler cannot cover because a pending ticket may
 // have no payment row at all. Safe-idle when there are no stale pending tickets.
 func NewTicketSweeper(cfg Config, db *pgxpool.Pool, log *slog.Logger) *tickets.PendingSweeper {
-	staleAfter := newPaymentsConfig(cfg).HoldTTL + 4*time.Hour // comfortably past the hold TTL
+	// StaleAfter must comfortably exceed the payments HoldTTL so a ticket whose
+	// hold is still legitimately in flight is never swept; the configured value
+	// (default 100h) is floored at HoldTTL+4h as a safety net against a
+	// misconfigured-too-low override.
+	staleAfter := cfg.TicketsSweep.StaleAfter
+	if floor := newPaymentsConfig(cfg).HoldTTL + 4*time.Hour; staleAfter < floor {
+		staleAfter = floor
+	}
 	return tickets.NewPendingSweeper(
 		eventticketrepo.New(db), paymentrepo.New(db),
-		tickets.SweepConfig{StaleAfter: staleAfter}, log)
+		tickets.SweepConfig{
+			TickInterval: cfg.TicketsSweep.TickInterval,
+			StaleAfter:   staleAfter,
+			BatchSize:    cfg.TicketsSweep.BatchSize,
+		}, log)
 }
 
 // NewNotificationDispatcher wires the background notification dispatcher: it
