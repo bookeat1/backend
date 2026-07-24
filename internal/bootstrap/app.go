@@ -25,6 +25,7 @@ import (
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
 	paymentsrest "backend-core/internal/transport/rest/payments"
+	payoutsrest "backend-core/internal/transport/rest/payouts"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -164,6 +165,15 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// superadmin passes; a restaurant owner/manager/hostess or a guest gets 403.
 	// The usecase re-checks the superadmin role as defense-in-depth.
 	dashboardrest.NewHandler(deps.Dashboard).RegisterRoutes(adminGlobal)
+
+	// Restaurant payouts (выплаты заведениям). The money-OUT routes (generate +
+	// send) are mounted on the superadmin group; the venue-scoped routes
+	// (set/read destination, read statement) are mounted on the plain authed
+	// group below, same choice as the staff-roster routes — the usecase resolves
+	// the owner/manager (restaurant.manage) gate per (actor, restaurant).
+	payoutHandler := payoutsrest.NewHandler(deps.Payouts)
+	payoutHandler.RegisterSuperadminRoutes(adminGlobal)
+	payoutHandler.RegisterStaffRoutes(authed)
 
 	// Staff-roster management (list/assign/set role/remove a restaurant's own
 	// manager/hostess accounts): NOT gated by RequireRole/RequireRestaurantManager
