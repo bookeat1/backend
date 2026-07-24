@@ -756,6 +756,34 @@ func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restauran
 	return f.byRestaurant[restaurantID], nil
 }
 
+// fakeSpecialDays is a hand-written specialDayResolver. By default no
+// restaurant has a paid special day (bookings are FREE) — the common case that
+// keeps every existing create test unchanged. A test that exercises the
+// paid-special-day path registers a (restaurantID -> depositMinor) entry via
+// setPaid; err lets a test drive the error path.
+type fakeSpecialDays struct {
+	paid map[uuid.UUID]int64
+	err  error
+}
+
+func newFakeSpecialDays() *fakeSpecialDays {
+	return &fakeSpecialDays{paid: map[uuid.UUID]int64{}}
+}
+
+func (f *fakeSpecialDays) setPaid(restaurantID uuid.UUID, depositMinor int64) {
+	f.paid[restaurantID] = depositMinor
+}
+
+func (f *fakeSpecialDays) PaidSpecialDayFor(_ context.Context, restaurantID uuid.UUID, _ time.Time) (bool, int64, error) {
+	if f.err != nil {
+		return false, 0, f.err
+	}
+	if amt, ok := f.paid[restaurantID]; ok {
+		return true, amt, nil
+	}
+	return false, 0, nil
+}
+
 // ---------------------------------------------------------------------------
 // manager checker (tenant scoping, report item #13) + cancel deadline
 // ---------------------------------------------------------------------------

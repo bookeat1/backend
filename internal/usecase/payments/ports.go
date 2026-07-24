@@ -150,6 +150,24 @@ type restaurantPaymentSettings interface {
 	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
 }
 
+// specialDayResolver answers the ONE question the prepayment decision needs
+// about a booking's calendar date: did the restaurant mark that day as a PAID
+// special day (a holiday/event override with booking_payment_required = true),
+// and if so, what deposit does it require? Bookings are FREE by default, so the
+// common answer is (false, 0) — either there is no schedule override for that
+// date at all, or the override leaves the day free.
+//
+// It is deliberately a thin (bool, int64) contract, not a *domain.ScheduleOverride:
+// this package only cares "is this date a paid special day, and how much",
+// never the venue's opening hours for that day. The timezone-correct mapping
+// from the booking instant to the venue's local calendar date lives behind the
+// port (bootstrap's scheduleOverride adapter over
+// ScheduleOverrideRepository.GetForBookingInstant), so this package never has
+// to know the venue timezone.
+type specialDayResolver interface {
+	PaidSpecialDayFor(ctx context.Context, restaurantID uuid.UUID, at time.Time) (required bool, depositMinor int64, err error)
+}
+
 // managerChecker answers whether a user manages a restaurant (Manages, the
 // same port shape as usecase/bookings.managerChecker) and, additionally,
 // whether they hold a specific domain.Permission there (HasPermission, RBAC

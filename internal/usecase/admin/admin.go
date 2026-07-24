@@ -284,6 +284,14 @@ type ScheduleOverrideInput struct {
 	OpenTime  *string
 	CloseTime *string
 	Note      *string
+	// BookingPaymentRequired marks this special day as PAID (a deposit is
+	// required to book that date). When true, DepositAmountMinor must be set and
+	// positive. When false the day is FREE (the restaurant's ordinary payment
+	// settings apply) and DepositAmountMinor is ignored/cleared.
+	BookingPaymentRequired bool
+	// DepositAmountMinor is the required deposit in int64 MINOR units when the
+	// day is paid. Nil on a free day.
+	DepositAmountMinor *int64
 }
 
 // SetScheduleOverride upserts one special-day override. owner/manager. When not
@@ -310,6 +318,24 @@ func (u *UseCase) SetScheduleOverride(ctx context.Context, actor Actor, restaura
 			return nil, fmt.Errorf("%w: an open override needs valid open_time/close_time (HH:MM)", domain.ErrValidation)
 		}
 		o.OpenTime, o.CloseTime = in.OpenTime, in.CloseTime
+	}
+	// Paid special day: a deposit is required to book that date. Only meaningful
+	// on an OPEN day (a closed venue takes no bookings) and needs a positive
+	// amount — validated here so the caller gets a 422, not a 500 from the DB
+	// CHECK (migration 0036). On a free day the amount is cleared so it never
+	// lingers from a previous paid state.
+	if in.BookingPaymentRequired {
+		if in.IsClosed {
+			return nil, fmt.Errorf("%w: a closed day cannot require booking payment", domain.ErrValidation)
+		}
+		if in.DepositAmountMinor == nil || *in.DepositAmountMinor <= 0 {
+			return nil, fmt.Errorf("%w: a paid special day needs a positive deposit_amount_minor", domain.ErrValidation)
+		}
+		o.BookingPaymentRequired = true
+		o.DepositAmountMinor = in.DepositAmountMinor
+	} else {
+		o.BookingPaymentRequired = false
+		o.DepositAmountMinor = nil
 	}
 	if err := u.overrides.Upsert(ctx, o); err != nil {
 		return nil, err
