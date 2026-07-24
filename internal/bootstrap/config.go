@@ -56,7 +56,28 @@ type Config struct {
 	// that middleware's doc comment for which routes fall into which tier
 	// and why webhooks get their own profile).
 	RateLimit RateLimiterConfig
+
+	// Analytics configures the Amplitude analytics worker. Absent
+	// AMPLITUDE_API_KEY makes the worker a clean no-op — it still ticks and
+	// advances its cursor, it just ships nothing until the owner provisions a
+	// key (same discipline as web push without VAPID keys).
+	Analytics AnalyticsConfig
 }
+
+// AnalyticsConfig holds the Amplitude project credentials and the analytics
+// dispatcher's scheduling. The API key comes from env only and is never logged
+// (same discipline as acquirer credentials / VAPID keys). When it is absent the
+// worker is built with a no-op sender.
+type AnalyticsConfig struct {
+	APIKey        string        // env: AMPLITUDE_API_KEY
+	Endpoint      string        // env: AMPLITUDE_ENDPOINT (defaults to Amplitude US /2/httpapi)
+	DispatchTick  time.Duration // env: ANALYTICS_DISPATCH_TICK_INTERVAL
+	DispatchBatch int           // env: ANALYTICS_DISPATCH_BATCH_SIZE
+	HTTPTimeout   time.Duration // env: ANALYTICS_HTTP_TIMEOUT
+}
+
+// Configured reports whether an Amplitude API key is present.
+func (a AnalyticsConfig) Configured() bool { return strings.TrimSpace(a.APIKey) != "" }
 
 // RateLimiterConfig bundles middleware.RateLimit's own config (budgets, one
 // per tier) with the memory-bound settings for the InMemoryLimiter backing
@@ -434,6 +455,13 @@ func NewConfig() (Config, error) {
 			},
 			IdleTTL:    getEnvDuration("RATE_LIMIT_IDLE_TTL", 10*time.Minute),
 			SweepEvery: getEnvDuration("RATE_LIMIT_SWEEP_INTERVAL", time.Minute),
+		},
+		Analytics: AnalyticsConfig{
+			APIKey:        getEnv("AMPLITUDE_API_KEY", ""),
+			Endpoint:      getEnv("AMPLITUDE_ENDPOINT", ""),
+			DispatchTick:  getEnvDuration("ANALYTICS_DISPATCH_TICK_INTERVAL", 30*time.Second),
+			DispatchBatch: getEnvInt("ANALYTICS_DISPATCH_BATCH_SIZE", 100),
+			HTTPTimeout:   getEnvDuration("ANALYTICS_HTTP_TIMEOUT", 10*time.Second),
 		},
 	}
 

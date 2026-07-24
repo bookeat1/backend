@@ -13,11 +13,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/amplitude"
 	"backend-core/internal/infrastructure/legacysource"
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
 	"backend-core/internal/infrastructure/payment/freedompay"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
+	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
@@ -46,6 +48,7 @@ import (
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/webpush"
 	"backend-core/internal/usecase/admin"
+	"backend-core/internal/usecase/analytics"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
 	"backend-core/internal/usecase/consent"
@@ -722,6 +725,38 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
 		}, log, webPush, telegram)
+}
+
+// NewAnalyticsDispatcher wires the background Amplitude analytics worker. It
+// re-reads the EXISTING booking_outbox / payment_outbox through its own cursor
+// (analytics_cursor, migration 0046) and ships a PII-free projection of the
+// tracked rows to Amplitude in batches. It never touches the request path.
+//
+// When AMPLITUDE_API_KEY is absent the worker is built with a no-op sender: it
+// still ticks and advances its cursor (a cheap read), it just sends nothing —
+// so provisioning a key later never needs a schema change or a worker rebuild,
+// only the env var and a restart (same discipline as the notification
+// dispatcher without VAPID keys).
+func NewAnalyticsDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *analytics.Dispatcher {
+	var sender analytics.Sender
+	if cfg.Analytics.Configured() {
+		sender = amplitude.NewClient(amplitude.Config{
+			APIKey:   cfg.Analytics.APIKey,
+			Endpoint: cfg.Analytics.Endpoint,
+			Timeout:  cfg.Analytics.HTTPTimeout,
+		}, log)
+	} else {
+		log.Warn("amplitude analytics not configured (no AMPLITUDE_API_KEY) — the worker will run but ship nothing until it is set")
+		sender = analytics.NewNoopSender()
+	}
+	return analytics.NewDispatcher(
+		analyticsrepo.NewSourceReader(db),
+		analyticsrepo.NewCursorStore(db),
+		sender,
+		analytics.Config{
+			TickInterval: cfg.Analytics.DispatchTick,
+			BatchSize:    cfg.Analytics.DispatchBatch,
+		}, log)
 }
 
 // NewLegacySyncWorker wires cmd/worker's one-way legacy sync. It opens a

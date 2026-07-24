@@ -52,6 +52,14 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// pending tickets every pass finds nothing.
 	ticketSweeper := NewTicketSweeper(cfg, db, log)
 
+	// The analytics dispatcher ships product events (booking/payment) to
+	// Amplitude by re-reading the existing outboxes through its own cursor.
+	// Started unconditionally, same rationale as the notification dispatcher:
+	// with no AMPLITUDE_API_KEY the sender no-ops, and with no new outbox rows
+	// every tick is a cheap read — so enabling analytics later never needs a
+	// worker redeploy, only the env var.
+	analyticsDispatcher := NewAnalyticsDispatcher(cfg, db, log)
+
 	// The legacy one-way sync (old Supabase -> new DB) is started only when
 	// LEGACY_DB_URL is set. When it is unset legacySync is nil and the loop is
 	// simply never started — a clean no-op, same discipline as the other
@@ -69,8 +77,8 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr, notifyErr, payoutErr, ticketSweepErr, legacyErr error
-	wg.Add(5)
+	var bookingErr, paymentsErr, notifyErr, payoutErr, ticketSweepErr, analyticsErr, legacyErr error
+	wg.Add(6)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -90,6 +98,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	go func() {
 		defer wg.Done()
 		ticketSweepErr = ticketSweeper.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		analyticsErr = analyticsDispatcher.Run(ctx)
 	}()
 	if legacySync != nil {
 		wg.Add(1)
@@ -114,6 +126,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if ticketSweepErr != nil {
 		return fmt.Errorf("ticket sweeper: %w", ticketSweepErr)
+	}
+	if analyticsErr != nil {
+		return fmt.Errorf("analytics dispatcher: %w", analyticsErr)
 	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)
