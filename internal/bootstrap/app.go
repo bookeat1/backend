@@ -27,6 +27,7 @@ import (
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	payoutsrest "backend-core/internal/transport/rest/payouts"
+	preorderrest "backend-core/internal/transport/rest/preorder"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -159,6 +160,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// RequireRestaurantManager cannot gate them: the guest/manager/admin split is
 	// resolved inside the usecases from the booking itself.
 	bookingHandler.RegisterRoutes(authed)
+
+	// Booking pre-order (roadmap #1): read/replace a booking's pre-ordered menu
+	// items. Booking-scoped (/bookings/:id/preorder), so authorized inside
+	// usecase/preorder (owner or venue staff), not via RequireRestaurantManager.
+	preorderrest.NewHandler(deps.Preorder).RegisterRoutes(authed)
 
 	// Global admin-only routes (no single-restaurant scope).
 	adminGlobal := authed.Group("")

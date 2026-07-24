@@ -133,6 +133,26 @@ func (s PaymentStatus) Valid() bool {
 // Terminal reports whether no further transition is allowed from s.
 func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 }
 
+// NonTerminalPaymentStatuses returns every payment status from which a further
+// transition is still possible (i.e. !Terminal): a payment in one of these is
+// still "in flight" for its booking — money is being taken, is held, has been
+// taken (captured, which can still be refunded), or only partially returned.
+// The terminal complement is {voided, expired, failed, refunded}. Derived from
+// the transition table so it can never drift from Terminal(); order is
+// unspecified (callers use it as a set). Used to freeze a booking's pre-order
+// while any payment for it is in flight (usecase/preorder), which must include
+// the `created` window (amount already snapshotted at POST /payments, captured
+// later by the webhook) — NOT just the money-holding statuses.
+func NonTerminalPaymentStatuses() []PaymentStatus {
+	out := make([]PaymentStatus, 0, len(paymentTransitions))
+	for s := range paymentTransitions {
+		if !s.Terminal() {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // HoldsMoney reports whether a payment in this status is holding or has taken
 // the guest's money. Used to decide whether a cancellation has to reach the
 // acquirer at all, and mirrors the partial unique index
@@ -430,6 +450,14 @@ type PaymentSettingsOverride struct {
 	// struct a uniform "nil = use the global default" override shape and so an
 	// in-memory / test override can still say "inherit the default".
 	FreeCancelWindowMinutes *int
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total in
+	// int64 MINOR units (restaurants.preorder_min_amount_minor, migration 0042).
+	// nil = the venue set no minimum. It is NOT a global-fallback field (unlike
+	// the others, there is no env default): a NULL column simply means "no floor",
+	// which is why it stays only on the override and is absent from
+	// PaymentSettings. Enforced when a guest attaches a pre-order (usecase/preorder),
+	// not in the payment amount resolution.
+	PreorderMinAmountMinor *int64
 }
 
 // ---------------------------------------------------------------------------

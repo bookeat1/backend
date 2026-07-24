@@ -20,7 +20,7 @@ import (
 // numbering above.
 const paymentSettingsCols = `payments_enabled, deposit_required, deposit_amount_minor,
 	preorder_payment_required, service_fee_bps, payment_provider,
-	free_cancel_window_minutes`
+	free_cancel_window_minutes, preorder_min_amount_minor`
 
 // UpdateFreeCancelWindow sets the venue's money-path free-cancellation window
 // (restaurants.free_cancel_window_minutes, migration 0034/0035). A single
@@ -33,6 +33,28 @@ func (r *Repository) UpdateFreeCancelWindow(ctx context.Context, restaurantID uu
 		restaurantID, minutes)
 	if err != nil {
 		return mapWrite(err, "update free cancel window")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// UpdatePreorderSettings sets the venue's pre-order policy: whether it requires
+// pre-payment for pre-ordered dishes (restaurants.preorder_payment_required) and
+// its optional minimum pre-order total (restaurants.preorder_min_amount_minor,
+// migration 0042; NULL clears the floor). A single atomic UPDATE. The min's
+// range (NULL or >= 0) is validated by the caller (usecase/admin) and the DB
+// CHECK, so a bad value never reaches this method silently. ErrNotFound when the
+// restaurant does not exist.
+func (r *Repository) UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, required bool, minMinor *int64) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants
+		    SET preorder_payment_required=$2, preorder_min_amount_minor=$3, updated_at=now()
+		  WHERE id=$1`,
+		restaurantID, required, minMinor)
+	if err != nil {
+		return mapWrite(err, "update preorder settings")
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound
@@ -61,8 +83,9 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		feeBps          *int
 		provider        *string
 		freeCancelWin   *int
+		preorderMin     *int64
 	)
-	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider, &freeCancelWin)
+	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider, &freeCancelWin, &preorderMin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.PaymentSettingsOverride{}, domain.ErrNotFound
 	}
@@ -80,6 +103,7 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		// is effectively always present; resolveSettings still treats nil as
 		// "use the global default", the uniform override shape.
 		FreeCancelWindowMinutes: freeCancelWin,
+		PreorderMinAmountMinor:  preorderMin,
 	}
 	// Only a known, valid provider code is trusted as an override — an unknown
 	// value (should never happen behind the admin panel, but this column has

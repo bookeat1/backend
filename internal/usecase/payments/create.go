@@ -262,12 +262,12 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 		if err != nil {
 			return "", domain.Money{}, err
 		}
-		var total int64
-		for _, it := range items {
-			if it.Status == domain.BookingItemCancelled {
-				continue
-			}
-			total += it.TotalMinor()
+		// The pre-order amount is the ONE shared definition (domain.SumPreorderItems),
+		// the same helper usecase/preorder shows the guest — the charged amount can
+		// never drift from the displayed total. Overflow-guarded.
+		total, err := domain.SumPreorderItems(items)
+		if err != nil {
+			return "", domain.Money{}, err
 		}
 		if total > 0 {
 			m, err := domain.NewMoney(total, domain.CurrencyKZT)

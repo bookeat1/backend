@@ -203,12 +203,16 @@ func (f *fakeTelegramSettings) ClearTelegramChatID(_ context.Context, restaurant
 	return nil
 }
 
-// fakePaymentSettings records the last free-cancel-window write.
+// fakePaymentSettings records the last free-cancel-window / preorder write.
 type fakePaymentSettings struct {
-	lastRestaurant uuid.UUID
-	lastMinutes    int
-	calls          int
-	err            error
+	lastRestaurant  uuid.UUID
+	lastMinutes     int
+	calls           int
+	err             error
+	preorderCalls   int
+	lastPreorderReq bool
+	lastPreorderMin *int64
+	override        domain.PaymentSettingsOverride
 }
 
 func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaurantID uuid.UUID, minutes int) error {
@@ -219,6 +223,24 @@ func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaura
 	f.lastRestaurant = restaurantID
 	f.lastMinutes = minutes
 	return nil
+}
+
+func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaurantID uuid.UUID, required bool, minMinor *int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.preorderCalls++
+	f.lastRestaurant = restaurantID
+	f.lastPreorderReq = required
+	f.lastPreorderMin = minMinor
+	return nil
+}
+
+func (f *fakePaymentSettings) GetPaymentOverride(_ context.Context, _ uuid.UUID) (domain.PaymentSettingsOverride, error) {
+	if f.err != nil {
+		return domain.PaymentSettingsOverride{}, f.err
+	}
+	return f.override, nil
 }
 
 // grantAll seeds every permission a role holds at restaurantID for userID, from
@@ -611,5 +633,68 @@ func TestCrossTenantCannotSetPaidSpecialDay(t *testing.T) {
 	}
 	if h.overrides.upserted {
 		t.Fatal("cross-tenant call reached the override repo")
+	}
+}
+
+func TestSetPreorderSettings(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	// Manager holds restaurant.manage → allowed, delegated with the values.
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	min := int64(500000)
+	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &min}); err != nil {
+		t.Fatalf("manager SetPreorderSettings: %v", err)
+	}
+	if h.paySet.preorderCalls != 1 || !h.paySet.lastPreorderReq ||
+		h.paySet.lastPreorderMin == nil || *h.paySet.lastPreorderMin != 500000 || h.paySet.lastRestaurant != rid {
+		t.Fatalf("writer got calls=%d required=%v min=%v restaurant=%s",
+			h.paySet.preorderCalls, h.paySet.lastPreorderReq, h.paySet.lastPreorderMin, h.paySet.lastRestaurant)
+	}
+
+	// A negative / absurd minimum is rejected BEFORE the writer is touched.
+	neg := int64(-1)
+	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &neg}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("negative minimum: got %v, want ErrValidation", err)
+	}
+	big := maxPreorderMinAmountMinor + 1
+	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &big}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("too-large minimum: got %v, want ErrValidation", err)
+	}
+	if h.paySet.preorderCalls != 1 {
+		t.Fatalf("writer called %d times, want it untouched by the rejected values", h.paySet.preorderCalls)
+	}
+
+	// A hostess (no restaurant.manage) is forbidden.
+	hh := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
+	if err := hh.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess SetPreorderSettings: got %v, want ErrForbidden", err)
+	}
+	if hh.paySet.preorderCalls != 0 {
+		t.Fatalf("writer reached despite forbidden actor")
+	}
+}
+
+func TestGetPreorderSettings(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	enabled := true
+	min := int64(300000)
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: &enabled, PreorderMinAmountMinor: &min}
+
+	v, err := h.uc.GetPreorderSettings(ctx, staffActor(uid), rid)
+	if err != nil {
+		t.Fatalf("GetPreorderSettings: %v", err)
+	}
+	if !v.Enabled || v.MinAmountMinor == nil || *v.MinAmountMinor != 300000 {
+		t.Fatalf("view = %+v, want enabled + min 300000", v)
+	}
+
+	// Cross-tenant / non-staff is forbidden (no grant here).
+	hh := newHarness(nil)
+	if _, err := hh.uc.GetPreorderSettings(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("non-staff GetPreorderSettings: got %v, want ErrForbidden", err)
 	}
 }
