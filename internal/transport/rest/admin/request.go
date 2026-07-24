@@ -201,3 +201,10 @@ func parseTimeQuery(v string) (*time.Time, error) {
 	}
 	return &t, nil
 }
+
+// freeCancelWindowRequest sets the money-path free-cancellation window
+// (minutes). A pointer so "0" (a valid, if aggressive, window) is told apart
+// from an omitted field; the handler rejects a missing value.
+type freeCancelWindowRequest struct {
+	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes"`
+}

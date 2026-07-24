@@ -190,6 +190,14 @@ type PaymentsConfig struct {
 	// instead of expiring, which is the opposite of what an expiry should do.
 	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
 
+	// FreeCancelWindow is the GLOBAL default free-cancellation window for the
+	// money path, applied to any restaurant that has not overridden
+	// free_cancel_window_minutes (migration 0034/0035). A deposit hold is
+	// released to the guest only when the booking is cancelled earlier than
+	// this before starts_at; a later cancellation or a no-show forfeits it to
+	// the venue. Owner-confirmed default 120 minutes.
+	FreeCancelWindow time.Duration // env: PAYMENTS_FREE_CANCEL_WINDOW_MINUTES
+
 	// PublicBaseURL is this backend's own externally-reachable origin (e.g.
 	// https://api.bookeat.kz), used ONLY to build the webhook CallbackURL
 	// handed to an acquirer at Authorize time. It is never taken from the
@@ -297,6 +305,7 @@ func NewConfig() (Config, error) {
 			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
 			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			FreeCancelWindow:        getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
 			PublicBaseURL:           strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
 		},
 		PaymentsReconciler: PaymentsReconcilerConfig{

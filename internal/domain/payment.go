@@ -405,6 +405,13 @@ type PaymentSettings struct {
 	PreorderPaymentRequired bool
 	ServiceFeeBps           int             // 350 = 3.5%
 	Provider                PaymentProvider // must be an enabled one, else the default
+	// FreeCancelWindow is the per-restaurant free-cancellation window used by
+	// the MONEY path (migration 0034/0035, restaurants.free_cancel_window_minutes):
+	// a deposit HOLD is released to the guest (voided) only when the booking is
+	// cancelled EARLIER than this before starts_at; a later cancellation or a
+	// no-show forfeits the deposit to the venue (the hold is captured). Always
+	// present (the column is NOT NULL, owner-confirmed default 120m).
+	FreeCancelWindow time.Duration
 }
 
 // PaymentSettingsOverride is a restaurant's optional per-field override of the
@@ -416,6 +423,13 @@ type PaymentSettingsOverride struct {
 	PreorderPaymentRequired *bool
 	ServiceFeeBps           *int
 	Provider                *PaymentProvider
+	// FreeCancelWindowMinutes overrides the money-path free-cancellation
+	// window per restaurant (restaurants.free_cancel_window_minutes). Unlike
+	// the other fields it maps to a NOT NULL column, so in practice it is
+	// never nil once read from Postgres; it stays a pointer only to keep this
+	// struct a uniform "nil = use the global default" override shape and so an
+	// in-memory / test override can still say "inherit the default".
+	FreeCancelWindowMinutes *int
 }
 
 // ---------------------------------------------------------------------------

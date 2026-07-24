@@ -35,6 +35,9 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/restaurants/:id/profile", h.getProfile)
 	rg.PUT("/admin/restaurants/:id/profile", h.updateProfile)
 
+	// Payment settings: the money-path free-cancellation window.
+	rg.PUT("/admin/restaurants/:id/payment-settings/free-cancel-window", h.setFreeCancelWindow)
+
 	// Menu.
 	rg.GET("/admin/restaurants/:id/menu", h.listMenu)
 	rg.GET("/admin/restaurants/:id/menu-categories", h.listCategories)
@@ -94,6 +97,29 @@ func (h *Handler) updateProfile(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, profileToResponse(a))
+}
+
+// setFreeCancelWindow updates the venue's money-path free-cancellation window
+// (minutes). owner/manager (restaurant.manage), enforced in the usecase.
+func (h *Handler) setFreeCancelWindow(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req freeCancelWindowRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if req.FreeCancelWindowMinutes == nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "free_cancel_window_minutes is required")
+		return
+	}
+	if err := h.panel.SetFreeCancelWindow(c.Request.Context(), actor, rid, *req.FreeCancelWindowMinutes); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, freeCancelWindowResponse{FreeCancelWindowMinutes: *req.FreeCancelWindowMinutes})
 }
 
 // ---- Menu ------------------------------------------------------------------

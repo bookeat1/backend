@@ -200,3 +200,8 @@ func guestToResponse(g domain.RestaurantGuest) guestResponse {
 		FirstBookingAt: g.FirstBookingAt, LastBookingAt: g.LastBookingAt,
 	}
 }
+
+// freeCancelWindowResponse echoes the stored window back to the caller.
+type freeCancelWindowResponse struct {
+	FreeCancelWindowMinutes int `json:"free_cancel_window_minutes"`
+}

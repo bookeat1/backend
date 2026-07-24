@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
@@ -74,12 +75,13 @@ type Deps struct {
 	PaymentGateways      *paymentgw.Registry
 
 	// Payments usecases — the guest/staff-facing HTTP surface (transport/rest/payments).
-	PaymentCreate  payments.CreateUseCase
-	PaymentCapture payments.CaptureUseCase
-	PaymentVoid    payments.VoidUseCase
-	PaymentRefund  payments.RefundUseCase
-	PaymentWebhook payments.WebhookUseCase
-	PaymentStatus  payments.StatusUseCase
+	PaymentCreate        payments.CreateUseCase
+	PaymentCapture       payments.CaptureUseCase
+	PaymentVoid          payments.VoidUseCase
+	PaymentRefund        payments.RefundUseCase
+	PaymentWebhook       payments.WebhookUseCase
+	PaymentStatus        payments.StatusUseCase
+	PaymentDepositCancel payments.DepositCancellationUseCase
 	// PaymentsPublicBaseURL is threaded straight through from cfg.Payments so
 	// the transport layer can build the FreedomPay CallbackURL without
 	// importing bootstrap.Config.
@@ -154,7 +156,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	}
 	paymentsCfg := newPaymentsConfig(cfg)
 	paymentSettings := restRepo // *restaurant.Repository now also implements restaurantPaymentSettings (GetPaymentOverride)
-	cancelDeadline := cancelDeadlineAdapter{restaurants: restRepo, cfg: bookingCfg}
+	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: paymentsCfg}
 
 	paymentCreate := payments.NewCreateUseCase(paymentsRepo, paymentOutboxRepo, bookingRepo, bookingItems,
 		paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
@@ -166,6 +168,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, txm)
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
+	// Deposit hold settlement on booking cancel / no-show (void-early /
+	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
+	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
+	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, txm)
 
 	// Named facade/usecase variables so both the Deps struct and the admin
 	// panel below share the SAME instances (rather than re-constructing them).
@@ -174,7 +181,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm)
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
-		restRepo, restaurantManagers, txm, bookingCfg)
+		restRepo, restaurantManagers, txm, bookingCfg,
+		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
 
 	// Restaurant admin panel (Ф1): an RBAC-guarded orchestration over the
 	// existing building blocks. It reuses restaurantManagers for the RBAC
@@ -184,6 +192,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	adminPanel := admin.NewUseCase(
 		restaurantManagers, restaurantsFacade, menuFacade, restRelated,
 		schedulerepo.New(db), guestrepo.New(db), bookingsFacade, bookingStatus,
+		restRepo, // paymentSettingsWriter: edits free_cancel_window_minutes
 	)
 
 	return &Deps{
@@ -224,6 +233,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentRefund:         paymentRefund,
 		PaymentWebhook:        paymentWebhook,
 		PaymentStatus:         paymentStatus,
+		PaymentDepositCancel:  paymentDepositCancel,
 		PaymentsPublicBaseURL: cfg.Payments.PublicBaseURL,
 	}, nil
 }
@@ -240,26 +250,59 @@ func newPaymentsConfig(cfg Config) payments.Config {
 		DepositRequired:         cfg.Payments.DepositRequired,
 		PreorderPaymentRequired: cfg.Payments.PreorderPaymentRequired,
 		HoldTTL:                 cfg.Payments.HoldTTL,
+		FreeCancelWindow:        cfg.Payments.FreeCancelWindow,
 	}
+}
+
+// paymentSettingsReader is the slice of the restaurant repo the money-path
+// cancel-deadline adapter needs: one venue's payment-settings override,
+// including free_cancel_window_minutes. Implemented by *restaurant.Repository
+// (GetPaymentOverride).
+type paymentSettingsReader interface {
+	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
 }
 
 // cancelDeadlineAdapter implements usecase/payments' cancelDeadlineResolver
-// port over the same restaurant-policy resolution usecase/bookings already
-// owns (bookings.CancelDeadlineFor) — see the KNOWN GAP note this closes in
-// team-memory's payments-usecase entry: the deadline must come from the
-// venue's real, server-resolved policy, never be recomputed or trusted from a
-// caller.
+// port over the MONEY-path free-cancellation window
+// (restaurants.free_cancel_window_minutes, migration 0034/0035), resolved
+// through payments.FreeCancelDeadlineFor so BOTH settlement flows
+// (RefundUseCase.Settle and DepositCancellationUseCase) read one window.
+//
+// NOTE (flagged for review): this deliberately reads free_cancel_window_minutes
+// (owner-confirmed default 120m), NOT the older cancel_deadline_minutes
+// (default 180m) that still gates the GUEST self-cancel action in
+// usecase/bookings. The two windows can therefore diverge; the owner should
+// decide whether to consolidate them. See the PR description.
 type cancelDeadlineAdapter struct {
-	restaurants domain.RestaurantRepository
-	cfg         bookings.Config
+	settings paymentSettingsReader
+	cfg      payments.Config
 }
 
 func (a cancelDeadlineAdapter) CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error) {
-	rest, err := a.restaurants.GetByID(ctx, booking.RestaurantID)
+	o, err := a.settings.GetPaymentOverride(ctx, booking.RestaurantID)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return bookings.CancelDeadlineFor(rest.Restaurant, a.cfg, booking.StartsAt), nil
+	return payments.FreeCancelDeadlineFor(o, a.cfg, booking.StartsAt), nil
+}
+
+// depositSettlerAdapter binds usecase/payments.DepositCancellationUseCase to
+// usecase/bookings.DepositSettler so a booking cancel / no-show transition
+// settles the held deposit. It runs as a SYSTEM (admin) actor: the booking
+// transition itself already authorized the caller (a guest may only cancel
+// their own booking in time, a no-show is staff/worker-only), so re-checking
+// staff/tenant permission on the settlement would be redundant — the money
+// decision is a consequence of an already-authorized transition, not a new
+// user-initiated action.
+type depositSettlerAdapter struct {
+	uc payments.DepositCancellationUseCase
+}
+
+func (a depositSettlerAdapter) SettleDepositOnCancel(ctx context.Context, bookingID uuid.UUID, trigger domain.RefundTrigger, cancelledAt *time.Time) error {
+	_, err := a.uc.SettleDepositOnCancel(ctx, payments.Actor{Role: domain.RoleAdmin}, bookingID, payments.DepositCancelInput{
+		Trigger: trigger, CancelledAt: cancelledAt,
+	})
+	return err
 }
 
 // newBookingConfig mirrors BookingConfig field-for-field into the usecase
@@ -287,14 +330,38 @@ func newBookingConfig(cfg Config) bookings.Config {
 // key, and requiring AUTH_JWT_PRIVATE_KEY to start a janitor process would be
 // an operational trap.
 func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.Worker {
+	bookingRepo := bookingrepo.New(db)
+	restRepo := restrepo.New(db)
+	txm := sqltx.NewManager(db)
+	wcfg := bookings.WorkerConfig{
+		TickInterval: cfg.Worker.TickInterval,
+		NoShowGrace:  cfg.Worker.NoShowGrace,
+		BatchSize:    cfg.Worker.BatchSize,
+	}
+
+	// The worker settles the held deposit of the bookings it closes (a no-show
+	// forfeits it, an abandonment releases it). Building the acquirer registry
+	// can fail on bad env; that must NOT stop the janitor — it just runs without
+	// deposit settlement (the reconciliation worker / a manual action remains
+	// the backstop), so the failure is logged and the worker starts anyway.
+	gateways, gwErr := newPaymentGateways(cfg.Payments, paymentrepo.NewProviders(db), log)
+	if gwErr != nil {
+		log.Error("booking worker: deposit settlement disabled (payment gateway registry failed to build)",
+			slog.String("error", gwErr.Error()))
+		return bookings.NewWorker(
+			bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
+			restRepo, txm, newBookingConfig(cfg), wcfg, log)
+	}
+	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), txm)
+	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}
+	depositCancel := payments.NewDepositCancellationUseCase(
+		paymentrepo.New(db), paymentrepo.NewLedger(db), paymentrepo.NewOutbox(db),
+		gateways, restaurantManagers, bookingRepo, cancelDeadline, txm)
+
 	return bookings.NewWorker(
-		bookingrepo.New(db), bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
-		restrepo.New(db), sqltx.NewManager(db), newBookingConfig(cfg),
-		bookings.WorkerConfig{
-			TickInterval: cfg.Worker.TickInterval,
-			NoShowGrace:  cfg.Worker.NoShowGrace,
-			BatchSize:    cfg.Worker.BatchSize,
-		}, log)
+		bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
+		restRepo, txm, newBookingConfig(cfg), wcfg, log,
+		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}))
 }
 
 // newPaymentGateways builds the acquirer registry from whatever adapters this

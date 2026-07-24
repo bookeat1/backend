@@ -279,12 +279,36 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 	})
 	if txErr == nil {
 		logging.FromContext(ctx).Info(logging.EventPaymentAuthorized, slog.String("payment_id", p.ID.String()))
+		u.captureIfPreorder(ctx, p)
 		return nil
 	}
 	if !errors.Is(txErr, domain.ErrAlreadyExists) {
 		return txErr
 	}
 	return u.compensateLostRace(ctx, gw, p)
+}
+
+// captureIfPreorder captures a PRE-ORDER hold the instant it is authorized: the
+// kitchen has to prepare the food, so a pre-order is taken at payment time
+// rather than held until seating (a DEPOSIT, by contrast, stays a hold and is
+// only captured on a late cancellation / no-show — see cancel.go). A DEPOSIT is
+// left untouched here.
+//
+// It reuses CaptureOnSeating's exact CAS-guarded mechanic (captureHold), so it
+// is idempotent: a redelivered authorized webhook whose pre-order was already
+// captured finds status == captured and is a no-op. The authorization is
+// already durably committed by the caller, so a capture failure here (declined
+// or unknown outcome) must NOT fail the whole webhook — it is logged and left
+// for the reconciliation worker, exactly as a CaptureOnSeating failure is.
+func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) {
+	if p.Purpose != domain.PurposePreorder {
+		return
+	}
+	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
+	if _, err := cv.captureHold(ctx, p); err != nil {
+		logging.FromContext(ctx).Error("payment.preorder_immediate_capture_failed",
+			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+	}
 }
 
 // compensateLostRace releases the hold this payment placed after it lost the

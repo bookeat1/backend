@@ -141,6 +141,7 @@ type harness struct {
 	guests    *fakeGuests
 	bookList  *fakeBookingList
 	bookTx    *fakeBookingTx
+	paySet    *fakePaymentSettings
 }
 
 func newHarness(grant map[string]bool) *harness {
@@ -153,9 +154,28 @@ func newHarness(grant map[string]bool) *harness {
 		guests:    &fakeGuests{},
 		bookList:  &fakeBookingList{},
 		bookTx:    &fakeBookingTx{},
+		paySet:    &fakePaymentSettings{},
 	}
-	h.uc = NewUseCase(h.perms, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx)
+	h.uc = NewUseCase(h.perms, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, h.paySet)
 	return h
+}
+
+// fakePaymentSettings records the last free-cancel-window write.
+type fakePaymentSettings struct {
+	lastRestaurant uuid.UUID
+	lastMinutes    int
+	calls          int
+	err            error
+}
+
+func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaurantID uuid.UUID, minutes int) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.calls++
+	f.lastRestaurant = restaurantID
+	f.lastMinutes = minutes
+	return nil
 }
 
 // grantAll seeds every permission a role holds at restaurantID for userID, from
@@ -354,5 +374,40 @@ func TestWorkingHoursValidation(t *testing.T) {
 	}
 	if h.wh.replaced {
 		t.Fatal("invalid working hours reached the repo")
+	}
+}
+
+func TestSetFreeCancelWindow(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	// Manager holds restaurant.manage → allowed, delegated with the value.
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	if err := h.uc.SetFreeCancelWindow(ctx, staffActor(uid), rid, 300); err != nil {
+		t.Fatalf("manager SetFreeCancelWindow: %v", err)
+	}
+	if h.paySet.calls != 1 || h.paySet.lastMinutes != 300 || h.paySet.lastRestaurant != rid {
+		t.Fatalf("writer got calls=%d minutes=%d restaurant=%s, want 1/300/%s",
+			h.paySet.calls, h.paySet.lastMinutes, h.paySet.lastRestaurant, rid)
+	}
+
+	// Out-of-range value is rejected BEFORE the writer is touched.
+	if err := h.uc.SetFreeCancelWindow(ctx, staffActor(uid), rid, -1); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("negative window: got %v, want ErrValidation", err)
+	}
+	if err := h.uc.SetFreeCancelWindow(ctx, staffActor(uid), rid, maxFreeCancelWindowMinutes+1); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("too-large window: got %v, want ErrValidation", err)
+	}
+	if h.paySet.calls != 1 {
+		t.Fatalf("writer called %d times, want it untouched by the rejected values", h.paySet.calls)
+	}
+
+	// A hostess (no restaurant.manage) is forbidden.
+	hh := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
+	if err := hh.uc.SetFreeCancelWindow(ctx, staffActor(uid), rid, 120); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess SetFreeCancelWindow: got %v, want ErrForbidden", err)
+	}
+	if hh.paySet.calls != 0 {
+		t.Fatalf("writer reached despite forbidden actor")
 	}
 }
