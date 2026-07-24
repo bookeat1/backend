@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +28,7 @@ import (
 	notificationrepo "backend-core/internal/infrastructure/postgres/notification"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
+	payoutrepo "backend-core/internal/infrastructure/postgres/payout"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
@@ -47,6 +50,7 @@ import (
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
+	"backend-core/internal/usecase/payouts"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
@@ -100,6 +104,11 @@ type Deps struct {
 	PaymentWebhook       payments.WebhookUseCase
 	PaymentStatus        payments.StatusUseCase
 	PaymentDepositCancel payments.DepositCancellationUseCase
+
+	// Payouts — restaurant settlement (выплаты заведениям). Destinations +
+	// generation + send + statement, all behind usecase RBAC.
+	Payouts *payouts.UseCase
+
 	// PaymentsPublicBaseURL is threaded straight through from cfg.Payments so
 	// the transport layer can build the FreedomPay CallbackURL without
 	// importing bootstrap.Config.
@@ -236,6 +245,23 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// repo (all aggregation in SQL); the usecase enforces the superadmin gate.
 	dashboardUC := dashboard.NewUseCase(dashboardrepo.New(db))
 
+	// Restaurant payouts (выплаты заведениям): what BookEat owes each venue
+	// (computed from the payment ledger) and paying it out via the FreedomPay
+	// payout gateway. The gateway is OFF by default (newPayoutGateway returns a
+	// genuine nil unless FREEDOMPAY_PAYOUT_ENABLED=true) — payouts can be
+	// generated (pending) but only SENT once the payout product is enabled and
+	// verified. RBAC (owner/manager for destinations, superadmin for money out)
+	// lives in the usecase.
+	payoutUC := payouts.NewUseCase(payouts.Ports{
+		Perms:        restaurantManagers,
+		Destinations: payoutrepo.NewDestinations(db),
+		Payouts:      payoutrepo.NewPayouts(db),
+		Items:        payoutrepo.NewItems(db),
+		Owed:         payoutrepo.NewOwed(db),
+		Gateway:      newPayoutGateway(log),
+		Tx:           txm,
+	}, log)
+
 	return &Deps{
 		AuthFacade:         authFacade,
 		AuthOTP:            authOTP,
@@ -281,8 +307,52 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentWebhook:        paymentWebhook,
 		PaymentStatus:         paymentStatus,
 		PaymentDepositCancel:  paymentDepositCancel,
+		Payouts:               payoutUC,
 		PaymentsPublicBaseURL: cfg.Payments.PublicBaseURL,
 	}, nil
+}
+
+// newPayoutGateway builds the FreedomPay payout adapter, OFF by default. It
+// returns a genuine nil interface (not a typed-nil) unless
+// FREEDOMPAY_PAYOUT_ENABLED=true AND the FreedomPay credentials validate — so
+// usecase/payouts.SendPayout's `gateway == nil` guard leaves payouts in
+// `pending` (never stranded in `sent`) until payouts are deliberately turned
+// on. Money-safety: going live requires FreedomPay to ENABLE the payout product
+// for merchant 588079 and a sandbox verification of the pg_ contract (see the
+// freedompay.PayoutGateway doc). Until then this stays nil in every deploy.
+func newPayoutGateway(log *slog.Logger) domain.PayoutGateway {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("FREEDOMPAY_PAYOUT_ENABLED")), "true") {
+		log.Info("freedompay payout gateway disabled (FREEDOMPAY_PAYOUT_ENABLED != true): payouts can be generated but not sent")
+		return nil
+	}
+	fpCfg := freedompay.ConfigFromEnv()
+	if err := fpCfg.Validate(); err != nil {
+		log.Warn("freedompay payout gateway not configured, leaving payouts un-sendable", slog.String("reason", err.Error()))
+		return nil
+	}
+	client := paymentgw.NewClient(nil, paymentgw.DefaultConfig(), log)
+	gw, err := freedompay.NewPayoutGateway(fpCfg, client, log)
+	if err != nil {
+		log.Warn("building freedompay payout gateway failed, leaving payouts un-sendable", slog.String("reason", err.Error()))
+		return nil
+	}
+	log.Warn("freedompay payout gateway ENABLED — payouts will move real money; ensure the payout product is verified on the sandbox")
+	return gw
+}
+
+// NewPayoutReconciler wires the background payout reconciliation worker
+// (usecase/payouts.Reconciler). Like NewPaymentsReconciler it is deliberately
+// separate from NewDeps (no HTTP stack). It is safe-idle when the payout
+// gateway is disabled (nil): Tick returns immediately.
+func NewPayoutReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) *payouts.Reconciler {
+	return payouts.NewReconciler(
+		payoutrepo.NewPayouts(db), payoutrepo.NewItems(db), newPayoutGateway(log), sqltx.NewManager(db),
+		payouts.ReconcilerConfig{
+			TickInterval: cfg.PaymentsReconciler.TickInterval,
+			StuckAfter:   cfg.PaymentsReconciler.StuckAfter,
+			BatchSize:    cfg.PaymentsReconciler.BatchSize,
+			MaxAttempts:  cfg.PaymentsReconciler.MaxAttempts,
+		}, log)
 }
 
 // newPaymentsConfig mirrors PaymentsConfig field-for-field into the usecase

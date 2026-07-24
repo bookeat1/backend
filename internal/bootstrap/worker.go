@@ -40,12 +40,18 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// enabling push later never needs a worker redeploy.
 	dispatcher := NewNotificationDispatcher(cfg, db, log)
 
+	// The payout reconciler resolves payouts stranded in `sent` (a lost/unknown
+	// acquirer answer). Started unconditionally, same rationale as the payments
+	// reconciler: it is safe-idle when the payout gateway is disabled (nil) or
+	// no payout is stale — Tick returns immediately.
+	payoutReconciler := NewPayoutReconciler(cfg, db, log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr, notifyErr error
-	wg.Add(3)
+	var bookingErr, paymentsErr, notifyErr, payoutErr error
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -58,6 +64,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer wg.Done()
 		notifyErr = dispatcher.Run(ctx)
 	}()
+	go func() {
+		defer wg.Done()
+		payoutErr = payoutReconciler.Run(ctx)
+	}()
 	wg.Wait()
 
 	if bookingErr != nil {
@@ -68,6 +78,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if notifyErr != nil {
 		return fmt.Errorf("notification dispatcher: %w", notifyErr)
+	}
+	if payoutErr != nil {
+		return fmt.Errorf("payout reconciler: %w", payoutErr)
 	}
 	return nil
 }
