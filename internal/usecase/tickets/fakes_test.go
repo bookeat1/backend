@@ -130,6 +130,18 @@ func (f *fakeTicketRepo) ListByUser(_ context.Context, userID uuid.UUID, _, _ in
 	return out, len(out), nil
 }
 
+func (f *fakeTicketRepo) ListStalePending(_ context.Context, before time.Time, limit int) ([]domain.EventTicket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.EventTicket
+	for _, t := range f.byID {
+		if t.Status == domain.TicketPending && t.CreatedAt.Before(before) {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeTicketRepo) Counts(_ context.Context, eventID uuid.UUID) (domain.EventTicketCounts, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

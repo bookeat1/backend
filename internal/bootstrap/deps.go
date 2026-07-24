@@ -612,6 +612,11 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 	if err != nil {
 		return nil, err
 	}
+	// Same ticket projection the HTTP webhook uses, so a payment the reconciler
+	// transitions (expired ticket hold voided, lost ticket capture synced in)
+	// reaches its ticket (seat freed / ticket marked paid) instead of stranding
+	// it `pending` forever.
+	ticketObserver := tickets.NewPaymentObserver(eventticketrepo.New(db))
 	return payments.NewReconciler(
 		paymentrepo.New(db), paymentrepo.NewRefunds(db), paymentrepo.NewLedger(db),
 		paymentrepo.NewOutbox(db), gateways, sqltx.NewManager(db),
@@ -622,7 +627,19 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			BatchSize:        cfg.PaymentsReconciler.BatchSize,
 			MaxAttempts:      cfg.PaymentsReconciler.MaxAttempts,
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
-		}, log), nil
+		}, log,
+		payments.WithReconcilerObserver(ticketObserver)), nil
+}
+
+// NewTicketSweeper builds the pending-ticket sweep worker: it releases seats
+// held by pending tickets whose payment never completed (or was never created),
+// the backstop the payments reconciler cannot cover because a pending ticket may
+// have no payment row at all. Safe-idle when there are no stale pending tickets.
+func NewTicketSweeper(cfg Config, db *pgxpool.Pool, log *slog.Logger) *tickets.PendingSweeper {
+	staleAfter := newPaymentsConfig(cfg).HoldTTL + 4*time.Hour // comfortably past the hold TTL
+	return tickets.NewPendingSweeper(
+		eventticketrepo.New(db), paymentrepo.New(db),
+		tickets.SweepConfig{StaleAfter: staleAfter}, log)
 }
 
 // NewNotificationDispatcher wires the background notification dispatcher: it

@@ -161,6 +161,12 @@ type EventTicketRepository interface {
 	ListByEvent(ctx context.Context, eventID uuid.UUID, statuses []TicketStatus, page, perPage int) ([]EventTicket, int, error)
 	// ListByUser returns a guest's own tickets, newest first, paginated.
 	ListByUser(ctx context.Context, userID uuid.UUID, page, perPage int) ([]EventTicket, int, error)
+	// ListStalePending returns up to limit `pending` tickets created before the
+	// given instant, oldest first. This is the pending-ticket sweep's input: a
+	// pending reservation whose payment never completed (or was never created at
+	// all — a crash between reserving the seat and creating the payment) must
+	// eventually release its held seat instead of stranding it forever.
+	ListStalePending(ctx context.Context, before time.Time, limit int) ([]EventTicket, error)
 	// Counts returns the admin "tickets sold" aggregate for an event.
 	Counts(ctx context.Context, eventID uuid.UUID) (EventTicketCounts, error)
 }

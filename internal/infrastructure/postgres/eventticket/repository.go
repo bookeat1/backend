@@ -209,6 +209,23 @@ func (r *Repository) ListByUser(ctx context.Context, userID uuid.UUID, pg, perPa
 	return list, total, nil
 }
 
+// ListStalePending returns up to limit pending tickets older than before,
+// oldest first — the sweep input (backed by idx_event_tickets_event_status /
+// the created_at scan).
+func (r *Repository) ListStalePending(ctx context.Context, before time.Time, limit int) ([]domain.EventTicket, error) {
+	if limit <= 0 {
+		limit = defaultPerPage
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+cols+` FROM event_tickets
+		 WHERE status = 'pending' AND created_at < $1
+		 ORDER BY created_at ASC, id ASC LIMIT $2`, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list stale pending tickets: %w", err)
+	}
+	return scanMany(rows)
+}
+
 // Counts returns the admin "tickets sold" aggregate for an event. All figures
 // are computed SQL-side (never a Go loop over full rows); revenue is summed
 // from stored minor units over paid rows only, never recomputed.

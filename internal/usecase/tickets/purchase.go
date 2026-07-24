@@ -92,6 +92,13 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 	if strings.TrimSpace(in.IdempotencyKey) == "" {
 		return nil, fmt.Errorf("%w: idempotency key required", domain.ErrValidation)
 	}
+	// An anonymous buyer MUST supply a phone: it is the contact for the ticket
+	// and the ONLY ownership proof an idempotency replay can check (an account
+	// buyer is proven by their user id instead). Without it a replay could not
+	// be safely scoped to its buyer.
+	if actor.UserID == nil && strings.TrimSpace(in.GuestPhone) == "" {
+		return nil, fmt.Errorf("%w: a guest phone is required to buy a ticket without an account", domain.ErrValidation)
+	}
 
 	event, err := u.events.GetByID(ctx, in.EventID)
 	if err != nil {
@@ -102,9 +109,12 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 	}
 	unitPrice := *event.TicketPriceMinor
 
-	// Idempotency replay: a retried purchase resolves to its own ticket.
+	// Idempotency replay: a retried purchase resolves to its own ticket. The
+	// ownership guard inside replay stops a second buyer using the same
+	// (public event id, guessable key) from receiving the first buyer's ticket,
+	// PII or payment URL.
 	if existing, err := u.tickets.GetByIdempotencyKey(ctx, in.EventID, in.IdempotencyKey); err == nil {
-		return u.replay(ctx, existing)
+		return u.replay(ctx, actor, in, existing)
 	} else if !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
 	}
@@ -113,37 +123,48 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 	if err != nil {
 		return nil, err
 	}
-	// A reservation-race replay (the idempotency insert lost) already carries its
-	// payment; return it as-is.
+	// A reservation-race replay (the idempotency insert lost to a concurrent
+	// identical retry) is handled through the same ownership-guarded replay.
 	if ticket.Status != domain.TicketPending || ticket.PaymentID != nil {
-		return u.replay(ctx, ticket)
+		return u.replay(ctx, actor, in, ticket)
 	}
 
+	payment, err := u.createTicketPayment(ctx, actor, in, ticket)
+	if err != nil {
+		// Payment could not be started — release the held seat so it is not
+		// stranded pending forever. Best-effort: a release failure is logged by
+		// the CAS layer; the pending-ticket sweep is the backstop.
+		_ = u.release(ctx, ticket)
+		return nil, err
+	}
+	return &PurchaseResult{Ticket: ticket, Payment: payment}, nil
+}
+
+// createTicketPayment creates the payment intent for a reserved ticket and
+// links it. The idempotency key is the ticket's own (server-scoped to the
+// ticket), so a re-attempt — including the repair path in replay — resolves to
+// the same acquirer hold instead of charging twice.
+func (u *purchaseUseCase) createTicketPayment(ctx context.Context, actor Actor, in PurchaseInput, ticket *domain.EventTicket) (*domain.Payment, error) {
 	payment, err := u.payments.CreateForTicket(ctx, actor.payment(), payments.TicketPaymentInput{
 		EventTicketID:   ticket.ID,
 		RestaurantID:    ticket.RestaurantID,
 		UserID:          ticket.UserID,
 		BaseAmountMinor: ticket.TotalMinor,
 		Currency:        ticket.Currency,
-		IdempotencyKey:  in.IdempotencyKey,
+		IdempotencyKey:  ticket.PurchaseIdempotencyKey,
 		ReturnURL:       in.ReturnURL,
 		CallbackURL:     in.CallbackURL,
 		CustomerPhone:   ticket.GuestPhone,
 		CustomerEmail:   ticket.GuestEmail,
 	})
 	if err != nil {
-		// Payment could not be started — release the held seat so it is not
-		// stranded pending forever. Best-effort: a release failure is logged by
-		// the CAS layer; the hold TTL / reconciler is the backstop.
-		_ = u.release(ctx, ticket)
 		return nil, err
 	}
-
 	if serr := u.tickets.SetPaymentID(ctx, ticket.ID, payment.ID); serr != nil {
 		return nil, serr
 	}
 	ticket.PaymentID = &payment.ID
-	return &PurchaseResult{Ticket: ticket, Payment: payment}, nil
+	return payment, nil
 }
 
 // reserve holds the seats: lock the event, enforce capacity, insert the pending
@@ -208,10 +229,25 @@ func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domai
 	return ticket, nil
 }
 
-// replay returns the existing ticket with its payment loaded (if any). A
-// cancelled reservation is returned as-is (no payment); the client must use a
-// fresh idempotency key to try again.
-func (u *purchaseUseCase) replay(ctx context.Context, ticket *domain.EventTicket) (*PurchaseResult, error) {
+// replay returns the existing ticket for a retried purchase, but only to its
+// rightful buyer (authorizeReplay) — an event id is public and idempotency keys
+// are client-chosen with no entropy, so without this guard a second buyer
+// posting the same (event, key) would receive the first buyer's ticket, PII and
+// payment URL. It also REPAIRS a pending ticket that was left without a payment
+// (SetPaymentID failed, or a crash between reserve and payment creation): it
+// re-creates the payment idempotently so the guest can actually pay, instead of
+// holding the seat forever with no way to complete checkout.
+func (u *purchaseUseCase) replay(ctx context.Context, actor Actor, in PurchaseInput, ticket *domain.EventTicket) (*PurchaseResult, error) {
+	if err := authorizeReplay(actor, in, ticket); err != nil {
+		return nil, err
+	}
+	if ticket.Status == domain.TicketPending && ticket.PaymentID == nil {
+		payment, err := u.createTicketPayment(ctx, actor, in, ticket)
+		if err != nil {
+			return nil, err
+		}
+		return &PurchaseResult{Ticket: ticket, Payment: payment}, nil
+	}
 	res := &PurchaseResult{Ticket: ticket}
 	if ticket.PaymentID != nil {
 		p, err := u.paymentByID(ctx, *ticket.PaymentID)
@@ -221,6 +257,30 @@ func (u *purchaseUseCase) replay(ctx context.Context, ticket *domain.EventTicket
 		res.Payment = p
 	}
 	return res, nil
+}
+
+// authorizeReplay ensures a retried purchase resolves to its OWN buyer's
+// ticket. An account buyer must be the same authenticated user; an anonymous
+// buyer must present the same normalised guest phone the ticket was bought
+// with. A mismatch is ErrForbidden — the caller never sees the other buyer's
+// ticket or PII. A superadmin/staff actor is allowed (admin tooling), but a
+// plain venue-staff role is treated like any other non-owner unless it is the
+// buyer's account.
+func authorizeReplay(actor Actor, in PurchaseInput, existing *domain.EventTicket) error {
+	if actor.Role == domain.RoleAdmin {
+		return nil
+	}
+	if existing.UserID != nil {
+		if actor.UserID == nil || *actor.UserID != *existing.UserID {
+			return fmt.Errorf("%w: this idempotency key belongs to another buyer", domain.ErrForbidden)
+		}
+		return nil
+	}
+	// Anonymous purchase: the phone is the only ownership proof available.
+	if in.GuestPhone == "" || in.GuestPhone != existing.GuestPhone {
+		return fmt.Errorf("%w: this idempotency key belongs to another buyer", domain.ErrForbidden)
+	}
+	return nil
 }
 
 // release moves a pending reservation to cancelled, freeing its held capacity.
