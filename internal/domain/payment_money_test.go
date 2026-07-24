@@ -170,3 +170,65 @@ func TestTotalWithFee(t *testing.T) {
 		t.Errorf("TotalWithFee() overflow error = %v, want ErrMoneyOverflow", err)
 	}
 }
+
+func TestGrossUpForAcquirer_VenueMadeWhole(t *testing.T) {
+	// For a range of bases and acquirer rates, the venue must always net at
+	// least the base after the acquirer withholds its cut of the total, and the
+	// shortfall-in-its-favour (dust) must never exceed one tiyn.
+	rates := []int{0, 100, 290, 350, 500, 1000, 9900}
+	bases := []int64{0, 1, 99, 100, 12_345, 1_000_000, 999_999_999}
+	for _, bps := range rates {
+		for _, baseMinor := range bases {
+			base := KZT(baseMinor)
+			fee, total, err := GrossUpForAcquirer(base, bps)
+			if err != nil {
+				t.Fatalf("GrossUpForAcquirer(%d, %d) error = %v", baseMinor, bps, err)
+			}
+			if total.AmountMinor != base.AmountMinor+fee.AmountMinor {
+				t.Fatalf("bps=%d base=%d: total %d != base+fee %d", bps, baseMinor, total.AmountMinor, base.AmountMinor+fee.AmountMinor)
+			}
+			// Net after the acquirer's cut of the TOTAL (acquirer floors its fee,
+			// which only helps the venue; we model the worst case with a ceil cut).
+			acquirerCut := (total.AmountMinor*int64(bps) + BasisPointsDenominator - 1) / BasisPointsDenominator
+			net := total.AmountMinor - acquirerCut
+			if net < base.AmountMinor {
+				t.Fatalf("bps=%d base=%d: net to venue %d < base %d", bps, baseMinor, net, base.AmountMinor)
+			}
+			if net-base.AmountMinor > 1 {
+				t.Fatalf("bps=%d base=%d: dust %d exceeds 1 tiyn (net %d, base %d)", bps, baseMinor, net-base.AmountMinor, net, base.AmountMinor)
+			}
+		}
+	}
+}
+
+func TestGrossUpForAcquirer_KnownValues(t *testing.T) {
+	// 3.5% acquirer on 10,000.00 ₸ (1,000,000 tiyn): total = ceil(1e6*1e4/9650)
+	// = 1,036,270; fee = 36,270. A plain additive 3.5% (35,000) would be short.
+	fee, total, err := GrossUpForAcquirer(KZT(1_000_000), 350)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if total.AmountMinor != 1_036_270 || fee.AmountMinor != 36_270 {
+		t.Fatalf("got total=%d fee=%d, want total=1036270 fee=36270", total.AmountMinor, fee.AmountMinor)
+	}
+	// Zero rate → no markup.
+	fee, total, err = GrossUpForAcquirer(KZT(500), 0)
+	if err != nil || fee.AmountMinor != 0 || total.AmountMinor != 500 {
+		t.Fatalf("zero-rate: got total=%d fee=%d err=%v, want 500/0/nil", total.AmountMinor, fee.AmountMinor, err)
+	}
+}
+
+func TestGrossUpForAcquirer_Errors(t *testing.T) {
+	if _, _, err := GrossUpForAcquirer(KZT(100), 10000); !errors.Is(err, ErrValidation) {
+		t.Errorf("bps=10000 (100%%) error = %v, want ErrValidation", err)
+	}
+	if _, _, err := GrossUpForAcquirer(KZT(100), -1); !errors.Is(err, ErrValidation) {
+		t.Errorf("bps=-1 error = %v, want ErrValidation", err)
+	}
+	if _, _, err := GrossUpForAcquirer(Money{AmountMinor: -5, Currency: "KZT"}, 350); !errors.Is(err, ErrNegativeAmount) {
+		t.Errorf("negative base error = %v, want ErrNegativeAmount", err)
+	}
+	if _, _, err := GrossUpForAcquirer(KZT(math.MaxInt64-1), 350); !errors.Is(err, ErrMoneyOverflow) {
+		t.Errorf("overflow error = %v, want ErrMoneyOverflow", err)
+	}
+}

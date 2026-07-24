@@ -275,8 +275,13 @@ func TestCreatePayment_GuestAnonymousCheckout(t *testing.T) {
 	if resp.PaymentURL == nil || *resp.PaymentURL == "" {
 		t.Error("expected a payment_url to redirect the guest to")
 	}
-	if resp.AmountMinor != 10350 { // 10000 deposit + 3.5% fee, rounded up
-		t.Errorf("amount_minor = %d, want 10350", resp.AmountMinor)
+	// 10000 deposit grossed up for a 3.5% acquirer cut: ceil(10000×10000/9650)
+	// = 10363, so the venue nets the full 10000 after the acquirer's cut.
+	if resp.AmountMinor != 10363 {
+		t.Errorf("amount_minor = %d, want 10363 (gross-up for 3.5%% acquirer)", resp.AmountMinor)
+	}
+	if net := resp.AmountMinor - (resp.AmountMinor*350)/10_000; net < 10000 {
+		t.Errorf("net to venue %d < deposit 10000 — venue is short", net)
 	}
 }
 
