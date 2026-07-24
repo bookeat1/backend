@@ -26,6 +26,7 @@ import (
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	promosrest "backend-core/internal/transport/rest/promos"
+	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
 	"backend-core/internal/transport/rest/swaggerui"
@@ -104,6 +105,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// group (no RequireRestaurantManager gate); the usecase returns only the
 	// caller's own memberships (a superadmin gets every venue).
 	myrestaurantsrest.NewHandler(deps.MyRestaurants).RegisterRoutes(authed)
+	// Web-push subscription register/unregister. Authenticated but NOT
+	// restaurant-scoped by the router: a staff member manages their OWN devices,
+	// and the usecase authorizes a registration against the caller's staff
+	// membership of the target restaurant (superadmin bypasses). The endpoint
+	// carries no restaurant id in the path, so RequireRestaurantManager cannot
+	// gate it — same pattern as the booking/review staff routes.
+	pushsubscriptionsrest.NewHandler(deps.PushSubscriptions).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)

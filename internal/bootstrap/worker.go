@@ -9,11 +9,11 @@ import (
 	"syscall"
 )
 
-// RunWorker starts the background booking worker and the payments
-// reconciliation worker side by side, and blocks until SIGINT or SIGTERM. The
-// current pass of each is allowed to finish: the signal cancels the shared
-// context, each worker returns from its own Run between ticks, and the pool
-// is closed only after both have stopped.
+// RunWorker starts the background booking worker, the payments reconciliation
+// worker and the notification dispatcher side by side, and blocks until SIGINT
+// or SIGTERM. The current pass of each is allowed to finish: the signal cancels
+// the shared context, each worker returns from its own Run between ticks, and
+// the pool is closed only after all have stopped.
 //
 // The payments reconciler is started unconditionally, even with
 // PAYMENTS_ENABLED=false and no acquirer credentials configured: with zero
@@ -33,13 +33,19 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("build payments reconciler: %w", err)
 	}
+	// The notification dispatcher drains the booking outbox and fans
+	// "booking.created" out to the web-push channel. Started unconditionally,
+	// same rationale as the reconciler: with no VAPID keys the web-push notifier
+	// no-ops, and with no unpublished events every tick is a cheap no-op — so
+	// enabling push later never needs a worker redeploy.
+	dispatcher := NewNotificationDispatcher(cfg, db, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr error
-	wg.Add(2)
+	var bookingErr, paymentsErr, notifyErr error
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -48,6 +54,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer wg.Done()
 		paymentsErr = reconciler.Run(ctx)
 	}()
+	go func() {
+		defer wg.Done()
+		notifyErr = dispatcher.Run(ctx)
+	}()
 	wg.Wait()
 
 	if bookingErr != nil {
@@ -55,6 +65,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if paymentsErr != nil {
 		return fmt.Errorf("payments reconciler: %w", paymentsErr)
+	}
+	if notifyErr != nil {
+		return fmt.Errorf("notification dispatcher: %w", notifyErr)
 	}
 	return nil
 }
