@@ -16,6 +16,23 @@ type BookingDetails struct {
 	Booking domain.Booking
 	Items   []domain.BookingItem
 	Tables  []domain.BookingTable
+	// FreeCancelDeadline is the absolute moment free cancellation ends for this
+	// booking: starts_at − the venue's free_cancel_window_minutes (the SAME
+	// per-restaurant window the money path uses — single source of truth). The
+	// client renders a live countdown from it. It is nil for a booking that can
+	// no longer be cancelled (a terminal status); when the deadline has already
+	// PASSED it is still returned (non-nil) so the app can show the "paid
+	// cancellation" state — the client compares it to now, this layer does not
+	// null it out. See the facade Get doc for the free-booking judgement.
+	FreeCancelDeadline *time.Time
+}
+
+// freeCancelDeadlineResolver derives starts_at − free_cancel_window_minutes for
+// a booking. Bound in bootstrap to the SAME adapter the payment settlement uses
+// (payments.FreeCancelDeadlineFor over restaurants.free_cancel_window_minutes),
+// so the countdown the guest sees and the money decision can never disagree.
+type freeCancelDeadlineResolver interface {
+	CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error)
 }
 
 // Facade exposes booking reads plus the chat and survey side-channels.
@@ -47,15 +64,27 @@ type SurveyInput struct {
 }
 
 type facade struct {
-	bookings domain.BookingRepository
-	links    domain.BookingTableRepository
-	items    domain.BookingItemRepository
-	messages domain.BookingMessageRepository
-	surveys  domain.RestaurantSurveyRepository
-	history  domain.BookingStatusHistoryRepository
-	outbox   domain.BookingOutboxRepository
-	managers managerChecker
-	tx       domain.TxManager
+	bookings   domain.BookingRepository
+	links      domain.BookingTableRepository
+	items      domain.BookingItemRepository
+	messages   domain.BookingMessageRepository
+	surveys    domain.RestaurantSurveyRepository
+	history    domain.BookingStatusHistoryRepository
+	outbox     domain.BookingOutboxRepository
+	managers   managerChecker
+	tx         domain.TxManager
+	freeCancel freeCancelDeadlineResolver
+}
+
+// FacadeOption configures optional facade dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type FacadeOption func(*facade)
+
+// WithFreeCancelDeadlineResolver wires the per-restaurant free-cancel deadline
+// used to populate BookingDetails.FreeCancelDeadline. Left nil in tests / when
+// payments are not wired, in which case the field is simply omitted (nil).
+func WithFreeCancelDeadlineResolver(r freeCancelDeadlineResolver) FacadeOption {
+	return func(f *facade) { f.freeCancel = r }
 }
 
 // NewFacade constructs the bookings Facade.
@@ -69,11 +98,16 @@ func NewFacade(
 	outbox domain.BookingOutboxRepository,
 	managers managerChecker,
 	tx domain.TxManager,
+	opts ...FacadeOption,
 ) Facade {
-	return &facade{
+	f := &facade{
 		bookings: bookings, links: links, items: items, messages: messages,
 		surveys: surveys, history: history, outbox: outbox, managers: managers, tx: tx,
 	}
+	for _, o := range opts {
+		o(f)
+	}
+	return f
 }
 
 func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDetails, error) {
@@ -88,7 +122,42 @@ func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDe
 	if out.Tables, err = f.links.ListByBooking(ctx, id); err != nil {
 		return nil, err
 	}
+	out.FreeCancelDeadline = f.freeCancelDeadline(ctx, b)
 	return out, nil
+}
+
+// freeCancelDeadline computes the booking's free-cancellation deadline for the
+// client countdown, or nil.
+//
+// It is returned only for a booking that can still be cancelled (a pending /
+// confirmed / waitlisted booking); a terminal booking (arrived, completed,
+// cancelled, no-show, rejected) is past cancellation, so the countdown is
+// meaningless and the field is omitted.
+//
+// JUDGEMENT (free vs paid booking): a booking with NO prepayment has no money
+// at stake, so the deadline is arguably irrelevant there. This facade does not
+// carry the payment repository, and adding it only to null out a timestamp
+// would couple the read path to payments for no functional gain — so the
+// deadline IS returned for any active booking, and the client (which already
+// knows the booking's payment state) renders the countdown only when money is
+// at stake. Documented rather than silently coupled.
+//
+// A resolver error is swallowed (nil) on purpose: a booking read must not fail
+// because a per-restaurant policy lookup hiccuped; the countdown is auxiliary.
+func (f *facade) freeCancelDeadline(ctx context.Context, b *domain.Booking) *time.Time {
+	if f.freeCancel == nil {
+		return nil
+	}
+	switch b.Status {
+	case domain.BookingPending, domain.BookingConfirmed, domain.BookingWaitlist:
+	default:
+		return nil
+	}
+	deadline, err := f.freeCancel.CancelDeadlineFor(ctx, *b)
+	if err != nil {
+		return nil
+	}
+	return &deadline
 }
 
 // ListMine returns the caller's own bookings. The user filter is overwritten

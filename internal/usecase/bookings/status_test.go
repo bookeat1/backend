@@ -191,9 +191,13 @@ func TestStatusActorPermissions(t *testing.T) {
 	}
 }
 
-func TestGuestCancelDeadline(t *testing.T) {
-	t.Run("before the deadline", func(t *testing.T) {
-		h := newStatusHarness(t, domain.BookingConfirmed, 4*time.Hour) // deadline is 3h before
+// Owner decision (single-window consolidation): a guest may cancel their own
+// booking at ANY time — there is no hard "too late to cancel" cutoff anymore.
+// Whether it is free or paid is decided by the payment settlement, not by
+// blocking the transition here.
+func TestGuestCancelAlwaysAllowed(t *testing.T) {
+	t.Run("well before the window: cancels", func(t *testing.T) {
+		h := newStatusHarness(t, domain.BookingConfirmed, 4*time.Hour)
 		b, err := h.uc.Cancel(context.Background(), h.guest, h.booking.ID, CancelInput{Reason: sptr("changed plans")})
 		if err != nil {
 			t.Fatalf("guest cancel: %v", err)
@@ -212,18 +216,22 @@ func TestGuestCancelDeadline(t *testing.T) {
 		}
 	})
 
-	t.Run("after the deadline", func(t *testing.T) {
-		h := newStatusHarness(t, domain.BookingConfirmed, 2*time.Hour) // inside the 3h window
-		_, err := h.uc.Cancel(context.Background(), h.guest, h.booking.ID, CancelInput{})
-		if !errors.Is(err, domain.ErrForbidden) {
-			t.Fatalf("late guest cancel = %v, want ErrForbidden", err)
+	t.Run("late (inside the window): STILL cancels, not blocked", func(t *testing.T) {
+		h := newStatusHarness(t, domain.BookingConfirmed, 30*time.Minute) // well inside any window
+		b, err := h.uc.Cancel(context.Background(), h.guest, h.booking.ID, CancelInput{})
+		if err != nil {
+			t.Fatalf("late guest cancel must be allowed now, got %v", err)
 		}
-		if len(h.bookings.statuses) != 0 || len(h.outbox.created) != 0 {
-			t.Fatal("late cancel must not write anything")
+		if b.Status != domain.BookingCancelled || b.CancelledBy == nil || *b.CancelledBy != domain.CancelledByGuest {
+			t.Fatalf("late guest cancel booking = %+v, want cancelled-by-guest", b)
 		}
+		// The money consequence (deposit captured to the venue) lives in the
+		// payment settlement, exercised in usecase/payments
+		// (TestSettleDeposit_LateGuestCancel_Captures) and asserted end-to-end
+		// via the settler hook (TestStatus_LateGuestCancelStillSettlesDeposit).
 	})
 
-	t.Run("the venue can still cancel after the deadline", func(t *testing.T) {
+	t.Run("the venue can also cancel any time", func(t *testing.T) {
 		h := newStatusHarness(t, domain.BookingConfirmed, 30*time.Minute)
 		b, err := h.uc.Cancel(context.Background(), h.manager, h.booking.ID, CancelInput{})
 		if err != nil {

@@ -37,6 +37,7 @@ type UseCase struct {
 	guests       guestStore
 	bookingList  bookingLister
 	bookingTx    bookingTransitioner
+	paySettings  paymentSettingsWriter
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -49,11 +50,37 @@ func NewUseCase(
 	guests guestStore,
 	bookingList bookingLister,
 	bookingTx bookingTransitioner,
+	paySettings paymentSettingsWriter,
 ) *UseCase {
 	return &UseCase{
 		perms: perms, restaurants: rest, menu: menu, workingHours: workingHours,
 		overrides: overrides, guests: guests, bookingList: bookingList, bookingTx: bookingTx,
+		paySettings: paySettings,
 	}
+}
+
+// Bounds for the free-cancellation window (minutes), enforced here rather than
+// as a DB CHECK beyond ">= 0": a week is already an unusually long window, and
+// a negative value is meaningless. Mirrors usecase/bookings' policy bounds.
+const (
+	minFreeCancelWindowMinutes = 0
+	maxFreeCancelWindowMinutes = 7 * 24 * 60
+)
+
+// SetFreeCancelWindow updates the venue's money-path free-cancellation window
+// (restaurants.free_cancel_window_minutes): a deposit hold is released to the
+// guest only when the booking is cancelled earlier than this before starts_at;
+// a later cancellation or a no-show forfeits it to the venue. owner/manager
+// (PermRestaurantManage).
+func (u *UseCase) SetFreeCancelWindow(ctx context.Context, actor Actor, restaurantID uuid.UUID, minutes int) error {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return err
+	}
+	if minutes < minFreeCancelWindowMinutes || minutes > maxFreeCancelWindowMinutes {
+		return fmt.Errorf("%w: free_cancel_window_minutes must be between %d and %d",
+			domain.ErrValidation, minFreeCancelWindowMinutes, maxFreeCancelWindowMinutes)
+	}
+	return u.paySettings.UpdateFreeCancelWindow(ctx, restaurantID, minutes)
 }
 
 // authorize is the single RBAC gate for every admin-panel action. A superadmin

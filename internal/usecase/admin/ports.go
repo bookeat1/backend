@@ -40,6 +40,14 @@ type restaurantStore interface {
 	Update(ctx context.Context, id uuid.UUID, in restaurants.SaveInput) (*domain.RestaurantAggregate, error)
 }
 
+// paymentSettingsWriter is the slice of the restaurant repo this package needs
+// to edit the venue's money-path settings. Today that is just the
+// free-cancellation window (restaurants.free_cancel_window_minutes); the range
+// is validated in the usecase, not the DB. Implemented by *restaurant.Repository.
+type paymentSettingsWriter interface {
+	UpdateFreeCancelWindow(ctx context.Context, restaurantID uuid.UUID, minutes int) error
+}
+
 // menuStore is the slice of menu.Facade this package needs. Every mutating
 // method takes restaurantID and enforces item ownership against it (IDOR guard
 // lives in menu.Facade / the repo's restaurant_id predicate).

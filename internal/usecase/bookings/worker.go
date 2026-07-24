@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 )
 
@@ -42,6 +44,19 @@ type Worker struct {
 	wcfg        WorkerConfig
 	log         *slog.Logger
 	now         func() time.Time // injectable clock for tests
+	deposits    DepositSettler
+}
+
+// WorkerOption configures optional worker dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type WorkerOption func(*Worker)
+
+// WithWorkerDepositSettler wires the deposit settlement the worker runs for the
+// bookings it closes: a no-show forfeits the held deposit to the venue, a
+// venue-never-responded abandonment releases it back to the guest. Left nil in
+// tests / when payments are disabled (no settlement then).
+func WithWorkerDepositSettler(d DepositSettler) WorkerOption {
+	return func(w *Worker) { w.deposits = d }
 }
 
 // WorkerConfig is the worker's own scheduling configuration. The per-booking
@@ -86,13 +101,18 @@ func NewWorker(
 	cfg Config,
 	wcfg WorkerConfig,
 	log *slog.Logger,
+	opts ...WorkerOption,
 ) *Worker {
-	return &Worker{
+	w := &Worker{
 		bookings: bookingsRepo, history: history, outbox: outbox,
 		restaurants: restaurants, tx: tx,
 		cfg: cfg.withDefaults(), wcfg: wcfg.withDefaults(),
 		log: log, now: time.Now,
 	}
+	for _, o := range opts {
+		o(w)
+	}
+	return w
 }
 
 // TickResult counts what one pass did. Zero values are the normal steady state.
@@ -147,8 +167,13 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	now := w.now()
 	var res TickResult
+	// Deposit settlements to run AFTER the passes commit: each makes an external
+	// acquirer call, which must never run inside the pass transaction (it holds
+	// the ClaimDue row locks). Collected here, settled by settleDeposits below.
+	var abandonedIDs, noShowIDs []uuid.UUID
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		r, err := w.processAbandoned(ctx, now)
+		ids, r, err := w.processAbandoned(ctx, now)
+		abandonedIDs = ids
 		res.Abandoned, res.Skipped = r.Abandoned, r.Skipped
 		return err
 	}); err != nil {
@@ -163,14 +188,40 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 		return res, fmt.Errorf("confirm sla pass: %w", err)
 	}
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		r, err := w.processExpired(ctx, now)
+		ids, r, err := w.processExpired(ctx, now)
+		noShowIDs = ids
 		res.Completed, res.NoShow = r.Completed, r.NoShow
 		res.Skipped += r.Skipped
 		return err
 	}); err != nil {
 		return res, fmt.Errorf("expiry pass: %w", err)
 	}
+	// A no-show forfeits the held deposit to the venue; a venue-never-responded
+	// abandonment releases it to the guest. Outside every transaction, and never
+	// fatal: a settlement error is logged and left for the reconciliation worker.
+	w.settleDeposits(ctx, noShowIDs, domain.RefundTriggerNoShow)
+	w.settleDeposits(ctx, abandonedIDs, domain.RefundTriggerVenueCancel)
 	return res, nil
+}
+
+// settleDeposits runs the held-deposit money decision for a set of just-closed
+// bookings, outside any transaction. A booking with no deposit is a cheap
+// no-op inside the settler; an error never fails the tick.
+func (w *Worker) settleDeposits(ctx context.Context, bookingIDs []uuid.UUID, trigger domain.RefundTrigger) {
+	if w.deposits == nil {
+		return
+	}
+	for _, id := range bookingIDs {
+		// cancelledAt is nil: a no-show is decided at the visit window's lapse
+		// (the settler treats no-show as a late forfeit regardless of timing),
+		// and a venue-side release does not consult it either.
+		if err := w.deposits.SettleDepositOnCancel(ctx, id, trigger, nil); err != nil {
+			w.log.Error("booking worker deposit settlement failed",
+				slog.String("booking_id", id.String()),
+				slog.String("trigger", string(trigger)),
+				slog.String("error", err.Error()))
+		}
+	}
 }
 
 // processConfirmSLA handles bookings the venue has not answered in time.
@@ -243,14 +294,15 @@ const abandonedReason = "venue never responded"
 // worker cancels them as the system with an explicit reason. Cancelling also
 // releases the table: booking_tables.active is driven by the status trigger,
 // and a dead pending booking must not sit on a slot forever.
-func (w *Worker) processAbandoned(ctx context.Context, now time.Time) (TickResult, error) {
+func (w *Worker) processAbandoned(ctx context.Context, now time.Time) ([]uuid.UUID, TickResult, error) {
 	var res TickResult
+	var settled []uuid.UUID
 	cutoff := now.Add(-w.wcfg.NoShowGrace)
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist},
 		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
 	if err != nil {
-		return res, err
+		return nil, res, err
 	}
 	reason := abandonedReason
 	for i := range due {
@@ -263,27 +315,29 @@ func (w *Worker) processAbandoned(ctx context.Context, now time.Time) (TickResul
 				b.CancellationReason = &reason
 			})
 		if err != nil {
-			return res, err
+			return nil, res, err
 		}
 		if !ok {
 			res.Skipped++
 			continue
 		}
 		res.Abandoned++
+		settled = append(settled, b.ID)
 	}
-	return res, nil
+	return settled, res, nil
 }
 
 // processExpired closes bookings whose visit window is over: arrived guests are
 // completed, guests never marked as arrived become no_show.
-func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult, error) {
+func (w *Worker) processExpired(ctx context.Context, now time.Time) ([]uuid.UUID, TickResult, error) {
 	var res TickResult
+	var noShowIDs []uuid.UUID
 	cutoff := now.Add(-w.wcfg.NoShowGrace)
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingArrived, domain.BookingConfirmed},
 		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
 	if err != nil {
-		return res, err
+		return nil, res, err
 	}
 	for i := range due {
 		b := due[i]
@@ -293,7 +347,7 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 		}
 		ok, err := w.transition(ctx, &b, to, now, reason, nil)
 		if err != nil {
-			return res, err
+			return nil, res, err
 		}
 		if !ok {
 			res.Skipped++
@@ -303,9 +357,10 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 			res.Completed++
 		} else {
 			res.NoShow++
+			noShowIDs = append(noShowIDs, b.ID)
 		}
 	}
-	return res, nil
+	return noShowIDs, res, nil
 }
 
 // transition applies one system-driven status change: bookings UPDATE + history

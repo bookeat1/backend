@@ -19,7 +19,26 @@ import (
 // adding a column here must never shift the Create/Update placeholder
 // numbering above.
 const paymentSettingsCols = `payments_enabled, deposit_required, deposit_amount_minor,
-	preorder_payment_required, service_fee_bps, payment_provider`
+	preorder_payment_required, service_fee_bps, payment_provider,
+	free_cancel_window_minutes`
+
+// UpdateFreeCancelWindow sets the venue's money-path free-cancellation window
+// (restaurants.free_cancel_window_minutes, migration 0034/0035). A single
+// atomic UPDATE; the column is NOT NULL with a >= 0 CHECK, and the caller
+// (usecase/admin) validates the range before this, so a bad value never
+// reaches Postgres. ErrNotFound when the restaurant does not exist.
+func (r *Repository) UpdateFreeCancelWindow(ctx context.Context, restaurantID uuid.UUID, minutes int) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants SET free_cancel_window_minutes=$2, updated_at=now() WHERE id=$1`,
+		restaurantID, minutes)
+	if err != nil {
+		return mapWrite(err, "update free cancel window")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
 
 // GetPaymentOverride reads one restaurant's payment-settings override. It
 // implements usecase/payments' restaurantPaymentSettings port (a minimal local
@@ -41,8 +60,9 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		preorderPay     *bool
 		feeBps          *int
 		provider        *string
+		freeCancelWin   *int
 	)
-	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider)
+	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider, &freeCancelWin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.PaymentSettingsOverride{}, domain.ErrNotFound
 	}
@@ -56,6 +76,10 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		DepositAmountMinor:      depositMinor,
 		PreorderPaymentRequired: preorderPay,
 		ServiceFeeBps:           feeBps,
+		// free_cancel_window_minutes is NOT NULL (migration 0034/0035), so this
+		// is effectively always present; resolveSettings still treats nil as
+		// "use the global default", the uniform override shape.
+		FreeCancelWindowMinutes: freeCancelWin,
 	}
 	// Only a known, valid provider code is trusted as an override — an unknown
 	// value (should never happen behind the admin panel, but this column has

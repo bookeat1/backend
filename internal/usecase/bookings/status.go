@@ -3,11 +3,13 @@ package bookings
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 )
 
 // StatusUseCase drives the booking state machine (spec §5). Every transition
@@ -39,6 +41,32 @@ type statusUseCase struct {
 	managers    managerChecker
 	tx          domain.TxManager
 	cfg         Config
+	deposits    DepositSettler
+}
+
+// DepositSettler settles a booking's HELD deposit as a CONSEQUENCE of a cancel
+// or no-show transition (void the hold when the guest cancelled in time or the
+// venue cancelled; capture it to the venue on a late cancel or a no-show). It
+// is bound in bootstrap to an adapter over usecase/payments.DepositCancellationUseCase
+// and left nil in tests / when payments are disabled, in which case a
+// transition simply performs no settlement.
+//
+// It is called AFTER the booking-status transaction commits, never inside it:
+// the settlement makes an external acquirer call, which must not run inside a
+// DB transaction, and a settlement failure must not roll back a cancel the
+// guest already sees as done (it is logged and left for the reconciliation
+// worker).
+type DepositSettler interface {
+	SettleDepositOnCancel(ctx context.Context, bookingID uuid.UUID, trigger domain.RefundTrigger, cancelledAt *time.Time) error
+}
+
+// StatusOption configures optional dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type StatusOption func(*statusUseCase)
+
+// WithDepositSettler wires the deposit settlement invoked on cancel / no-show.
+func WithDepositSettler(d DepositSettler) StatusOption {
+	return func(u *statusUseCase) { u.deposits = d }
 }
 
 // NewStatusUseCase constructs the booking status usecase.
@@ -50,11 +78,16 @@ func NewStatusUseCase(
 	managers managerChecker,
 	tx domain.TxManager,
 	cfg Config,
+	opts ...StatusOption,
 ) StatusUseCase {
-	return &statusUseCase{
+	u := &statusUseCase{
 		bookings: bookings, history: history, outbox: outbox,
 		restaurants: restaurants, managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
+	for _, o := range opts {
+		o(u)
+	}
+	return u
 }
 
 func (u *statusUseCase) Confirm(ctx context.Context, actor Actor, id uuid.UUID, reason *string) (*domain.Booking, error) {
@@ -161,12 +194,61 @@ func (u *statusUseCase) transition(
 	if err != nil {
 		return nil, err
 	}
+	u.settleDepositAfterTransition(ctx, b, to)
 	return b, nil
 }
 
+// settleDepositAfterTransition drives the held-deposit money decision as a
+// consequence of a cancel / no-show that has ALREADY committed. It runs
+// outside the booking transaction (external acquirer call) and never fails the
+// transition: a settlement error is logged and left for the reconciliation
+// worker, because the booking is already, durably, cancelled.
+//
+//	no-show                    → forfeit (capture the hold to the venue)
+//	guest cancelled            → void if in time, capture if late (decided in payments)
+//	venue / staff / system cancelled → release the hold (void)
+func (u *statusUseCase) settleDepositAfterTransition(ctx context.Context, b *domain.Booking, to domain.BookingStatus) {
+	if u.deposits == nil {
+		return
+	}
+	var (
+		trigger     domain.RefundTrigger
+		cancelledAt *time.Time
+	)
+	switch to {
+	case domain.BookingNoShow:
+		trigger = domain.RefundTriggerNoShow
+	case domain.BookingCancelled:
+		if b.CancelledBy != nil && *b.CancelledBy == domain.CancelledByGuest {
+			trigger, cancelledAt = domain.RefundTriggerGuestCancel, b.CancelledAt
+		} else {
+			// Reject, a staff cancel, or a system cancel: the guest did not
+			// choose to break the booking, so the hold is released.
+			trigger = domain.RefundTriggerVenueCancel
+		}
+	default:
+		return
+	}
+	if err := u.deposits.SettleDepositOnCancel(ctx, b.ID, trigger, cancelledAt); err != nil {
+		logging.FromContext(ctx).Error("booking.deposit_settlement_failed",
+			slog.String("booking_id", b.ID.String()),
+			slog.String("trigger", string(trigger)),
+			slog.String("error", err.Error()))
+	}
+}
+
 // authorizeTransition enforces who may request which transition. Staff may make
-// any legal transition; a guest may only cancel their own booking, and only
-// before the venue's cancellation deadline.
+// any legal transition; a guest may only cancel their OWN booking — but at ANY
+// time.
+//
+// Owner decision (single-window consolidation): there is no longer a hard
+// "too late to cancel" cutoff. The per-restaurant free-cancel window
+// (restaurants.free_cancel_window_minutes) no longer BLOCKS a late cancellation
+// — it only decides whether the money is returned (before the window: deposit
+// voided / pre-order refunded; after: deposit captured / pre-order kept — see
+// usecase/payments deposit settlement). The old hard gate on
+// cancel_deadline_minutes is removed; that column is superseded (see
+// resolvePolicy). The booking's ownership was already checked in authorize().
 func (u *statusUseCase) authorizeTransition(ctx context.Context, acc access, b *domain.Booking, to domain.BookingStatus, staffOnly bool) error {
 	if acc.staff() {
 		return nil
@@ -177,22 +259,7 @@ func (u *statusUseCase) authorizeTransition(ctx context.Context, acc access, b *
 	if to != domain.BookingCancelled {
 		return fmt.Errorf("%w: only the restaurant can set status %s", domain.ErrForbidden, to)
 	}
-	deadline, err := u.cancelDeadline(ctx, b)
-	if err != nil {
-		return err
-	}
-	if !time.Now().Before(deadline) {
-		return fmt.Errorf("%w: free cancellation ended at %s, contact the restaurant",
-			domain.ErrForbidden, deadline.UTC().Format(time.RFC3339))
-	}
+	// A guest may cancel their own booking at any time; the money consequence
+	// (free vs paid) is handled by the payment settlement, not by blocking here.
 	return nil
-}
-
-// cancelDeadline is starts_at minus the venue's cancellation window.
-func (u *statusUseCase) cancelDeadline(ctx context.Context, b *domain.Booking) (time.Time, error) {
-	rest, err := u.restaurants.GetByID(ctx, b.RestaurantID)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return CancelDeadlineFor(rest.Restaurant, u.cfg, b.StartsAt), nil
 }

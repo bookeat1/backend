@@ -251,3 +251,71 @@ func TestFacadeHistoryAccess(t *testing.T) {
 		t.Fatalf("manager history: %v", err)
 	}
 }
+
+// fakeWindowResolver computes starts_at − window, standing in for the
+// per-restaurant free_cancel_window_minutes resolution.
+type fakeWindowResolver struct{ window time.Duration }
+
+func (r fakeWindowResolver) CancelDeadlineFor(_ context.Context, b domain.Booking) (time.Time, error) {
+	return b.StartsAt.Add(-r.window), nil
+}
+
+// Item 4: the guest booking detail exposes free_cancel_deadline = start − the
+// restaurant's window, and two restaurants with different windows yield
+// different deadlines for the same booking start.
+func TestFacadeGet_FreeCancelDeadline(t *testing.T) {
+	rid, guestID := uuid.New(), uuid.New()
+	start := time.Now().Add(24 * time.Hour)
+	b := &domain.Booking{
+		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Guests: 2,
+		Status: domain.BookingConfirmed, StartsAt: start, EndsAt: start.Add(2 * time.Hour), Source: domain.SourceApp,
+	}
+	guest := Actor{UserID: guestID, Role: domain.RoleUser}
+	build := func(window time.Duration) Facade {
+		return NewFacade(newFakeBookings(b), &fakeLinks{}, &fakeItems{}, &fakeMessages{}, &fakeSurveys{},
+			&fakeHistory{}, &fakeOutbox{}, newFakeManagers([2]uuid.UUID{uuid.New(), rid}), &fakeTx{},
+			WithFreeCancelDeadlineResolver(fakeWindowResolver{window: window}))
+	}
+
+	d1, err := build(120*time.Minute).Get(context.Background(), guest, b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if d1.FreeCancelDeadline == nil {
+		t.Fatalf("free_cancel_deadline missing for an active booking")
+	}
+	if !d1.FreeCancelDeadline.Equal(start.Add(-120 * time.Minute)) {
+		t.Fatalf("deadline = %v, want start−120m %v", d1.FreeCancelDeadline, start.Add(-120*time.Minute))
+	}
+
+	d2, err := build(300*time.Minute).Get(context.Background(), guest, b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !d2.FreeCancelDeadline.Equal(start.Add(-300 * time.Minute)) {
+		t.Fatalf("deadline = %v, want start−300m", d2.FreeCancelDeadline)
+	}
+	if d2.FreeCancelDeadline.Equal(*d1.FreeCancelDeadline) {
+		t.Fatalf("two different restaurant windows produced the SAME deadline")
+	}
+}
+
+// A terminal booking (past cancellation) has no countdown.
+func TestFacadeGet_FreeCancelDeadline_NilForTerminal(t *testing.T) {
+	rid, guestID := uuid.New(), uuid.New()
+	start := time.Now().Add(24 * time.Hour)
+	b := &domain.Booking{
+		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Guests: 2,
+		Status: domain.BookingCancelled, StartsAt: start, EndsAt: start.Add(2 * time.Hour), Source: domain.SourceApp,
+	}
+	f := NewFacade(newFakeBookings(b), &fakeLinks{}, &fakeItems{}, &fakeMessages{}, &fakeSurveys{},
+		&fakeHistory{}, &fakeOutbox{}, newFakeManagers([2]uuid.UUID{uuid.New(), rid}), &fakeTx{},
+		WithFreeCancelDeadlineResolver(fakeWindowResolver{window: 120 * time.Minute}))
+	got, err := f.Get(context.Background(), Actor{UserID: guestID, Role: domain.RoleUser}, b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.FreeCancelDeadline != nil {
+		t.Fatalf("terminal booking should have no free_cancel_deadline, got %v", *got.FreeCancelDeadline)
+	}
+}

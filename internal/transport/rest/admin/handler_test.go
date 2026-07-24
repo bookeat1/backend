@@ -183,7 +183,7 @@ func newHarness(allow, manages bool) *harness {
 		overrides: &fakeOverrides{}, guests: &fakeGuests{},
 		bookList: &fakeBookingList{}, bookTx: &fakeBookingTx{},
 	}
-	uc := adminuc.NewUseCase(fakePerms{allow: allow}, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx)
+	uc := adminuc.NewUseCase(fakePerms{allow: allow}, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, fakePaySettings{})
 
 	r := gin.New()
 	api := r.Group("/api/v1")
@@ -447,4 +447,11 @@ func TestUnauthenticated(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (body %s)", w.Code, w.Body)
 	}
+}
+
+// fakePaySettings satisfies the admin usecase's paymentSettingsWriter port.
+type fakePaySettings struct{}
+
+func (fakePaySettings) UpdateFreeCancelWindow(_ context.Context, _ uuid.UUID, _ int) error {
+	return nil
 }
