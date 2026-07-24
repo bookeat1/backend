@@ -133,6 +133,26 @@ func (s PaymentStatus) Valid() bool {
 // Terminal reports whether no further transition is allowed from s.
 func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 }
 
+// NonTerminalPaymentStatuses returns every payment status from which a further
+// transition is still possible (i.e. !Terminal): a payment in one of these is
+// still "in flight" for its booking — money is being taken, is held, has been
+// taken (captured, which can still be refunded), or only partially returned.
+// The terminal complement is {voided, expired, failed, refunded}. Derived from
+// the transition table so it can never drift from Terminal(); order is
+// unspecified (callers use it as a set). Used to freeze a booking's pre-order
+// while any payment for it is in flight (usecase/preorder), which must include
+// the `created` window (amount already snapshotted at POST /payments, captured
+// later by the webhook) — NOT just the money-holding statuses.
+func NonTerminalPaymentStatuses() []PaymentStatus {
+	out := make([]PaymentStatus, 0, len(paymentTransitions))
+	for s := range paymentTransitions {
+		if !s.Terminal() {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // HoldsMoney reports whether a payment in this status is holding or has taken
 // the guest's money. Used to decide whether a cancellation has to reach the
 // acquirer at all, and mirrors the partial unique index

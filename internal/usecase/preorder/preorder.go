@@ -84,11 +84,15 @@ type managerChecker interface {
 	Manages(ctx context.Context, userID, restaurantID uuid.UUID) (bool, error)
 }
 
-// paymentReader reports whether a booking already has a LIVE (authorized or
-// captured) payment. Once a pre-order has been paid, its lines are frozen:
-// changing them would desync the captured amount from the food actually ordered.
+// paymentReader reports whether a booking has a payment IN FLIGHT — any
+// non-terminal payment, including one still in the `created` state (the amount
+// is snapshotted at POST /payments and captured later by the webhook, without
+// re-reading the items). Once such a payment exists the pre-order is frozen:
+// changing the lines would let the webhook capture an amount that no longer
+// matches the ordered food. A terminal payment (failed/expired/voided/refunded)
+// does not freeze it — the guest may re-order after a failed attempt.
 type paymentReader interface {
-	GetLiveByBookingID(ctx context.Context, bookingID uuid.UUID) (*domain.Payment, error)
+	HasInFlightForBooking(ctx context.Context, bookingID uuid.UUID) (bool, error)
 }
 
 // UseCase attaches/reads a booking's pre-order.
@@ -132,7 +136,7 @@ func (u *UseCase) Get(ctx context.Context, actor Actor, bookingID uuid.UUID) (*P
 	if err != nil {
 		return nil, err
 	}
-	return buildPreorder(bookingID, items), nil
+	return buildPreorder(bookingID, items)
 }
 
 // Replace sets the booking's pre-order to exactly the given lines (a full
@@ -162,13 +166,17 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 		return nil, fmt.Errorf("%w: booking is %s, its pre-order can no longer be changed", domain.ErrValidation, b.Status)
 	}
 
-	// Frozen after payment: a live (authorized/captured) payment already reflects
-	// the current lines; changing them would move the charged amount away from
-	// what was ordered. Not payable yet → free to edit.
-	if live, err := u.payments.GetLiveByBookingID(ctx, bookingID); err == nil && live != nil {
-		return nil, fmt.Errorf("%w: this booking's pre-order is already paid and can no longer be changed", domain.ErrValidation)
-	} else if err != nil && !errors.Is(err, domain.ErrNotFound) {
+	// Frozen while a payment is in flight: any non-terminal payment (including a
+	// `created` one whose amount is already snapshotted and will be captured by
+	// the webhook) already reflects the current lines; changing them would move
+	// the charged amount away from what was ordered. Only a terminal payment
+	// (failed/expired/voided/refunded) leaves the pre-order free to edit again.
+	inFlight, err := u.payments.HasInFlightForBooking(ctx, bookingID)
+	if err != nil {
 		return nil, err
+	}
+	if inFlight {
+		return nil, fmt.Errorf("%w: this booking has a payment in progress; its pre-order can no longer be changed", domain.ErrValidation)
 	}
 
 	if len(lines) > maxLines {
@@ -176,7 +184,6 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 	}
 
 	built := make([]domain.BookingItem, 0, len(lines))
-	var total int64
 	for _, ln := range lines {
 		if ln.Quantity <= 0 || ln.Quantity > maxQtyPerLine {
 			return nil, fmt.Errorf("%w: quantity must be between 1 and %d", domain.ErrValidation, maxQtyPerLine)
@@ -209,8 +216,14 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 			Status:     domain.BookingItemPending,
 			Comment:    ln.Comment,
 		}
-		total += line.TotalMinor()
 		built = append(built, line)
+	}
+
+	// The total is the ONE shared definition (domain.SumPreorderItems), the same
+	// helper the payment charge uses — displayed total and charge cannot drift.
+	total, err := domain.SumPreorderItems(built)
+	if err != nil {
+		return nil, err
 	}
 
 	// Optional per-venue minimum pre-order, enforced only on a non-empty order.
@@ -236,7 +249,7 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 	if err != nil {
 		return nil, err
 	}
-	return buildPreorder(bookingID, saved), nil
+	return buildPreorder(bookingID, saved)
 }
 
 // authorize resolves the caller's relation to the booking: an admin always
@@ -269,20 +282,25 @@ func (u *UseCase) authorize(ctx context.Context, actor Actor, b *domain.Booking)
 	return fmt.Errorf("%w: booking", domain.ErrNotFound)
 }
 
-// buildPreorder assembles the result, summing the (non-cancelled) lines exactly
-// as usecase/payments.resolveAmount does so the total shown here equals the
-// amount that will be charged. Currency is taken from the lines (all KZT today);
-// an empty pre-order reports KZT so the client always has a currency.
-func buildPreorder(bookingID uuid.UUID, items []domain.BookingItem) *Preorder {
-	out := &Preorder{BookingID: bookingID, Items: items, Currency: string(domain.CurrencyKZT)}
+// buildPreorder assembles the result. The total uses the SAME shared helper
+// (domain.SumPreorderItems) as usecase/payments.resolveAmount, so the total
+// shown here is byte-for-byte the amount that will be charged — a single source
+// of truth, not two parallel loops that could drift. Currency is taken from the
+// lines (all KZT today); an empty pre-order reports KZT so the client always has
+// a currency.
+func buildPreorder(bookingID uuid.UUID, items []domain.BookingItem) (*Preorder, error) {
+	total, err := domain.SumPreorderItems(items)
+	if err != nil {
+		return nil, err
+	}
+	out := &Preorder{BookingID: bookingID, Items: items, TotalMinor: total, Currency: string(domain.CurrencyKZT)}
 	for _, it := range items {
 		if it.Status == domain.BookingItemCancelled {
 			continue
 		}
-		out.TotalMinor += it.TotalMinor()
 		if it.Currency != "" {
 			out.Currency = it.Currency
 		}
 	}
-	return out
+	return out, nil
 }

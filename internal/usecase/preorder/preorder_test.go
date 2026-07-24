@@ -84,14 +84,13 @@ func (f fakeManagers) Manages(_ context.Context, userID, restaurantID uuid.UUID)
 	return f.manages[userID.String()+"|"+restaurantID.String()], nil
 }
 
-// fakePayments returns a configurable "live payment" for the booking.
-type fakePayments struct{ live *domain.Payment }
+// fakePayments reports whether a non-terminal payment is in flight for the
+// booking. A `created` or any live/captured payment sets inFlight=true; a
+// terminal (failed/expired/voided/refunded) payment sets it false.
+type fakePayments struct{ inFlight bool }
 
-func (f fakePayments) GetLiveByBookingID(_ context.Context, _ uuid.UUID) (*domain.Payment, error) {
-	if f.live == nil {
-		return nil, domain.ErrNotFound
-	}
-	return f.live, nil
+func (f fakePayments) HasInFlightForBooking(_ context.Context, _ uuid.UUID) (bool, error) {
+	return f.inFlight, nil
 }
 
 type fakeTx struct{}
@@ -270,17 +269,31 @@ func TestReplace_ClearBypassesMinimum(t *testing.T) {
 	}
 }
 
-// Once a live payment exists the pre-order is frozen.
-func TestReplace_FrozenAfterPayment(t *testing.T) {
+// A payment in flight (any non-terminal status, INCLUDING `created` — the
+// amount is snapshotted at POST /payments and captured later by the webhook)
+// freezes the pre-order. This is the blocking money-integrity case: without it,
+// a guest could change the items during the created→authorized window while the
+// webhook captures the OLD snapshotted amount.
+func TestReplace_FrozenWhilePaymentInFlight(t *testing.T) {
 	owner := uuid.New()
 	h := newHarness(t, &owner, domain.BookingPending, nil)
-	h.payments.live = &domain.Payment{ID: uuid.New(), Status: domain.PaymentCaptured}
+	h.payments.inFlight = true // e.g. a payment in `created` (redirect/3DS in flight)
 	actor := Actor{UserID: owner, Role: domain.RoleUser}
 
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
 	if h.items.replaceCalls != 0 {
-		t.Errorf("replace was called on a paid booking")
+		t.Errorf("replace was called while a payment was in flight")
+	}
+
+	// After that payment reaches a TERMINAL state (failed/expired/voided/
+	// refunded) the booking is free to be re-ordered again.
+	h.payments.inFlight = false
+	if _, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}}); err != nil {
+		t.Fatalf("replace after terminal payment: %v", err)
+	}
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace was not applied after the payment went terminal")
 	}
 }
 

@@ -164,6 +164,39 @@ func (r *Repository) GetSettleableByBookingID(ctx context.Context, bookingID uui
 	return p, nil
 }
 
+// inFlightStatuses is every NON-TERMINAL payment status as strings, built once
+// from domain.NonTerminalPaymentStatuses so the SQL predicate can never drift
+// from the domain's Terminal() definition. A payment in any of these is still in
+// play for its booking (being taken, held, taken, or partially returned) —
+// crucially including `created`, whose amount is already snapshotted and will be
+// captured by the webhook. See HasInFlightForBooking.
+var inFlightStatuses = func() []string {
+	ss := domain.NonTerminalPaymentStatuses()
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = string(s)
+	}
+	return out
+}()
+
+// HasInFlightForBooking reports whether the booking has ANY non-terminal payment
+// (see inFlightStatuses). Used by usecase/preorder to freeze a booking's
+// pre-order while a payment for it is in flight, so the charged amount (snapshot
+// taken at POST /payments, status `created`, captured later by the webhook) can
+// never diverge from the ordered items. A terminal payment (failed/expired/
+// voided/refunded) does NOT count, so a guest may re-order after a failed
+// attempt.
+func (r *Repository) HasInFlightForBooking(ctx context.Context, bookingID uuid.UUID) (bool, error) {
+	var exists bool
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM payments WHERE booking_id=$1 AND status = ANY($2))`,
+		bookingID, inFlightStatuses).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check in-flight payment for booking: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *Repository) GetByIdempotencyKey(ctx context.Context, provider domain.PaymentProvider, idempotencyKey string) (*domain.Payment, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`SELECT `+paymentCols+` FROM payments WHERE provider=$1 AND idempotency_key=$2`,
