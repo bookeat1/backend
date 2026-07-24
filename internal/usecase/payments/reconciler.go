@@ -65,6 +65,39 @@ type Reconciler struct {
 	log      *slog.Logger
 	now      func() time.Time // injectable clock for tests
 	pace     *pacer
+	// ticketObserver projects a ticket payment's status onto its event ticket,
+	// the SAME projection the HTTP webhook does — see applier(). Without it a
+	// payment the reconciler transitions (an expired ticket hold it voids, a
+	// lost ticket capture it syncs in) would move the payment but leave the
+	// ticket stranded `pending`, permanently eating the seat (void) or leaving a
+	// paid guest with no ticket (capture). Optional (WithReconcilerObserver);
+	// nil for a deploy with no ticketing wired.
+	ticketObserver PaymentSubjectObserver
+}
+
+// ReconcilerOption configures the reconciler without breaking the positional
+// constructor — same backward-compatible variadic-option pattern as
+// WithPaymentSubjectObserver on the webhook usecase.
+type ReconcilerOption func(*Reconciler)
+
+// WithReconcilerObserver wires the ticket (non-booking subject) projection so
+// reconciler-driven payment transitions reach the ticket, exactly like the
+// HTTP webhook path.
+func WithReconcilerObserver(obs PaymentSubjectObserver) ReconcilerOption {
+	return func(r *Reconciler) { r.ticketObserver = obs }
+}
+
+// applier builds a webhookUseCase that shares the reconciler's repos, gateway
+// resolver AND ticket observer, so a transition the reconciler replays applies
+// identically to the way a real webhook would — including the immediate-capture
+// of a ticket/pre-order (needs gateways) and the ticket-status projection
+// (needs ticketObserver). Both were previously nil in the two ad-hoc literals,
+// which is exactly why reconciler-driven transitions never reached the ticket.
+func (r *Reconciler) applier() *webhookUseCase {
+	return &webhookUseCase{
+		payments: r.payments, ledger: r.ledger, outbox: r.outbox,
+		gateways: r.gateways, tx: r.tx, ticketObserver: r.ticketObserver,
+	}
 }
 
 // ReconcilerConfig is the worker's own scheduling and safety configuration,
@@ -143,13 +176,18 @@ func NewReconciler(
 	tx domain.TxManager,
 	cfg ReconcilerConfig,
 	log *slog.Logger,
+	opts ...ReconcilerOption,
 ) *Reconciler {
 	cfg = cfg.withDefaults()
-	return &Reconciler{
+	r := &Reconciler{
 		payments: paymentsRepo, refunds: refundsRepo, ledger: ledger, outbox: outbox,
 		gateways: gateways, tx: tx, cfg: cfg, log: log, now: time.Now,
 		pace: &pacer{minGap: cfg.ProviderMinGap},
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // ReconcileResult counts what one pass did. This is what an alert is built on
@@ -616,7 +654,7 @@ func (r *Reconciler) resolveLostWebhook(ctx context.Context, gw domain.PaymentGa
 		Type: eventType, Status: resp.Status, Amount: resp.Amount, OccurredAt: now, SignatureValid: true,
 		FailureCode: resp.FailureCode, FailureMessage: resp.FailureMessage,
 	}
-	applier := &webhookUseCase{payments: r.payments, ledger: r.ledger, outbox: r.outbox, tx: r.tx}
+	applier := r.applier()
 	if err := applier.apply(ctx, gw, p, event); err != nil {
 		if errors.Is(err, domain.ErrInvalidStatus) {
 			return false, fmt.Sprintf("acquirer reports %q, not a legal transition from local %q: %s", resp.Status, p.Status, err.Error()), nil
@@ -657,7 +695,7 @@ func (r *Reconciler) reconcileExpiredHolds(ctx context.Context, now time.Time, r
 // in, never overwritten by an expiry. Anything the acquirer already resolved
 // on its own (voided/failed/expired) is simply synced to match.
 func (r *Reconciler) resolveExpiredHold(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, resp *domain.GatewayPayment, now time.Time) (bool, string, error) {
-	applier := &webhookUseCase{payments: r.payments, ledger: r.ledger, outbox: r.outbox, tx: r.tx}
+	applier := r.applier()
 
 	switch resp.Status {
 	case domain.PaymentAuthorized:

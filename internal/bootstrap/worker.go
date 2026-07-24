@@ -46,6 +46,12 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// no payout is stale — Tick returns immediately.
 	payoutReconciler := NewPayoutReconciler(cfg, db, log)
 
+	// The pending-ticket sweeper releases seats held by pending event tickets
+	// whose payment never completed (or was never created). Started
+	// unconditionally, same safe-idle rationale as the reconciler: with no stale
+	// pending tickets every pass finds nothing.
+	ticketSweeper := NewTicketSweeper(cfg, db, log)
+
 	// The legacy one-way sync (old Supabase -> new DB) is started only when
 	// LEGACY_DB_URL is set. When it is unset legacySync is nil and the loop is
 	// simply never started — a clean no-op, same discipline as the other
@@ -63,8 +69,8 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr, notifyErr, payoutErr, legacyErr error
-	wg.Add(4)
+	var bookingErr, paymentsErr, notifyErr, payoutErr, ticketSweepErr, legacyErr error
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -80,6 +86,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	go func() {
 		defer wg.Done()
 		payoutErr = payoutReconciler.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		ticketSweepErr = ticketSweeper.Run(ctx)
 	}()
 	if legacySync != nil {
 		wg.Add(1)
@@ -101,6 +111,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if payoutErr != nil {
 		return fmt.Errorf("payout reconciler: %w", payoutErr)
+	}
+	if ticketSweepErr != nil {
+		return fmt.Errorf("ticket sweeper: %w", ticketSweepErr)
 	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)

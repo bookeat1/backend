@@ -15,18 +15,22 @@ import (
 // an edge delivery layer needs to render a message, never the full row (no
 // idempotency key, no raw acquirer payload).
 type paymentEventPayload struct {
-	ID           uuid.UUID             `json:"id"`
-	BookingID    uuid.UUID             `json:"booking_id"`
-	RestaurantID uuid.UUID             `json:"restaurant_id"`
-	Purpose      domain.PaymentPurpose `json:"purpose"`
-	Status       domain.PaymentStatus  `json:"status"`
-	AmountMinor  int64                 `json:"amount_minor"`
-	Currency     domain.Currency       `json:"currency"`
+	ID uuid.UUID `json:"id"`
+	// BookingID is uuid.Nil for a ticket payment; EventTicketID is set instead
+	// (and omitted for a booking payment), so a downstream consumer can tell a
+	// ticket payment apart and render the right message.
+	BookingID     uuid.UUID             `json:"booking_id"`
+	EventTicketID *uuid.UUID            `json:"event_ticket_id,omitempty"`
+	RestaurantID  uuid.UUID             `json:"restaurant_id"`
+	Purpose       domain.PaymentPurpose `json:"purpose"`
+	Status        domain.PaymentStatus  `json:"status"`
+	AmountMinor   int64                 `json:"amount_minor"`
+	Currency      domain.Currency       `json:"currency"`
 }
 
 func newPaymentEventPayload(p *domain.Payment) paymentEventPayload {
 	return paymentEventPayload{
-		ID: p.ID, BookingID: p.BookingID, RestaurantID: p.RestaurantID,
+		ID: p.ID, BookingID: p.BookingID, EventTicketID: p.EventTicketID, RestaurantID: p.RestaurantID,
 		Purpose: p.Purpose, Status: p.Status, AmountMinor: p.AmountMinor, Currency: p.Currency,
 	}
 }

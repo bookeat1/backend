@@ -23,6 +23,7 @@ import (
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
 	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
+	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
@@ -61,6 +62,7 @@ import (
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
+	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 )
 
@@ -113,6 +115,13 @@ type Deps struct {
 	PaymentWebhook       payments.WebhookUseCase
 	PaymentStatus        payments.StatusUseCase
 	PaymentDepositCancel payments.DepositCancellationUseCase
+
+	// Event ticketing (roadmap #2) — guest purchase + refund, admin sold view,
+	// own-tickets. Money flows through the payments contour above.
+	TicketPurchase tickets.PurchaseUseCase
+	TicketRefund   tickets.RefundUseCase
+	TicketAdmin    tickets.AdminUseCase
+	MyTickets      tickets.MyTicketsUseCase
 
 	// Payouts — restaurant settlement (выплаты заведениям). Destinations +
 	// generation + send + statement, all behind usecase RBAC.
@@ -222,9 +231,23 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	paymentVoid := payments.NewVoidUseCase(paymentsRepo, paymentOutboxRepo, paymentGateways, restaurantManagers, txm)
 	paymentRefund := payments.NewRefundUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, txm, paymentsCfg)
+	// Event ticketing (roadmap #2): tickets reuse the SAME payments contour as
+	// bookings. The ticket-payment usecase owns the money (gross-up, acquirer,
+	// ledger, refund CAS); the ticket observer projects a payment's status onto
+	// its ticket (pending→paid on capture, →cancelled on fail, →refunded on
+	// refund) and is hooked into the webhook so a ticket confirms through the
+	// exact same callback flow a booking does.
+	eventTicketsRepo := eventticketrepo.New(db)
+	ticketObserver := tickets.NewPaymentObserver(eventTicketsRepo)
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, txm)
+		paymentGateways, txm, payments.WithPaymentSubjectObserver(ticketObserver))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
+	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
+		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
+	ticketPurchase := tickets.NewPurchaseUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, paymentsRepo, txm)
+	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, ticketPayments)
+	ticketAdmin := tickets.NewAdminUseCase(eventTicketsRepo, eventrepo.New(db), restaurantManagers)
+	myTickets := tickets.NewMyTicketsUseCase(eventTicketsRepo)
 	// Deposit hold settlement on booking cancel / no-show (void-early /
 	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
 	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
@@ -328,6 +351,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentVoid:           paymentVoid,
 		PaymentRefund:         paymentRefund,
 		PaymentWebhook:        paymentWebhook,
+		TicketPurchase:        ticketPurchase,
+		TicketRefund:          ticketRefund,
+		TicketAdmin:           ticketAdmin,
+		MyTickets:             myTickets,
 		PaymentStatus:         paymentStatus,
 		PaymentDepositCancel:  paymentDepositCancel,
 		Payouts:               payoutUC,
@@ -595,6 +622,11 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 	if err != nil {
 		return nil, err
 	}
+	// Same ticket projection the HTTP webhook uses, so a payment the reconciler
+	// transitions (expired ticket hold voided, lost ticket capture synced in)
+	// reaches its ticket (seat freed / ticket marked paid) instead of stranding
+	// it `pending` forever.
+	ticketObserver := tickets.NewPaymentObserver(eventticketrepo.New(db))
 	return payments.NewReconciler(
 		paymentrepo.New(db), paymentrepo.NewRefunds(db), paymentrepo.NewLedger(db),
 		paymentrepo.NewOutbox(db), gateways, sqltx.NewManager(db),
@@ -605,7 +637,30 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			BatchSize:        cfg.PaymentsReconciler.BatchSize,
 			MaxAttempts:      cfg.PaymentsReconciler.MaxAttempts,
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
-		}, log), nil
+		}, log,
+		payments.WithReconcilerObserver(ticketObserver)), nil
+}
+
+// NewTicketSweeper builds the pending-ticket sweep worker: it releases seats
+// held by pending tickets whose payment never completed (or was never created),
+// the backstop the payments reconciler cannot cover because a pending ticket may
+// have no payment row at all. Safe-idle when there are no stale pending tickets.
+func NewTicketSweeper(cfg Config, db *pgxpool.Pool, log *slog.Logger) *tickets.PendingSweeper {
+	// StaleAfter must comfortably exceed the payments HoldTTL so a ticket whose
+	// hold is still legitimately in flight is never swept; the configured value
+	// (default 100h) is floored at HoldTTL+4h as a safety net against a
+	// misconfigured-too-low override.
+	staleAfter := cfg.TicketsSweep.StaleAfter
+	if floor := newPaymentsConfig(cfg).HoldTTL + 4*time.Hour; staleAfter < floor {
+		staleAfter = floor
+	}
+	return tickets.NewPendingSweeper(
+		eventticketrepo.New(db), paymentrepo.New(db),
+		tickets.SweepConfig{
+			TickInterval: cfg.TicketsSweep.TickInterval,
+			StaleAfter:   staleAfter,
+			BatchSize:    cfg.TicketsSweep.BatchSize,
+		}, log)
 }
 
 // NewNotificationDispatcher wires the background notification dispatcher: it

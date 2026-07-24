@@ -33,6 +33,7 @@ import (
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
 	"backend-core/internal/transport/rest/swaggerui"
+	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
 )
 
@@ -238,6 +239,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// Acquirer webhooks: public, unauthenticated, NOT under /api/v1 (the
 	// acquirer calls the bare route it was configured with).
 	paymentHandler.RegisterWebhooks(r.Group("/"))
+
+	// Event ticketing (roadmap #2). Guest buy/view/cancel run on the same
+	// OptionalAuth group as the payments checkout (a buyer may have no account);
+	// admin "tickets sold" runs on the authed group (usecase RBAC). Ticket
+	// payment webhooks reuse the payments webhook routes registered above.
+	ticketHandler := ticketsrest.NewHandler(deps.TicketPurchase, deps.TicketRefund, deps.TicketAdmin, deps.MyTickets, deps.PaymentsPublicBaseURL)
+	ticketHandler.RegisterGuestRoutes(paymentGuest)
+	ticketHandler.RegisterAdminRoutes(authed)
 
 	return r
 }
