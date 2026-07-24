@@ -62,11 +62,22 @@ func TestCreateForBooking_HappyPath(t *testing.T) {
 	if p.BaseAmountMinor != 1_000_000 {
 		t.Fatalf("base = %d, want 1000000", p.BaseAmountMinor)
 	}
-	if p.FeeMinor != 35_000 { // 3.5% of 1,000,000, rounded up = exact here
-		t.Fatalf("fee = %d, want 35000", p.FeeMinor)
+	// Grossed up to cover a 3.5% acquirer cut: total = ceil(1000000×10000/9650)
+	// = 1036270, fee = 36270. NOT a plain 3.5% (35000) of base — the acquirer
+	// takes its cut from the total, so the markup must be slightly larger.
+	if p.FeeMinor != 36_270 {
+		t.Fatalf("fee = %d, want 36270 (gross-up for 3.5%% acquirer)", p.FeeMinor)
 	}
 	if p.AmountMinor != p.BaseAmountMinor+p.FeeMinor {
 		t.Fatalf("amount %d != base+fee %d", p.AmountMinor, p.BaseAmountMinor+p.FeeMinor)
+	}
+	// The venue-made-whole property: after the acquirer withholds 3.5% of the
+	// TOTAL, the venue still nets at least the full base. Model the acquirer's
+	// cut with CEILING (worst case for the venue: the acquirer rounds its own
+	// fee up), matching the domain property test.
+	acquirerCut := (p.AmountMinor*350 + 9_999) / 10_000
+	if netToVenue := p.AmountMinor - acquirerCut; netToVenue < p.BaseAmountMinor {
+		t.Fatalf("net to venue %d < base %d — venue is short", netToVenue, p.BaseAmountMinor)
 	}
 	if p.PaymentURL == nil || *p.PaymentURL == "" {
 		t.Fatalf("payment url not set")

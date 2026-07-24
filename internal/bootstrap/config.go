@@ -156,9 +156,12 @@ type PaymentsConfig struct {
 	// its preferred one is disabled in the payment_providers registry.
 	DefaultProvider string // env: PAYMENTS_DEFAULT_PROVIDER
 
-	// ServiceFeeBps is the BookEat service fee charged to the guest, in basis
-	// points (350 = 3.5%). Basis points, not a float percentage: 3.5% in a
-	// float is a rounding error in somebody else's wallet.
+	// ServiceFeeBps is the acquirer's fee rate, in basis points (350 = 3.5%
+	// prod, 290 = 2.9% sandbox). The guest is charged a grossed-up total so the
+	// venue nets the full base after the acquirer withholds this rate from the
+	// total (see domain.GrossUpForAcquirer). BookEat earns from the venue's
+	// subscription, not from this fee — its take on the payment is ~zero. Basis
+	// points, not a float: 3.5% in a float is a rounding error in someone's wallet.
 	ServiceFeeBps int // env: PAYMENTS_SERVICE_FEE_BPS
 
 	// RefundAcquiringBps is what is withheld from a refund to cover the cost of

@@ -168,15 +168,63 @@ func ServiceFee(base Money, bps int) (Money, error) {
 }
 
 // TotalWithFee returns (fee, total) for a base amount at the given rate:
-// total = base + fee. This is the only amount ever shown to the guest and the
-// only amount ever sent to the acquirer — the client's idea of the price is
-// always ignored (spec §8).
+// total = base + fee. This is a plain additive markup: the fee is bps of the
+// BASE. Kept as a domain primitive; the payment flow uses GrossUpForAcquirer
+// instead (see its doc for why additive is the wrong tool for covering an
+// acquirer fee).
 func TotalWithFee(base Money, bps int) (fee Money, total Money, err error) {
 	fee, err = ServiceFee(base, bps)
 	if err != nil {
 		return Money{}, Money{}, err
 	}
 	total, err = base.Add(fee)
+	if err != nil {
+		return Money{}, Money{}, err
+	}
+	return fee, total, nil
+}
+
+// GrossUpForAcquirer returns (fee, total) such that after the acquirer withholds
+// acquirerBps of the TOTAL, the venue still nets the full base.
+//
+// This is NOT base + base×bps. The acquirer takes its cut from the total charged
+// to the guest, not from the base, so a plain additive markup always leaves the
+// venue short by bps of the fee itself. The correct amount grosses up:
+//
+//	total = ceil( base × 10000 / (10000 − acquirerBps) )
+//	fee   = total − base
+//
+// Because total is rounded UP, total×(10000−acquirerBps) ≥ base×10000, i.e. the
+// net after the acquirer's cut is always ≥ base — the rounding remainder (≤ 1
+// tiyn) falls in the VENUE's favour, never the guest's shortfall. Under the
+// subscription model BookEat's own take on the payment is ~zero: the fee exists
+// only to make the venue whole against the acquirer (spec §9.2). The guest-facing
+// label stays "service fee", never "card/acquiring fee" (spec §3, §9.4).
+//
+// acquirerBps must be in [0, 10000). 10000 (100%) is rejected: it would mean the
+// acquirer takes everything, leaving no finite total that nets a positive base.
+func GrossUpForAcquirer(base Money, acquirerBps int) (fee Money, total Money, err error) {
+	if acquirerBps < 0 || int64(acquirerBps) >= BasisPointsDenominator {
+		return Money{}, Money{}, fmt.Errorf("acquirer basis points %d out of range [0,%d): %w", acquirerBps, BasisPointsDenominator, ErrValidation)
+	}
+	if base.AmountMinor < 0 {
+		return Money{}, Money{}, ErrNegativeAmount
+	}
+	if acquirerBps == 0 || base.AmountMinor == 0 {
+		return Money{AmountMinor: 0, Currency: base.Currency},
+			Money{AmountMinor: base.AmountMinor, Currency: base.Currency}, nil
+	}
+	// Overflow guard before the multiplication: base × 10000 must fit in int64.
+	if base.AmountMinor > math.MaxInt64/BasisPointsDenominator {
+		return Money{}, Money{}, ErrMoneyOverflow
+	}
+	denom := BasisPointsDenominator - int64(acquirerBps)
+	numerator := base.AmountMinor * BasisPointsDenominator
+	// Ceiling division for non-negative operands: round the total UP so the net
+	// after the acquirer's cut never falls below base.
+	totalMinor := (numerator + denom - 1) / denom
+	total = Money{AmountMinor: totalMinor, Currency: base.Currency}
+	fee, err = total.Sub(base)
 	if err != nil {
 		return Money{}, Money{}, err
 	}
