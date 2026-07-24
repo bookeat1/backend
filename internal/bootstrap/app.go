@@ -18,6 +18,7 @@ import (
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	contentrest "backend-core/internal/transport/rest/content"
+	dashboardrest "backend-core/internal/transport/rest/dashboard"
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	menurest "backend-core/internal/transport/rest/menu"
@@ -150,6 +151,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
+	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregate
+	// statistics. Mounted on the RequireRole(RoleAdmin) group so ONLY the global
+	// superadmin passes; a restaurant owner/manager/hostess or a guest gets 403.
+	// The usecase re-checks the superadmin role as defense-in-depth.
+	dashboardrest.NewHandler(deps.Dashboard).RegisterRoutes(adminGlobal)
 
 	// Staff-roster management (list/assign/set role/remove a restaurant's own
 	// manager/hostess accounts): NOT gated by RequireRole/RequireRestaurantManager

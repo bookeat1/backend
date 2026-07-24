@@ -16,6 +16,7 @@ import (
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
+	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
@@ -37,6 +38,7 @@ import (
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
 	"backend-core/internal/usecase/content"
+	"backend-core/internal/usecase/dashboard"
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/menu"
@@ -71,6 +73,7 @@ type Deps struct {
 	BookingBlacklist   bookings.BlacklistUseCase
 	BookingPolicy      bookings.PolicyUseCase
 	AdminPanel         *admin.UseCase
+	Dashboard          *dashboard.UseCase
 	BookingExternal    bookings.ExternalReservationUseCase
 	Issuer             *token.RSAIssuer
 
@@ -216,6 +219,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		restRepo, // paymentSettingsWriter: edits free_cancel_window_minutes
 	)
 
+	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
+	// for the global superadmin only. Pure reads over a dedicated read-model
+	// repo (all aggregation in SQL); the usecase enforces the superadmin gate.
+	dashboardUC := dashboard.NewUseCase(dashboardrepo.New(db))
+
 	return &Deps{
 		AuthFacade:         authFacade,
 		AuthOTP:            authOTP,
@@ -240,6 +248,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
 		AdminPanel:       adminPanel,
+		Dashboard:        dashboardUC,
 		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
 			restRelated, restaurantManagers, txm),
 		Issuer: issuer,
