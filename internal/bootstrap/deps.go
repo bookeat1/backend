@@ -18,6 +18,7 @@ import (
 	"backend-core/internal/infrastructure/payment/freedompay"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	consentrepo "backend-core/internal/infrastructure/postgres/consent"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
 	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
@@ -44,6 +45,7 @@ import (
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	"backend-core/internal/usecase/consent"
 	"backend-core/internal/usecase/content"
 	"backend-core/internal/usecase/dashboard"
 	"backend-core/internal/usecase/events"
@@ -69,6 +71,7 @@ type Deps struct {
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
 	FavoritesFacade    favorites.Facade
+	ConsentFacade      consent.Facade
 	ReviewsFacade      reviews.Facade
 	EventsFacade       events.Facade
 	PromosFacade       promos.Facade
@@ -154,6 +157,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	pushSubscriptions := notifications.NewSubscriptionUseCase(notificationrepo.NewSubscriptions(db), restManagers)
 	favoritesRepo := favoriterepo.New(db)
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
+	consentFacade := consent.NewFacade(
+		consentrepo.NewConsentRepository(db),
+		consentrepo.NewPreferenceRepository(db),
+	)
 
 	bookingRepo := bookingrepo.New(db)
 	reviewsFacade := reviews.NewFacade(reviewrepo.New(db), bookingRepo, restManagers)
@@ -274,6 +281,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		MyRestaurants:      myRestaurants,
 		PushSubscriptions:  pushSubscriptions,
 		FavoritesFacade:    favoritesFacade,
+		ConsentFacade:      consentFacade,
 		ReviewsFacade:      reviewsFacade,
 		EventsFacade:       eventsFacade,
 		PromosFacade:       promosFacade,
