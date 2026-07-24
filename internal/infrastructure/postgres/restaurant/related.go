@@ -399,6 +399,37 @@ func (m *Managers) ListByUser(ctx context.Context, uid uuid.UUID) ([]domain.Rest
 	return m.scanRows(rows)
 }
 
+// ListMembershipsByUser returns every restaurant uid is staff of, joined to the
+// venue's display name, ordered by name. It is the read behind
+// GET /admin/my-restaurants: one query scoped to the caller's own user id, so a
+// caller can never see a restaurant they have no membership in. Returns an
+// empty (non-nil-safe) slice, not an error, when the user manages nothing.
+func (m *Managers) ListMembershipsByUser(ctx context.Context, uid uuid.UUID) ([]domain.StaffMembership, error) {
+	rows, err := sqltx.From(ctx, m.pool).Query(ctx,
+		`SELECT rm.restaurant_id, r.name, r.name_i18n, rm.role
+		 FROM restaurant_managers rm
+		 JOIN restaurants r ON r.id = rm.restaurant_id
+		 WHERE rm.user_id=$1
+		 ORDER BY r.name`, uid)
+	if err != nil {
+		return nil, fmt.Errorf("list memberships by user: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.StaffMembership
+	for rows.Next() {
+		var sm domain.StaffMembership
+		var role string
+		var nameI18n []byte
+		if err := rows.Scan(&sm.RestaurantID, &sm.Name, &nameI18n, &role); err != nil {
+			return nil, err
+		}
+		sm.NameI18n = i18nFromDB(nameI18n)
+		sm.Role = domain.StaffRole(role)
+		out = append(out, sm)
+	}
+	return out, rows.Err()
+}
+
 func (m *Managers) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantManager, error) {
 	row := sqltx.From(ctx, m.pool).QueryRow(ctx,
 		`SELECT `+mgrCols+` FROM restaurant_managers WHERE id=$1`, id)

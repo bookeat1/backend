@@ -98,6 +98,20 @@ type RestaurantManager struct {
 	CreatedAt     time.Time
 }
 
+// StaffMembership is one restaurant the caller is a staff member of, carrying
+// the venue's display name (localizable) and the caller's StaffRole there. It
+// is the read model behind GET /admin/my-restaurants — the post-login "which
+// restaurants do I manage" picker, so the admin panel never asks staff to type
+// a restaurant UUID. It is produced by a single join of restaurant_managers to
+// restaurants scoped to the caller's own user id; a caller only ever sees rows
+// they have a membership in.
+type StaffMembership struct {
+	RestaurantID uuid.UUID
+	Name         string
+	NameI18n     I18n
+	Role         StaffRole
+}
+
 type RestaurantCategory struct {
 	ID              uuid.UUID
 	Name            string

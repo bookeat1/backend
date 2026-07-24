@@ -177,3 +177,13 @@ type RestaurantListItem struct {
 	Restaurant
 	PrimaryImage *string
 }
+
+// RestaurantBrief is a minimal (id, localizable name) row. It backs the
+// superadmin variant of the my-restaurants picker, which spans EVERY venue on
+// the platform — including inactive/hidden ones, since a superadmin manages
+// them all (see usecase/restaurants.MyRestaurantsUseCase).
+type RestaurantBrief struct {
+	ID       uuid.UUID
+	Name     string
+	NameI18n I18n
+}
