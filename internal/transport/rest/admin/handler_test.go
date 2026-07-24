@@ -125,6 +125,9 @@ type fakeOverrides struct{ err error }
 func (f *fakeOverrides) ListByRestaurant(_ context.Context, _ uuid.UUID) ([]domain.ScheduleOverride, error) {
 	return nil, f.err
 }
+func (f *fakeOverrides) GetForBookingInstant(_ context.Context, _ uuid.UUID, _ time.Time, _ string) (*domain.ScheduleOverride, error) {
+	return nil, domain.ErrNotFound
+}
 func (f *fakeOverrides) Upsert(_ context.Context, _ *domain.ScheduleOverride) error { return f.err }
 func (f *fakeOverrides) Delete(_ context.Context, _ uuid.UUID, _ time.Time) error   { return f.err }
 

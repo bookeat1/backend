@@ -101,20 +101,24 @@ type workingHoursResponse struct {
 }
 
 type scheduleOverrideResponse struct {
-	Date      string  `json:"date"` // YYYY-MM-DD
-	IsClosed  bool    `json:"is_closed"`
-	OpenTime  *string `json:"open_time"`
-	CloseTime *string `json:"close_time"`
-	Note      *string `json:"note"`
+	Date                   string  `json:"date"` // YYYY-MM-DD
+	IsClosed               bool    `json:"is_closed"`
+	OpenTime               *string `json:"open_time"`
+	CloseTime              *string `json:"close_time"`
+	Note                   *string `json:"note"`
+	BookingPaymentRequired bool    `json:"booking_payment_required"`
+	DepositAmountMinor     *int64  `json:"deposit_amount_minor"`
 }
 
 func overrideToResponse(o domain.ScheduleOverride) scheduleOverrideResponse {
 	return scheduleOverrideResponse{
-		Date:      o.Date.Format(dateLayout),
-		IsClosed:  o.IsClosed,
-		OpenTime:  o.OpenTime,
-		CloseTime: o.CloseTime,
-		Note:      o.Note,
+		Date:                   o.Date.Format(dateLayout),
+		IsClosed:               o.IsClosed,
+		OpenTime:               o.OpenTime,
+		CloseTime:              o.CloseTime,
+		Note:                   o.Note,
+		BookingPaymentRequired: o.BookingPaymentRequired,
+		DepositAmountMinor:     o.DepositAmountMinor,
 	}
 }
 

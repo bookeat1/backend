@@ -38,7 +38,7 @@ func newCreateHarness(t *testing.T, b *domain.Booking, deposit int64, feeBps int
 	resolver := newFakeGatewayResolver(gw)
 	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: payments, outbox: outbox}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{}).(*createUseCase)
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, newFakeSpecialDays(), resolver, managers, tx, Config{}).(*createUseCase)
 	return u, payments, outbox, gw
 }
 
@@ -234,7 +234,7 @@ func TestCreateForBooking_NoPaymentRequired(t *testing.T) {
 	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: payments, outbox: outbox}
 	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(true)}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{})
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, newFakeSpecialDays(), resolver, managers, tx, Config{})
 
 	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
 	if !errors.Is(err, domain.ErrValidation) {
@@ -266,7 +266,7 @@ func TestCreateForBooking_GlobalDepositRequiredWithNoOverride(t *testing.T) {
 	managers := newFakeManagerChecker()
 	tx := &fakeTx{payments: payments, outbox: outbox}
 	cfg := Config{DepositRequired: true, DepositDefaultMinor: 500_000, ServiceFeeBps: 350}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, cfg)
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, newFakeSpecialDays(), resolver, managers, tx, cfg)
 
 	p, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
 	if err != nil {
@@ -314,7 +314,7 @@ func TestCreateForBooking_CrossTenantStaffIsRejected(t *testing.T) {
 	managers := &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: false}
 	managers.set(strangerStaff, b.RestaurantID, false)
 	tx := &fakeTx{payments: payments, outbox: outbox}
-	u := NewCreateUseCase(payments, outbox, bookings, items, settings, resolver, managers, tx, Config{})
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, newFakeSpecialDays(), resolver, managers, tx, Config{})
 
 	_, err := u.CreateForBooking(context.Background(), Actor{UserID: &strangerStaff, Role: domain.RoleRestaurant}, CreateInput{
 		BookingID: b.ID, IdempotencyKey: "k",
@@ -335,5 +335,125 @@ func TestCreateForBooking_RejectsWrongBookingStatus(t *testing.T) {
 	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("error = %v, want ErrValidation", err)
+	}
+}
+
+// newSpecialDayCreateHarness builds a create usecase whose restaurant runs on
+// the platform defaults (payments enabled, NO deposit/preorder required — the
+// "free by default" case), plus a configurable specialDayResolver. It returns
+// the usecase and the special-days fake so a test can flip a given date to a
+// paid special day.
+func newSpecialDayCreateHarness(t *testing.T, b *domain.Booking) (*createUseCase, *fakeSpecialDays, *fakeGateway) {
+	t.Helper()
+	payments := newFakePaymentRepo()
+	outbox := newFakePaymentOutbox()
+	bookings := newFakeBookingReader(b)
+	items := newFakeItemReader()
+	settings := newFakeRestaurantSettings()
+	// Enabled, but nothing required by default — a normal day is FREE.
+	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(true)}
+	special := newFakeSpecialDays()
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
+	tx := &fakeTx{payments: payments, outbox: outbox}
+	cfg := Config{ServiceFeeBps: 350}
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, special, resolver, managers, tx, cfg).(*createUseCase)
+	return u, special, gw
+}
+
+// A booking on a NORMAL day (no paid special day) at a free-by-default venue
+// requires no prepayment: resolveAmount reaches "this booking requires no
+// payment" and no hold is placed.
+func TestCreateForBooking_NormalDay_NoPrepayment(t *testing.T) {
+	b := testBooking(uuid.New())
+	u, _, gw := newSpecialDayCreateHarness(t, b)
+
+	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("error = %v, want ErrValidation (a normal day at a free venue is not payable)", err)
+	}
+	if gw.callCount("authorize") != 0 {
+		t.Fatalf("authorize called %d times on a free normal day, want 0", gw.callCount("authorize"))
+	}
+}
+
+// A booking on a PAID special day requires a deposit of exactly the override's
+// amount, held through the SAME machinery as any deposit (PurposeDeposit +
+// gateway Authorize).
+func TestCreateForBooking_PaidSpecialDay_DepositRequired(t *testing.T) {
+	b := testBooking(uuid.New())
+	u, special, gw := newSpecialDayCreateHarness(t, b)
+	const specialDeposit = 750_000
+	special.setPaid(b.RestaurantID, specialDeposit)
+
+	p, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
+	if err != nil {
+		t.Fatalf("CreateForBooking() error = %v, want nil (a paid special day must require a deposit)", err)
+	}
+	if p.Purpose != domain.PurposeDeposit {
+		t.Fatalf("purpose = %s, want deposit", p.Purpose)
+	}
+	if p.BaseAmountMinor != specialDeposit {
+		t.Fatalf("base = %d, want the override's deposit_amount_minor %d", p.BaseAmountMinor, specialDeposit)
+	}
+	if p.Status != domain.PaymentCreated {
+		t.Fatalf("status = %s, want created", p.Status)
+	}
+	if gw.callCount("authorize") != 1 {
+		t.Fatalf("authorize called %d times, want 1 (deposit hold placed)", gw.callCount("authorize"))
+	}
+}
+
+// A paid special day makes an otherwise-free booking payable EVEN when the
+// venue requires no deposit by default — the special-day override is the sole
+// reason a prepayment is taken. It also overrides a preorder-required venue so
+// the charged amount is deterministically the special deposit, not a preorder
+// total.
+func TestCreateForBooking_PaidSpecialDay_OverridesPreorder(t *testing.T) {
+	b := testBooking(uuid.New())
+	payments := newFakePaymentRepo()
+	outbox := newFakePaymentOutbox()
+	bookings := newFakeBookingReader(b)
+	items := newFakeItemReader()
+	items.byBooking[b.ID] = []domain.BookingItem{
+		{ID: uuid.New(), BookingID: b.ID, Quantity: 2, PriceMinor: 300_000, Status: domain.BookingItemPending},
+	}
+	settings := newFakeRestaurantSettings()
+	settings.byRestaurant[b.RestaurantID] = domain.PaymentSettingsOverride{
+		PaymentsEnabled: boolPtr(true), PreorderPaymentRequired: boolPtr(true),
+	}
+	special := newFakeSpecialDays()
+	const specialDeposit = 400_000
+	special.setPaid(b.RestaurantID, specialDeposit)
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	resolver := newFakeGatewayResolver(gw)
+	managers := newFakeManagerChecker()
+	tx := &fakeTx{payments: payments, outbox: outbox}
+	u := NewCreateUseCase(payments, outbox, bookings, items, settings, special, resolver, managers, tx, Config{ServiceFeeBps: 350})
+
+	p, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
+	if err != nil {
+		t.Fatalf("CreateForBooking() error = %v", err)
+	}
+	if p.Purpose != domain.PurposeDeposit {
+		t.Fatalf("purpose = %s, want deposit (special day overrides preorder)", p.Purpose)
+	}
+	if p.BaseAmountMinor != specialDeposit {
+		t.Fatalf("base = %d, want the special-day deposit %d, not the preorder total", p.BaseAmountMinor, specialDeposit)
+	}
+}
+
+// A special-day resolver error is propagated, never swallowed into a free
+// booking — a failure to read the schedule must not silently drop a required
+// prepayment.
+func TestCreateForBooking_SpecialDayResolverError(t *testing.T) {
+	b := testBooking(uuid.New())
+	u, special, _ := newSpecialDayCreateHarness(t, b)
+	special.err = errors.New("schedule read failed")
+
+	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: b.ID, IdempotencyKey: "k"})
+	if err == nil {
+		t.Fatalf("error = nil, want the resolver error to propagate")
 	}
 }

@@ -127,6 +127,10 @@ type scheduleOverrideRequest struct {
 	OpenTime  *string `json:"open_time"`
 	CloseTime *string `json:"close_time"`
 	Note      *string `json:"note"`
+	// BookingPaymentRequired marks the day as PAID; DepositAmountMinor is the
+	// required deposit in int64 minor units (validated in the usecase).
+	BookingPaymentRequired bool   `json:"booking_payment_required"`
+	DepositAmountMinor     *int64 `json:"deposit_amount_minor"`
 }
 
 func (r scheduleOverrideRequest) toInput() (adminuc.ScheduleOverrideInput, error) {
@@ -136,6 +140,7 @@ func (r scheduleOverrideRequest) toInput() (adminuc.ScheduleOverrideInput, error
 	}
 	return adminuc.ScheduleOverrideInput{
 		Date: d, IsClosed: r.IsClosed, OpenTime: r.OpenTime, CloseTime: r.CloseTime, Note: r.Note,
+		BookingPaymentRequired: r.BookingPaymentRequired, DepositAmountMinor: r.DepositAmountMinor,
 	}, nil
 }
 

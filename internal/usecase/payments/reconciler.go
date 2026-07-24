@@ -43,10 +43,17 @@ import (
 //
 // Money-safety over completeness: where this build cannot tell an acquirer's
 // answer apart from "still unknown" (see resolveRefund's TODO(verify)), it
-// leaves the row alone rather than guess. DO NOT run this in production
-// before internal/infrastructure/postgres has real PaymentRepository /
-// PaymentRefundRepository implementations of ClaimStale / ClaimExpiredHolds /
-// RecordReconcileAttempt — only in-memory fakes exist as of this change.
+// leaves the row alone rather than guess.
+//
+// Production status: the Postgres implementations of ClaimStale /
+// ClaimExpiredHolds / RecordReconcileAttempt now exist
+// (internal/infrastructure/postgres/payment) and this reconciler is wired into
+// cmd/worker (bootstrap.RunWorker), started unconditionally alongside the
+// booking worker — it is safe idle when no payment is stale. The one caveat
+// that remains open is resolveRefund's ambiguous-outcome gap above: an explicit
+// acquirer refund decline is not yet distinguishable from "not settled yet"
+// (TODO(verify)), so a refund in that state is deliberately left for a human /
+// a later definitive signal, never auto-resolved.
 type Reconciler struct {
 	payments domain.PaymentRepository
 	refunds  domain.PaymentRefundRepository

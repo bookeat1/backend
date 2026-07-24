@@ -82,13 +82,20 @@ func (f *fakeWH) ReplaceWorkingHours(_ context.Context, _ uuid.UUID, _ []domain.
 	return nil
 }
 
-type fakeOverrides struct{ upserted, deleted bool }
+type fakeOverrides struct {
+	upserted, deleted bool
+	last              *domain.ScheduleOverride
+}
 
 func (f *fakeOverrides) ListByRestaurant(_ context.Context, _ uuid.UUID) ([]domain.ScheduleOverride, error) {
 	return nil, nil
 }
-func (f *fakeOverrides) Upsert(_ context.Context, _ *domain.ScheduleOverride) error {
+func (f *fakeOverrides) GetForBookingInstant(_ context.Context, _ uuid.UUID, _ time.Time, _ string) (*domain.ScheduleOverride, error) {
+	return nil, domain.ErrNotFound
+}
+func (f *fakeOverrides) Upsert(_ context.Context, o *domain.ScheduleOverride) error {
 	f.upserted = true
+	f.last = o
 	return nil
 }
 func (f *fakeOverrides) Delete(_ context.Context, _ uuid.UUID, _ time.Time) error {
@@ -409,5 +416,111 @@ func TestSetFreeCancelWindow(t *testing.T) {
 	}
 	if hh.paySet.calls != 0 {
 		t.Fatalf("writer reached despite forbidden actor")
+	}
+}
+
+// TestScheduleOverridePaidSpecialDay covers the paid-booking flag on a special
+// day: a manager may mark a day paid with a positive deposit; a paid day needs
+// a positive amount; a paid day cannot also be closed; and clearing the flag
+// clears the amount.
+func TestScheduleOverridePaidSpecialDay(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	actor := staffActor(uid)
+	ctx := context.Background()
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	open1, open2 := "10:00", "23:00"
+
+	// Manager marks the day paid with a positive deposit.
+	amt := int64(500_000)
+	o, err := h.uc.SetScheduleOverride(ctx, actor, rid, ScheduleOverrideInput{
+		Date: day, OpenTime: &open1, CloseTime: &open2,
+		BookingPaymentRequired: true, DepositAmountMinor: &amt,
+	})
+	if err != nil {
+		t.Fatalf("manager set paid special day: unexpected error %v", err)
+	}
+	if !o.BookingPaymentRequired || o.DepositAmountMinor == nil || *o.DepositAmountMinor != amt {
+		t.Fatalf("stored override = %+v, want paid with deposit %d", o, amt)
+	}
+	if h.overrides.last == nil || !h.overrides.last.BookingPaymentRequired {
+		t.Fatal("paid flag did not reach the repo")
+	}
+
+	// A paid day with a missing amount is rejected before the repo.
+	h.overrides.upserted = false
+	if _, err := h.uc.SetScheduleOverride(ctx, actor, rid, ScheduleOverrideInput{
+		Date: day, OpenTime: &open1, CloseTime: &open2, BookingPaymentRequired: true,
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("paid day without amount: got %v, want ErrValidation", err)
+	}
+	// A paid day with a zero/negative amount is rejected.
+	zero := int64(0)
+	if _, err := h.uc.SetScheduleOverride(ctx, actor, rid, ScheduleOverrideInput{
+		Date: day, OpenTime: &open1, CloseTime: &open2,
+		BookingPaymentRequired: true, DepositAmountMinor: &zero,
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("paid day with zero amount: got %v, want ErrValidation", err)
+	}
+	// A paid day cannot also be closed (a closed venue takes no bookings).
+	if _, err := h.uc.SetScheduleOverride(ctx, actor, rid, ScheduleOverrideInput{
+		Date: day, IsClosed: true, BookingPaymentRequired: true, DepositAmountMinor: &amt,
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("paid + closed: got %v, want ErrValidation", err)
+	}
+	if h.overrides.upserted {
+		t.Fatal("an invalid paid override reached the repo")
+	}
+
+	// Clearing the paid flag clears the amount even if one is passed.
+	free, err := h.uc.SetScheduleOverride(ctx, actor, rid, ScheduleOverrideInput{
+		Date: day, OpenTime: &open1, CloseTime: &open2,
+		BookingPaymentRequired: false, DepositAmountMinor: &amt,
+	})
+	if err != nil {
+		t.Fatalf("free override: unexpected error %v", err)
+	}
+	if free.BookingPaymentRequired || free.DepositAmountMinor != nil {
+		t.Fatalf("free override kept paid state: %+v", free)
+	}
+}
+
+// TestHostessCannotSetPaidSpecialDay: the paid flag is a restaurant.manage
+// action (owner+manager); a hostess is rejected and never reaches the repo.
+func TestHostessCannotSetPaidSpecialDay(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
+	actor := staffActor(uid)
+	open1, open2 := "10:00", "23:00"
+	amt := int64(500_000)
+
+	if _, err := h.uc.SetScheduleOverride(context.Background(), actor, rid, ScheduleOverrideInput{
+		Date: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), OpenTime: &open1, CloseTime: &open2,
+		BookingPaymentRequired: true, DepositAmountMinor: &amt,
+	}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess set paid day: got %v, want ErrForbidden", err)
+	}
+	if h.overrides.upserted {
+		t.Fatal("hostess reached the override repo")
+	}
+}
+
+// TestCrossTenantCannotSetPaidSpecialDay: a manager of A cannot mark a paid day
+// at restaurant B (they hold no permission there).
+func TestCrossTenantCannotSetPaidSpecialDay(t *testing.T) {
+	uid, restA, restB := uuid.New(), uuid.New(), uuid.New()
+	h := newHarness(grantAll(uid, restA, domain.StaffRoleManager))
+	actor := staffActor(uid)
+	open1, open2 := "10:00", "23:00"
+	amt := int64(500_000)
+
+	if _, err := h.uc.SetScheduleOverride(context.Background(), actor, restB, ScheduleOverrideInput{
+		Date: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), OpenTime: &open1, CloseTime: &open2,
+		BookingPaymentRequired: true, DepositAmountMinor: &amt,
+	}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("cross-tenant paid day: got %v, want ErrForbidden", err)
+	}
+	if h.overrides.upserted {
+		t.Fatal("cross-tenant call reached the override repo")
 	}
 }

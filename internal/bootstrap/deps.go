@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -181,8 +182,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	paymentSettings := restRepo // *restaurant.Repository now also implements restaurantPaymentSettings (GetPaymentOverride)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: paymentsCfg}
 
+	// Shared schedule-override repo: the admin panel edits special-day overrides
+	// (including the paid-booking flag), and the payments create path reads them
+	// to decide whether a booking on that date needs a prepayment.
+	scheduleRepo := schedulerepo.New(db)
+	specialDays := specialDayAdapter{overrides: scheduleRepo, fallbackTZ: cfg.Booking.TimezoneFallback}
+
 	paymentCreate := payments.NewCreateUseCase(paymentsRepo, paymentOutboxRepo, bookingRepo, bookingItems,
-		paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
+		paymentSettings, specialDays, paymentGateways, restaurantManagers, txm, paymentsCfg)
 	paymentCapture := payments.NewCaptureUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, txm)
 	paymentVoid := payments.NewVoidUseCase(paymentsRepo, paymentOutboxRepo, paymentGateways, restaurantManagers, txm)
@@ -215,7 +222,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// ad-hoc status write), and dedicated schedule-override + guest read repos.
 	adminPanel := admin.NewUseCase(
 		restaurantManagers, restaurantsFacade, menuFacade, restRelated,
-		schedulerepo.New(db), guestrepo.New(db), bookingsFacade, bookingStatus,
+		scheduleRepo, guestrepo.New(db), bookingsFacade, bookingStatus,
 		restRepo, // paymentSettingsWriter: edits free_cancel_window_minutes
 	)
 
@@ -302,11 +309,13 @@ type paymentSettingsReader interface {
 // through payments.FreeCancelDeadlineFor so BOTH settlement flows
 // (RefundUseCase.Settle and DepositCancellationUseCase) read one window.
 //
-// NOTE (flagged for review): this deliberately reads free_cancel_window_minutes
-// (owner-confirmed default 120m), NOT the older cancel_deadline_minutes
-// (default 180m) that still gates the GUEST self-cancel action in
-// usecase/bookings. The two windows can therefore diverge; the owner should
-// decide whether to consolidate them. See the PR description.
+// NOTE: this reads free_cancel_window_minutes (owner-confirmed default 120m),
+// which is now the SINGLE source of truth for the money decision on cancel/
+// no-show. The older cancel_deadline_minutes column (migration 0004) no longer
+// gates the guest self-cancel action — that hard gate was removed in the
+// cancellation PR (a guest may cancel their own booking at any time; the window
+// only decides free-vs-paid, never blocks). The column is kept but deprecated;
+// nothing in the money path reads it.
 type cancelDeadlineAdapter struct {
 	settings paymentSettingsReader
 	cfg      payments.Config
@@ -337,6 +346,31 @@ func (a depositSettlerAdapter) SettleDepositOnCancel(ctx context.Context, bookin
 		Trigger: trigger, CancelledAt: cancelledAt,
 	})
 	return err
+}
+
+// specialDayAdapter implements usecase/payments' specialDayResolver over the
+// schedule-override table (migration 0036). It maps a booking instant to the
+// venue's local calendar date (in the venue timezone, falling back to the
+// platform default) and reports whether that day is a PAID special day and the
+// deposit it requires. A date with no override — the common case, bookings are
+// FREE by default — resolves to (false, 0) via ErrNotFound.
+type specialDayAdapter struct {
+	overrides  domain.ScheduleOverrideRepository
+	fallbackTZ string
+}
+
+func (a specialDayAdapter) PaidSpecialDayFor(ctx context.Context, restaurantID uuid.UUID, at time.Time) (bool, int64, error) {
+	o, err := a.overrides.GetForBookingInstant(ctx, restaurantID, at, a.fallbackTZ)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, 0, nil // no override for that date → a normal, free day
+		}
+		return false, 0, err
+	}
+	if !o.BookingPaymentRequired || o.DepositAmountMinor == nil {
+		return false, 0, nil // override exists but the day is not marked paid
+	}
+	return true, *o.DepositAmountMinor, nil
 }
 
 // newBookingConfig mirrors BookingConfig field-for-field into the usecase

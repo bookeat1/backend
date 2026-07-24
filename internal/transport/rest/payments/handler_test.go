@@ -81,6 +81,15 @@ func (f fakeCancelDeadline) CancelDeadlineFor(context.Context, domain.Booking) (
 	return f.deadline, nil
 }
 
+// noSpecialDays is a specialDayResolver that never reports a paid special day —
+// these handler tests exercise the ordinary (default) deposit/preorder path;
+// the paid-special-day decision has its own unit tests in usecase/payments.
+type noSpecialDays struct{}
+
+func (noSpecialDays) PaidSpecialDayFor(context.Context, uuid.UUID, time.Time) (bool, int64, error) {
+	return false, 0, nil
+}
+
 // testEnv wires the real Postgres repositories and real usecases behind the
 // transport handler, mirroring bootstrap.NewDeps/NewApp closely enough to
 // exercise the same wiring this package will actually run with.
@@ -142,7 +151,7 @@ func newTestEnvWithConfigSamePool(t *testing.T, pool *pgxpool.Pool, mutate func(
 		mutate(&cfg)
 	}
 
-	create := uc.NewCreateUseCase(paymentsRepo, outboxRepo, bookingRepo, bookingItems, restRepo, registry, managers, txm, cfg)
+	create := uc.NewCreateUseCase(paymentsRepo, outboxRepo, bookingRepo, bookingItems, restRepo, noSpecialDays{}, registry, managers, txm, cfg)
 	capture := uc.NewCaptureUseCase(paymentsRepo, ledgerRepo, outboxRepo, registry, managers, txm)
 	void := uc.NewVoidUseCase(paymentsRepo, outboxRepo, registry, managers, txm)
 	refund := uc.NewRefundUseCase(paymentsRepo, refundsRepo, ledgerRepo, outboxRepo, registry, managers, bookingRepo, deadline, txm, cfg)

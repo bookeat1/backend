@@ -42,6 +42,7 @@ type createUseCase struct {
 	bookings    bookingReader
 	items       bookingItemReader
 	restaurants restaurantPaymentSettings
+	specialDays specialDayResolver
 	gateways    gatewayResolver
 	managers    managerChecker
 	tx          domain.TxManager
@@ -55,6 +56,7 @@ func NewCreateUseCase(
 	bookings bookingReader,
 	items bookingItemReader,
 	restaurants restaurantPaymentSettings,
+	specialDays specialDayResolver,
 	gateways gatewayResolver,
 	managers managerChecker,
 	tx domain.TxManager,
@@ -62,7 +64,8 @@ func NewCreateUseCase(
 ) CreateUseCase {
 	return &createUseCase{
 		payments: payments, outbox: outbox, bookings: bookings, items: items,
-		restaurants: restaurants, gateways: gateways, managers: managers, tx: tx, cfg: cfg.withDefaults(),
+		restaurants: restaurants, specialDays: specialDays, gateways: gateways,
+		managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
 }
 
@@ -110,6 +113,31 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	settings := resolveSettings(override, u.cfg)
 	if !settings.Enabled {
 		return nil, fmt.Errorf("%w: payments are not enabled for this restaurant", domain.ErrValidation)
+	}
+
+	// Paid special day (holidays/events). Bookings are FREE by default; if the
+	// restaurant marked the booking's calendar DATE as a paid special day
+	// (schedule override, booking_payment_required = true, migration 0036), a
+	// deposit of the override's amount is required to book that date. This is
+	// the single place the special-day decision is applied: it forces a deposit
+	// for THIS booking, overriding the venue's default free-booking behaviour,
+	// while leaving the ordinary deposit/preorder settings untouched for every
+	// normal day. The resulting deposit flows through the SAME hold/capture/void
+	// machinery as any other deposit (resolveAmount → PurposeDeposit).
+	specialPaid, specialDeposit, err := u.specialDays.PaidSpecialDayFor(ctx, booking.RestaurantID, booking.StartsAt)
+	if err != nil {
+		return nil, err
+	}
+	if specialPaid {
+		// The special-day deposit is authoritative for this date: the guest must
+		// prepay exactly the amount the venue set for that day. Forcing a deposit
+		// AND clearing any preorder-required flag makes resolveAmount
+		// deterministic here (PurposeDeposit, specialDeposit), so the charged
+		// amount is always the override's deposit — never a preorder total that
+		// happens to be configured on the same venue.
+		settings.DepositRequired = true
+		settings.DepositAmountMinor = specialDeposit
+		settings.PreorderPaymentRequired = false
 	}
 
 	purpose, base, err := u.resolveAmount(ctx, *booking, settings)

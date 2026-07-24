@@ -26,8 +26,18 @@ type ScheduleOverride struct {
 	OpenTime     *string
 	CloseTime    *string
 	Note         *string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// BookingPaymentRequired marks this special day as PAID: the guest must
+	// place a prepayment (deposit) to book on this date. Bookings are FREE by
+	// default (migration 0036) — false here means the day follows the
+	// restaurant's ordinary payment settings, true means a deposit of
+	// DepositAmountMinor is required to book that day.
+	BookingPaymentRequired bool
+	// DepositAmountMinor is the required prepayment for a paid special day, in
+	// int64 MINOR units (never a float). NULL/nil on a free day; a DB CHECK
+	// guarantees it is present and > 0 whenever BookingPaymentRequired is true.
+	DepositAmountMinor *int64
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // ScheduleOverrideRepository persists a restaurant's special-day overrides.
@@ -36,6 +46,15 @@ type ScheduleOverride struct {
 type ScheduleOverrideRepository interface {
 	// ListByRestaurant returns the venue's overrides ordered by date ascending.
 	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]ScheduleOverride, error)
+	// GetForBookingInstant returns the override whose override_date equals the
+	// CALENDAR DATE of `at` in the venue's own timezone (restaurants.timezone,
+	// falling back to fallbackTZ when the venue has no timezone set or it is not
+	// a recognized IANA name). It exists specifically for the prepayment
+	// decision on booking/payment creation: a booking is an instant, but a
+	// special day is a local calendar date, so the two must be compared in the
+	// venue's zone, not UTC. Returns ErrNotFound when the venue has no override
+	// for that date (a normal day).
+	GetForBookingInstant(ctx context.Context, restaurantID uuid.UUID, at time.Time, fallbackTZ string) (*ScheduleOverride, error)
 	// Upsert inserts or replaces the override for (restaurant_id, date). The
 	// unique key on that pair makes "set the override for this day" idempotent
 	// — a second call for the same day updates in place rather than duplicating.
