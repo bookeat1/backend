@@ -214,6 +214,15 @@ type freeCancelWindowRequest struct {
 	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes"`
 }
 
+// preorderSettingsRequest sets the venue's pre-order policy. min_amount_minor is
+// a pointer so an omitted field CLEARS the floor (null) and an explicit 0 is
+// distinguishable — both mean "no minimum" here, but the pointer keeps the DTO
+// honest about intent. enabled defaults to false when omitted.
+type preorderSettingsRequest struct {
+	Enabled        bool   `json:"enabled"`
+	MinAmountMinor *int64 `json:"min_amount_minor"`
+}
+
 // telegramChatRequest connects the venue's Telegram alert chat. The shape is
 // validated in the usecase (numeric chat id or @username).
 type telegramChatRequest struct {

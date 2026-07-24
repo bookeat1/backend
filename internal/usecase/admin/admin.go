@@ -86,6 +86,61 @@ func (u *UseCase) SetFreeCancelWindow(ctx context.Context, actor Actor, restaura
 	return u.paySettings.UpdateFreeCancelWindow(ctx, restaurantID, minutes)
 }
 
+// PreorderSettingsInput is the venue's pre-order policy. Enabled = the venue
+// requires pre-payment for pre-ordered dishes (restaurants.preorder_payment_required,
+// which usecase/payments.resolveAmount reads to charge the pre-order total as
+// PurposePreorder). MinAmountMinor is an OPTIONAL floor in int64 MINOR units
+// (nil = no minimum) enforced when a guest attaches a pre-order.
+type PreorderSettingsInput struct {
+	Enabled        bool
+	MinAmountMinor *int64
+}
+
+// PreorderSettingsView echoes the venue's stored pre-order policy back to the
+// panel. MinAmountMinor is nil when no floor is set.
+type PreorderSettingsView struct {
+	Enabled        bool
+	MinAmountMinor *int64
+}
+
+// maxPreorderMinAmountMinor bounds the configurable minimum (10,000,000 tiyn =
+// 100,000 KZT): a floor higher than any plausible table's pre-order is a
+// misconfiguration, not a policy. The DB CHECK only enforces >= 0.
+const maxPreorderMinAmountMinor int64 = 10_000_000
+
+// GetPreorderSettings returns the venue's current pre-order policy for the
+// panel. owner/manager (PermRestaurantManage).
+func (u *UseCase) GetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID) (PreorderSettingsView, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return PreorderSettingsView{}, err
+	}
+	override, err := u.paySettings.GetPaymentOverride(ctx, restaurantID)
+	if err != nil {
+		return PreorderSettingsView{}, err
+	}
+	view := PreorderSettingsView{MinAmountMinor: override.PreorderMinAmountMinor}
+	if override.PreorderPaymentRequired != nil {
+		view.Enabled = *override.PreorderPaymentRequired
+	}
+	return view, nil
+}
+
+// SetPreorderSettings updates the venue's pre-order policy: whether it requires
+// pre-payment for pre-ordered dishes and its optional minimum. owner/manager
+// (PermRestaurantManage). A negative or absurdly large minimum is rejected here
+// with 422 before it reaches the DB CHECK.
+func (u *UseCase) SetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID, in PreorderSettingsInput) error {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return err
+	}
+	if in.MinAmountMinor != nil {
+		if *in.MinAmountMinor < 0 || *in.MinAmountMinor > maxPreorderMinAmountMinor {
+			return fmt.Errorf("%w: preorder_min_amount_minor must be between 0 and %d", domain.ErrValidation, maxPreorderMinAmountMinor)
+		}
+	}
+	return u.paySettings.UpdatePreorderSettings(ctx, restaurantID, in.Enabled, in.MinAmountMinor)
+}
+
 // telegramChatIDPattern validates the shape of a Telegram chat id staff paste
 // in. Two accepted forms:
 //   - a numeric chat id: an optional leading '-' (groups/supergroups/channels

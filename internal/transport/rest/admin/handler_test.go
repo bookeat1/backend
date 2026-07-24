@@ -459,6 +459,14 @@ func (fakePaySettings) UpdateFreeCancelWindow(_ context.Context, _ uuid.UUID, _ 
 	return nil
 }
 
+func (fakePaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, _ bool, _ *int64) error {
+	return nil
+}
+
+func (fakePaySettings) GetPaymentOverride(_ context.Context, _ uuid.UUID) (domain.PaymentSettingsOverride, error) {
+	return domain.PaymentSettingsOverride{}, nil
+}
+
 // fakeTelegramSettings satisfies the admin usecase's telegramSettings port.
 type fakeTelegramSettings struct{}
 

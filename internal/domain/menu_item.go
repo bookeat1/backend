@@ -2,7 +2,11 @@ package domain
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +17,44 @@ var priceRe = regexp.MustCompile(`^\d+(\.\d{1,2})?$`)
 
 // ValidPrice reports whether s is a well-formed price string (e.g. "4500.00").
 func ValidPrice(s string) bool { return priceRe.MatchString(s) }
+
+// PriceStringToMinor converts a well-formed decimal price string (major units,
+// e.g. "4500.00" or "4500" or "4500.5") into int64 MINOR units (tiyn), i.e. it
+// multiplies by 100. It is exact: the integer and fractional parts are parsed
+// as separate integers, never through a float, so there is no rounding error
+// (a menu price of "0.10" is exactly 10 tiyn, not 9). It rejects anything that
+// is not a valid price (see ValidPrice) so a malformed column value can never
+// silently become a wrong amount a guest is charged. This is the single place
+// a menu price crosses from the stored decimal string into the money domain's
+// integer minor units — pre-order line prices are computed with it, never with
+// a client-sent amount.
+func PriceStringToMinor(s string) (int64, error) {
+	if !ValidPrice(s) {
+		return 0, fmt.Errorf("%w: malformed price %q", ErrValidation, s)
+	}
+	intPart, fracPart, hasFrac := strings.Cut(s, ".")
+	whole, err := strconv.ParseInt(intPart, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: price %q out of range", ErrValidation, s)
+	}
+	var cents int64
+	if hasFrac {
+		// ValidPrice guarantees 1..2 fractional digits; normalise to exactly 2.
+		if len(fracPart) == 1 {
+			fracPart += "0"
+		}
+		cents, err = strconv.ParseInt(fracPart, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: price %q out of range", ErrValidation, s)
+		}
+	}
+	// Guard the multiplication against overflow (a menu price is never anywhere
+	// near this, but an untrusted/corrupt column value must not wrap).
+	if whole > (math.MaxInt64-cents)/100 {
+		return 0, fmt.Errorf("%w: price %q too large", ErrValidation, s)
+	}
+	return whole*100 + cents, nil
+}
 
 // MenuItem is a dish on a restaurant's menu. Price is a decimal string
 // ("4500.00"). Category/Subcategory are free text (not FKs). Language is set

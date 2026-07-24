@@ -38,6 +38,10 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	// Payment settings: the money-path free-cancellation window.
 	rg.PUT("/admin/restaurants/:id/payment-settings/free-cancel-window", h.setFreeCancelWindow)
 
+	// Payment settings: the pre-order policy (offer pre-payment + optional minimum).
+	rg.GET("/admin/restaurants/:id/payment-settings/preorder", h.getPreorderSettings)
+	rg.PUT("/admin/restaurants/:id/payment-settings/preorder", h.setPreorderSettings)
+
 	// Notification settings: the venue's Telegram alert chat.
 	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
 	rg.PUT("/admin/restaurants/:id/notification-settings/telegram", h.setTelegramChat)
@@ -125,6 +129,42 @@ func (h *Handler) setFreeCancelWindow(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, freeCancelWindowResponse{FreeCancelWindowMinutes: *req.FreeCancelWindowMinutes})
+}
+
+// getPreorderSettings returns the venue's current pre-order policy. owner/manager
+// (restaurant.manage), enforced in the usecase.
+func (h *Handler) getPreorderSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	v, err := h.panel.GetPreorderSettings(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, preorderSettingsResponse{Enabled: v.Enabled, MinAmountMinor: v.MinAmountMinor})
+}
+
+// setPreorderSettings updates the venue's pre-order policy: whether it requires
+// pre-payment for pre-ordered dishes and its optional minimum. owner/manager
+// (restaurant.manage), enforced in the usecase.
+func (h *Handler) setPreorderSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req preorderSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	in := uc.PreorderSettingsInput{Enabled: req.Enabled, MinAmountMinor: req.MinAmountMinor}
+	if err := h.panel.SetPreorderSettings(c.Request.Context(), actor, rid, in); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, preorderSettingsResponse{Enabled: req.Enabled, MinAmountMinor: req.MinAmountMinor})
 }
 
 // ---- Notification settings (Telegram) --------------------------------------

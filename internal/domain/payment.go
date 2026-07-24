@@ -430,6 +430,14 @@ type PaymentSettingsOverride struct {
 	// struct a uniform "nil = use the global default" override shape and so an
 	// in-memory / test override can still say "inherit the default".
 	FreeCancelWindowMinutes *int
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total in
+	// int64 MINOR units (restaurants.preorder_min_amount_minor, migration 0042).
+	// nil = the venue set no minimum. It is NOT a global-fallback field (unlike
+	// the others, there is no env default): a NULL column simply means "no floor",
+	// which is why it stays only on the override and is absent from
+	// PaymentSettings. Enforced when a guest attaches a pre-order (usecase/preorder),
+	// not in the payment amount resolution.
+	PreorderMinAmountMinor *int64
 }
 
 // ---------------------------------------------------------------------------

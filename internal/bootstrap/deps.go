@@ -57,6 +57,7 @@ import (
 	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/payouts"
+	"backend-core/internal/usecase/preorder"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
@@ -91,6 +92,7 @@ type Deps struct {
 	AdminPanel         *admin.UseCase
 	Dashboard          *dashboard.UseCase
 	BookingExternal    bookings.ExternalReservationUseCase
+	Preorder           *preorder.UseCase
 	Issuer             *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
@@ -303,6 +305,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		Dashboard:        dashboardUC,
 		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
 			restRelated, restaurantManagers, txm),
+		// Pre-order (roadmap #1): the guest attaches menu items to a booking to be
+		// prepared and PAID FOR upfront. Reuses booking_items for the lines; the
+		// total it computes server-side (never a client amount) is what
+		// usecase/payments charges as PurposePreorder. menuItems = current price +
+		// availability lookup, restRepo = the venue's preorder minimum, paymentsRepo
+		// = the "already paid → frozen" guard.
+		Preorder: preorder.NewUseCase(bookingRepo, menuItems, bookingItems, restRepo,
+			restaurantManagers, paymentsRepo, txm),
 		Issuer: issuer,
 
 		PaymentsRepo:         paymentsRepo,

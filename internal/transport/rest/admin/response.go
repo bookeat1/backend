@@ -210,6 +210,13 @@ type freeCancelWindowResponse struct {
 	FreeCancelWindowMinutes int `json:"free_cancel_window_minutes"`
 }
 
+// preorderSettingsResponse reports the venue's pre-order policy. MinAmountMinor
+// is omitted (null) when no floor is set.
+type preorderSettingsResponse struct {
+	Enabled        bool   `json:"enabled"`
+	MinAmountMinor *int64 `json:"min_amount_minor"`
+}
+
 // telegramSettingsResponse reports the venue's Telegram alert configuration.
 type telegramSettingsResponse struct {
 	Connected      bool   `json:"connected"`
