@@ -23,6 +23,7 @@ import (
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
 	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
+	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
@@ -60,6 +61,7 @@ import (
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
+	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 )
 
@@ -111,6 +113,13 @@ type Deps struct {
 	PaymentWebhook       payments.WebhookUseCase
 	PaymentStatus        payments.StatusUseCase
 	PaymentDepositCancel payments.DepositCancellationUseCase
+
+	// Event ticketing (roadmap #2) — guest purchase + refund, admin sold view,
+	// own-tickets. Money flows through the payments contour above.
+	TicketPurchase tickets.PurchaseUseCase
+	TicketRefund   tickets.RefundUseCase
+	TicketAdmin    tickets.AdminUseCase
+	MyTickets      tickets.MyTicketsUseCase
 
 	// Payouts — restaurant settlement (выплаты заведениям). Destinations +
 	// generation + send + statement, all behind usecase RBAC.
@@ -220,9 +229,23 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	paymentVoid := payments.NewVoidUseCase(paymentsRepo, paymentOutboxRepo, paymentGateways, restaurantManagers, txm)
 	paymentRefund := payments.NewRefundUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, txm, paymentsCfg)
+	// Event ticketing (roadmap #2): tickets reuse the SAME payments contour as
+	// bookings. The ticket-payment usecase owns the money (gross-up, acquirer,
+	// ledger, refund CAS); the ticket observer projects a payment's status onto
+	// its ticket (pending→paid on capture, →cancelled on fail, →refunded on
+	// refund) and is hooked into the webhook so a ticket confirms through the
+	// exact same callback flow a booking does.
+	eventTicketsRepo := eventticketrepo.New(db)
+	ticketObserver := tickets.NewPaymentObserver(eventTicketsRepo)
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, txm)
+		paymentGateways, txm, payments.WithPaymentSubjectObserver(ticketObserver))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
+	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
+		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
+	ticketPurchase := tickets.NewPurchaseUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, paymentsRepo, txm)
+	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, ticketPayments)
+	ticketAdmin := tickets.NewAdminUseCase(eventTicketsRepo, eventrepo.New(db), restaurantManagers)
+	myTickets := tickets.NewMyTicketsUseCase(eventTicketsRepo)
 	// Deposit hold settlement on booking cancel / no-show (void-early /
 	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
 	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
@@ -318,6 +341,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentVoid:           paymentVoid,
 		PaymentRefund:         paymentRefund,
 		PaymentWebhook:        paymentWebhook,
+		TicketPurchase:        ticketPurchase,
+		TicketRefund:          ticketRefund,
+		TicketAdmin:           ticketAdmin,
+		MyTickets:             myTickets,
 		PaymentStatus:         paymentStatus,
 		PaymentDepositCancel:  paymentDepositCancel,
 		Payouts:               payoutUC,

@@ -26,12 +26,39 @@ type WebhookUseCase interface {
 }
 
 type webhookUseCase struct {
-	payments domain.PaymentRepository
-	events   domain.PaymentEventRepository
-	ledger   domain.PaymentLedgerRepository
-	outbox   domain.PaymentOutboxRepository
-	gateways gatewayResolver
-	tx       domain.TxManager
+	payments       domain.PaymentRepository
+	events         domain.PaymentEventRepository
+	ledger         domain.PaymentLedgerRepository
+	outbox         domain.PaymentOutboxRepository
+	gateways       gatewayResolver
+	tx             domain.TxManager
+	ticketObserver PaymentSubjectObserver
+}
+
+// PaymentSubjectObserver is notified after a webhook has successfully applied a
+// status change to a payment whose subject is NOT a booking (EventTicketID set).
+// It exists so the ticket layer can project the payment's new status onto its
+// ticket (pending→paid on capture, pending→cancelled on fail/expire/void,
+// paid→refunded) WITHOUT this package ever importing usecase/tickets and
+// WITHOUT forking the webhook. A booking payment (EventTicketID == nil) never
+// invokes it. It is an OPTIONAL dependency (WithPaymentSubjectObserver) —
+// existing callers pass none and behave exactly as before.
+type PaymentSubjectObserver interface {
+	// OnPaymentApplied projects p's current status onto its subject. Returning
+	// an error leaves the webhook event unprocessed so it is retried (the
+	// projection must not be silently lost), same contract as any other apply
+	// failure.
+	OnPaymentApplied(ctx context.Context, p *domain.Payment) error
+}
+
+// WebhookOption configures the webhook usecase without breaking positional
+// callers — same backward-compatible variadic-option pattern as
+// bookings.NewStatusUseCase's WithDepositSettler.
+type WebhookOption func(*webhookUseCase)
+
+// WithPaymentSubjectObserver wires a non-booking subject projection (tickets).
+func WithPaymentSubjectObserver(obs PaymentSubjectObserver) WebhookOption {
+	return func(u *webhookUseCase) { u.ticketObserver = obs }
 }
 
 // NewWebhookUseCase constructs the webhook-processing usecase.
@@ -42,8 +69,13 @@ func NewWebhookUseCase(
 	outbox domain.PaymentOutboxRepository,
 	gateways gatewayResolver,
 	tx domain.TxManager,
+	opts ...WebhookOption,
 ) WebhookUseCase {
-	return &webhookUseCase{payments: payments, events: events, ledger: ledger, outbox: outbox, gateways: gateways, tx: tx}
+	u := &webhookUseCase{payments: payments, events: events, ledger: ledger, outbox: outbox, gateways: gateways, tx: tx}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // HandleWebhook is the single entry point for every provider's callback
@@ -228,6 +260,20 @@ func (u *webhookUseCase) resolvePayment(ctx context.Context, provider domain.Pay
 // acknowledged and never read as "paid" (spec §7) — it is evidence, already
 // stored, waiting for a human.
 func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
+	if err := u.applyToPayment(ctx, gw, p, event); err != nil {
+		return err
+	}
+	// Project the payment's now-current status onto a non-booking subject (an
+	// event ticket). p.Status was updated in place by the handler above. A
+	// projection failure is returned so the webhook event stays unprocessed and
+	// is retried — the ticket must never silently diverge from its payment.
+	if u.ticketObserver != nil && p.EventTicketID != nil {
+		return u.ticketObserver.OnPaymentApplied(ctx, p)
+	}
+	return nil
+}
+
+func (u *webhookUseCase) applyToPayment(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
 	switch event.Type {
 	case domain.WebhookPaymentAuthorized:
 		return u.applyAuthorized(ctx, gw, p, event)
@@ -271,7 +317,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 	//     otherwise a failed pre-order capture is never retried and the money
 	//     is left as an uncaptured hold that auto-expires (silent revenue loss).
 	// A DEPOSIT is a plain created → authorized and is done once authorized.
-	if p.Purpose == domain.PurposePreorder {
+	if p.Purpose.CapturesImmediately() {
 		switch p.Status {
 		case domain.PaymentCaptured, domain.PaymentRefunded, domain.PaymentPartiallyRefunded:
 			return nil
@@ -321,7 +367,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 // webhook event unprocessed so it is retried, otherwise the food is prepared
 // while the money stays an uncaptured hold that silently auto-expires.
 func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) error {
-	if p.Purpose != domain.PurposePreorder {
+	if !p.Purpose.CapturesImmediately() {
 		return nil
 	}
 	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}

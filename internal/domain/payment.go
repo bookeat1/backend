@@ -191,11 +191,25 @@ const (
 	PurposeDeposit PaymentPurpose = "deposit"
 	// PurposePreorder is payment for pre-ordered menu items.
 	PurposePreorder PaymentPurpose = "preorder"
+	// PurposeTicket is payment for event tickets. Like a pre-order it is
+	// captured immediately on authorization (a ticket is paid-for-good, not a
+	// refundable hold) — see CapturesImmediately.
+	PurposeTicket PaymentPurpose = "ticket"
 )
 
 // Valid reports whether p is a known payment purpose.
 func (p PaymentPurpose) Valid() bool {
-	return p == PurposeDeposit || p == PurposePreorder
+	return p == PurposeDeposit || p == PurposePreorder || p == PurposeTicket
+}
+
+// CapturesImmediately reports whether a payment for this purpose is captured
+// the moment it is authorized (the webhook's applyAuthorized path), rather than
+// held until seating. A pre-order (the kitchen must cook) and a ticket (paid
+// for good) both capture immediately; a deposit stays a hold. This is the
+// single predicate the webhook branches on, so adding a new immediate-capture
+// purpose never means touching the state machine in more than one place.
+func (p PaymentPurpose) CapturesImmediately() bool {
+	return p == PurposePreorder || p == PurposeTicket
 }
 
 // Payment is one attempt to take money for a booking. RestaurantID and UserID
@@ -206,8 +220,17 @@ func (p PaymentPurpose) Valid() bool {
 // it too (chk_payments_amount_split). The server is the only party that ever
 // computes these numbers (spec §8).
 type Payment struct {
-	ID                uuid.UUID
-	BookingID         uuid.UUID
+	ID uuid.UUID
+	// BookingID is the booking this payment pays for, or uuid.Nil for a payment
+	// whose subject is an event ticket instead (EventTicketID set). Exactly one
+	// of BookingID / EventTicketID is set — enforced by chk_payments_subject.
+	// It stays a non-pointer uuid.UUID (uuid.Nil ⇔ SQL NULL, mapped in the
+	// postgres repo) so the whole booking-payment codebase is untouched; only
+	// the ticket path reads EventTicketID.
+	BookingID uuid.UUID
+	// EventTicketID is the event ticket this payment pays for, nil for a booking
+	// payment. See BookingID.
+	EventTicketID     *uuid.UUID
 	RestaurantID      uuid.UUID
 	UserID            *uuid.UUID // nil = guest checkout without an account
 	Provider          PaymentProvider

@@ -27,7 +27,7 @@ const paymentCols = `id, booking_id, restaurant_id, user_id, provider, provider_
 	expires_at, failure_code, failure_message,
 	settled_at, settled_trigger, settlement_idempotency_key,
 	status_changed_at, reconcile_attempts, last_reconcile_attempt_at, needs_manual_review,
-	created_at, updated_at`
+	created_at, updated_at, event_ticket_id`
 
 // liveStatuses mirrors domain.PaymentStatus.HoldsMoney and
 // idx_payments_live_per_booking exactly — keep all three in sync (the
@@ -55,7 +55,7 @@ func (r *Repository) Create(ctx context.Context, p *domain.Payment) error {
 	}
 	q := `INSERT INTO payments (` + paymentCols + `) VALUES (
 		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-		$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`
+		$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(p)...); err != nil {
 		return mapWrite(err, "create payment")
 	}
@@ -410,14 +410,25 @@ func (r *Repository) RecordReconcileAttempt(ctx context.Context, id uuid.UUID, e
 
 func (r *Repository) args(p *domain.Payment) []any {
 	return []any{
-		p.ID, p.BookingID, p.RestaurantID, p.UserID, string(p.Provider), p.ProviderPaymentID,
+		p.ID, nullableUUID(p.BookingID), p.RestaurantID, p.UserID, string(p.Provider), p.ProviderPaymentID,
 		string(p.Purpose), string(p.Status), p.AmountMinor, p.BaseAmountMinor, p.FeeMinor, string(p.Currency),
 		p.IdempotencyKey, p.PaymentURL, p.AuthorizedAt, p.CapturedAt, p.VoidedAt, p.FailedAt,
 		p.ExpiresAt, p.FailureCode, p.FailureMessage,
 		p.SettledAt, triggerToDB(p.SettledTrigger), p.SettlementIdempotencyKey,
 		p.StatusChangedAt, p.ReconcileAttempts, p.LastReconcileAttemptAt, p.NeedsManualReview,
-		p.CreatedAt, p.UpdatedAt,
+		p.CreatedAt, p.UpdatedAt, p.EventTicketID,
 	}
+}
+
+// nullableUUID maps a booking id to SQL: uuid.Nil (a ticket payment) becomes
+// NULL, any real id stays itself. This is what lets Payment.BookingID remain a
+// non-pointer uuid.UUID (uuid.Nil ⇔ NULL) so the entire booking-payment
+// codebase is untouched by the polymorphic-subject change.
+func nullableUUID(id uuid.UUID) any {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
 }
 
 func scanPayments(rows pgx.Rows) ([]domain.Payment, error) {
@@ -436,16 +447,22 @@ func scanPayment(row scanner) (*domain.Payment, error) {
 	var p domain.Payment
 	var provider, purpose, status, currency string
 	var settledTrigger *string
+	var bookingID *uuid.UUID
 	if err := row.Scan(
-		&p.ID, &p.BookingID, &p.RestaurantID, &p.UserID, &provider, &p.ProviderPaymentID,
+		&p.ID, &bookingID, &p.RestaurantID, &p.UserID, &provider, &p.ProviderPaymentID,
 		&purpose, &status, &p.AmountMinor, &p.BaseAmountMinor, &p.FeeMinor, &currency,
 		&p.IdempotencyKey, &p.PaymentURL, &p.AuthorizedAt, &p.CapturedAt, &p.VoidedAt, &p.FailedAt,
 		&p.ExpiresAt, &p.FailureCode, &p.FailureMessage,
 		&p.SettledAt, &settledTrigger, &p.SettlementIdempotencyKey,
 		&p.StatusChangedAt, &p.ReconcileAttempts, &p.LastReconcileAttemptAt, &p.NeedsManualReview,
-		&p.CreatedAt, &p.UpdatedAt,
+		&p.CreatedAt, &p.UpdatedAt, &p.EventTicketID,
 	); err != nil {
 		return nil, err
+	}
+	// NULL booking_id (a ticket payment) maps back to uuid.Nil; a real id is
+	// dereferenced. Mirrors nullableUUID on the write path.
+	if bookingID != nil {
+		p.BookingID = *bookingID
 	}
 	p.Provider = domain.PaymentProvider(provider)
 	p.Purpose = domain.PaymentPurpose(purpose)
