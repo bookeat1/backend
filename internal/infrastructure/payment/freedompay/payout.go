@@ -127,18 +127,37 @@ func (g *PayoutGateway) Payout(ctx context.Context, req domain.PayoutRequest) (*
 	status, known := mapPayoutStatus(values.Get("pg_payment_status"))
 	if !known {
 		// Envelope pg_status was ok (call() already checked it) but the money
-		// status word is absent/unrecognised: accepted, still processing. Never
-		// read as paid.
-		status = domain.PayoutSent
+		// status word is absent/unrecognised: accepted, still processing. NEVER
+		// read as paid, and — critically — never as a definite decline either.
+		// An ambiguous/unknown status stays `sent` for the reconciler to resolve.
 		g.log.Warn("freedompay payout accepted with unrecognised pg_payment_status, treating as processing",
 			slog.String("payout_id", req.PayoutID.String()),
 			slog.String("status", values.Get("pg_payment_status")),
 		)
+		return &domain.GatewayPayout{ProviderRef: providerRef, Status: domain.PayoutSent, Amount: req.Amount}, nil
+	}
+	if status == domain.PayoutFailed {
+		// A definite, MAPPED decline: the envelope said ok, but the money status
+		// (pg_payment_status=error/declined) is a known "no". The
+		// domain.PayoutGateway.Payout contract says a definite decline is an
+		// ERROR (ErrProviderDeclined), not a nil-error GatewayPayout{Failed} —
+		// returning the latter would land in the usecase's resolveSendSuccess
+		// default branch and silently leave the payout `sent`, delaying the
+		// claim release until the reconciler self-heals ~10 min later. Returning
+		// ErrProviderDeclined routes it into resolveSendError → markFailedAndRelease,
+		// which flips the payout to `failed` AND releases its claimed ledger
+		// entries in the SAME transaction, immediately.
+		g.log.Info("freedompay payout declined synchronously",
+			slog.String("payout_id", req.PayoutID.String()),
+			slog.String("status", values.Get("pg_payment_status")),
+		)
+		return nil, fmt.Errorf("freedompay reg2reg: declined (%s): %w",
+			sanitise(values.Get("pg_error_description")), domain.ErrProviderDeclined)
 	}
 
 	return &domain.GatewayPayout{
 		ProviderRef: providerRef,
-		Status:      status,
+		Status:      status, // PayoutPaid or PayoutSent (processing) only
 		Amount:      req.Amount,
 	}, nil
 }

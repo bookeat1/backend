@@ -118,6 +118,30 @@ func TestPayout_ProviderErrorIsDecline(t *testing.T) {
 	}
 }
 
+// TestPayout_EnvelopeOkButStatusErrorIsDecline guards the reviewed bug: reg2reg
+// can answer with a SUCCESSFUL envelope (pg_status=ok) but a FAILED money status
+// (pg_payment_status=error, e.g. an expired card token). That is a definite
+// decline and MUST surface as ErrProviderDeclined — not a nil-error
+// GatewayPayout{Failed} that the usecase would swallow into `sent`.
+func TestPayout_EnvelopeOkButStatusErrorIsDecline(t *testing.T) {
+	f := newFakeGateway(t, func(_ string, _ int, _ url.Values, w http.ResponseWriter) {
+		respond(w, "reg2reg", map[string]string{
+			"pg_status":            "ok", // envelope accepted…
+			"pg_payment_id":        "9000009",
+			"pg_payment_status":    "error", // …but the payout itself failed
+			"pg_error_description": "card token expired",
+		})
+	})
+	g := f.payoutGateway(t, slog.New(slog.DiscardHandler))
+	out, err := g.Payout(context.Background(), payoutRequest())
+	if out != nil {
+		t.Fatalf("a definite decline must not return a GatewayPayout, got %+v", out)
+	}
+	if !errors.Is(err, domain.ErrProviderDeclined) {
+		t.Fatalf("a mapped failed status must be a definite decline, got %v", err)
+	}
+}
+
 func TestPayout_UnsignedResponseIsUnknownNotPaid(t *testing.T) {
 	f := newFakeGateway(t, func(_ string, _ int, _ url.Values, w http.ResponseWriter) {
 		respondUnsigned(w, map[string]string{
