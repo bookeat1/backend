@@ -17,6 +17,7 @@ import (
 	adminrest "backend-core/internal/transport/rest/admin"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	consentrest "backend-core/internal/transport/rest/consent"
 	contentrest "backend-core/internal/transport/rest/content"
 	dashboardrest "backend-core/internal/transport/rest/dashboard"
 	eventsrest "backend-core/internal/transport/rest/events"
@@ -101,6 +102,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed.Use(middleware.LogUserContext())
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 	favoritesrest.NewHandler(deps.FavoritesFacade).RegisterRoutes(authed)
+	// Guest data-processing consent + notification opt-out. Authenticated and
+	// scoped to the caller's OWN user id (no restaurant/RBAC gate) — same
+	// own-user pattern as /users/me and /favorites.
+	consentrest.NewHandler(deps.ConsentFacade).RegisterRoutes(authed)
 	// "Which restaurants am I staff of" — the admin-panel post-login picker.
 	// Authenticated but NOT restaurant-scoped, so it mounts on the plain authed
 	// group (no RequireRestaurantManager gate); the usecase returns only the
