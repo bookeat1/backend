@@ -40,10 +40,11 @@ func legacyBookingStatus(old string) (domain.BookingStatus, bool) {
 //     (internal/auth/phone), never taken from the old row (the old table has no
 //     such column).
 //   - ends_at: the old system stores only a single booking_date; the new schema
-//     requires ends_at > starts_at. It is derived as starts_at + defaultDuration
-//     (BOOKING_DEFAULT_DURATION_MINUTES, 90m). This is a display window for
-//     historical rows, not a re-computation of the original reservation length,
-//     which the old system did not persist.
+//     requires ends_at > starts_at. It is derived as starts_at + duration, where
+//     duration is the venue's own booking_duration_minutes when set, else the env
+//     default (see resolveDuration). This is a display window for historical rows,
+//     not a re-computation of the original reservation length, which the old
+//     system did not persist.
 //   - source: old rows carry no source; created_by_admin picks admin vs app
 //     (both are valid new BookingSource values). Guest bookings from the old app
 //     become `app`, which is the truth we care about.
@@ -55,7 +56,7 @@ func legacyBookingStatus(old string) (domain.BookingStatus, bool) {
 //   - guests: the new schema enforces guests > 0. A non-positive value (none
 //     exist in the live data today) is reported so the Sink Skips+flags it
 //     rather than failing the CHECK.
-func mapBooking(l LegacyBooking, defaultDuration time.Duration) (Booking, bool) {
+func mapBooking(l LegacyBooking, duration time.Duration) (Booking, bool) {
 	status, ok := legacyBookingStatus(l.Status)
 	if !ok || l.Guests <= 0 {
 		return Booking{}, false
@@ -76,7 +77,7 @@ func mapBooking(l LegacyBooking, defaultDuration time.Duration) (Booking, bool) 
 		PhoneNormalized:        phone.Normalize(l.Phone),
 		Guests:                 l.Guests,
 		StartsAt:               l.BookingDate,
-		EndsAt:                 l.BookingDate.Add(defaultDuration),
+		EndsAt:                 l.BookingDate.Add(duration),
 		Status:                 string(status),
 		Source:                 string(source),
 		Notes:                  l.Notes,
@@ -104,13 +105,13 @@ func mapBooking(l LegacyBooking, defaultDuration time.Duration) (Booking, bool) 
 //     (ID == uuid.Nil) a deterministic UUIDv5 over (booking_id, table_id) is
 //     derived so re-runs are idempotent.
 //   - slot: the new table stores a tstzrange; it is built as
-//     [booking_date, booking_date+defaultDuration). No buffer is added — buffer
+//     [booking_date, booking_date+duration). No buffer is added — buffer
 //     is a live-placement concern, and omitting it minimises false collisions
 //     with the exclusion constraint on historical rows.
 //   - active: mirrors the new schema's own trigger rule — a hold is active only
 //     while the booking is pending/confirmed/arrived. Terminal bookings map to
 //     active=false, which also keeps them clear of the exclusion constraint.
-func mapBookingTable(l LegacyBookingTable, defaultDuration time.Duration) BookingTable {
+func mapBookingTable(l LegacyBookingTable, duration time.Duration) BookingTable {
 	id := l.ID
 	if id == uuid.Nil {
 		name := "booking_table:" + l.BookingID.String() + ":" + l.TableID.String()
@@ -122,14 +123,21 @@ func mapBookingTable(l LegacyBookingTable, defaultDuration time.Duration) Bookin
 		BookingID: l.BookingID,
 		TableID:   l.TableID,
 		SlotStart: l.BookingDate,
-		SlotEnd:   l.BookingDate.Add(defaultDuration),
+		SlotEnd:   l.BookingDate.Add(duration),
 		Active:    status.HoldsTable(),
 		CreatedAt: l.CreatedAt,
-		// The cursor uses the DERIVED id (unique per assignment), not the source
-		// id which is uuid.Nil for a synthesized row. The Source filters/orders
-		// booking_tables by updated_at only (it cannot compute the derived id in
-		// SQL); the worker sorts by this cursor and drops rows <= it, so the
-		// timestamp+id pair still walks each assignment exactly once.
-		Cur: Cursor{UpdatedAt: l.UpdatedAt, ID: id},
 	}
+}
+
+// resolveDuration mirrors cmd/etl/bookings.go resolveDurationMinutes: the venue's
+// booking_duration_minutes when set and positive, otherwise the env default. It
+// keeps ends_at and the booking_tables slot end consistent (same resolved value).
+func resolveDuration(durations map[uuid.UUID]int, restaurantID uuid.UUID, def time.Duration) time.Duration {
+	if m, ok := durations[restaurantID]; ok && m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	if def <= 0 {
+		return 90 * time.Minute
+	}
+	return def
 }

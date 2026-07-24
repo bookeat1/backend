@@ -75,15 +75,8 @@ func (f *fakeSource) Bookings(_ context.Context, c uc.Cursor, n int) ([]uc.Legac
 	return page(f.bookings, c, n, uc.LegacyBooking.Cursor), nil
 }
 func (f *fakeSource) BookingTables(_ context.Context, c uc.Cursor, n int) ([]uc.LegacyBookingTable, error) {
-	// The real adapter filters booking_tables by updated_at only (`>=`), leaving
-	// the id-precise skip to the worker; mirror that here.
-	var out []uc.LegacyBookingTable
-	for _, r := range f.btables {
-		if !r.UpdatedAt.Before(c.UpdatedAt) {
-			out = append(out, r)
-		}
-	}
-	return out, nil
+	// Mirror the real adapter's genuine keyset pagination on (updated_at, sort_id).
+	return page(f.btables, c, n, uc.LegacyBookingTable.Cursor), nil
 }
 
 var (
@@ -138,8 +131,8 @@ func newFakeSource() *fakeSource {
 		},
 		btables: []uc.LegacyBookingTable{
 			{ // explicit join row, active booking -> active hold with a slot
-				ID: bt1, BookingID: book1, TableID: tbl1, BookingDate: t0(10),
-				Status: "confirmed", CreatedAt: t0(2), UpdatedAt: t0(2),
+				ID: bt1, SortID: bt1, BookingID: book1, TableID: tbl1, RestaurantID: rest1,
+				BookingDate: t0(10), Status: "confirmed", CreatedAt: t0(2), UpdatedAt: t0(2),
 			},
 		},
 	}
@@ -357,8 +350,8 @@ func TestSyncBookingTableSynthesizedFromTableID(t *testing.T) {
 	// Emulate the real adapter's UNION arm for bookings.table_id: a synthesized
 	// row (ID == uuid.Nil) that the worker turns into a deterministic id.
 	src.btables = append(src.btables, uc.LegacyBookingTable{
-		ID: uuid.Nil, BookingID: book1, TableID: tbl1, BookingDate: t0(10),
-		Status: "confirmed", CreatedAt: t0(2), UpdatedAt: t0(2),
+		ID: uuid.Nil, SortID: book1, BookingID: book1, TableID: tbl1, RestaurantID: rest1,
+		BookingDate: t0(10), Status: "confirmed", CreatedAt: t0(2), UpdatedAt: t0(2),
 	})
 	w := newWorker(src, pool)
 	if err := w.Tick(ctx); err != nil {
@@ -374,5 +367,102 @@ func TestSyncBookingTableSynthesizedFromTableID(t *testing.T) {
 	}
 	if active != 1 {
 		t.Fatalf("active holds on tbl1=%d want 1 (exclusion constraint holds)", active)
+	}
+}
+
+func TestSyncBookingDurationFromRestaurant(t *testing.T) {
+	pool := testdb.Connect(t)
+	ctx := context.Background()
+	reset(t, pool)
+	src := newFakeSource()
+	// A second restaurant with no duration override -> its bookings fall back to
+	// the 90m default.
+	src.restaurants = append(src.restaurants, uc.Restaurant{
+		ID: rest2, Name: "Rest Two", Description: "d", CuisineType: "kz", Address: "a",
+		OpeningHours: "9-21", City: "Астана", PriceCategory: "₸", Email: "r2@x.kz",
+		Phone: "+7701", IsActive: true, CreatedAt: t0(1), UpdatedAt: t0(1),
+	})
+	w := newWorker(src, pool)
+	if err := w.Tick(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+
+	// Give rest1 a non-default duration in the NEW DB (the sync leaves it NULL by
+	// design; a real venue sets it via the admin). rest2 stays NULL.
+	if _, err := pool.Exec(ctx,
+		`UPDATE restaurants SET booking_duration_minutes=150 WHERE id=$1`, rest1); err != nil {
+		t.Fatalf("set duration: %v", err)
+	}
+
+	// New bookings for both restaurants.
+	src.bookings = append(src.bookings,
+		uc.LegacyBooking{ID: book3, RestaurantID: rest1, Name: "C", Phone: "8700",
+			Email: "c@x.kz", Guests: 2, BookingDate: t0(40), Status: "pending",
+			CreatedAt: t0(40), UpdatedAt: t0(40)},
+		uc.LegacyBooking{ID: book4, RestaurantID: rest2, Name: "D", Phone: "8700",
+			Email: "d@x.kz", Guests: 2, BookingDate: t0(41), Status: "pending",
+			CreatedAt: t0(41), UpdatedAt: t0(41)},
+	)
+	if err := w.Tick(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+
+	dur := func(id uuid.UUID) time.Duration {
+		var s, e time.Time
+		if err := pool.QueryRow(ctx, `SELECT starts_at, ends_at FROM bookings WHERE id=$1`, id).
+			Scan(&s, &e); err != nil {
+			t.Fatalf("read %v: %v", id, err)
+		}
+		return e.Sub(s)
+	}
+	if got := dur(book3); got != 150*time.Minute {
+		t.Errorf("book3 duration=%v want 150m (restaurant override)", got)
+	}
+	if got := dur(book4); got != 90*time.Minute {
+		t.Errorf("book4 duration=%v want 90m (default)", got)
+	}
+}
+
+// TestSyncBookingTablesKeysetNoLoss guards against the data-loss bug: many
+// booking_tables rows sharing ONE updated_at, more than a single batch holds.
+// With genuine keyset pagination on (updated_at, sort_id) every row is written
+// exactly once across ticks — none dropped at a batch boundary, none duplicated.
+func TestSyncBookingTablesKeysetNoLoss(t *testing.T) {
+	pool := testdb.Connect(t)
+	ctx := context.Background()
+	reset(t, pool)
+	src := newFakeSource()
+
+	const n = 5
+	sameTS := t0(2) // all share ONE updated_at instant
+	for i := 0; i < n; i++ {
+		tableID := uuid.MustParse("77777777-0000-0000-0000-00000000000" + string(rune('1'+i)))
+		btID := uuid.MustParse("88888888-0000-0000-0000-00000000000" + string(rune('1'+i)))
+		src.tables = append(src.tables, uc.Table{
+			ID: tableID, RestaurantID: rest1, Name: "T", Capacity: 2, IsActive: true,
+			CreatedAt: t0(1), UpdatedAt: t0(1),
+		})
+		src.btables = append(src.btables, uc.LegacyBookingTable{
+			ID: btID, SortID: btID, BookingID: book1, TableID: tableID, RestaurantID: rest1,
+			BookingDate: t0(10), Status: "confirmed", CreatedAt: sameTS, UpdatedAt: sameTS,
+		})
+	}
+
+	// Batch size 2 forces the shared-timestamp group to straddle batch boundaries.
+	log := logger.New("error", "text")
+	w := uc.NewWorker(src, legacysink.NewSink(pool), uc.Config{
+		TickInterval: time.Hour, BatchSize: 2, DefaultDuration: 90 * time.Minute,
+	}, log)
+
+	// Drain across as many ticks as needed.
+	for i := 0; i < 10; i++ {
+		if err := w.Tick(ctx); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+
+	// The original join row (bt1, book1->tbl1) plus the n new distinct-table rows.
+	if got := count(t, pool, "booking_tables"); got != n+1 {
+		t.Fatalf("booking_tables=%d want %d (every keyset row written exactly once)", got, n+1)
 	}
 }

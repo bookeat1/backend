@@ -198,25 +198,36 @@ LIMIT $3`
 func (s *Source) BookingTables(ctx context.Context, cur legacysync.Cursor, limit int) ([]legacysync.LegacyBookingTable, error) {
 	// Two old sources of table assignment: the (rarely used) booking_tables join
 	// table, and the per-booking bookings.table_id single-table pointer for
-	// bookings that have no join row. The synthesized rows' ids cannot be
-	// computed in SQL, so this filters/orders by updated_at only and the worker
-	// derives the ids, sorts, and drops rows at/behind the cursor. `>=` (not `>`)
-	// re-includes the cursor's own timestamp group; idempotent upserts make the
-	// small over-fetch harmless.
+	// bookings that have no join row.
+	//
+	// sort_id = bt.id for a join row, the booking id for a synthesized one. It is
+	// unique per row across both arms and available here in SQL (unlike the
+	// synthesized new-DB id), so the UNION is paginated with real keyset
+	// pagination on (updated_at, sort_id) > ($1, $2). This is a genuine,
+	// deterministic tie-break: rows sharing an updated_at can never straddle a
+	// batch boundary and be lost, exactly like every other entity's `(updated_at,
+	// id) > ...`. row_id is the join id (NULL for synthesized rows) — the worker
+	// reuses it as the new-DB id or derives one.
 	const q = `
-SELECT bt.id, bt.booking_id, bt.table_id, b.booking_date, b.status::text, bt.created_at, b.updated_at
-FROM booking_tables bt
-JOIN bookings b ON b.id = bt.booking_id
-WHERE b.updated_at >= $1::timestamptz
-UNION ALL
-SELECT NULL::uuid, b.id, b.table_id, b.booking_date, b.status::text, b.created_at, b.updated_at
-FROM bookings b
-WHERE b.table_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM booking_tables bt2 WHERE bt2.booking_id = b.id)
-  AND b.updated_at >= $1::timestamptz
-ORDER BY updated_at
-LIMIT $2`
-	rows, err := s.pool.Query(ctx, q, cur.UpdatedAt, limit)
+SELECT sort_id, row_id, booking_id, table_id, restaurant_id, booking_date, status, created_at, updated_at
+FROM (
+    SELECT bt.id AS sort_id, bt.id AS row_id, bt.booking_id, bt.table_id,
+           b.restaurant_id, b.booking_date, b.status::text AS status,
+           bt.created_at, b.updated_at
+    FROM booking_tables bt
+    JOIN bookings b ON b.id = bt.booking_id
+    UNION ALL
+    SELECT b.id AS sort_id, NULL::uuid AS row_id, b.id AS booking_id, b.table_id,
+           b.restaurant_id, b.booking_date, b.status::text,
+           b.created_at, b.updated_at
+    FROM bookings b
+    WHERE b.table_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM booking_tables bt2 WHERE bt2.booking_id = b.id)
+) u
+WHERE (u.updated_at, u.sort_id) > ($1::timestamptz, $2::uuid)
+ORDER BY u.updated_at, u.sort_id
+LIMIT $3`
+	rows, err := s.pool.Query(ctx, q, cur.UpdatedAt, cur.ID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -224,15 +235,15 @@ LIMIT $2`
 	var out []legacysync.LegacyBookingTable
 	for rows.Next() {
 		var (
-			bt legacysync.LegacyBookingTable
-			id *uuid.UUID
+			bt    legacysync.LegacyBookingTable
+			rowID *uuid.UUID
 		)
-		if err := rows.Scan(&id, &bt.BookingID, &bt.TableID, &bt.BookingDate,
-			&bt.Status, &bt.CreatedAt, &bt.UpdatedAt); err != nil {
+		if err := rows.Scan(&bt.SortID, &rowID, &bt.BookingID, &bt.TableID,
+			&bt.RestaurantID, &bt.BookingDate, &bt.Status, &bt.CreatedAt, &bt.UpdatedAt); err != nil {
 			return nil, err
 		}
-		if id != nil {
-			bt.ID = *id
+		if rowID != nil {
+			bt.ID = *rowID
 		}
 		out = append(out, bt)
 	}

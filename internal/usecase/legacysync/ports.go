@@ -82,6 +82,13 @@ type Sink interface {
 	GetCursor(ctx context.Context, entity string) (Cursor, error)
 	SetCursor(ctx context.Context, entity string, c Cursor) error
 
+	// RestaurantDurations returns per-restaurant booking_duration_minutes for the
+	// restaurants that have a set, positive override. Used to resolve a booking's
+	// ends_at / slot end from the venue's own duration (restaurants sync before
+	// bookings, so the value is already present), falling back to the env default
+	// for any restaurant not in the map.
+	RestaurantDurations(ctx context.Context) (map[uuid.UUID]int, error)
+
 	UpsertRestaurant(ctx context.Context, r Restaurant) (Outcome, error)
 	UpsertTable(ctx context.Context, t Table) (Outcome, error)
 	UpsertMenuCategory(ctx context.Context, c MenuCategory) (Outcome, error)
@@ -253,18 +260,28 @@ type Booking struct {
 // per-booking bookings.table_id single-table pointer. For a synthesized row
 // (from bookings.table_id) ID is uuid.Nil and the worker derives a deterministic
 // id from (booking_id, table_id).
+//
+// SortID is the keyset pagination key: bt.id for a join row, the booking id for
+// a synthesized row. It is unique per row across BOTH union arms and — unlike the
+// synthesized new-DB id — is available in SQL before mapping, so the Source can
+// paginate on (updated_at, sort_id) with a real, gap-free tie-break. Without it
+// two rows sharing an updated_at could straddle a batch boundary and be lost.
 type LegacyBookingTable struct {
-	ID          uuid.UUID // uuid.Nil => synthesized from bookings.table_id
-	BookingID   uuid.UUID
-	TableID     uuid.UUID
-	BookingDate time.Time // -> slot start
-	Status      string    // old booking status, decides `active`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time // = booking.updated_at
+	ID           uuid.UUID // uuid.Nil => synthesized from bookings.table_id
+	SortID       uuid.UUID // keyset tie-break (bt.id or booking id); never Nil
+	BookingID    uuid.UUID
+	TableID      uuid.UUID
+	RestaurantID uuid.UUID // booking's restaurant, for duration resolution
+	BookingDate  time.Time // -> slot start
+	Status       string    // old booking status, decides `active`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time // = booking.updated_at
 }
 
+// Cursor keys booking_tables on (updated_at, sort_id) — the same pair the Source
+// paginates on — so the worker advances exactly over what the next fetch returns.
 func (bt LegacyBookingTable) Cursor() Cursor {
-	return Cursor{UpdatedAt: bt.UpdatedAt, ID: bt.ID}
+	return Cursor{UpdatedAt: bt.UpdatedAt, ID: bt.SortID}
 }
 
 // BookingTable is a new-shaped booking_tables row, after mapping.
@@ -276,7 +293,4 @@ type BookingTable struct {
 	SlotEnd   time.Time
 	Active    bool
 	CreatedAt time.Time
-	// Cur is the cursor key for this row, carried through mapping because the
-	// synthesized id is computed here, not in the Source.
-	Cur Cursor
 }

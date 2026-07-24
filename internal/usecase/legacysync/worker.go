@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sort"
 	"time"
 
 	"backend-core/internal/logging"
@@ -225,15 +224,22 @@ func (w *Worker) syncMenuItems(ctx context.Context) (EntityResult, error) {
 		w.cfg.BatchSize, w.log)
 }
 
-// syncBookings wraps the generic loop with the raw->new mapping. A row whose
-// status is unrecognized or whose guest count is non-positive is dropped as
-// Skipped (logged), never coerced onto the booking.
+// syncBookings wraps the generic loop with the raw->new mapping. A booking's
+// ends_at is derived from its restaurant's booking_duration_minutes (loaded once
+// per pass; restaurants sync before bookings so the value is present), falling
+// back to the env default. A row whose status is unrecognized or whose guest
+// count is non-positive is dropped as Skipped (logged), never coerced.
 func (w *Worker) syncBookings(ctx context.Context) (EntityResult, error) {
+	durations, err := w.sink.RestaurantDurations(ctx)
+	if err != nil {
+		return EntityResult{Entity: EntityBookings}, err
+	}
 	fetch := func(ctx context.Context, cur Cursor, limit int) ([]LegacyBooking, error) {
 		return w.source.Bookings(ctx, cur, limit)
 	}
 	upsert := func(ctx context.Context, l LegacyBooking) (Outcome, error) {
-		b, ok := mapBooking(l, w.cfg.DefaultDuration)
+		dur := resolveDuration(durations, l.RestaurantID, w.cfg.DefaultDuration)
+		b, ok := mapBooking(l, dur)
 		if !ok {
 			w.log.Warn("legacy sync booking skipped (bad status or guest count)",
 				slog.String("booking_id", l.ID.String()),
@@ -247,74 +253,24 @@ func (w *Worker) syncBookings(ctx context.Context) (EntityResult, error) {
 		fetch, LegacyBooking.Cursor, upsert, w.cfg.BatchSize, w.log)
 }
 
-// syncBookingTables is the one entity that does not fit the generic loop: its
-// rows come from a UNION whose synthesized ids cannot be computed in SQL, so the
-// Source orders/filters by updated_at only and the worker computes ids, sorts by
-// the derived (updated_at, id) cursor, and drops rows already at/behind the
-// stored cursor. Idempotent upserts make the over-fetch harmless.
+// syncBookingTables uses the generic loop like every other entity: the Source
+// now paginates the UNION with genuine keyset pagination on (updated_at,
+// sort_id) — sort_id (bt.id or booking id) is unique per row and computable in
+// SQL, so a batch boundary is exhaustive and gap-free even when many rows share
+// one updated_at. The slot end uses the same per-restaurant resolved duration as
+// the booking's ends_at.
 func (w *Worker) syncBookingTables(ctx context.Context) (EntityResult, error) {
-	res := EntityResult{Entity: EntityBookingTables}
-	cur, err := w.sink.GetCursor(ctx, EntityBookingTables)
+	durations, err := w.sink.RestaurantDurations(ctx)
 	if err != nil {
-		return res, err
+		return EntityResult{Entity: EntityBookingTables}, err
 	}
-	raw, err := w.source.BookingTables(ctx, cur, w.cfg.BatchSize)
-	if err != nil {
-		return res, err
+	fetch := func(ctx context.Context, cur Cursor, limit int) ([]LegacyBookingTable, error) {
+		return w.source.BookingTables(ctx, cur, limit)
 	}
-
-	mapped := make([]BookingTable, 0, len(raw))
-	for _, l := range raw {
-		bt := mapBookingTable(l, w.cfg.DefaultDuration)
-		if !cursorAfter(bt.Cur, cur) {
-			continue // already synced at or before the stored cursor
-		}
-		mapped = append(mapped, bt)
+	upsert := func(ctx context.Context, l LegacyBookingTable) (Outcome, error) {
+		dur := resolveDuration(durations, l.RestaurantID, w.cfg.DefaultDuration)
+		return w.sink.UpsertBookingTable(ctx, mapBookingTable(l, dur))
 	}
-	sort.Slice(mapped, func(i, j int) bool {
-		return cursorAfter(mapped[j].Cur, mapped[i].Cur)
-	})
-	res.Fetched = len(mapped)
-
-	watermark := cur
-	contiguous := true
-	for _, bt := range mapped {
-		outcome, err := w.sink.UpsertBookingTable(ctx, bt)
-		if err != nil {
-			if werr := advanceCursor(ctx, w.sink, EntityBookingTables, cur, watermark); werr != nil {
-				return res, werr
-			}
-			return res, err
-		}
-		switch outcome {
-		case Written:
-			res.Written++
-			if contiguous {
-				watermark = bt.Cur
-			}
-		case Skipped:
-			res.Skipped++
-			if contiguous {
-				watermark = bt.Cur
-			}
-		case Parked:
-			res.Parked++
-			contiguous = false
-		}
-	}
-	if err := advanceCursor(ctx, w.sink, EntityBookingTables, cur, watermark); err != nil {
-		return res, err
-	}
-	return res, nil
-}
-
-// cursorAfter reports whether a is strictly after b in (updated_at, id) order.
-func cursorAfter(a, b Cursor) bool {
-	if a.UpdatedAt.After(b.UpdatedAt) {
-		return true
-	}
-	if a.UpdatedAt.Equal(b.UpdatedAt) {
-		return a.ID.String() > b.ID.String()
-	}
-	return false
+	return syncEntity(ctx, EntityBookingTables, w.sink,
+		fetch, LegacyBookingTable.Cursor, upsert, w.cfg.BatchSize, w.log)
 }

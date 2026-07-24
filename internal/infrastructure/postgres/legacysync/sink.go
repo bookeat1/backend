@@ -56,6 +56,32 @@ func exec(ctx context.Context, q sqltx.Querier, sql string, args ...any) (legacy
 	return legacysync.Written, nil
 }
 
+// RestaurantDurations returns booking_duration_minutes for every restaurant that
+// has a set, positive override. The worker resolves each booking's ends_at from
+// this (falling back to the env default), so a venue's own reservation length is
+// honoured — same rule as cmd/etl's resolveDurationMinutes.
+func (s *Sink) RestaurantDurations(ctx context.Context) (map[uuid.UUID]int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, booking_duration_minutes FROM restaurants
+		 WHERE booking_duration_minutes IS NOT NULL AND booking_duration_minutes > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[uuid.UUID]int)
+	for rows.Next() {
+		var (
+			id  uuid.UUID
+			min int
+		)
+		if err := rows.Scan(&id, &min); err != nil {
+			return nil, err
+		}
+		out[id] = min
+	}
+	return out, rows.Err()
+}
+
 func (s *Sink) GetCursor(ctx context.Context, entity string) (legacysync.Cursor, error) {
 	var (
 		cur legacysync.Cursor
