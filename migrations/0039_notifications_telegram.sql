@@ -36,12 +36,20 @@ ALTER TABLE notification_deliveries
 
 -- +goose Down
 
--- Drop telegram delivery markers first: their target_id is a restaurant id, not
--- a push_subscriptions id, so restoring the FK would otherwise fail on them.
-DELETE FROM notification_deliveries WHERE channel = 'telegram';
-
 ALTER TABLE notification_deliveries
     RENAME COLUMN target_id TO subscription_id;
+
+-- Before restoring the push-only FK, remove every row it could not accept:
+--   1. telegram markers — their subscription_id is a restaurant id, never a
+--      push_subscriptions id;
+--   2. orphaned web_push markers — the UP migration deliberately dropped the
+--      ON DELETE CASCADE, so a delivery row can outlive the subscription it
+--      references (the "harmless orphan" case documented above). Those orphans
+--      would now violate the restored FK, so they must go too.
+DELETE FROM notification_deliveries WHERE channel = 'telegram';
+DELETE FROM notification_deliveries
+    WHERE subscription_id NOT IN (SELECT id FROM push_subscriptions);
+
 ALTER TABLE notification_deliveries
     ADD CONSTRAINT notification_deliveries_subscription_id_fkey
         FOREIGN KEY (subscription_id) REFERENCES push_subscriptions (id) ON DELETE CASCADE;
