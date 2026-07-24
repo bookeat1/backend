@@ -336,3 +336,15 @@ on both servers, regenerate `/opt/bookeat/backups/rclone.conf` from the new
 values (same file, `access_key_id`/`secret_access_key`/`endpoint` lines), and
 run the backup script once by hand to confirm the new credentials work
 end-to-end before leaving it to cron.
+
+## Внимание: воркер запускать в ОДНОМ экземпляре
+
+Сервис `worker` (cmd/worker) должен работать строго в ОДНОМ экземпляре.
+Внутри него три цикла: автоподтверждение/неявки броней, сверка платежей и
+рассыльщик уведомлений. Все три используют `FOR UPDATE SKIP LOCKED` внутри
+короткой транзакции — это защищает от гонок между тиками ОДНОГО процесса, но
+не между двумя процессами. Если поднять `worker` в двух экземплярах
+(`docker compose up --scale worker=2`, k8s HPA и т.п.), два рассыльщика могут
+разослать одно и то же уведомление дважды, а сверка — дважды дёрнуть банк.
+НЕ масштабировать `worker` выше одной реплики, пока в claim не добавлена
+колонка-владелец (lease). Приложение (`app`) масштабируется свободно.
