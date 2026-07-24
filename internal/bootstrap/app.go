@@ -17,10 +17,13 @@ import (
 	adminrest "backend-core/internal/transport/rest/admin"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	contentrest "backend-core/internal/transport/rest/content"
+	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	paymentsrest "backend-core/internal/transport/rest/payments"
+	promosrest "backend-core/internal/transport/rest/promos"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
 	"backend-core/internal/transport/rest/swaggerui"
@@ -108,6 +111,23 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	reviewsHandler.RegisterPublic(api)
 	reviewsHandler.RegisterGuestRoutes(authed)
 	reviewsHandler.RegisterStaffRoutes(authed)
+
+	// Events & promos (Ф2). Public: a restaurant's published upcoming events +
+	// one event, and its active promos (no auth, localized). Admin CRUD and the
+	// content-draft review queue mount on the authenticated group — the RBAC
+	// gate (PermRestaurantManage at the entity's own restaurant) is resolved
+	// inside the usecase, same reason reviews' staff routes need no
+	// RequireRestaurantManager gate (the entity id, not a restaurant id,
+	// identifies the target).
+	eventsHandler := eventsrest.NewHandler(deps.EventsFacade)
+	eventsHandler.RegisterPublic(api)
+	eventsHandler.RegisterAdminRoutes(authed)
+
+	promosHandler := promosrest.NewHandler(deps.PromosFacade)
+	promosHandler.RegisterPublic(api)
+	promosHandler.RegisterAdminRoutes(authed)
+
+	contentrest.NewHandler(deps.ContentFacade).RegisterStaffRoutes(authed)
 
 	bookingHandler := bookingsrest.NewHandler(deps.BookingsFacade, deps.BookingCreate,
 		deps.BookingIdempotent, deps.BookingStatus, deps.BookingUpdate,
