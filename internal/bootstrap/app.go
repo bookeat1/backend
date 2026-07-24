@@ -22,6 +22,7 @@ import (
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
+	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	promosrest "backend-core/internal/transport/rest/promos"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -97,6 +98,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed.Use(middleware.LogUserContext())
 	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
 	favoritesrest.NewHandler(deps.FavoritesFacade).RegisterRoutes(authed)
+	// "Which restaurants am I staff of" — the admin-panel post-login picker.
+	// Authenticated but NOT restaurant-scoped, so it mounts on the plain authed
+	// group (no RequireRestaurantManager gate); the usecase returns only the
+	// caller's own memberships (a superadmin gets every venue).
+	myrestaurantsrest.NewHandler(deps.MyRestaurants).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)

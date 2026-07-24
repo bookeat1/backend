@@ -55,6 +55,7 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
+	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	FavoritesFacade    favorites.Facade
 	ReviewsFacade      reviews.Facade
 	EventsFacade       events.Facade
@@ -131,6 +132,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	menuCategories := menurepo.NewCategories(db)
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
+	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
 	favoritesRepo := favoriterepo.New(db)
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
 
@@ -221,6 +223,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersRepo:          usersRepo,
 		RestaurantsFacade:  restaurantsFacade,
 		RestaurantManagers: restaurantManagers,
+		MyRestaurants:      myRestaurants,
 		FavoritesFacade:    favoritesFacade,
 		ReviewsFacade:      reviewsFacade,
 		EventsFacade:       eventsFacade,

@@ -487,6 +487,31 @@ func escapeLike(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
+// ListManageableBrief returns a lightweight (id, name, name_i18n) row for EVERY
+// restaurant, ordered by name. It backs the superadmin variant of
+// GET /admin/my-restaurants: a superadmin manages the whole platform, so this
+// deliberately includes inactive and hidden-from-home venues (unlike the public
+// catalog reads). Returns an empty slice, not an error, when there are none.
+func (r *Repository) ListManageableBrief(ctx context.Context) ([]domain.RestaurantBrief, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, name, name_i18n FROM restaurants ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("list restaurants brief: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.RestaurantBrief
+	for rows.Next() {
+		var b domain.RestaurantBrief
+		var nameI18n []byte
+		if err := rows.Scan(&b.ID, &b.Name, &nameI18n); err != nil {
+			return nil, err
+		}
+		b.NameI18n = i18nFromDB(nameI18n)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // prefixed rewrites a bare column list into a table-qualified one.
 func prefixed(colList, alias string) string {
 	parts := strings.Split(colList, ",")
