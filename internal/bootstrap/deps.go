@@ -14,12 +14,15 @@ import (
 	"backend-core/internal/infrastructure/payment/freedompay"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
+	eventrepo "backend-core/internal/infrastructure/postgres/event"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
+	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
@@ -32,9 +35,12 @@ import (
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	"backend-core/internal/usecase/content"
+	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/payments"
+	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
 	"backend-core/internal/usecase/users"
@@ -50,6 +56,9 @@ type Deps struct {
 	RestaurantManagers restaurants.ManagerUseCase
 	FavoritesFacade    favorites.Facade
 	ReviewsFacade      reviews.Facade
+	EventsFacade       events.Facade
+	PromosFacade       promos.Facade
+	ContentFacade      content.Facade
 	MenuFacade         menu.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
@@ -125,6 +134,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingRepo := bookingrepo.New(db)
 	reviewsFacade := reviews.NewFacade(reviewrepo.New(db), bookingRepo, restManagers)
+
+	// Events & promos (Ф2): admin CRUD + public listings, both gated by the
+	// shared RBAC matrix (PermRestaurantManage) via restaurantManagers. The
+	// content-draft review queue reuses the same permission gate and creates
+	// the real published Event/Promo on approval inside one transaction (txm).
+	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers)
+	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers)
+	contentFacade := content.NewFacade(
+		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
 	bookingItems := bookingrepo.NewItems(db)
 	bookingMessages := bookingrepo.NewMessages(db)
@@ -195,6 +213,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantManagers: restaurantManagers,
 		FavoritesFacade:    favoritesFacade,
 		ReviewsFacade:      reviewsFacade,
+		EventsFacade:       eventsFacade,
+		PromosFacade:       promosFacade,
+		ContentFacade:      contentFacade,
 		MenuFacade:         menuFacade,
 		BookingsFacade:     bookingsFacade,
 		BookingCreate:      bookingCreate,
