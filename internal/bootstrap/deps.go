@@ -23,6 +23,7 @@ import (
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
+	notificationrepo "backend-core/internal/infrastructure/postgres/notification"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
@@ -35,6 +36,7 @@ import (
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/token"
+	"backend-core/internal/infrastructure/webpush"
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
@@ -43,6 +45,7 @@ import (
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/menu"
+	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
@@ -59,6 +62,7 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
+	PushSubscriptions  *notifications.SubscriptionUseCase
 	FavoritesFacade    favorites.Facade
 	ReviewsFacade      reviews.Facade
 	EventsFacade       events.Facade
@@ -137,6 +141,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
+	pushSubscriptions := notifications.NewSubscriptionUseCase(notificationrepo.NewSubscriptions(db), restManagers)
 	favoritesRepo := favoriterepo.New(db)
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
 
@@ -239,6 +244,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantsFacade:  restaurantsFacade,
 		RestaurantManagers: restaurantManagers,
 		MyRestaurants:      myRestaurants,
+		PushSubscriptions:  pushSubscriptions,
 		FavoritesFacade:    favoritesFacade,
 		ReviewsFacade:      reviewsFacade,
 		EventsFacade:       eventsFacade,
@@ -507,4 +513,47 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			MaxAttempts:      cfg.PaymentsReconciler.MaxAttempts,
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
 		}, log), nil
+}
+
+// NewNotificationDispatcher wires the background notification dispatcher: it
+// drains the booking transactional outbox and fans "booking.created" out to the
+// registered channel notifiers. Increment 1 registers exactly one channel, web
+// push. Deliberately separate from NewDeps (no HTTP stack) for the same reason
+// NewBookingWorker is.
+//
+// When the VAPID keys are absent the web-push notifier is built DISABLED: the
+// dispatcher still runs and drains the outbox, it just sends nothing until the
+// owner provisions PUSH_VAPID_PUBLIC_KEY / PUSH_VAPID_PRIVATE_KEY — the worker
+// never crashes for lack of keys.
+func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notifications.Dispatcher {
+	txm := sqltx.NewManager(db)
+
+	pushCfg := webpush.Config{
+		PublicKey:  cfg.Push.VAPIDPublicKey,
+		PrivateKey: cfg.Push.VAPIDPrivateKey,
+		Subject:    cfg.Push.VAPIDSubject,
+		TTL:        cfg.Push.TTL,
+	}
+	var sender notifications.PushSender
+	if pushCfg.Configured() {
+		sender = webpush.NewSender(pushCfg).Send
+	} else {
+		log.Warn("web push not configured (no VAPID keys) — the channel will no-op until PUSH_VAPID_* is set")
+	}
+
+	webPush := notifications.NewWebPushNotifier(
+		notificationrepo.NewSubscriptions(db),
+		notificationrepo.NewDeliveries(db),
+		notificationrepo.NewSettings(db),
+		sender,
+		pushCfg.Configured(),
+		log,
+	)
+
+	return notifications.NewDispatcher(
+		bookingrepo.NewOutbox(db), txm,
+		notifications.DispatcherConfig{
+			TickInterval: cfg.Push.DispatchTick,
+			BatchSize:    cfg.Push.DispatchBatch,
+		}, log, webPush)
 }

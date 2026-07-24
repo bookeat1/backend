@@ -33,6 +33,12 @@ type Config struct {
 	// is the next step once that adapter lands.
 	PaymentsReconciler PaymentsReconcilerConfig
 
+	// Push configures the web-push notification channel (VAPID keys) and the
+	// notification dispatcher worker. Absent VAPID keys make the channel a
+	// clean no-op — the dispatcher still runs and drains the outbox, it just
+	// sends nothing until the owner provisions keys.
+	Push PushConfig
+
 	// RateLimit configures middleware.RateLimit and the in-memory limiter
 	// backing it (per-client-IP request budgets, one per route tier — see
 	// that middleware's doc comment for which routes fall into which tier
@@ -227,6 +233,19 @@ type PaymentsReconcilerConfig struct {
 	ProviderMinGap   time.Duration // env: PAYMENTS_RECONCILE_PROVIDER_MIN_GAP
 }
 
+// PushConfig holds the web-push channel's VAPID keys and the notification
+// dispatcher's scheduling. The VAPID keys come from env only and are never
+// logged (same discipline as acquirer credentials). When the keys are absent
+// the web-push notifier is built disabled and no-ops cleanly.
+type PushConfig struct {
+	VAPIDPublicKey  string        // env: PUSH_VAPID_PUBLIC_KEY
+	VAPIDPrivateKey string        // env: PUSH_VAPID_PRIVATE_KEY
+	VAPIDSubject    string        // env: PUSH_VAPID_SUBJECT (mailto:/https: URL)
+	TTL             time.Duration // env: PUSH_TTL — push-service message retention
+	DispatchTick    time.Duration // env: NOTIFY_DISPATCH_TICK_INTERVAL
+	DispatchBatch   int           // env: NOTIFY_DISPATCH_BATCH_SIZE
+}
+
 func (p PostgresConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -315,6 +334,14 @@ func NewConfig() (Config, error) {
 			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
 			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
+		},
+		Push: PushConfig{
+			VAPIDPublicKey:  getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
+			VAPIDPrivateKey: getEnv("PUSH_VAPID_PRIVATE_KEY", ""),
+			VAPIDSubject:    getEnv("PUSH_VAPID_SUBJECT", ""),
+			TTL:             getEnvDuration("PUSH_TTL", 24*time.Hour),
+			DispatchTick:    getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
+			DispatchBatch:   getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
 		},
 		RateLimit: RateLimiterConfig{
 			RateLimitConfig: middleware.RateLimitConfig{
