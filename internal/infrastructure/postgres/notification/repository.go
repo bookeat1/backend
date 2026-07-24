@@ -94,12 +94,12 @@ func NewDeliveries(pool sqltx.Querier) *Deliveries { return &Deliveries{pool: po
 
 var _ domain.NotificationDeliveryRepository = (*Deliveries)(nil)
 
-func (r *Deliveries) AlreadyDelivered(ctx context.Context, outboxEventID uuid.UUID, channel domain.NotificationChannel, subscriptionID uuid.UUID) (bool, error) {
+func (r *Deliveries) AlreadyDelivered(ctx context.Context, outboxEventID uuid.UUID, channel domain.NotificationChannel, targetID uuid.UUID) (bool, error) {
 	var exists bool
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM notification_deliveries
-		                WHERE outbox_event_id=$1 AND channel=$2 AND subscription_id=$3)`,
-		outboxEventID, string(channel), subscriptionID).Scan(&exists)
+		                WHERE outbox_event_id=$1 AND channel=$2 AND target_id=$3)`,
+		outboxEventID, string(channel), targetID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("check notification delivery: %w", err)
 	}
@@ -108,13 +108,13 @@ func (r *Deliveries) AlreadyDelivered(ctx context.Context, outboxEventID uuid.UU
 
 // RecordDelivered writes the delivery marker. ON CONFLICT DO NOTHING makes it
 // safe under a redelivery race: a second recording of the same
-// (event, channel, subscription) is a no-op, never a unique-violation error.
-func (r *Deliveries) RecordDelivered(ctx context.Context, outboxEventID uuid.UUID, channel domain.NotificationChannel, subscriptionID uuid.UUID) error {
+// (event, channel, target) is a no-op, never a unique-violation error.
+func (r *Deliveries) RecordDelivered(ctx context.Context, outboxEventID uuid.UUID, channel domain.NotificationChannel, targetID uuid.UUID) error {
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`INSERT INTO notification_deliveries (id, outbox_event_id, channel, subscription_id, created_at)
+		`INSERT INTO notification_deliveries (id, outbox_event_id, channel, target_id, created_at)
 		 VALUES ($1,$2,$3,$4, now())
-		 ON CONFLICT (outbox_event_id, channel, subscription_id) DO NOTHING`,
-		uuid.New(), outboxEventID, string(channel), subscriptionID); err != nil {
+		 ON CONFLICT (outbox_event_id, channel, target_id) DO NOTHING`,
+		uuid.New(), outboxEventID, string(channel), targetID); err != nil {
 		return fmt.Errorf("record notification delivery: %w", err)
 	}
 	return nil
@@ -142,4 +142,56 @@ func (r *Settings) WebPushEnabled(ctx context.Context, restaurantID uuid.UUID) (
 		return false, fmt.Errorf("read notification settings: %w", err)
 	}
 	return enabled, nil
+}
+
+// TelegramSettings returns the venue's telegram target + toggle. A missing row
+// is TelegramSettings{ChatID: "", Enabled: true}: telegram defaults enabled but
+// is silent until a chat id is connected.
+func (r *Settings) TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
+	var chatID *string
+	var enabled bool
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT telegram_chat_id, telegram_enabled FROM restaurant_notification_settings WHERE restaurant_id=$1`,
+		restaurantID).Scan(&chatID, &enabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.TelegramSettings{ChatID: "", Enabled: true}, nil
+	}
+	if err != nil {
+		return domain.TelegramSettings{}, fmt.Errorf("read telegram settings: %w", err)
+	}
+	out := domain.TelegramSettings{Enabled: enabled}
+	if chatID != nil {
+		out.ChatID = *chatID
+	}
+	return out, nil
+}
+
+// SetTelegramChatID upserts the venue's telegram chat id and marks the channel
+// enabled. The row is created on first use (web_push_enabled keeps its column
+// default of true). Re-connecting a new chat id overwrites in place.
+func (r *Settings) SetTelegramChatID(ctx context.Context, restaurantID uuid.UUID, chatID string) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`INSERT INTO restaurant_notification_settings (restaurant_id, telegram_chat_id, telegram_enabled, updated_at)
+		 VALUES ($1, $2, true, now())
+		 ON CONFLICT (restaurant_id) DO UPDATE
+		   SET telegram_chat_id = EXCLUDED.telegram_chat_id,
+		       telegram_enabled = true,
+		       updated_at       = now()`,
+		restaurantID, chatID); err != nil {
+		return fmt.Errorf("set telegram chat id: %w", err)
+	}
+	return nil
+}
+
+// ClearTelegramChatID unsets the chat id, silencing the channel. Idempotent: a
+// venue with no settings row stays without one (nothing to clear).
+func (r *Settings) ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurant_notification_settings
+		    SET telegram_chat_id = NULL, updated_at = now()
+		  WHERE restaurant_id = $1`,
+		restaurantID); err != nil {
+		return fmt.Errorf("clear telegram chat id: %w", err)
+	}
+	return nil
 }

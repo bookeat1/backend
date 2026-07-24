@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,7 @@ type UseCase struct {
 	bookingList  bookingLister
 	bookingTx    bookingTransitioner
 	paySettings  paymentSettingsWriter
+	telegram     telegramSettings
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -51,11 +53,12 @@ func NewUseCase(
 	bookingList bookingLister,
 	bookingTx bookingTransitioner,
 	paySettings paymentSettingsWriter,
+	telegram telegramSettings,
 ) *UseCase {
 	return &UseCase{
 		perms: perms, restaurants: rest, menu: menu, workingHours: workingHours,
 		overrides: overrides, guests: guests, bookingList: bookingList, bookingTx: bookingTx,
-		paySettings: paySettings,
+		paySettings: paySettings, telegram: telegram,
 	}
 }
 
@@ -81,6 +84,52 @@ func (u *UseCase) SetFreeCancelWindow(ctx context.Context, actor Actor, restaura
 			domain.ErrValidation, minFreeCancelWindowMinutes, maxFreeCancelWindowMinutes)
 	}
 	return u.paySettings.UpdateFreeCancelWindow(ctx, restaurantID, minutes)
+}
+
+// telegramChatIDPattern validates the shape of a Telegram chat id staff paste
+// in. Two accepted forms:
+//   - a numeric chat id: an optional leading '-' (groups/supergroups/channels
+//     are negative) followed by up to 20 digits (a private user chat is a small
+//     positive id, a supergroup is like -1001234567890);
+//   - an '@username' for a public channel/group (5-32 chars after '@',
+//     letters/digits/underscore, must start with a letter).
+//
+// This is shape validation only — that the bot can actually reach the chat is
+// proven at send time (a wrong chat surfaces as a 400/403 the notifier logs).
+var telegramChatIDPattern = regexp.MustCompile(`^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$`)
+
+// SetTelegramChatID connects (or re-connects) the venue's Telegram alert chat:
+// the notifications bot will post "Новая бронь" there on each new booking. For
+// increment 1 staff paste the chat id directly (a "connect your Telegram"
+// deep-link / @start flow is future work). owner/manager (PermRestaurantManage).
+func (u *UseCase) SetTelegramChatID(ctx context.Context, actor Actor, restaurantID uuid.UUID, chatID string) error {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return err
+	}
+	chatID = strings.TrimSpace(chatID)
+	if !telegramChatIDPattern.MatchString(chatID) {
+		return fmt.Errorf("%w: telegram_chat_id must be a numeric chat id (e.g. -1001234567890) or an @username", domain.ErrValidation)
+	}
+	return u.telegram.SetTelegramChatID(ctx, restaurantID, chatID)
+}
+
+// ClearTelegramChatID disconnects the venue's Telegram alert chat, silencing the
+// channel. Idempotent. owner/manager (PermRestaurantManage).
+func (u *UseCase) ClearTelegramChatID(ctx context.Context, actor Actor, restaurantID uuid.UUID) error {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return err
+	}
+	return u.telegram.ClearTelegramChatID(ctx, restaurantID)
+}
+
+// GetTelegramSettings returns the venue's current Telegram target + toggle, so
+// the admin panel can show whether a chat is connected. owner/manager
+// (PermRestaurantManage).
+func (u *UseCase) GetTelegramSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return domain.TelegramSettings{}, err
+	}
+	return u.telegram.TelegramSettings(ctx, restaurantID)
 }
 
 // authorize is the single RBAC gate for every admin-panel action. A superadmin

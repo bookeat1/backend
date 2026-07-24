@@ -12,7 +12,8 @@ import (
 type NotificationChannel string
 
 const (
-	ChannelWebPush NotificationChannel = "web_push"
+	ChannelWebPush  NotificationChannel = "web_push"
+	ChannelTelegram NotificationChannel = "telegram"
 )
 
 // PushSubscription is a staff member's browser Web Push subscription, as handed
@@ -52,15 +53,39 @@ type PushSubscriptionRepository interface {
 // written only AFTER a successful send, so a crash between send and record
 // re-sends (a tolerated duplicate) rather than dropping a notification; the
 // AlreadyDelivered pre-check then stops a redelivery of the same outbox event
-// from re-notifying a subscription that already got it.
+// from re-notifying the same target that already got it.
+//
+// targetID is the channel-specific fan-out target: a push subscription id for
+// web push, the restaurant id for telegram (a venue has one chat). The ledger's
+// (outbox_event_id, channel, target_id) unique key makes the dedupe scoped per
+// channel, so the same booking event can still notify web push AND telegram.
 type NotificationDeliveryRepository interface {
-	AlreadyDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, subscriptionID uuid.UUID) (bool, error)
-	RecordDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, subscriptionID uuid.UUID) error
+	AlreadyDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, targetID uuid.UUID) (bool, error)
+	RecordDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, targetID uuid.UUID) error
+}
+
+// TelegramSettings is a venue's Telegram channel state: the chat id staff
+// connected (empty when unset) and whether the channel is enabled. The notifier
+// sends only when Enabled is true AND ChatID is non-empty.
+type TelegramSettings struct {
+	ChatID  string
+	Enabled bool
 }
 
 // RestaurantNotificationSettingsRepository backs the per-restaurant channel
-// toggle. Web push defaults to ON: a MISSING settings row means enabled, so
+// toggles. Web push defaults to ON: a MISSING settings row means enabled, so
 // WebPushEnabled returns true when the venue has never touched its settings.
+// Telegram defaults to enabled too, but has no target until a chat id is
+// connected, so a missing row leaves the telegram channel silent by default.
 type RestaurantNotificationSettingsRepository interface {
 	WebPushEnabled(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+	// TelegramSettings returns the venue's telegram target + toggle. A missing
+	// settings row is TelegramSettings{ChatID: "", Enabled: true}.
+	TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (TelegramSettings, error)
+	// SetTelegramChatID upserts the venue's telegram chat id (creating the
+	// settings row on first use) and marks the channel enabled.
+	SetTelegramChatID(ctx context.Context, restaurantID uuid.UUID, chatID string) error
+	// ClearTelegramChatID unsets the chat id, silencing the channel while
+	// preserving the rest of the venue's notification settings.
+	ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error
 }

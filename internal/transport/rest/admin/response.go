@@ -209,3 +209,10 @@ func guestToResponse(g domain.RestaurantGuest) guestResponse {
 type freeCancelWindowResponse struct {
 	FreeCancelWindowMinutes int `json:"free_cancel_window_minutes"`
 }
+
+// telegramSettingsResponse reports the venue's Telegram alert configuration.
+type telegramSettingsResponse struct {
+	Connected      bool   `json:"connected"`
+	TelegramChatID string `json:"telegram_chat_id"`
+	Enabled        bool   `json:"enabled"`
+}

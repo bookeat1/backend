@@ -149,6 +149,84 @@ func TestSettings_DefaultOnWhenNoRow(t *testing.T) {
 	}
 }
 
+func TestTelegramSettings_DefaultSetClear(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	rid := seedRestaurant(t, pool)
+	repo := NewSettings(pool)
+
+	// No row → enabled, no chat id (silent by default).
+	s, err := repo.TelegramSettings(ctx, rid)
+	if err != nil {
+		t.Fatalf("telegram settings (no row): %v", err)
+	}
+	if s.ChatID != "" || !s.Enabled {
+		t.Fatalf("default = %+v, want {ChatID:'' Enabled:true}", s)
+	}
+
+	// Connect a chat id → stored, enabled.
+	if err := repo.SetTelegramChatID(ctx, rid, "-1001234567890"); err != nil {
+		t.Fatalf("set chat id: %v", err)
+	}
+	s, _ = repo.TelegramSettings(ctx, rid)
+	if s.ChatID != "-1001234567890" || !s.Enabled {
+		t.Fatalf("after set = %+v, want chat -1001234567890 / enabled", s)
+	}
+	// Web push default must be untouched by connecting telegram.
+	if enabled, _ := repo.WebPushEnabled(ctx, rid); !enabled {
+		t.Fatal("connecting telegram must not disable web push (row default)")
+	}
+
+	// Re-connect a different chat id → overwrites in place.
+	if err := repo.SetTelegramChatID(ctx, rid, "@bookeat_venue"); err != nil {
+		t.Fatalf("re-set chat id: %v", err)
+	}
+	s, _ = repo.TelegramSettings(ctx, rid)
+	if s.ChatID != "@bookeat_venue" {
+		t.Fatalf("after re-set chat = %q, want @bookeat_venue", s.ChatID)
+	}
+
+	// Clear → silent again (chat id gone), row preserved.
+	if err := repo.ClearTelegramChatID(ctx, rid); err != nil {
+		t.Fatalf("clear chat id: %v", err)
+	}
+	s, _ = repo.TelegramSettings(ctx, rid)
+	if s.ChatID != "" {
+		t.Fatalf("after clear chat = %q, want empty", s.ChatID)
+	}
+}
+
+// The generalized ledger dedupes a telegram delivery keyed by the restaurant id
+// (its target), independently of any web_push delivery of the same event.
+func TestDeliveries_TelegramTargetDedupe(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	rid := seedRestaurant(t, pool)
+	eventID := seedOutboxEvent(t, pool, rid)
+
+	del := NewDeliveries(pool)
+	if already, _ := del.AlreadyDelivered(ctx, eventID, domain.ChannelTelegram, rid); already {
+		t.Fatal("nothing delivered yet, want false")
+	}
+	if err := del.RecordDelivered(ctx, eventID, domain.ChannelTelegram, rid); err != nil {
+		t.Fatalf("record telegram: %v", err)
+	}
+	// Idempotent on the same (event, telegram, restaurant).
+	if err := del.RecordDelivered(ctx, eventID, domain.ChannelTelegram, rid); err != nil {
+		t.Fatalf("record telegram again (ON CONFLICT): %v", err)
+	}
+	if already, _ := del.AlreadyDelivered(ctx, eventID, domain.ChannelTelegram, rid); !already {
+		t.Fatal("telegram delivery not recorded")
+	}
+	// A web_push delivery of the SAME event to the SAME target id is a DIFFERENT
+	// ledger row (channel is part of the key) — proves per-channel dedupe.
+	if already, _ := del.AlreadyDelivered(ctx, eventID, domain.ChannelWebPush, rid); already {
+		t.Fatal("telegram delivery must not mark web_push as delivered")
+	}
+}
+
 func TestDeliveries_DedupeOnConflict(t *testing.T) {
 	pool := testdb.Connect(t)
 	truncate(t, pool)

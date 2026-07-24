@@ -213,3 +213,9 @@ func parseTimeQuery(v string) (*time.Time, error) {
 type freeCancelWindowRequest struct {
 	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes"`
 }
+
+// telegramChatRequest connects the venue's Telegram alert chat. The shape is
+// validated in the usecase (numeric chat id or @username).
+type telegramChatRequest struct {
+	TelegramChatID string `json:"telegram_chat_id" binding:"required"`
+}
