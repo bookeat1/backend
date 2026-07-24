@@ -149,6 +149,7 @@ type harness struct {
 	bookList  *fakeBookingList
 	bookTx    *fakeBookingTx
 	paySet    *fakePaymentSettings
+	telegram  *fakeTelegramSettings
 }
 
 func newHarness(grant map[string]bool) *harness {
@@ -162,9 +163,44 @@ func newHarness(grant map[string]bool) *harness {
 		bookList:  &fakeBookingList{},
 		bookTx:    &fakeBookingTx{},
 		paySet:    &fakePaymentSettings{},
+		telegram:  &fakeTelegramSettings{},
 	}
-	h.uc = NewUseCase(h.perms, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, h.paySet)
+	h.uc = NewUseCase(h.perms, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, h.paySet, h.telegram)
 	return h
+}
+
+// fakeTelegramSettings records the venue's Telegram target writes.
+type fakeTelegramSettings struct {
+	stored     map[uuid.UUID]domain.TelegramSettings
+	setCalls   int
+	clearCalls int
+}
+
+func (f *fakeTelegramSettings) TelegramSettings(_ context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
+	if f.stored == nil {
+		return domain.TelegramSettings{Enabled: true}, nil
+	}
+	if s, ok := f.stored[restaurantID]; ok {
+		return s, nil
+	}
+	return domain.TelegramSettings{Enabled: true}, nil
+}
+
+func (f *fakeTelegramSettings) SetTelegramChatID(_ context.Context, restaurantID uuid.UUID, chatID string) error {
+	f.setCalls++
+	if f.stored == nil {
+		f.stored = map[uuid.UUID]domain.TelegramSettings{}
+	}
+	f.stored[restaurantID] = domain.TelegramSettings{ChatID: chatID, Enabled: true}
+	return nil
+}
+
+func (f *fakeTelegramSettings) ClearTelegramChatID(_ context.Context, restaurantID uuid.UUID) error {
+	f.clearCalls++
+	if f.stored != nil {
+		delete(f.stored, restaurantID)
+	}
+	return nil
 }
 
 // fakePaymentSettings records the last free-cancel-window write.
@@ -416,6 +452,59 @@ func TestSetFreeCancelWindow(t *testing.T) {
 	}
 	if hh.paySet.calls != 0 {
 		t.Fatalf("writer reached despite forbidden actor")
+	}
+}
+
+func TestSetTelegramChatID(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	// Manager holds restaurant.manage → allowed; a supergroup chat id is stored.
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	if err := h.uc.SetTelegramChatID(ctx, staffActor(uid), rid, "-1001234567890"); err != nil {
+		t.Fatalf("manager SetTelegramChatID: %v", err)
+	}
+	if h.telegram.setCalls != 1 {
+		t.Fatalf("writer got %d calls, want 1", h.telegram.setCalls)
+	}
+	if got := h.telegram.stored[rid].ChatID; got != "-1001234567890" {
+		t.Fatalf("stored chat id = %q, want -1001234567890", got)
+	}
+
+	// An @username is also accepted.
+	if err := h.uc.SetTelegramChatID(ctx, staffActor(uid), rid, "@bookeat_venue"); err != nil {
+		t.Fatalf("username chat id: %v", err)
+	}
+
+	// A malformed chat id is rejected BEFORE the writer is touched.
+	before := h.telegram.setCalls
+	for _, bad := range []string{"", "not a chat", "12.5", "@ab", "--10"} {
+		if err := h.uc.SetTelegramChatID(ctx, staffActor(uid), rid, bad); !errors.Is(err, domain.ErrValidation) {
+			t.Fatalf("chat id %q: got %v, want ErrValidation", bad, err)
+		}
+	}
+	if h.telegram.setCalls != before {
+		t.Fatalf("writer reached by a rejected chat id")
+	}
+
+	// A hostess (no restaurant.manage) is forbidden for both set and clear.
+	hh := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
+	if err := hh.uc.SetTelegramChatID(ctx, staffActor(uid), rid, "-1001234567890"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess SetTelegramChatID: got %v, want ErrForbidden", err)
+	}
+	if err := hh.uc.ClearTelegramChatID(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess ClearTelegramChatID: got %v, want ErrForbidden", err)
+	}
+	if hh.telegram.setCalls != 0 || hh.telegram.clearCalls != 0 {
+		t.Fatalf("writer reached despite forbidden actor")
+	}
+
+	// A manager can clear.
+	if err := h.uc.ClearTelegramChatID(ctx, staffActor(uid), rid); err != nil {
+		t.Fatalf("manager ClearTelegramChatID: %v", err)
+	}
+	if h.telegram.clearCalls != 1 {
+		t.Fatalf("clear writer got %d calls, want 1", h.telegram.clearCalls)
 	}
 }
 

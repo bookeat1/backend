@@ -156,13 +156,82 @@ func (f *fakeDeliveries) RecordDelivered(_ context.Context, ev uuid.UUID, ch dom
 	return nil
 }
 
-// fakeSettings toggles web push per restaurant; absent = enabled (default on).
-type fakeSettings struct{ disabled map[uuid.UUID]bool }
+// fakeSettings toggles web push and telegram per restaurant; absent = enabled
+// (default on). tgChat holds the connected telegram chat id per restaurant;
+// tgDisabled marks the telegram channel explicitly off.
+type fakeSettings struct {
+	disabled   map[uuid.UUID]bool
+	tgChat     map[uuid.UUID]string
+	tgDisabled map[uuid.UUID]bool
+}
 
-func newFakeSettings() *fakeSettings { return &fakeSettings{disabled: map[uuid.UUID]bool{}} }
+func newFakeSettings() *fakeSettings {
+	return &fakeSettings{
+		disabled:   map[uuid.UUID]bool{},
+		tgChat:     map[uuid.UUID]string{},
+		tgDisabled: map[uuid.UUID]bool{},
+	}
+}
 
 func (f *fakeSettings) WebPushEnabled(_ context.Context, restaurantID uuid.UUID) (bool, error) {
 	return !f.disabled[restaurantID], nil
+}
+
+func (f *fakeSettings) TelegramSettings(_ context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
+	return domain.TelegramSettings{
+		ChatID:  f.tgChat[restaurantID],
+		Enabled: !f.tgDisabled[restaurantID],
+	}, nil
+}
+
+func (f *fakeSettings) SetTelegramChatID(_ context.Context, restaurantID uuid.UUID, chatID string) error {
+	f.tgChat[restaurantID] = chatID
+	f.tgDisabled[restaurantID] = false
+	return nil
+}
+
+func (f *fakeSettings) ClearTelegramChatID(_ context.Context, restaurantID uuid.UUID) error {
+	delete(f.tgChat, restaurantID)
+	return nil
+}
+
+// recordingTelegramSender captures every (chatID, text) it was asked to send
+// and returns a scripted status/error per chat id.
+type recordingTelegramSender struct {
+	mu     sync.Mutex
+	sent   []telegramSend
+	status map[string]int   // default 200 when absent
+	errFor map[string]error // transport error per chat id
+}
+
+type telegramSend struct {
+	chatID string
+	text   string
+}
+
+func newRecordingTelegramSender() *recordingTelegramSender {
+	return &recordingTelegramSender{status: map[string]int{}, errFor: map[string]error{}}
+}
+
+func (s *recordingTelegramSender) send(_ context.Context, chatID, text string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, telegramSend{chatID: chatID, text: text})
+	if err := s.errFor[chatID]; err != nil {
+		return 0, err
+	}
+	if st, ok := s.status[chatID]; ok {
+		return st, nil
+	}
+	return 200, nil
+}
+
+func (s *recordingTelegramSender) sends() []telegramSend {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]telegramSend, len(s.sent))
+	copy(out, s.sent)
+	return out
 }
 
 // recordingSender captures every (subscription) it was asked to push to and

@@ -38,6 +38,11 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	// Payment settings: the money-path free-cancellation window.
 	rg.PUT("/admin/restaurants/:id/payment-settings/free-cancel-window", h.setFreeCancelWindow)
 
+	// Notification settings: the venue's Telegram alert chat.
+	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
+	rg.PUT("/admin/restaurants/:id/notification-settings/telegram", h.setTelegramChat)
+	rg.DELETE("/admin/restaurants/:id/notification-settings/telegram", h.clearTelegramChat)
+
 	// Menu.
 	rg.GET("/admin/restaurants/:id/menu", h.listMenu)
 	rg.GET("/admin/restaurants/:id/menu-categories", h.listCategories)
@@ -120,6 +125,65 @@ func (h *Handler) setFreeCancelWindow(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, freeCancelWindowResponse{FreeCancelWindowMinutes: *req.FreeCancelWindowMinutes})
+}
+
+// ---- Notification settings (Telegram) --------------------------------------
+
+// getTelegramSettings returns whether the venue has a Telegram alert chat
+// connected and whether the channel is enabled. owner/manager
+// (restaurant.manage), enforced in the usecase.
+func (h *Handler) getTelegramSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	s, err := h.panel.GetTelegramSettings(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, telegramSettingsResponse{
+		Connected:      s.ChatID != "",
+		TelegramChatID: s.ChatID,
+		Enabled:        s.Enabled,
+	})
+}
+
+// setTelegramChat connects the venue's Telegram alert chat. For increment 1 the
+// staff paste the chat id directly. owner/manager (restaurant.manage).
+func (h *Handler) setTelegramChat(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req telegramChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if err := h.panel.SetTelegramChatID(c.Request.Context(), actor, rid, req.TelegramChatID); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, telegramSettingsResponse{
+		Connected:      true,
+		TelegramChatID: req.TelegramChatID,
+		Enabled:        true,
+	})
+}
+
+// clearTelegramChat disconnects the venue's Telegram alert chat. Idempotent.
+// owner/manager (restaurant.manage).
+func (h *Handler) clearTelegramChat(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	if err := h.panel.ClearTelegramChatID(c.Request.Context(), actor, rid); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, gin.H{"status": "cleared"})
 }
 
 // ---- Menu ------------------------------------------------------------------

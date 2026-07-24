@@ -48,6 +48,16 @@ type paymentSettingsWriter interface {
 	UpdateFreeCancelWindow(ctx context.Context, restaurantID uuid.UUID, minutes int) error
 }
 
+// telegramSettings is the slice of the notification-settings repo this package
+// needs to manage a venue's Telegram alert target. The chat-id shape is
+// validated in the usecase, not the DB. Implemented by
+// *notification.Settings (internal/infrastructure/postgres/notification).
+type telegramSettings interface {
+	TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error)
+	SetTelegramChatID(ctx context.Context, restaurantID uuid.UUID, chatID string) error
+	ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error
+}
+
 // menuStore is the slice of menu.Facade this package needs. Every mutating
 // method takes restaurantID and enforces item ownership against it (IDOR guard
 // lives in menu.Facade / the repo's restaurant_id predicate).

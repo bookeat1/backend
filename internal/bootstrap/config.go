@@ -244,6 +244,10 @@ type PushConfig struct {
 	TTL             time.Duration // env: PUSH_TTL — push-service message retention
 	DispatchTick    time.Duration // env: NOTIFY_DISPATCH_TICK_INTERVAL
 	DispatchBatch   int           // env: NOTIFY_DISPATCH_BATCH_SIZE
+	// TelegramBotToken is the BookEat notifications bot token. Read from env
+	// only and never logged (a bot credential). Absent → the telegram channel
+	// no-ops cleanly, exactly like absent VAPID keys for web push.
+	TelegramBotToken string // env: TELEGRAM_NOTIFY_BOT_TOKEN
 }
 
 func (p PostgresConfig) DSN() string {
@@ -336,12 +340,13 @@ func NewConfig() (Config, error) {
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
 		},
 		Push: PushConfig{
-			VAPIDPublicKey:  getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
-			VAPIDPrivateKey: getEnv("PUSH_VAPID_PRIVATE_KEY", ""),
-			VAPIDSubject:    getEnv("PUSH_VAPID_SUBJECT", ""),
-			TTL:             getEnvDuration("PUSH_TTL", 24*time.Hour),
-			DispatchTick:    getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
-			DispatchBatch:   getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
+			VAPIDPublicKey:   getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
+			VAPIDPrivateKey:  getEnv("PUSH_VAPID_PRIVATE_KEY", ""),
+			VAPIDSubject:     getEnv("PUSH_VAPID_SUBJECT", ""),
+			TTL:              getEnvDuration("PUSH_TTL", 24*time.Hour),
+			DispatchTick:     getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
+			DispatchBatch:    getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
+			TelegramBotToken: getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
 		},
 		RateLimit: RateLimiterConfig{
 			RateLimitConfig: middleware.RateLimitConfig{

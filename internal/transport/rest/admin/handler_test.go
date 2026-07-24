@@ -186,7 +186,7 @@ func newHarness(allow, manages bool) *harness {
 		overrides: &fakeOverrides{}, guests: &fakeGuests{},
 		bookList: &fakeBookingList{}, bookTx: &fakeBookingTx{},
 	}
-	uc := adminuc.NewUseCase(fakePerms{allow: allow}, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, fakePaySettings{})
+	uc := adminuc.NewUseCase(fakePerms{allow: allow}, h.rest, h.menu, h.wh, h.overrides, h.guests, h.bookList, h.bookTx, fakePaySettings{}, fakeTelegramSettings{})
 
 	r := gin.New()
 	api := r.Group("/api/v1")
@@ -456,5 +456,20 @@ func TestUnauthenticated(t *testing.T) {
 type fakePaySettings struct{}
 
 func (fakePaySettings) UpdateFreeCancelWindow(_ context.Context, _ uuid.UUID, _ int) error {
+	return nil
+}
+
+// fakeTelegramSettings satisfies the admin usecase's telegramSettings port.
+type fakeTelegramSettings struct{}
+
+func (fakeTelegramSettings) TelegramSettings(_ context.Context, _ uuid.UUID) (domain.TelegramSettings, error) {
+	return domain.TelegramSettings{Enabled: true}, nil
+}
+
+func (fakeTelegramSettings) SetTelegramChatID(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
+func (fakeTelegramSettings) ClearTelegramChatID(_ context.Context, _ uuid.UUID) error {
 	return nil
 }

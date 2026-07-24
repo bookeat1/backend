@@ -38,6 +38,7 @@ import (
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	"backend-core/internal/infrastructure/sqltx"
+	"backend-core/internal/infrastructure/telegramnotify"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/webpush"
 	"backend-core/internal/usecase/admin"
@@ -237,7 +238,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	adminPanel := admin.NewUseCase(
 		restaurantManagers, restaurantsFacade, menuFacade, restRelated,
 		scheduleRepo, guestrepo.New(db), bookingsFacade, bookingStatus,
-		restRepo, // paymentSettingsWriter: edits free_cancel_window_minutes
+		restRepo,                         // paymentSettingsWriter: edits free_cancel_window_minutes
+		notificationrepo.NewSettings(db), // telegramSettings: connects/clears the venue's Telegram alert chat
 	)
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -620,10 +622,28 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		log,
 	)
 
+	// Telegram channel: a second notifier on the SAME dispatcher, dedupe ledger
+	// and per-restaurant toggle. Absent TELEGRAM_NOTIFY_BOT_TOKEN → built
+	// disabled and no-ops (like web push without VAPID keys).
+	tgCfg := telegramnotify.Config{BotToken: cfg.Push.TelegramBotToken}
+	var tgSender notifications.TelegramSender
+	if tgCfg.Configured() {
+		tgSender = telegramnotify.NewSender(tgCfg).Send
+	} else {
+		log.Warn("telegram notifications not configured (no bot token) — the channel will no-op until TELEGRAM_NOTIFY_BOT_TOKEN is set")
+	}
+	telegram := notifications.NewTelegramNotifier(
+		notificationrepo.NewSettings(db),
+		notificationrepo.NewDeliveries(db),
+		tgSender,
+		tgCfg.Configured(),
+		log,
+	)
+
 	return notifications.NewDispatcher(
 		bookingrepo.NewOutbox(db), txm,
 		notifications.DispatcherConfig{
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
-		}, log, webPush)
+		}, log, webPush, telegram)
 }
