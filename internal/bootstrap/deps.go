@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/legacysource"
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
 	"backend-core/internal/infrastructure/payment/freedompay"
@@ -25,6 +26,7 @@ import (
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
+	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	notificationrepo "backend-core/internal/infrastructure/postgres/notification"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
@@ -50,6 +52,7 @@ import (
 	"backend-core/internal/usecase/dashboard"
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
+	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
@@ -654,4 +657,34 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
 		}, log, webPush, telegram)
+}
+
+// NewLegacySyncWorker wires cmd/worker's one-way legacy sync. It opens a
+// SEPARATE, read-only pool to the OLD database (LEGACY_DB_URL) and upserts into
+// the new-DB pool `db`. When LEGACY_DB_URL is empty the sync is disabled: this
+// returns (nil, nil, nil) and RunWorker simply never starts the loop — a clean
+// no-op, the same discipline as the other optional workers.
+//
+// The returned closer owns the legacy pool; RunWorker calls it on shutdown. The
+// connection string is a credential and is never logged.
+func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legacysync.Worker, func(), error) {
+	if cfg.LegacySync.DatabaseURL == "" {
+		log.Info("legacy sync disabled (LEGACY_DB_URL unset)")
+		return nil, nil, nil
+	}
+	pool, err := legacysource.OpenReadOnlyPool(context.Background(), cfg.LegacySync.DatabaseURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open legacy source: %w", err)
+	}
+	worker := legacysync.NewWorker(
+		legacysource.NewSource(pool),
+		legacysink.NewSink(db),
+		legacysync.Config{
+			TickInterval:    cfg.LegacySync.TickInterval,
+			BatchSize:       cfg.LegacySync.BatchSize,
+			DefaultDuration: cfg.Booking.DefaultDuration,
+		},
+		log,
+	)
+	return worker, pool.Close, nil
 }
