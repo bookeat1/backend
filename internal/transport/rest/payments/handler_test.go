@@ -280,7 +280,8 @@ func TestCreatePayment_GuestAnonymousCheckout(t *testing.T) {
 	if resp.AmountMinor != 10363 {
 		t.Errorf("amount_minor = %d, want 10363 (gross-up for 3.5%% acquirer)", resp.AmountMinor)
 	}
-	if net := resp.AmountMinor - (resp.AmountMinor*350)/10_000; net < 10000 {
+	// Worst-case acquirer cut (ceiling): the venue still nets the full deposit.
+	if net := resp.AmountMinor - (resp.AmountMinor*350+9_999)/10_000; net < 10000 {
 		t.Errorf("net to venue %d < deposit 10000 — venue is short", net)
 	}
 }

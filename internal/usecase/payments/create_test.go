@@ -72,9 +72,11 @@ func TestCreateForBooking_HappyPath(t *testing.T) {
 		t.Fatalf("amount %d != base+fee %d", p.AmountMinor, p.BaseAmountMinor+p.FeeMinor)
 	}
 	// The venue-made-whole property: after the acquirer withholds 3.5% of the
-	// TOTAL, the venue still nets at least the full base.
-	netToVenue := p.AmountMinor - (p.AmountMinor*350)/10_000
-	if netToVenue < p.BaseAmountMinor {
+	// TOTAL, the venue still nets at least the full base. Model the acquirer's
+	// cut with CEILING (worst case for the venue: the acquirer rounds its own
+	// fee up), matching the domain property test.
+	acquirerCut := (p.AmountMinor*350 + 9_999) / 10_000
+	if netToVenue := p.AmountMinor - acquirerCut; netToVenue < p.BaseAmountMinor {
 		t.Fatalf("net to venue %d < base %d — venue is short", netToVenue, p.BaseAmountMinor)
 	}
 	if p.PaymentURL == nil || *p.PaymentURL == "" {
