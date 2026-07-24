@@ -46,11 +46,24 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// no payout is stale — Tick returns immediately.
 	payoutReconciler := NewPayoutReconciler(cfg, db, log)
 
+	// The legacy one-way sync (old Supabase -> new DB) is started only when
+	// LEGACY_DB_URL is set. When it is unset legacySync is nil and the loop is
+	// simply never started — a clean no-op, same discipline as the other
+	// optional workers. closeLegacy owns the separate read-only pool to the old
+	// database and is called on shutdown.
+	legacySync, closeLegacy, err := NewLegacySyncWorker(cfg, db, log)
+	if err != nil {
+		return fmt.Errorf("build legacy sync worker: %w", err)
+	}
+	if closeLegacy != nil {
+		defer closeLegacy()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr, notifyErr, payoutErr error
+	var bookingErr, paymentsErr, notifyErr, payoutErr, legacyErr error
 	wg.Add(4)
 	go func() {
 		defer wg.Done()
@@ -68,6 +81,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer wg.Done()
 		payoutErr = payoutReconciler.Run(ctx)
 	}()
+	if legacySync != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			legacyErr = legacySync.Run(ctx)
+		}()
+	}
 	wg.Wait()
 
 	if bookingErr != nil {
@@ -81,6 +101,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if payoutErr != nil {
 		return fmt.Errorf("payout reconciler: %w", payoutErr)
+	}
+	if legacyErr != nil {
+		return fmt.Errorf("legacy sync: %w", legacyErr)
 	}
 	return nil
 }

@@ -42,4 +42,10 @@ const (
 	EventPaymentReconcileResolved     = "payment.reconcile_resolved"      // one stuck payment/refund reached a terminal-for-now state
 	EventPaymentReconcileUnknown      = "payment.reconcile_unknown"       // acquirer answer still does not let us decide
 	EventPaymentReconcileManualReview = "payment.reconcile_manual_review" // attempts exhausted, needs a human
+
+	// Legacy one-way sync (cmd/worker's legacysync loop). LegacySyncTick is one
+	// pass summary per entity: fetched / written / parked (parent not synced
+	// yet, retried next tick) / skipped (a source row that can never land, e.g.
+	// an overlapping table hold — logged and stepped over, never retried).
+	EventLegacySyncTick = "legacy_sync.tick"
 )

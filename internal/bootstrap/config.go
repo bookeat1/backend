@@ -39,6 +39,13 @@ type Config struct {
 	// sends nothing until the owner provisions keys.
 	Push PushConfig
 
+	// LegacySync configures the one-way data sync from the OLD BookEat system
+	// (the live Supabase Postgres guests still book on during "Вариант Б") into
+	// this backend. When LEGACY_DB_URL is empty the sync never starts — a clean
+	// no-op, exactly like the other optional workers when their credentials are
+	// absent.
+	LegacySync LegacySyncConfig
+
 	// RateLimit configures middleware.RateLimit and the in-memory limiter
 	// backing it (per-client-IP request budgets, one per route tier — see
 	// that middleware's doc comment for which routes fall into which tier
@@ -233,6 +240,18 @@ type PaymentsReconcilerConfig struct {
 	ProviderMinGap   time.Duration // env: PAYMENTS_RECONCILE_PROVIDER_MIN_GAP
 }
 
+// LegacySyncConfig configures cmd/worker's legacy-sync loop. DatabaseURL is a
+// read-only Postgres connection string to the OLD system; empty disables the
+// whole sync. The connection string is a credential — read from env only, never
+// logged. The end-time each booking needs (the old system stores only a single
+// time) is derived with Booking.DefaultDuration, so there is no separate knob
+// for it here.
+type LegacySyncConfig struct {
+	DatabaseURL  string        // env: LEGACY_DB_URL
+	TickInterval time.Duration // env: LEGACY_SYNC_TICK_INTERVAL
+	BatchSize    int           // env: LEGACY_SYNC_BATCH_SIZE
+}
+
 // PushConfig holds the web-push channel's VAPID keys and the notification
 // dispatcher's scheduling. The VAPID keys come from env only and are never
 // logged (same discipline as acquirer credentials). When the keys are absent
@@ -338,6 +357,11 @@ func NewConfig() (Config, error) {
 			BatchSize:        getEnvInt("PAYMENTS_RECONCILE_BATCH_SIZE", 50),
 			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
+		},
+		LegacySync: LegacySyncConfig{
+			DatabaseURL:  getEnv("LEGACY_DB_URL", ""),
+			TickInterval: getEnvDuration("LEGACY_SYNC_TICK_INTERVAL", time.Minute),
+			BatchSize:    getEnvInt("LEGACY_SYNC_BATCH_SIZE", 500),
 		},
 		Push: PushConfig{
 			VAPIDPublicKey:   getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
