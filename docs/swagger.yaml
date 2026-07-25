@@ -105,6 +105,23 @@ definitions:
         example: "2026-07-01"
         type: string
     type: object
+  devicetokens.registerRequest:
+    properties:
+      platform:
+        type: string
+      token:
+        type: string
+    required:
+    - platform
+    - token
+    type: object
+  devicetokens.unregisterRequest:
+    properties:
+      token:
+        type: string
+    required:
+    - token
+    type: object
   payments.createPaymentRequest:
     properties:
       return_url:
@@ -212,6 +229,8 @@ definitions:
     type: object
   response.Envelope:
     properties:
+      code:
+        type: string
       data: {}
       error:
         type: string
@@ -974,6 +993,67 @@ paths:
       summary: Record a consent decision
       tags:
       - consent
+  /api/v1/devices/push-tokens:
+    delete:
+      consumes:
+      - application/json
+      parameters:
+      - description: The token to silence
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/devicetokens.unregisterRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Unregister my device from push notifications
+      tags:
+      - push
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Provider push token + platform
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/devicetokens.registerRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Register my device for push notifications
+      tags:
+      - push
   /api/v1/favorites:
     get:
       produces:

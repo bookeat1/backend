@@ -52,6 +52,8 @@ Clean/Hexagonal. Dependencies point **inward**: `transport → usecase → domai
 
 Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) and route **every** error through **`response.HandleError`**, which maps domain sentinels to status codes (404/409/403/401/422/500). Always `return` immediately after writing an error response.
 
+Error responses also carry a machine-readable `code` (`domain.ErrorCode`) next to the human-readable `error` message. Clients branch on `code`, never on the message. The default is the sentinel's generic code (`already_exists`, `not_found`, …); when one status hides two different outcomes, the usecase attaches a narrower one with `domain.WithCode(...)` — e.g. `slot_taken` vs `idempotency_key_reused`, both 409 on `POST /bookings`. Adding a new code is additive; changing or removing one is a breaking API change.
+
 **`internal/infrastructure/`** — implements domain interfaces; depends only on `domain`. `postgres/<entity>/repository.go` per entity; external-service HTTP clients live in their own subpackage; `sqltx/` provides the transaction manager.
 
 **`internal/logger/`** — thin logging wrapper over the standard library `log/slog`. Do **not** pull in a private logging library.

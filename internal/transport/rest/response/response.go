@@ -16,9 +16,17 @@ import (
 )
 
 // Envelope is the uniform shape of every API response.
+//
+// Error is the human-readable message and stays exactly what it has always
+// been — no client that reads it breaks. Code is the machine-readable name of
+// the failure (domain.ErrorCode) and is what clients MUST branch on: the same
+// status can carry two very different outcomes (see domain.CodeSlotTaken vs
+// domain.CodeIdempotencyKeyReused, both 409). It is omitted on success and on
+// the ad-hoc Error() calls that carry no domain error.
 type Envelope struct {
 	Data  any    `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
+	Code  string `json:"code,omitempty"`
 }
 
 // Page is the uniform envelope for a paginated list. Wrap list results in it and
@@ -61,33 +69,47 @@ func Error(w http.ResponseWriter, status int, msg string) {
 // is never sent to the client, so it cannot leak. Always `return` immediately
 // after calling this from a handler.
 func HandleError(w http.ResponseWriter, err error) {
-	status, msg := classify(err)
+	status, code, msg := classify(err)
 	if status >= http.StatusInternalServerError {
-		slog.Error("request failed", "status", status, "error", err)
+		slog.Error("request failed", "status", status, "code", string(code), "error", err)
 	} else {
-		slog.Warn("request rejected", "status", status, "error", err)
+		slog.Warn("request rejected", "status", status, "code", string(code), "error", err)
 	}
-	Error(w, status, msg)
+	write(w, status, Envelope{Error: msg, Code: string(code)})
 }
 
-// classify maps a domain sentinel error to an HTTP status and a fixed, generic
-// message safe to return to clients.
-func classify(err error) (int, string) {
+// classify maps a domain sentinel error to an HTTP status, a machine-readable
+// code and a fixed, generic message safe to return to clients.
+//
+// The status and the message come from the sentinel alone, so both are
+// unchanged by this function's code awareness. The code is the sentinel's
+// generic one unless the usecase attached a narrower one with
+// domain.WithCode — that is the only way two failures sharing a status become
+// distinguishable to a client.
+func classify(err error) (int, domain.ErrorCode, string) {
+	status, code, msg := classifySentinel(err)
+	if specific, ok := domain.CodeOf(err); ok {
+		code = specific
+	}
+	return status, code, msg
+}
+
+func classifySentinel(err error) (int, domain.ErrorCode, string) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
-		return http.StatusNotFound, "not found"
+		return http.StatusNotFound, domain.CodeNotFound, "not found"
 	case errors.Is(err, domain.ErrAlreadyExists):
-		return http.StatusConflict, "already exists"
+		return http.StatusConflict, domain.CodeAlreadyExists, "already exists"
 	case errors.Is(err, domain.ErrForbidden):
-		return http.StatusForbidden, "forbidden"
+		return http.StatusForbidden, domain.CodeForbidden, "forbidden"
 	case errors.Is(err, domain.ErrUnauthorized):
-		return http.StatusUnauthorized, "unauthorized"
+		return http.StatusUnauthorized, domain.CodeUnauthorized, "unauthorized"
 	case errors.Is(err, domain.ErrValidation):
-		return http.StatusUnprocessableEntity, "validation failed"
+		return http.StatusUnprocessableEntity, domain.CodeValidation, "validation failed"
 	case errors.Is(err, domain.ErrInvalidStatus):
-		return http.StatusUnprocessableEntity, "invalid status transition"
+		return http.StatusUnprocessableEntity, domain.CodeInvalidStatus, "invalid status transition"
 	default:
-		return http.StatusInternalServerError, "internal server error"
+		return http.StatusInternalServerError, domain.CodeInternal, "internal server error"
 	}
 }
 

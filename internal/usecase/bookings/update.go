@@ -149,7 +149,9 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrAlreadyExists) {
-			return nil, fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists)
+			// Same lost race as on create: the booking was not moved.
+			return nil, domain.WithCode(domain.CodeSlotTaken,
+				fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists))
 		}
 		return nil, err
 	}
@@ -227,8 +229,9 @@ func (u *updateUseCase) resolveLinks(
 	}
 	picked := pickTables(freeTables(sched.tables, excludeOwn(busy, own), from, to), b.Guests)
 	if len(picked) == 0 {
-		return nil, false, fmt.Errorf("%w: no table available for %d guests at this time",
-			domain.ErrAlreadyExists, b.Guests)
+		return nil, false, domain.WithCode(domain.CodeNoTableAvailable,
+			fmt.Errorf("%w: no table available for %d guests at this time",
+				domain.ErrAlreadyExists, b.Guests))
 	}
 	return build(picked), true, nil
 }

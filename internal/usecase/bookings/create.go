@@ -245,7 +245,11 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrAlreadyExists) {
-			return nil, fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists)
+			// A lost capacity race, NOT a duplicate submit: nothing was
+			// booked. The code is what lets the app say "pick another time"
+			// instead of "check your reservations".
+			return nil, domain.WithCode(domain.CodeSlotTaken,
+				fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists))
 		}
 		return nil, err
 	}
@@ -394,8 +398,9 @@ func (u *createUseCase) selectTables(
 	}
 	picked := pickTables(freeTables(sched.tables, busy, from, to), in.Guests)
 	if len(picked) == 0 {
-		return nil, fmt.Errorf("%w: no table available for %d guests at this time",
-			domain.ErrAlreadyExists, in.Guests)
+		return nil, domain.WithCode(domain.CodeNoTableAvailable,
+			fmt.Errorf("%w: no table available for %d guests at this time",
+				domain.ErrAlreadyExists, in.Guests))
 	}
 	return picked, nil
 }
