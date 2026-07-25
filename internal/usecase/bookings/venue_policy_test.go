@@ -70,6 +70,7 @@ type policyHarness struct {
 	rid      uuid.UUID
 	schedule *fakeSchedule
 	capacity *fakeCapacity
+	links    *fakeLinks
 	bookings *fakeBookings
 }
 
@@ -86,14 +87,16 @@ func newPolicyHarness(t *testing.T, managerID uuid.UUID) *policyHarness {
 	sched := &fakeSchedule{}
 	capacity := newFakeCapacity()
 	bookings := newFakeBookings()
+	links := &fakeLinks{}
 	uc := NewPolicyUseCase(
 		&fakeRestaurants{agg: agg},
 		writer,
 		newFakeManagers([2]uuid.UUID{managerID, rid}),
-		sched, capacity, bookings, &fakeTx{},
+		sched, capacity, links, bookings, &fakeTx{},
 		cfg,
 	)
-	return &policyHarness{uc: uc, writer: writer, rid: rid, schedule: sched, capacity: capacity, bookings: bookings}
+	return &policyHarness{uc: uc, writer: writer, rid: rid, schedule: sched,
+		capacity: capacity, links: links, bookings: bookings}
 }
 
 func TestPolicyUpdateAuthorization(t *testing.T) {

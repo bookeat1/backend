@@ -345,7 +345,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 			restRelated, bookingCfg),
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
 		BookingPolicy: bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers,
-			restRelated, bookingCapacity, bookingRepo, txm, bookingCfg),
+			restRelated, bookingCapacity, bookingLinks, bookingRepo, txm, bookingCfg),
 		AdminPanel: adminPanel,
 		Dashboard:  dashboardUC,
 		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,

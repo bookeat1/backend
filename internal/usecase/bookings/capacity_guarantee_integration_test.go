@@ -96,7 +96,8 @@ func newGuaranteeHarness(t *testing.T, mode string, seats int) *guaranteeHarness
 	return &guaranteeHarness{
 		pool: pool, bookings: bookings, capacity: capacity, txm: txm,
 		restRepo: rr, related: related,
-		policy: NewPolicyUseCase(rr, rr, managers, related, capacity, bookings, txm, testConfig()),
+		policy: NewPolicyUseCase(rr, rr, managers, related, capacity, bookingrepo.NewTables(pool),
+			bookings, txm, testConfig()),
 		update: NewUpdateUseCase(bookings, bookingrepo.NewTables(pool), capacity,
 			bookingrepo.NewOutbox(pool), rr, related, managers, txm, testConfig()),
 		create: NewCreateUseCase(bookings, bookingrepo.NewTables(pool), capacity,
@@ -525,5 +526,186 @@ func TestModeSwitchBackfillsAnInProgressBooking(t *testing.T) {
 		domain.BookingPolicy{Duration: 2 * time.Hour, CapacitySeats: 40}, time.Now()))
 	if !errors.Is(err, domain.ErrAlreadyExists) {
 		t.Fatalf("selling 11 more seats of the 10 left = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// links reads the booking's table links straight from the repository, including
+// the inactive ones — "does this booking hold a table at all?" is exactly what
+// the reconciliation below has to answer.
+func (h *guaranteeHarness) links(t *testing.T, bookingID uuid.UUID) []domain.BookingTable {
+	t.Helper()
+	out, err := bookingrepo.NewTables(h.pool).ListByBooking(context.Background(), bookingID)
+	if err != nil {
+		t.Fatalf("list booking tables: %v", err)
+	}
+	return out
+}
+
+// addTable gives the venue one active table and returns its id.
+func (h *guaranteeHarness) addTable(t *testing.T, name string, capacity int) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := h.pool.Exec(context.Background(),
+		`INSERT INTO restaurant_tables (id, restaurant_id, name, capacity) VALUES ($1,$2,$3,$4)`,
+		id, h.restaurantID, name, capacity); err != nil {
+		t.Fatalf("seed table %s: %v", name, err)
+	}
+	return id
+}
+
+// toTables is the PATCH that moves the venue back to booking by tables.
+func toTables() domain.BookingPolicyOverride {
+	return domain.BookingPolicyOverride{BookingCapacityMode: capModePtr(domain.CapacityModeTables)}
+}
+
+// BLOCKING (review, 25.07.2026). The seats→tables direction of the mode switch
+// reconciled NOTHING: it checked that the venue had at least one active table
+// and wrote the policy. A capacity-mode booking owns no booking_tables row (see
+// create.go), and the table engine reads only booking_tables — so the moment the
+// venue was back in table mode, every table looked free at a time a live
+// table-less booking was already sitting on, and the same seats were sold twice.
+//
+// The whole sequence is ordinary product usage: book table-lessly, add a table,
+// flip the mode, let the next guest book the same slot.
+func TestModeSwitchBackToTablesSeatsTheCapacityBookings(t *testing.T) {
+	h := newGuaranteeHarness(t, "seats", 10)
+	ctx := context.Background()
+	start := h.slotAt(t, 19)
+	policy := domain.BookingPolicy{Duration: 2 * time.Hour, Buffer: 15 * time.Minute, CapacitySeats: 10}
+
+	// 1. Eight of the ten seats are sold table-lessly and confirmed.
+	sold := h.seedBooking(t, start, 8, domain.BookingPending)
+	if err := h.capacity.Create(ctx, buildCapacityHolds(sold, policy, time.Now())); err != nil {
+		t.Fatalf("seed holds: %v", err)
+	}
+	if err := h.bookings.UpdateStatus(ctx, sold.ID, domain.BookingConfirmed, time.Now()); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if got := h.links(t, sold.ID); len(got) != 0 {
+		t.Fatalf("a capacity-mode booking already holds %d table links, the test premise is wrong", len(got))
+	}
+
+	// 2. The owner writes down the one table that room actually is, and switches
+	//    the venue back to booking by tables.
+	h.addTable(t, "T1", 10)
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, toTables()); err != nil {
+		t.Fatalf("switch back to tables: %v", err)
+	}
+
+	// The live booking must now hold a REAL table: booking_tables and its
+	// exclusion constraint are the only guarantee left in this mode.
+	placed := h.links(t, sold.ID)
+	if len(placed) == 0 {
+		t.Fatal("the confirmed table-less booking holds no table after the switch: the room reads empty at 19:00")
+	}
+	for _, l := range placed {
+		if !l.Active {
+			t.Fatalf("the placement of a confirmed booking is inactive: %+v", l)
+		}
+		if !l.SlotStart.Equal(start.Add(-15*time.Minute)) || !l.SlotEnd.Equal(start.Add(2*time.Hour+15*time.Minute)) {
+			t.Fatalf("placement slot = %s..%s, want the booking's own occupancy window",
+				l.SlotStart, l.SlotEnd)
+		}
+	}
+	// And it no longer holds seats: the seats ledger does not govern this venue
+	// any more, and a hold nobody maintains is a hold that lies.
+	if hs := h.holds(t, sold.ID); len(hs) != 0 {
+		t.Fatalf("the booking still holds %d capacity rows after leaving seats mode", len(hs))
+	}
+
+	// 3. The consequence that makes it a bug: the next guest books the same
+	//    19:00 through the ordinary table flow. It must be refused.
+	_, err := h.create.Create(ctx, h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID,
+		Name: "Второй гость", Phone: "+7 (701) 111-11-11",
+		Guests: 4, StartsAt: start, Source: domain.SourceApp,
+	})
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("second booking onto the same seats = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// The other half of the same fix: a booking the new table list cannot seat must
+// refuse the whole switch, with the venue left exactly as it was. The
+// alternative shapes are both worse — leaving it unseated is the bug, and
+// cancelling a confirmed guest to make a settings toggle succeed is not the
+// backend's decision.
+func TestModeSwitchBackToTablesRefusedWhenABookingCannotBeSeated(t *testing.T) {
+	h := newGuaranteeHarness(t, "seats", 10)
+	ctx := context.Background()
+	start := h.slotAt(t, 19)
+	policy := domain.BookingPolicy{Duration: 2 * time.Hour, Buffer: 15 * time.Minute, CapacitySeats: 10}
+
+	sold := h.seedBooking(t, start, 8, domain.BookingPending)
+	if err := h.capacity.Create(ctx, buildCapacityHolds(sold, policy, time.Now())); err != nil {
+		t.Fatalf("seed holds: %v", err)
+	}
+	// The venue's whole table list seats four, and eight guests are coming.
+	h.addTable(t, "T1", 4)
+
+	_, err := h.policy.Update(ctx, h.manager, h.restaurantID, toTables())
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("switch that strands a confirmed party = %v, want ErrValidation", err)
+	}
+
+	// Nothing moved: still seats mode, still holding its seats, still no links.
+	view, err := h.policy.Get(ctx, h.manager, h.restaurantID)
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	if view.Effective.CapacityMode != domain.CapacityModeSeats {
+		t.Fatalf("mode after the refused switch = %q, want seats", view.Effective.CapacityMode)
+	}
+	if got := h.links(t, sold.ID); len(got) != 0 {
+		t.Fatalf("the refused switch left %d table links behind", len(got))
+	}
+	if hs := h.holds(t, sold.ID); len(hs) == 0 {
+		t.Fatal("the refused switch dropped the booking's capacity holds")
+	}
+	if taken, _ := h.peak(t); taken != 8 {
+		t.Fatalf("seats taken after the refused switch = %d, want 8", taken)
+	}
+}
+
+// A booking on the WAITING LIST is placed too, and its placement is inactive
+// while it waits — the mirror of what 0057 does with capacity holds. Two things
+// have to hold at once: waiting costs the venue nothing, and confirming later is
+// judged by the exclusion constraint instead of slipping past it (a waitlisted
+// booking with no links at all would come back confirmed and invisible).
+func TestModeSwitchBackToTablesPlacesWaitlistedBookingsInactive(t *testing.T) {
+	h := newGuaranteeHarness(t, "seats", 10)
+	ctx := context.Background()
+	start := h.slotAt(t, 19)
+
+	waitlisted := h.seedBooking(t, start, 4, domain.BookingWaitlist)
+	h.addTable(t, "T1", 4)
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, toTables()); err != nil {
+		t.Fatalf("switch back to tables: %v", err)
+	}
+
+	placed := h.links(t, waitlisted.ID)
+	if len(placed) == 0 {
+		t.Fatal("the waitlisted booking got no placement — confirming it would flip nothing")
+	}
+	for _, l := range placed {
+		if l.Active {
+			t.Fatalf("a waitlisted booking occupies a table: %+v", l)
+		}
+	}
+
+	// The table is therefore still sellable, and somebody else buys it.
+	if _, err := h.create.Create(ctx, h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID,
+		Name: "Второй гость", Phone: "+7 (701) 222-22-22",
+		Guests: 4, StartsAt: start, Source: domain.SourceApp,
+	}); err != nil {
+		t.Fatalf("the waiting list must not block the table: %v", err)
+	}
+
+	// Confirming the waitlisted booking now re-claims a table that is gone. The
+	// DATABASE is what refuses it.
+	err := h.bookings.UpdateStatus(ctx, waitlisted.ID, domain.BookingConfirmed, time.Now())
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("confirm into a taken table = %v, want ErrAlreadyExists", err)
 	}
 }
