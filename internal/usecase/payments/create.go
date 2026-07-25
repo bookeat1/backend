@@ -147,7 +147,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	// Gross up so the venue nets the full base after the acquirer withholds its
 	// cut of the total (ServiceFeeBps is that acquirer rate). A plain additive
 	// markup would leave the venue short; see domain.GrossUpForAcquirer.
-	fee, total, err := domain.GrossUpForAcquirer(base, settings.ServiceFeeBps)
+	fee, total, err := domain.GrossUpForAcquirerWithMinimum(base, settings.ServiceFeeBps, u.cfg.AcquirerMinFeeMinor)
 	if err != nil {
 		return nil, err
 	}

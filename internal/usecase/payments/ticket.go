@@ -130,7 +130,7 @@ func (u *ticketPaymentUseCase) CreateForTicket(ctx context.Context, actor Actor,
 	if err != nil {
 		return nil, err
 	}
-	fee, total, err := domain.GrossUpForAcquirer(base, settings.ServiceFeeBps)
+	fee, total, err := domain.GrossUpForAcquirerWithMinimum(base, settings.ServiceFeeBps, u.cfg.AcquirerMinFeeMinor)
 	if err != nil {
 		return nil, err
 	}

@@ -232,3 +232,68 @@ func TestGrossUpForAcquirer_Errors(t *testing.T) {
 		t.Errorf("overflow error = %v, want ErrMoneyOverflow", err)
 	}
 }
+
+// FreedomPay's tariff is "3.5%, minimum 25 ₸ per operation" (merchant
+// questionnaire, 14.07.2026). The floor is what protects a SMALL deposit: 3.5%
+// of 500 ₸ is 17.5 ₸, but the acquirer still takes 25 ₸, and without the floor
+// that difference comes out of the venue's base.
+func TestGrossUpForAcquirerWithMinimum(t *testing.T) {
+	const bps, minFee = 350, 2500 // 3.5%, 25 ₸ in tiyn
+
+	cases := []struct {
+		name      string
+		baseMinor int64
+		wantTotal int64
+		wantFee   int64
+	}{
+		{"floor binds on a small deposit", 50_000, 52_500, 2_500},
+		// The real crossover for 350 bps / 2500 tiyn: below it the floor wins,
+		// at and above it the percentage does. Pinned to the tiyn, because a
+		// boundary that is only "about right" is a boundary nobody checked.
+		{"floor still binds one tiyn below the crossover", 68_928, 71_428, 2_500},
+		{"rate takes over at the crossover", 68_929, 71_430, 2_501},
+		{"rate binds on a large deposit", 1_000_000, 1_036_270, 36_270},
+		{"zero base is not an operation", 0, 0, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fee, total, err := GrossUpForAcquirerWithMinimum(KZT(tc.baseMinor), bps, minFee)
+			if err != nil {
+				t.Fatalf("GrossUpForAcquirerWithMinimum: %v", err)
+			}
+			if total.AmountMinor != tc.wantTotal || fee.AmountMinor != tc.wantFee {
+				t.Fatalf("total=%d fee=%d, want total=%d fee=%d",
+					total.AmountMinor, fee.AmountMinor, tc.wantTotal, tc.wantFee)
+			}
+			// The invariant that matters: whatever the acquirer takes — its
+			// percentage or its floor, whichever is larger — the venue still
+			// nets its base.
+			acquirerTakes := total.AmountMinor * bps / 10000
+			if acquirerTakes < minFee {
+				acquirerTakes = minFee
+			}
+			if tc.baseMinor > 0 && total.AmountMinor-acquirerTakes < tc.baseMinor {
+				t.Fatalf("venue nets %d, less than its base %d", total.AmountMinor-acquirerTakes, tc.baseMinor)
+			}
+		})
+	}
+}
+
+// The floor must never be charged on top of a percentage that already exceeds
+// it — the guest pays one fee, not two.
+func TestGrossUpForAcquirerWithMinimum_NoDoubleCharge(t *testing.T) {
+	withFloor, totalFloor, err := GrossUpForAcquirerWithMinimum(KZT(1_000_000), 350, 2500)
+	if err != nil {
+		t.Fatalf("with floor: %v", err)
+	}
+	withoutFloor, totalPlain, err := GrossUpForAcquirer(KZT(1_000_000), 350)
+	_ = withoutFloor
+	if err != nil {
+		t.Fatalf("without floor: %v", err)
+	}
+	if totalFloor != totalPlain {
+		t.Fatalf("floor changed a total the rate already covers: %d vs %d", totalFloor.AmountMinor, totalPlain.AmountMinor)
+	}
+	_ = withFloor
+}

@@ -81,3 +81,30 @@ func TestKnownPaymentProvidersAreRealProviders(t *testing.T) {
 		}
 	}
 }
+
+// A money knob that is documented, defaulted in .env.example and threaded all
+// the way into the domain — but never PARSED — is worse than no knob at all: the
+// binary silently keeps the old behaviour while everyone believes the fix
+// shipped. That is exactly what happened here, so the wiring itself is pinned.
+func TestNewConfig_ParsesTheAcquirerMinimumFee(t *testing.T) {
+	t.Run("default is the FreedomPay floor", func(t *testing.T) {
+		cfg, err := NewConfig()
+		if err != nil {
+			t.Fatalf("NewConfig: %v", err)
+		}
+		if cfg.Payments.AcquirerMinFeeMinor != 2500 {
+			t.Fatalf("AcquirerMinFeeMinor = %d, want 2500 (25 ₸)", cfg.Payments.AcquirerMinFeeMinor)
+		}
+	})
+
+	t.Run("env overrides it", func(t *testing.T) {
+		t.Setenv("PAYMENTS_ACQUIRER_MIN_FEE_MINOR", "9900")
+		cfg, err := NewConfig()
+		if err != nil {
+			t.Fatalf("NewConfig: %v", err)
+		}
+		if cfg.Payments.AcquirerMinFeeMinor != 9900 {
+			t.Fatalf("AcquirerMinFeeMinor = %d, want 9900", cfg.Payments.AcquirerMinFeeMinor)
+		}
+	})
+}
