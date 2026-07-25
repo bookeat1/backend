@@ -46,6 +46,12 @@ type Facade interface {
 	// ListAdmin returns a restaurant's events (optionally status-filtered) for
 	// the cabinet, paginated. Requires PermRestaurantManage at restaurantID.
 	ListAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error)
+	// SetRefundPolicy sets the venue's OWN ticket-refund rules for one event
+	// without going through the full-replace Update. Requires
+	// PermRestaurantManage at the event's own restaurant. A change here applies
+	// only to tickets sold AFTER it — every existing ticket keeps the snapshot
+	// it was bought under (domain.EventTicket.RefundPolicy).
+	SetRefundPolicy(ctx context.Context, actor Actor, eventID uuid.UUID, policy domain.TicketRefundPolicy) (*domain.Event, error)
 
 	// ListPublic returns a restaurant's published, not-yet-ended events,
 	// paginated. No authorization.
@@ -70,6 +76,11 @@ type CreateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// RefundPolicy is the venue's own ticket-refund rules for this event. The
+	// zero value is the conservative platform default (not refundable) — same
+	// as the migration 0047 backfill, so an old client that does not send the
+	// fields never accidentally opens refunds.
+	RefundPolicy domain.TicketRefundPolicy
 }
 
 // UpdateInput carries an event's mutable fields (full replace). Status must be
@@ -87,6 +98,14 @@ type UpdateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// RefundPolicy replaces the event's refund rules. Unlike every other field
+	// here, it is OPTIONAL: nil means "leave the rules as they are". Update is a
+	// full replace, and a cabinet build that predates this feature sends the
+	// whole event without these fields — treating that as "set false/0" would
+	// silently switch refunds off for future buyers every time someone edited a
+	// title. Money settings do not get turned off as a side effect of an
+	// unrelated edit.
+	RefundPolicy *domain.TicketRefundPolicy
 }
 
 type facade struct {
@@ -122,6 +141,9 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		Ticketed:         in.Ticketed,
 		TicketPriceMinor: in.TicketPriceMinor,
 		Capacity:         in.Capacity,
+
+		TicketsRefundable:         in.RefundPolicy.Refundable,
+		TicketRefundCutoffMinutes: in.RefundPolicy.CutoffMinutes,
 	}
 	if err := validateEvent(e); err != nil {
 		return nil, err
@@ -152,7 +174,35 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.Ticketed = in.Ticketed
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
+	if in.RefundPolicy != nil {
+		e.TicketsRefundable = in.RefundPolicy.Refundable
+		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
+	}
 	if err := validateEvent(e); err != nil {
+		return nil, err
+	}
+	if err := f.repo.Update(ctx, e); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// SetRefundPolicy is the narrow "just the refund rules" mutation the cabinet
+// uses, so a venue does not have to re-send the whole event (and risk clobbering
+// a field it did not intend to touch) to change one setting. Authorization is
+// the same resolve-the-event-then-check-its-restaurant gate every other event
+// mutation uses.
+func (f *facade) SetRefundPolicy(ctx context.Context, actor Actor, eventID uuid.UUID, policy domain.TicketRefundPolicy) (*domain.Event, error) {
+	e, err := f.repo.GetByID(ctx, eventID)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
+		return nil, err
+	}
+	e.TicketsRefundable = policy.Refundable
+	e.TicketRefundCutoffMinutes = policy.CutoffMinutes
+	if err := validateRefundPolicy(e.TicketRefundPolicy()); err != nil {
 		return nil, err
 	}
 	if err := f.repo.Update(ctx, e); err != nil {
@@ -243,6 +293,25 @@ func validateEvent(e *domain.Event) error {
 	}
 	if e.Capacity != nil && *e.Capacity < 0 {
 		return fmt.Errorf("%w: capacity must be >= 0", domain.ErrValidation)
+	}
+	return validateRefundPolicy(e.TicketRefundPolicy())
+}
+
+// Bounds for the refund cutoff, in the same spirit as usecase/admin's
+// free-cancellation window: a non-negative number of minutes, capped at 30 days
+// so a typo (minutes entered as seconds, say) cannot silently make every ticket
+// unrefundable in practice.
+const (
+	minRefundCutoffMinutes = 0
+	maxRefundCutoffMinutes = 30 * 24 * 60
+)
+
+// validateRefundPolicy mirrors the DB CHECK from migration 0048 but answers
+// with domain.ErrValidation (422) instead of a 500 from a constraint violation.
+func validateRefundPolicy(p domain.TicketRefundPolicy) error {
+	if p.CutoffMinutes < minRefundCutoffMinutes || p.CutoffMinutes > maxRefundCutoffMinutes {
+		return fmt.Errorf("%w: ticket refund cutoff must be between %d and %d minutes",
+			domain.ErrValidation, minRefundCutoffMinutes, maxRefundCutoffMinutes)
 	}
 	return nil
 }

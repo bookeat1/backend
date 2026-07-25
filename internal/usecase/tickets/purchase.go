@@ -92,12 +92,15 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 	if strings.TrimSpace(in.IdempotencyKey) == "" {
 		return nil, fmt.Errorf("%w: idempotency key required", domain.ErrValidation)
 	}
-	// An anonymous buyer MUST supply a phone: it is the contact for the ticket
-	// and the ONLY ownership proof an idempotency replay can check (an account
-	// buyer is proven by their user id instead). Without it a replay could not
-	// be safely scoped to its buyer.
-	if actor.UserID == nil && strings.TrimSpace(in.GuestPhone) == "" {
-		return nil, fmt.Errorf("%w: a guest phone is required to buy a ticket without an account", domain.ErrValidation)
+	// Owner decision (2026-07-25): a ticket is sold to an ACCOUNT, never to an
+	// anonymous caller. A ticket is money plus a seat plus a contact, and the
+	// only durable proof of who owns one is a verified account — a phone typed
+	// into a checkout form is not, which is exactly how a stranger holding a
+	// ticket id could once reach somebody else's purchase. Requiring the account
+	// here rather than only at the route keeps the rule true for every caller of
+	// this usecase.
+	if actor.UserID == nil {
+		return nil, fmt.Errorf("%w: buying a ticket requires a signed-in account", domain.ErrUnauthorized)
 	}
 
 	event, err := u.events.GetByID(ctx, in.EventID)
@@ -195,6 +198,12 @@ func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domai
 		Currency:               domain.CurrencyKZT,
 		Status:                 domain.TicketPending,
 		PurchaseIdempotencyKey: in.IdempotencyKey,
+		// Freeze the venue's refund rules onto the ticket, exactly like the
+		// price above: the terms promise the guest that a later change by the
+		// venue does not apply to a ticket already bought, so the refund path
+		// reads this snapshot and never the event's current columns.
+		RefundPolicyRefundable:    event.TicketsRefundable,
+		RefundPolicyCutoffMinutes: event.TicketRefundCutoffMinutes,
 	}
 
 	var raced *domain.EventTicket
@@ -286,11 +295,12 @@ func authorizeReplay(actor Actor, in PurchaseInput, existing *domain.EventTicket
 		}
 		return nil
 	}
-	// Anonymous purchase: the phone is the only ownership proof available.
-	if in.GuestPhone == "" || in.GuestPhone != existing.GuestPhone {
-		return fmt.Errorf("%w: this idempotency key belongs to another buyer", domain.ErrForbidden)
-	}
-	return nil
+	// A ticket with no owning account can only be a LEGACY one, sold before
+	// accounts were required. A phone typed into the request is not proof of
+	// anything (that assumption is exactly how a stranger could once reach
+	// somebody else's ticket), so nobody replays into it — the venue handles
+	// such a ticket. Same doctrine as the refund path.
+	return fmt.Errorf("%w: this ticket was bought without an account and can only be handled by the venue", domain.ErrForbidden)
 }
 
 // release moves a pending reservation to cancelled, freeing its held capacity.

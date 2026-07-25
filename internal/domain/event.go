@@ -59,9 +59,16 @@ type Event struct {
 	// the event is free / not ticketed. Not charged anywhere yet.
 	TicketPriceMinor *int64
 	// Capacity is the maximum number of attendees, nil when unbounded/unknown.
-	Capacity  *int
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Capacity *int
+	// TicketsRefundable / TicketRefundCutoffMinutes are the venue's OWN refund
+	// rules for this event (migration 0047) — see TicketRefundPolicy and
+	// TicketRefundAllowed in event_refund_policy.go. They are the rules shown to
+	// a guest BEFORE purchase and frozen onto every ticket sold from here on;
+	// changing them never affects an already-bought ticket.
+	TicketsRefundable         bool
+	TicketRefundCutoffMinutes int
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 // EventRepository persists restaurant events. Get* return ErrNotFound when

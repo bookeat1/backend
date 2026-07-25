@@ -97,6 +97,8 @@ func TestUpdateDelete_RoundTrip(t *testing.T) {
 	e.Ticketed = true
 	e.TicketPriceMinor = &price
 	e.Capacity = &cap
+	e.TicketsRefundable = true
+	e.TicketRefundCutoffMinutes = 180
 	if err := repo.Create(ctx, e); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -109,12 +111,22 @@ func TestUpdateDelete_RoundTrip(t *testing.T) {
 		t.Fatalf("carried fields not persisted: %+v", got)
 	}
 
+	if got.TicketRefundPolicy() != (domain.TicketRefundPolicy{Refundable: true, CutoffMinutes: 180}) {
+		t.Fatalf("refund policy not persisted: %+v", got.TicketRefundPolicy())
+	}
+
 	got.Status = domain.EventPublished
 	got.Title = "Renamed"
+	// The venue tightens its rules: a full-replace Update must carry them.
+	got.TicketsRefundable = false
+	got.TicketRefundCutoffMinutes = 0
 	if err := repo.Update(ctx, got); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	after, _ := repo.GetByID(ctx, e.ID)
+	if after.TicketRefundPolicy() != (domain.TicketRefundPolicy{Refundable: false, CutoffMinutes: 0}) {
+		t.Fatalf("refund policy not updated: %+v", after.TicketRefundPolicy())
+	}
 	if after.Status != domain.EventPublished || after.Title != "Renamed" {
 		t.Fatalf("update not persisted: %+v", after)
 	}

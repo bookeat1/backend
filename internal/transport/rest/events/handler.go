@@ -47,6 +47,7 @@ func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/events/:eventId", h.getAdmin)
 	rg.PUT("/admin/events/:eventId", h.update)
 	rg.DELETE("/admin/events/:eventId", h.delete)
+	rg.PUT("/admin/events/:eventId/refund-policy", h.setRefundPolicy)
 }
 
 func (h *Handler) listPublic(c *gin.Context) {
@@ -117,6 +118,7 @@ func (h *Handler) create(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		RefundPolicy:     req.refundPolicy(),
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -143,6 +145,12 @@ func (h *Handler) update(c *gin.Context) {
 	if !ok {
 		return
 	}
+	refundPolicy, ok := req.refundPolicyUpdate()
+	if !ok {
+		response.Error(c.Writer, http.StatusUnprocessableEntity,
+			"tickets_refundable and ticket_refund_cutoff_minutes must be sent together; use PUT /admin/events/{id}/refund-policy to change only the refund rules")
+		return
+	}
 	e, err := h.facade.Update(c.Request.Context(), actor, eid, uc.UpdateInput{
 		Title:            req.Title,
 		TitleI18n:        domain.I18n(req.TitleI18n),
@@ -156,6 +164,36 @@ func (h *Handler) update(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		RefundPolicy:     refundPolicy,
+	})
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, adminResponse(*e))
+}
+
+// setRefundPolicy lets an authorized venue role set THIS event's ticket-refund
+// rules without re-sending the whole event. The RBAC gate
+// (PermRestaurantManage at the event's own restaurant) lives in usecase/events,
+// like every other admin event route.
+func (h *Handler) setRefundPolicy(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	eid, ok := pathUUID(c, "eventId", "invalid event id")
+	if !ok {
+		return
+	}
+	var req refundPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	e, err := h.facade.SetRefundPolicy(c.Request.Context(), actor, eid, domain.TicketRefundPolicy{
+		Refundable:    req.TicketsRefundable,
+		CutoffMinutes: req.CutoffMinutes,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -284,6 +322,51 @@ type eventRequest struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor"`
 	Capacity         *int              `json:"capacity"`
+	// The venue's own refund rules for this event. POINTERS on purpose: this is a
+	// full-replace payload, and a cabinet build that predates the feature sends
+	// the event without these fields. On create, absent means the conservative
+	// default (not refundable). On update, absent means "leave the rules alone" —
+	// otherwise editing a title from an older client would silently switch
+	// refunds off for everyone who buys next.
+	TicketsRefundable         *bool `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes *int  `json:"ticket_refund_cutoff_minutes"`
+}
+
+// refundPolicyRequest is the narrow "just the refund rules" admin payload.
+type refundPolicyRequest struct {
+	TicketsRefundable bool `json:"tickets_refundable"`
+	CutoffMinutes     int  `json:"ticket_refund_cutoff_minutes"`
+}
+
+// refundPolicy is the CREATE reading: an absent field falls back to the ONE
+// platform default (domain.DefaultTicketRefundPolicy), so an event created by a
+// client that knows nothing about refunds gets the same rules as one created
+// through the DB default — a review caught this drifting into a third,
+// stricter default that contradicted the owner's decision.
+func (r eventRequest) refundPolicy() domain.TicketRefundPolicy {
+	p := domain.DefaultTicketRefundPolicy
+	if r.TicketsRefundable != nil {
+		p.Refundable = *r.TicketsRefundable
+	}
+	if r.TicketRefundCutoffMinutes != nil {
+		p.CutoffMinutes = *r.TicketRefundCutoffMinutes
+	}
+	return p
+}
+
+// refundPolicyUpdate is the UPDATE reading: nil means "keep what the event
+// already has". ok=false means the caller sent HALF a policy, which this
+// endpoint refuses rather than guessing the other half — the narrow
+// PUT .../refund-policy endpoint is the way to change one setting.
+func (r eventRequest) refundPolicyUpdate() (policy *domain.TicketRefundPolicy, ok bool) {
+	switch {
+	case r.TicketsRefundable == nil && r.TicketRefundCutoffMinutes == nil:
+		return nil, true
+	case r.TicketsRefundable == nil || r.TicketRefundCutoffMinutes == nil:
+		return nil, false
+	}
+	p := r.refundPolicy()
+	return &p, true
 }
 
 // parseWindow parses starts_at/ends_at as RFC3339. On a malformed/empty value it
@@ -317,8 +400,13 @@ type eventResponse struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor,omitempty"`
 	Capacity         *int              `json:"capacity,omitempty"`
-	CreatedAt        string            `json:"created_at"`
-	UpdatedAt        string            `json:"updated_at"`
+	// The refund rules a guest must be able to read BEFORE buying. Always
+	// present (never omitempty): "false" is a rule too, and an absent field
+	// would read as "unknown" in the app.
+	TicketsRefundable         bool   `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes int    `json:"ticket_refund_cutoff_minutes"`
+	CreatedAt                 string `json:"created_at"`
+	UpdatedAt                 string `json:"updated_at"`
 }
 
 // adminResponse is the full staff-facing shape: base scalar + the raw i18n maps
@@ -339,8 +427,11 @@ func adminResponse(e domain.Event) eventResponse {
 		Ticketed:         e.Ticketed,
 		TicketPriceMinor: e.TicketPriceMinor,
 		Capacity:         e.Capacity,
-		CreatedAt:        e.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:        e.UpdatedAt.Format(time.RFC3339),
+
+		TicketsRefundable:         e.TicketsRefundable,
+		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
+		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
 	}
 }
 

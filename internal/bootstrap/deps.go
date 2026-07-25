@@ -248,7 +248,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
 		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
 	ticketPurchase := tickets.NewPurchaseUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, paymentsRepo, txm)
-	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, ticketPayments)
+	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, restaurantManagers)
 	ticketAdmin := tickets.NewAdminUseCase(eventTicketsRepo, eventrepo.New(db), restaurantManagers)
 	myTickets := tickets.NewMyTicketsUseCase(eventTicketsRepo)
 	// Deposit hold settlement on booking cancel / no-show (void-early /
