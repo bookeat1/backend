@@ -667,10 +667,9 @@ func NewConfig() (Config, error) {
 			WhatsAppPhoneNumberID: getEnv("OTP_WHATSAPP_PHONE_NUMBER_ID", ""),
 			// The template that was verified against the live number on
 			// 2026-07-25, kept as the default so the owner only has to supply
-			// the two credentials.
-			// TODO(verify): проверить в Business Manager — язык шаблона
-			// bookeat_otp_en может быть заведён как "en_US", а не "en";
-			// несовпадение = отказ на каждой отправке.
+			// the two credentials. The language code is "en" (not "en_US"):
+			// confirmed by a real send that Meta accepted AND actually
+			// delivered to the owner's phone, not by reading the dashboard.
 			WhatsAppTemplateName: getEnv("OTP_WHATSAPP_TEMPLATE_NAME", "bookeat_otp_en"),
 			WhatsAppTemplateLang: getEnv("OTP_WHATSAPP_TEMPLATE_LANG", "en"),
 			// v22.0 is the version the live send was verified on.

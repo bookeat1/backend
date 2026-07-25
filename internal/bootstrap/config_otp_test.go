@@ -1,8 +1,10 @@
 package bootstrap
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,5 +164,103 @@ func TestNewOTPSenderAppendsChannelsMissingFromTheOrder(t *testing.T) {
 	got := waterfall.Channels()
 	if len(got) != 2 || got[0] != domain.OTPChannelTelegram || got[1] != domain.OTPChannelSMS {
 		t.Fatalf("channels = %v, want the unlisted sms appended last", got)
+	}
+}
+
+// A budget an operator can set freely must not be able to outlive the response
+// itself: past the HTTP server's WriteTimeout the guest's connection is gone
+// while we would still be paying providers. The guard clamps instead of
+// refusing to boot (an ops mistake must not take logins down), but it must
+// clamp, and it must say so.
+func TestOTPDeliveryDeadlinesClampToTheHTTPWriteTimeout(t *testing.T) {
+	max := maxOTPDeliveryBudget()
+
+	tests := []struct {
+		name           string
+		timeout        time.Duration
+		budget         time.Duration
+		wantTimeout    time.Duration
+		wantBudget     time.Duration
+		wantLogMention string
+	}{
+		{
+			name:        "defaults fit and are left alone",
+			timeout:     5 * time.Second,
+			budget:      12 * time.Second,
+			wantTimeout: 5 * time.Second,
+			wantBudget:  12 * time.Second,
+		},
+		{
+			name:           "a budget past the write timeout is clamped",
+			timeout:        5 * time.Second,
+			budget:         20 * time.Second,
+			wantTimeout:    5 * time.Second,
+			wantBudget:     max,
+			wantLogMention: "OTP_DELIVERY_BUDGET",
+		},
+		{
+			// The Waterfall raises its budget to the per-channel timeout when the
+			// latter is bigger, so an unclamped channel timeout would undo the
+			// clamp on the budget.
+			name:           "a channel timeout past the write timeout is clamped too",
+			timeout:        30 * time.Second,
+			budget:         12 * time.Second,
+			wantTimeout:    max,
+			wantBudget:     12 * time.Second,
+			wantLogMention: "OTP_SEND_TIMEOUT",
+		},
+		{
+			name:        "zeroes are left for the sender to default",
+			timeout:     0,
+			budget:      0,
+			wantTimeout: 0,
+			wantBudget:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			gotTimeout, gotBudget := otpDeliveryDeadlines(tc.timeout, tc.budget, log)
+			if gotTimeout != tc.wantTimeout || gotBudget != tc.wantBudget {
+				t.Fatalf("deadlines = (%s, %s), want (%s, %s)", gotTimeout, gotBudget, tc.wantTimeout, tc.wantBudget)
+			}
+			if tc.wantLogMention == "" {
+				if logged.Len() != 0 {
+					t.Fatalf("a valid configuration logged %q", logged.String())
+				}
+				return
+			}
+			if !strings.Contains(logged.String(), tc.wantLogMention) {
+				t.Fatalf("the clamp was silent about %s: %q", tc.wantLogMention, logged.String())
+			}
+		})
+	}
+
+	// The ceiling itself has to leave the handler room to answer.
+	if max >= httpWriteTimeout {
+		t.Fatalf("max budget %s leaves no margin under the write timeout %s", max, httpWriteTimeout)
+	}
+}
+
+// The shipped defaults must satisfy their own guard — otherwise every boot
+// would log a clamp and the defaults would be a lie.
+func TestDefaultOTPDeliveryBudgetFitsTheGuard(t *testing.T) {
+	var logged bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logged, nil))
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	timeout, budget := otpDeliveryDeadlines(cfg.OTPDelivery.SendTimeout, cfg.OTPDelivery.DeliveryBudget, log)
+	if timeout != cfg.OTPDelivery.SendTimeout || budget != cfg.OTPDelivery.DeliveryBudget {
+		t.Fatalf("the default deadlines were clamped: (%s, %s) -> (%s, %s)",
+			cfg.OTPDelivery.SendTimeout, cfg.OTPDelivery.DeliveryBudget, timeout, budget)
+	}
+	if logged.Len() != 0 {
+		t.Fatalf("the defaults logged a clamp: %q", logged.String())
 	}
 }

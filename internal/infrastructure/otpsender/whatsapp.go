@@ -27,7 +27,10 @@ type WhatsAppConfig struct {
 	// TemplateName is the approved authentication template. "bookeat_otp_en"
 	// is the one verified against the live number on 2026-07-25.
 	TemplateName string
-	// TemplateLang is the template's language code as approved ("ru").
+	// TemplateLang is the template's language code as approved. For
+	// "bookeat_otp_en" it is "en" — verified by a live send that was both
+	// accepted and delivered (2026-07-25). A mismatch here is rejected by Meta
+	// on every single send, so this is not a value to guess at.
 	TemplateLang string
 	// APIVersion pins the Graph API version. Meta deprecates versions on a
 	// schedule, so this is config: bumping it must not need a deploy of new code.
@@ -54,7 +57,9 @@ const (
 	whatsAppBaseURL = "https://graph.facebook.com"
 	// The Graph version the live send was verified on (2026-07-25).
 	whatsAppDefaultVersion = "v22.0"
-	whatsAppDefaultLang    = "en"
+	// "en" is the approved language of bookeat_otp_en, confirmed by a real
+	// delivery rather than by inspection.
+	whatsAppDefaultLang = "en"
 	// whatsAppNotOnWhatsApp is Meta's error code for "this recipient cannot
 	// receive the message" — in practice, no WhatsApp account on that number.
 	whatsAppNotOnWhatsApp = 131026

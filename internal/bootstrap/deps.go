@@ -886,14 +886,63 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 // development, and a loud WARN everywhere else). So the day a token arrives it
 // is one env var and a restart, and the day it is revoked the contour degrades
 // to the remaining channels instead of failing every login.
+// otpBudgetSafetyMargin is how much of the HTTP server's write budget must be
+// left over after the waterfall has given up: the handler still has to record
+// the attempt, render the error and get the bytes onto the wire.
+const otpBudgetSafetyMargin = 3 * time.Second
+
+// maxOTPDeliveryBudget is the hard ceiling on synchronous OTP delivery.
+func maxOTPDeliveryBudget() time.Duration { return httpWriteTimeout - otpBudgetSafetyMargin }
+
+// otpDeliveryDeadlines validates OTP_SEND_TIMEOUT / OTP_DELIVERY_BUDGET against
+// the HTTP server's WriteTimeout and clamps whatever does not fit.
+//
+// Without this an operator can set OTP_DELIVERY_BUDGET=20s, the service boots
+// happily, and every slow login re-creates the exact failure the budget exists
+// to prevent: the guest's connection dies at WriteTimeout while the waterfall
+// keeps walking channels and paying providers for a response nobody will read.
+//
+// Clamping rather than refusing to boot, deliberately: this repo only refuses
+// to start for values it cannot interpret (a malformed basis-point rate); a
+// duration that parses fine but is too generous is an ops mistake, and the same
+// treatment as a bad APP_TRUSTED_PROXIES or an unknown OTP_SMS_PROVIDER applies
+// — log it loudly and keep serving logins. The log line says what was clamped,
+// to what, and why, so it is actionable rather than mysterious.
+func otpDeliveryDeadlines(channelTimeout, budget time.Duration, log *slog.Logger) (time.Duration, time.Duration) {
+	max := maxOTPDeliveryBudget()
+	if budget > max {
+		log.Error("OTP_DELIVERY_BUDGET exceeds what the HTTP server can wait for — clamped",
+			slog.Duration("configured", budget),
+			slog.Duration("applied", max),
+			slog.Duration("http_write_timeout", httpWriteTimeout),
+			slog.Duration("safety_margin", otpBudgetSafetyMargin),
+			slog.String("detail", "a longer budget would keep paying OTP providers after the guest's connection is already dead"),
+		)
+		budget = max
+	}
+	// One channel may not outlast the whole waterfall either: the Waterfall
+	// would otherwise raise the budget to the per-channel timeout and undo the
+	// clamp above.
+	if channelTimeout > max {
+		log.Error("OTP_SEND_TIMEOUT exceeds what the HTTP server can wait for — clamped",
+			slog.Duration("configured", channelTimeout),
+			slog.Duration("applied", max),
+			slog.Duration("http_write_timeout", httpWriteTimeout),
+		)
+		channelTimeout = max
+	}
+	return channelTimeout, budget
+}
+
 func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {
 	available := make(map[string]otpsender.Channel, 3)
+	channelTimeout, budget := otpDeliveryDeadlines(cfg.OTPDelivery.SendTimeout, cfg.OTPDelivery.DeliveryBudget, log)
 
 	tgCfg := otpsender.TelegramGatewayConfig{
 		Token:          cfg.OTPDelivery.TelegramGatewayToken,
 		SenderUsername: cfg.OTPDelivery.TelegramSenderUser,
 		CodeTTL:        cfg.Auth.OTPCodeTTL,
-		Timeout:        cfg.OTPDelivery.SendTimeout,
+		Timeout:        channelTimeout,
 		BaseURL:        cfg.OTPDelivery.TelegramGatewayAPIURL,
 	}
 	if tgCfg.Configured() {
@@ -907,14 +956,14 @@ func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {
 		TemplateLang:   cfg.OTPDelivery.WhatsAppTemplateLang,
 		APIVersion:     cfg.OTPDelivery.WhatsAppAPIVersion,
 		CopyCodeButton: cfg.OTPDelivery.WhatsAppCopyButton,
-		Timeout:        cfg.OTPDelivery.SendTimeout,
+		Timeout:        channelTimeout,
 		BaseURL:        cfg.OTPDelivery.WhatsAppAPIURL,
 	}
 	if waCfg.Configured() {
 		available[domain.OTPChannelWhatsApp] = otpsender.NewWhatsApp(waCfg)
 	}
 
-	if provider := newSMSProvider(cfg, log); provider != nil {
+	if provider := newSMSProvider(cfg, channelTimeout, log); provider != nil {
 		available[domain.OTPChannelSMS] = otpsender.NewSMS(provider, otpsender.SMSConfig{CodeTTL: cfg.Auth.OTPCodeTTL})
 	}
 
@@ -951,8 +1000,8 @@ func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {
 	}
 
 	waterfall := otpsender.NewWaterfall(log, otpsender.WaterfallConfig{
-		ChannelTimeout: cfg.OTPDelivery.SendTimeout,
-		TotalBudget:    cfg.OTPDelivery.DeliveryBudget,
+		ChannelTimeout: channelTimeout,
+		TotalBudget:    budget,
 	}, ordered...)
 	if waterfall == nil {
 		log.Warn("no OTP delivery channel configured — falling back to the stub sender; " +
@@ -966,7 +1015,7 @@ func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {
 // newSMSProvider selects the SMS backend. Returns nil when none is selected or
 // the selected one lacks credentials — the SMS channel then simply does not
 // exist, exactly like an unconfigured Telegram or WhatsApp.
-func newSMSProvider(cfg Config, log *slog.Logger) otpsender.SMSProvider {
+func newSMSProvider(cfg Config, timeout time.Duration, log *slog.Logger) otpsender.SMSProvider {
 	switch strings.ToLower(strings.TrimSpace(cfg.OTPDelivery.SMSProvider)) {
 	case "":
 		return nil
@@ -976,7 +1025,7 @@ func newSMSProvider(cfg Config, log *slog.Logger) otpsender.SMSProvider {
 			AuthToken:           cfg.OTPDelivery.TwilioAuthToken,
 			From:                cfg.OTPDelivery.TwilioFrom,
 			MessagingServiceSID: cfg.OTPDelivery.TwilioMessagingSID,
-			Timeout:             cfg.OTPDelivery.SendTimeout,
+			Timeout:             timeout,
 			BaseURL:             cfg.OTPDelivery.TwilioAPIURL,
 		}
 		if !twilio.Configured() {
@@ -988,7 +1037,7 @@ func newSMSProvider(cfg Config, log *slog.Logger) otpsender.SMSProvider {
 		mobizon := otpsender.MobizonConfig{
 			APIKey:  cfg.OTPDelivery.MobizonAPIKey,
 			Sender:  cfg.OTPDelivery.MobizonSender,
-			Timeout: cfg.OTPDelivery.SendTimeout,
+			Timeout: timeout,
 			BaseURL: cfg.OTPDelivery.MobizonAPIURL,
 		}
 		if !mobizon.Configured() {

@@ -92,6 +92,26 @@ type WaterfallConfig struct {
 // Telegram or WhatsApp accounts, which is exactly the data a targeted phishing
 // campaign wants and which the guest never agreed to publish. The per-channel
 // outcomes exist only in our own logs, with the phone masked.
+//
+// # Known and accepted: the walk is observable in wall-clock time
+//
+// The response BODY cannot leak which channel was used — every outcome renders
+// the same envelope, and a total failure renders one generic error (above). The
+// DURATION can. A number that is on Telegram costs two Gateway round-trips
+// (checkSendAbility, then sendVerificationMessage) and answers; a number that is
+// not fails the pre-check on the first round-trip and then pays for a WhatsApp
+// or SMS attempt. Those paths take measurably different amounts of time, so an
+// observer who can time /auth/otp/request can infer, with some noise, whether a
+// number has Telegram — the very fact the opaque error above refuses to state.
+//
+// This is DOCUMENTED, NOT PAPERED OVER. Padding every response to a fixed
+// duration would mean holding a connection open on purpose and making every
+// honest login as slow as the worst path; whether that trade is worth making is
+// the owner's call, not this file's. Today the mitigation is the rate limit on
+// the endpoint (AUTH_OTP_RATE_PER_MIN / _PER_HOUR count otp_codes rows, and a
+// failed delivery consumes the budget too — see usecase/auth.RequestOTP), which
+// bounds how many numbers an attacker can time per phone number and per hour.
+// Enumerating a list of numbers this way stays possible, just slow and noisy.
 type Waterfall struct {
 	channels []Channel
 	log      *slog.Logger
