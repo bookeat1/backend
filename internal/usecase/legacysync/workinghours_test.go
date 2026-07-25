@@ -363,3 +363,21 @@ func TestDecideWorkingHours(t *testing.T) {
 		})
 	}
 }
+
+// Clearing the hours in the admin panel is a decision, not an absence: a venue
+// that wiped what the sync had filled must not have it quietly restored the
+// next time someone edits the legacy text.
+func TestDecideWorkingHours_ClearedByVenueIsNotRefilled(t *testing.T) {
+	st := WorkingHoursState{
+		SourceText: "Пн-Вс: 10:00-22:00",
+		Rows:       nil,
+		Import: &WorkingHoursImport{
+			SourceText:  "Пн-Вс: 09:00-21:00", // legacy text has since changed
+			Status:      HoursImportFilled,
+			Fingerprint: "whatever-we-wrote-before",
+		},
+	}
+	if got, why := decideWorkingHours(st); got != hoursKeepVenue {
+		t.Fatalf("decision = %v (%s), want keep-venue: an empty week the venue chose is still the venue's", got, why)
+	}
+}

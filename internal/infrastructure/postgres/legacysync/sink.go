@@ -279,6 +279,18 @@ func (s *Sink) LoadWorkingHours(ctx context.Context, rid uuid.UUID) (legacysync.
 	q := sqltx.From(ctx, s.pool)
 	var st legacysync.WorkingHoursState
 
+	// Serialise this venue's hours against the admin panel. Without it the
+	// whole fingerprint mechanism has a hole: we read the rows, decide they are
+	// still ours, a venue saves its own hours in the panel, and our DELETE then
+	// wipes the edit that had just been committed. Read Committed re-reads on
+	// every statement, so "checked" and "wrote" are not the same snapshot — an
+	// advisory lock, taken by BOTH writers (see restaurant.Related's
+	// ReplaceWorkingHours), is what makes them one. It is released with the
+	// transaction, and it is per venue, so venues never queue behind each other.
+	if _, err := q.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, rid.String()); err != nil {
+		return st, fmt.Errorf("load working hours: lock venue %s: %w", rid, err)
+	}
+
 	err := q.QueryRow(ctx,
 		`SELECT COALESCE(opening_hours, '') FROM restaurants WHERE id=$1`, rid).Scan(&st.SourceText)
 	if errors.Is(err, pgx.ErrNoRows) {

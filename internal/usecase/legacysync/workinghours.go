@@ -147,6 +147,14 @@ func decideWorkingHours(st WorkingHoursState) (hoursDecision, string) {
 		return hoursKeepVenue, "venue owns its working hours"
 	}
 	if len(st.Rows) == 0 {
+		// "No hours" is not always "never had hours". A venue that we filled and
+		// that then CLEARED its hours in the admin panel made a deliberate
+		// choice; re-filling it from legacy on the next text change would
+		// silently undo that, which is the one thing this whole mechanism
+		// exists to prevent.
+		if st.Import != nil && st.Import.Status == HoursImportFilled {
+			return hoursKeepVenue, "venue cleared the hours this sync had filled"
+		}
 		return hoursWrite, "venue has no working hours yet"
 	}
 	if st.Import == nil {

@@ -248,6 +248,16 @@ func (r *Related) ReplaceSocialLinks(ctx context.Context, rid uuid.UUID, items [
 }
 
 func (r *Related) ReplaceWorkingHours(ctx context.Context, rid uuid.UUID, items []domain.WorkingHours) error {
+	// The same per-venue advisory lock the legacy-hours import takes (see
+	// legacysync.Sink.LoadWorkingHours). Only one of the two writers may hold a
+	// venue's hours at a time, otherwise the import can delete a venue's edit
+	// microseconds after it landed. Outside a transaction this lock is a no-op
+	// beyond its own statement, which is exactly right: without a surrounding
+	// tx there is no window to protect.
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, rid.String()); err != nil {
+		return fmt.Errorf("replace working hours: lock venue %s: %w", rid, err)
+	}
 	if err := r.del(ctx, "restaurant_working_hours", rid); err != nil {
 		return fmt.Errorf("replace working hours: %w", err)
 	}
