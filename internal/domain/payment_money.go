@@ -253,10 +253,13 @@ func GrossUpForAcquirerWithMinimum(base Money, acquirerBps int, minFeeMinor int6
 	}
 	// The floor reading. Whichever of the two totals is larger is the one that
 	// actually leaves the venue whole, so that is the one charged.
+	// Overflow is checked BEFORE the addition: computed after, the sum has
+	// already wrapped negative, the comparison below quietly fails, and the
+	// guard can never fire — a dead check that hides the very case it names.
+	if minFeeMinor > math.MaxInt64-base.AmountMinor {
+		return Money{}, Money{}, ErrMoneyOverflow
+	}
 	if floorTotal := base.AmountMinor + minFeeMinor; floorTotal > totalMinor {
-		if minFeeMinor > math.MaxInt64-base.AmountMinor {
-			return Money{}, Money{}, ErrMoneyOverflow
-		}
 		totalMinor = floorTotal
 	}
 	total = Money{AmountMinor: totalMinor, Currency: base.Currency}

@@ -437,6 +437,7 @@ func NewConfig() (Config, error) {
 			DefaultProvider:              getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
 			ServiceFeeBps:                getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
 			RefundAcquiringBps:           getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
+			AcquirerMinFeeMinor:          getEnvInt64("PAYMENTS_ACQUIRER_MIN_FEE_MINOR", 2500),
 			RefundAcquiringBpsByProvider: refundAcquiring,
 			DepositDefaultMinor:          getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
 			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),

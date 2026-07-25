@@ -247,7 +247,11 @@ func TestGrossUpForAcquirerWithMinimum(t *testing.T) {
 		wantFee   int64
 	}{
 		{"floor binds on a small deposit", 50_000, 52_500, 2_500},
-		{"floor binds exactly at the crossover", 68_000, 70_500, 2_500},
+		// The real crossover for 350 bps / 2500 tiyn: below it the floor wins,
+		// at and above it the percentage does. Pinned to the tiyn, because a
+		// boundary that is only "about right" is a boundary nobody checked.
+		{"floor still binds one tiyn below the crossover", 68_928, 71_428, 2_500},
+		{"rate takes over at the crossover", 68_929, 71_430, 2_501},
 		{"rate binds on a large deposit", 1_000_000, 1_036_270, 36_270},
 		{"zero base is not an operation", 0, 0, 0},
 	}
