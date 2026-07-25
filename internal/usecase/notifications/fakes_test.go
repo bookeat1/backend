@@ -285,3 +285,174 @@ func createdEvent(restaurantID uuid.UUID) domain.BookingOutboxEvent {
 		CreatedAt: time.Now(),
 	}
 }
+
+// fakeDeviceTokens is an in-memory guest device-token repository. Upsert mirrors
+// the production ON CONFLICT (token) semantics: keyed on the TOKEN, so a repeat
+// registration re-points the existing row instead of adding a second one.
+type fakeDeviceTokens struct {
+	mu     sync.Mutex
+	byID   map[uuid.UUID]*domain.DevicePushToken
+	byTok  map[string]uuid.UUID
+	upsert int
+}
+
+func newFakeDeviceTokens(rows ...domain.DevicePushToken) *fakeDeviceTokens {
+	f := &fakeDeviceTokens{byID: map[uuid.UUID]*domain.DevicePushToken{}, byTok: map[string]uuid.UUID{}}
+	for i := range rows {
+		r := rows[i]
+		f.byID[r.ID] = &r
+		f.byTok[r.Token] = r.ID
+	}
+	return f
+}
+
+func (f *fakeDeviceTokens) Upsert(_ context.Context, t *domain.DevicePushToken) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upsert++
+	if id, ok := f.byTok[t.Token]; ok {
+		row := f.byID[id]
+		row.UserID, row.Platform, row.IsActive = t.UserID, t.Platform, true
+		*t = *row
+		return nil
+	}
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+	t.IsActive = true
+	row := *t
+	f.byID[t.ID] = &row
+	f.byTok[t.Token] = t.ID
+	return nil
+}
+
+func (f *fakeDeviceTokens) ListActiveByUser(_ context.Context, userID uuid.UUID) ([]domain.DevicePushToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.DevicePushToken
+	for _, r := range f.byID {
+		if r.UserID == userID && r.IsActive {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDeviceTokens) DeactivateByID(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.byID[id]; ok {
+		r.IsActive = false
+	}
+	return nil
+}
+
+func (f *fakeDeviceTokens) DeactivateForUser(_ context.Context, userID uuid.UUID, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id, ok := f.byTok[token]; ok {
+		if r := f.byID[id]; r.UserID == userID {
+			r.IsActive = false
+		}
+	}
+	return nil
+}
+
+func (f *fakeDeviceTokens) isActive(id uuid.UUID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.byID[id]
+	return ok && r.IsActive
+}
+
+func (f *fakeDeviceTokens) rowCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.byID)
+}
+
+func (f *fakeDeviceTokens) get(id uuid.UUID) domain.DevicePushToken {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return *f.byID[id]
+}
+
+// fakeGuestPrefs is the guest notification-preference repository. An unset user
+// gets the all-enabled default, exactly like the Postgres implementation.
+type fakeGuestPrefs struct {
+	mu   sync.Mutex
+	rows map[uuid.UUID]domain.NotificationPreference
+	err  error
+}
+
+func newFakeGuestPrefs() *fakeGuestPrefs {
+	return &fakeGuestPrefs{rows: map[uuid.UUID]domain.NotificationPreference{}}
+}
+
+func (f *fakeGuestPrefs) set(p domain.NotificationPreference) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows[p.UserID] = p
+}
+
+func (f *fakeGuestPrefs) Get(_ context.Context, userID uuid.UUID) (domain.NotificationPreference, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return domain.NotificationPreference{}, f.err
+	}
+	if p, ok := f.rows[userID]; ok {
+		return p, nil
+	}
+	return domain.DefaultNotificationPreference(userID), nil
+}
+
+func (f *fakeGuestPrefs) Upsert(_ context.Context, p domain.NotificationPreference) error {
+	f.set(p)
+	return nil
+}
+
+// fakeVenues resolves every restaurant to the same display name.
+type fakeVenues struct{ name string }
+
+func (f fakeVenues) Name(context.Context, uuid.UUID) (string, error) { return f.name, nil }
+
+// recordingMobileSender captures every device token it was asked to push to and
+// returns a scripted verdict/error per token.
+type recordingMobileSender struct {
+	mu      sync.Mutex
+	sent    []string
+	verdict map[string]MobilePushVerdict // default Delivered when absent
+	errFor  map[string]error
+}
+
+func newRecordingMobileSender() *recordingMobileSender {
+	return &recordingMobileSender{verdict: map[string]MobilePushVerdict{}, errFor: map[string]error{}}
+}
+
+func (s *recordingMobileSender) send(_ context.Context, token string, _ MobilePushMessage) (MobilePushVerdict, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, token)
+	if err := s.errFor[token]; err != nil {
+		return MobilePushRejected, err
+	}
+	if v, ok := s.verdict[token]; ok {
+		return v, nil
+	}
+	return MobilePushDelivered, nil
+}
+
+func (s *recordingMobileSender) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sent)
+}
+
+func (s *recordingMobileSender) tokens() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.sent))
+	copy(out, s.sent)
+	return out
+}

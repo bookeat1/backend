@@ -195,3 +195,106 @@ func (r *Settings) ClearTelegramChatID(ctx context.Context, restaurantID uuid.UU
 	}
 	return nil
 }
+
+// DeviceTokens implements domain.DevicePushTokenRepository — the GUEST-facing
+// mobile push tokens (device_push_tokens, migration 0049).
+type DeviceTokens struct{ pool sqltx.Querier }
+
+// NewDeviceTokens builds the guest device-token repository.
+func NewDeviceTokens(pool sqltx.Querier) *DeviceTokens { return &DeviceTokens{pool: pool} }
+
+var _ domain.DevicePushTokenRepository = (*DeviceTokens)(nil)
+
+const deviceTokenCols = `id, user_id, token, platform, is_active, created_at, updated_at`
+
+// Upsert stores a token keyed on the token value. A repeat registration of the
+// same token RE-POINTS the row at the calling user and reactivates it, never a
+// duplicate — the device may have changed hands since it was last registered.
+func (r *DeviceTokens) Upsert(ctx context.Context, t *domain.DevicePushToken) error {
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+	q := `INSERT INTO device_push_tokens (` + deviceTokenCols + `)
+	      VALUES ($1,$2,$3,$4, true, now(), now())
+	      ON CONFLICT (token) DO UPDATE
+	        SET user_id    = EXCLUDED.user_id,
+	            platform   = EXCLUDED.platform,
+	            is_active  = true,
+	            updated_at = now()
+	      RETURNING id, is_active, created_at, updated_at`
+	if err := sqltx.From(ctx, r.pool).QueryRow(ctx, q,
+		t.ID, t.UserID, t.Token, string(t.Platform),
+	).Scan(&t.ID, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		return fmt.Errorf("upsert device push token: %w", err)
+	}
+	return nil
+}
+
+// ListActiveByUser returns the guest's live devices, oldest first.
+func (r *DeviceTokens) ListActiveByUser(ctx context.Context, userID uuid.UUID) ([]domain.DevicePushToken, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+deviceTokenCols+` FROM device_push_tokens
+		  WHERE user_id=$1 AND is_active ORDER BY created_at, id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list device push tokens: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.DevicePushToken
+	for rows.Next() {
+		var t domain.DevicePushToken
+		var platform string
+		if err := rows.Scan(&t.ID, &t.UserID, &t.Token, &platform, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("list device push tokens: %w", err)
+		}
+		t.Platform = domain.DevicePlatform(platform)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeactivateByID silences a token the provider reported as gone. The row stays
+// (the delivery ledger points at its id); only the flag flips.
+func (r *DeviceTokens) DeactivateByID(ctx context.Context, id uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE device_push_tokens SET is_active=false, updated_at=now()
+		  WHERE id=$1 AND is_active`, id); err != nil {
+		return fmt.Errorf("deactivate device push token: %w", err)
+	}
+	return nil
+}
+
+// DeactivateForUser is the guest's own unregister. The user_id predicate makes
+// it impossible to silence another guest's device even knowing its exact token.
+func (r *DeviceTokens) DeactivateForUser(ctx context.Context, userID uuid.UUID, token string) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE device_push_tokens SET is_active=false, updated_at=now()
+		  WHERE user_id=$1 AND token=$2 AND is_active`, userID, token); err != nil {
+		return fmt.Errorf("deactivate device push token for user: %w", err)
+	}
+	return nil
+}
+
+// Venues reads the venue display name a guest-facing message needs. It is a
+// deliberately minimal reader, not the catalog's RestaurantRepository.GetByID:
+// that one loads the whole aggregate (images, features, tags) and the notifier
+// needs one string, once per event.
+type Venues struct{ pool sqltx.Querier }
+
+// NewVenues builds the venue-name reader.
+func NewVenues(pool sqltx.Querier) *Venues { return &Venues{pool: pool} }
+
+// Name returns the venue's Russian display name (the base `name` column — the
+// guest-facing texts are Russian, so no locale resolution is needed here). A
+// missing venue yields domain.ErrNotFound.
+func (r *Venues) Name(ctx context.Context, restaurantID uuid.UUID) (string, error) {
+	var name string
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT name FROM restaurants WHERE id=$1`, restaurantID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read venue name: %w", err)
+	}
+	return name, nil
+}

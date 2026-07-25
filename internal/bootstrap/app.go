@@ -20,6 +20,7 @@ import (
 	consentrest "backend-core/internal/transport/rest/consent"
 	contentrest "backend-core/internal/transport/rest/content"
 	dashboardrest "backend-core/internal/transport/rest/dashboard"
+	devicetokensrest "backend-core/internal/transport/rest/devicetokens"
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	menurest "backend-core/internal/transport/rest/menu"
@@ -120,6 +121,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// carries no restaurant id in the path, so RequireRestaurantManager cannot
 	// gate it — same pattern as the booking/review staff routes.
 	pushsubscriptionsrest.NewHandler(deps.PushSubscriptions).RegisterRoutes(authed)
+	// Guest MOBILE push tokens (Expo/React Native app). Same own-user pattern as
+	// /users/me: the account is the authorization, so no restaurant gate — a
+	// guest registers the device they are signed in on and is notified about
+	// their own bookings only.
+	devicetokensrest.NewHandler(deps.DeviceTokens).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)

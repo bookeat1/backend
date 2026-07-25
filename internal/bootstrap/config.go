@@ -177,7 +177,17 @@ type BookingConfig struct {
 type WorkerConfig struct {
 	TickInterval time.Duration // env: WORKER_TICK_INTERVAL
 	NoShowGrace  time.Duration // env: WORKER_NO_SHOW_GRACE
-	BatchSize    int           // env: WORKER_BATCH_SIZE — bookings claimed per pass
+	// ReminderLead is how long before starts_at the guest gets their pre-visit
+	// reminder (one per booking). env: WORKER_GUEST_REMINDER_LEAD
+	ReminderLead time.Duration
+
+	// GuestRemindersEnabled switches the pre-visit reminder pass on. OFF by
+	// default: while the old Supabase system still reminds the same guests, ours
+	// would be the second (or third) message about one visit. Turning this on is
+	// the owner's deliberate act once the old reminder path is dead.
+	// env: WORKER_GUEST_REMINDERS_ENABLED
+	GuestRemindersEnabled bool
+	BatchSize             int // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
 // PaymentsConfig holds the global (level-1) payment settings. A restaurant may
@@ -313,6 +323,27 @@ type PushConfig struct {
 	// only and never logged (a bot credential). Absent → the telegram channel
 	// no-ops cleanly, exactly like absent VAPID keys for web push.
 	TelegramBotToken string // env: TELEGRAM_NOTIFY_BOT_TOKEN
+
+	// GuestPushProvider selects the GUEST mobile-push provider. Empty (the
+	// default) means no provider is configured and the guest channel is a clean
+	// no-op — the dispatcher still drains, it just sends nothing. The only value
+	// implemented today is "expo"; it is an explicit switch rather than a
+	// derived flag so swapping in a direct FCM/APNs sender later is a config
+	// change, not a code change at the call site.
+	GuestPushProvider string // env: GUEST_PUSH_PROVIDER ("" | "expo")
+	// ExpoAccessToken is Expo's OPTIONAL push-security token. A credential: env
+	// only, never logged. Expo accepts unauthenticated sends unless push
+	// security is enabled on the project, so an empty value is legitimate and
+	// does NOT disable the channel — GuestPushProvider does.
+	ExpoAccessToken string // env: EXPO_ACCESS_TOKEN
+	// ExpoEndpoint overrides Expo's push URL (tests / a future relay).
+	ExpoEndpoint string // env: EXPO_PUSH_ENDPOINT
+}
+
+// GuestPushConfigured reports whether a guest mobile-push provider is selected.
+// When false the guest channel is built disabled and no-ops cleanly.
+func (p PushConfig) GuestPushConfigured() bool {
+	return strings.TrimSpace(p.GuestPushProvider) != ""
 }
 
 func (p PostgresConfig) DSN() string {
@@ -389,9 +420,11 @@ func NewConfig() (Config, error) {
 			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
 		},
 		Worker: WorkerConfig{
-			TickInterval: getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
-			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
-			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
+			TickInterval:          getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
+			NoShowGrace:           getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
+			GuestRemindersEnabled: getEnvBool("WORKER_GUEST_REMINDERS_ENABLED", false),
+			ReminderLead:          getEnvDuration("WORKER_GUEST_REMINDER_LEAD", time.Hour),
+			BatchSize:             getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 		Payments: PaymentsConfig{
 			Enabled:                      getEnvBool("PAYMENTS_ENABLED", false),
@@ -432,6 +465,10 @@ func NewConfig() (Config, error) {
 			DispatchTick:     getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
 			DispatchBatch:    getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
 			TelegramBotToken: getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
+
+			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
+			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),
+			ExpoEndpoint:      getEnv("EXPO_PUSH_ENDPOINT", ""),
 		},
 		RateLimit: RateLimiterConfig{
 			RateLimitConfig: middleware.RateLimitConfig{

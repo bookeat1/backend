@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -14,6 +15,11 @@ type NotificationChannel string
 const (
 	ChannelWebPush  NotificationChannel = "web_push"
 	ChannelTelegram NotificationChannel = "telegram"
+	// ChannelMobilePush is the GUEST-facing channel: a push to the signed-in
+	// guest's own phone (device_push_tokens). Unlike the two above it is not a
+	// staff alert, so every send through it must first pass the guest's opt-out
+	// (see notifications.GuestNotificationGate).
+	ChannelMobilePush NotificationChannel = "mobile_push"
 )
 
 // PushSubscription is a staff member's browser Web Push subscription, as handed
@@ -47,6 +53,66 @@ type PushSubscriptionRepository interface {
 	// DeleteByID removes a subscription the push service reported as gone (HTTP
 	// 404/410): the endpoint is dead, keeping it only wastes future sends.
 	DeleteByID(ctx context.Context, id uuid.UUID) error
+}
+
+// DevicePlatform names the mobile platform a push token belongs to. Stored as
+// VARCHAR and validated in app code — never a DB enum.
+type DevicePlatform string
+
+const (
+	PlatformIOS     DevicePlatform = "ios"
+	PlatformAndroid DevicePlatform = "android"
+	// PlatformWeb covers an Expo web build. It is a distinct concept from the
+	// staff PushSubscription (browser Web Push): this is still a token handed
+	// to the same provider, not a VAPID-encrypted endpoint.
+	PlatformWeb DevicePlatform = "web"
+)
+
+// ValidDevicePlatform reports whether p is a known device platform.
+func ValidDevicePlatform(p DevicePlatform) bool {
+	return p == PlatformIOS || p == PlatformAndroid || p == PlatformWeb
+}
+
+// DevicePushToken is ONE mobile device a signed-in guest wants notifications
+// on. The app is Expo/React Native, so Token is an Expo push token in practice,
+// but nothing here assumes that: the value is opaque to the domain, so an
+// FCM/APNs token fits the same row once the sender behind
+// notifications.MobilePushSender is swapped.
+//
+// It is scoped to the guest ONLY — no restaurant_id. A staff PushSubscription
+// answers "alert this device about THIS venue's bookings"; a guest device is
+// notified about the guest's OWN bookings, wherever they booked. One guest may
+// hold several rows (phone + tablet); the unique key is the token itself.
+type DevicePushToken struct {
+	ID        uuid.UUID
+	UserID    uuid.UUID
+	Token     string
+	Platform  DevicePlatform
+	IsActive  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// DevicePushTokenRepository persists guest mobile push tokens.
+type DevicePushTokenRepository interface {
+	// Upsert stores a token keyed on the token value itself. Re-registering an
+	// existing token RE-POINTS it to the calling user and reactivates it,
+	// instead of inserting a duplicate — a device changing hands (or a guest
+	// signing in on a friend's phone) must never keep delivering to the
+	// previous owner.
+	Upsert(ctx context.Context, t *DevicePushToken) error
+	// ListActiveByUser returns the guest's live devices — the fan-out target set
+	// for their own booking events. Deactivated rows are never returned.
+	ListActiveByUser(ctx context.Context, userID uuid.UUID) ([]DevicePushToken, error)
+	// DeactivateByID marks a token the push provider reported as gone
+	// (Expo "DeviceNotRegistered") inactive. The row is kept, not deleted: the
+	// delivery ledger references it as a target. Idempotent.
+	DeactivateByID(ctx context.Context, id uuid.UUID) error
+	// DeactivateForUser is the guest's own "stop notifying this device" (sign
+	// out / permission revoked in the OS). The userID predicate is the tenant
+	// guard: it is impossible to silence someone else's device even knowing its
+	// exact token. Absent / not-owned is not an error (idempotent).
+	DeactivateForUser(ctx context.Context, userID uuid.UUID, token string) error
 }
 
 // NotificationDeliveryRepository is the at-least-once dedupe ledger. A row is

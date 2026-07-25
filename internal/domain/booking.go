@@ -225,6 +225,30 @@ type BookingRepository interface {
 	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
 }
 
+// BookingReminderRepository backs the pre-visit guest reminder pass. It is a
+// port of its own, separate from BookingRepository, because the reminder marker
+// (bookings.guest_reminder_sent_at) is deliberately NOT a field of Booking: it
+// is worker bookkeeping written through these two methods only, so a full-row
+// Update from any other path can never clobber it.
+type BookingReminderRepository interface {
+	// ClaimDueReminders locks up to limit bookings whose visit starts inside
+	// (from, to] and that have not been reminded yet, with FOR UPDATE SKIP
+	// LOCKED. It returns only bookings that are still LIVE (pending / confirmed
+	// / waitlist) and belong to a guest ACCOUNT (user_id NOT NULL) — a cancelled
+	// visit is never reminded, and a phone booking has no device to remind.
+	//
+	// A booking created after its own reminder point (the guest booked less than
+	// the reminder lead before the visit) is skipped: they just made it, a
+	// "don't forget" a minute later is noise.
+	ClaimDueReminders(ctx context.Context, from, to time.Time, limit int) ([]Booking, error)
+	// MarkReminderSent stamps the reminder marker and reports whether THIS call
+	// is the one that stamped it. It is the idempotency arbiter: false means the
+	// booking was already reminded or is no longer live, and the caller must not
+	// emit the event. Call it inside the same transaction as the outbox insert,
+	// so the stamp and the event commit together or not at all.
+	MarkReminderSent(ctx context.Context, bookingID uuid.UUID, at time.Time) (bool, error)
+}
+
 // ClaimColumn names the timestamp ClaimDue compares against its cutoff. It is a
 // closed set on purpose: the value reaches the SQL text, so it must never be
 // caller-shaped data.
