@@ -47,6 +47,7 @@ func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/events/:eventId", h.getAdmin)
 	rg.PUT("/admin/events/:eventId", h.update)
 	rg.DELETE("/admin/events/:eventId", h.delete)
+	rg.PUT("/admin/events/:eventId/refund-policy", h.setRefundPolicy)
 }
 
 func (h *Handler) listPublic(c *gin.Context) {
@@ -117,6 +118,7 @@ func (h *Handler) create(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		RefundPolicy:     req.refundPolicy(),
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -156,6 +158,36 @@ func (h *Handler) update(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		RefundPolicy:     req.refundPolicy(),
+	})
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, adminResponse(*e))
+}
+
+// setRefundPolicy lets an authorized venue role set THIS event's ticket-refund
+// rules without re-sending the whole event. The RBAC gate
+// (PermRestaurantManage at the event's own restaurant) lives in usecase/events,
+// like every other admin event route.
+func (h *Handler) setRefundPolicy(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	eid, ok := pathUUID(c, "eventId", "invalid event id")
+	if !ok {
+		return
+	}
+	var req refundPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	e, err := h.facade.SetRefundPolicy(c.Request.Context(), actor, eid, domain.TicketRefundPolicy{
+		Refundable:    req.TicketsRefundable,
+		CutoffMinutes: req.CutoffMinutes,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -284,6 +316,24 @@ type eventRequest struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor"`
 	Capacity         *int              `json:"capacity"`
+	// The venue's own refund rules for this event. Absent fields mean the
+	// conservative default (not refundable) — an older client that does not know
+	// about them can never accidentally open refunds.
+	TicketsRefundable         bool `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes int  `json:"ticket_refund_cutoff_minutes"`
+}
+
+// refundPolicyRequest is the narrow "just the refund rules" admin payload.
+type refundPolicyRequest struct {
+	TicketsRefundable bool `json:"tickets_refundable"`
+	CutoffMinutes     int  `json:"ticket_refund_cutoff_minutes"`
+}
+
+func (r eventRequest) refundPolicy() domain.TicketRefundPolicy {
+	return domain.TicketRefundPolicy{
+		Refundable:    r.TicketsRefundable,
+		CutoffMinutes: r.TicketRefundCutoffMinutes,
+	}
 }
 
 // parseWindow parses starts_at/ends_at as RFC3339. On a malformed/empty value it
@@ -317,8 +367,13 @@ type eventResponse struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor,omitempty"`
 	Capacity         *int              `json:"capacity,omitempty"`
-	CreatedAt        string            `json:"created_at"`
-	UpdatedAt        string            `json:"updated_at"`
+	// The refund rules a guest must be able to read BEFORE buying. Always
+	// present (never omitempty): "false" is a rule too, and an absent field
+	// would read as "unknown" in the app.
+	TicketsRefundable         bool   `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes int    `json:"ticket_refund_cutoff_minutes"`
+	CreatedAt                 string `json:"created_at"`
+	UpdatedAt                 string `json:"updated_at"`
 }
 
 // adminResponse is the full staff-facing shape: base scalar + the raw i18n maps
@@ -339,8 +394,11 @@ func adminResponse(e domain.Event) eventResponse {
 		Ticketed:         e.Ticketed,
 		TicketPriceMinor: e.TicketPriceMinor,
 		Capacity:         e.Capacity,
-		CreatedAt:        e.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:        e.UpdatedAt.Format(time.RFC3339),
+
+		TicketsRefundable:         e.TicketsRefundable,
+		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
+		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
 	}
 }
 

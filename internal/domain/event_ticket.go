@@ -105,8 +105,16 @@ type EventTicket struct {
 	// as PaymentEvent.PaymentID.
 	PaymentID              *uuid.UUID
 	PurchaseIdempotencyKey string
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// RefundPolicyRefundable / RefundPolicyCutoffMinutes are the event's refund
+	// rules AS THEY STOOD AT PURCHASE TIME, frozen onto the ticket exactly like
+	// UnitPriceMinor is. The terms promise the guest that a later change by the
+	// venue does not apply to a ticket already bought, so the refund path
+	// evaluates this snapshot (EventTicket.RefundPolicy) and never re-reads the
+	// event's current columns.
+	RefundPolicyRefundable    bool
+	RefundPolicyCutoffMinutes int
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 // EventTicketCounts is the admin "tickets sold" aggregate for one event: how

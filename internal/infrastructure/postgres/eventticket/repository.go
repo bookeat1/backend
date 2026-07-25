@@ -42,7 +42,8 @@ var _ domain.EventTicketRepository = (*Repository)(nil)
 
 const cols = `id, event_id, restaurant_id, user_id, guest_name, guest_phone, guest_email,
 	quantity, unit_price_minor, total_minor, currency, status, payment_id,
-	purchase_idempotency_key, created_at, updated_at`
+	purchase_idempotency_key, refund_policy_refundable, refund_policy_cutoff_minutes,
+	created_at, updated_at`
 
 // LockEventForCapacity takes a FOR UPDATE row lock on the event. Every buyer of
 // the same event blocks here until the previous one's transaction commits, so
@@ -88,10 +89,11 @@ func (r *Repository) Create(ctx context.Context, t *domain.EventTicket) error {
 	t.UpdatedAt = now
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO event_tickets (`+cols+`) VALUES
-		 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 		t.ID, t.EventID, t.RestaurantID, t.UserID, t.GuestName, t.GuestPhone, t.GuestEmail,
 		t.Quantity, t.UnitPriceMinor, t.TotalMinor, string(t.Currency), string(t.Status), t.PaymentID,
-		t.PurchaseIdempotencyKey, t.CreatedAt, t.UpdatedAt)
+		t.PurchaseIdempotencyKey, t.RefundPolicyRefundable, t.RefundPolicyCutoffMinutes,
+		t.CreatedAt, t.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
@@ -279,7 +281,8 @@ func scanTicket(row scanner) (*domain.EventTicket, error) {
 	if err := row.Scan(
 		&t.ID, &t.EventID, &t.RestaurantID, &t.UserID, &t.GuestName, &t.GuestPhone, &t.GuestEmail,
 		&t.Quantity, &t.UnitPriceMinor, &t.TotalMinor, &currency, &status, &t.PaymentID,
-		&t.PurchaseIdempotencyKey, &t.CreatedAt, &t.UpdatedAt,
+		&t.PurchaseIdempotencyKey, &t.RefundPolicyRefundable, &t.RefundPolicyCutoffMinutes,
+		&t.CreatedAt, &t.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}

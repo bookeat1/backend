@@ -44,6 +44,9 @@ func mkTicket(eventID, restaurantID uuid.UUID, qty int, key string) *domain.Even
 		ID: uuid.New(), EventID: eventID, RestaurantID: restaurantID, Quantity: qty,
 		UnitPriceMinor: 35000, TotalMinor: int64(qty) * 35000, Currency: domain.CurrencyKZT,
 		Status: domain.TicketPending, PurchaseIdempotencyKey: key,
+		// Purchase-time snapshot of the event's refund policy — see
+		// domain.EventTicket.RefundPolicy.
+		RefundPolicyRefundable: true, RefundPolicyCutoffMinutes: 120,
 	}
 }
 
@@ -170,6 +173,15 @@ func TestCASStatusIdempotent(t *testing.T) {
 	tk := mkTicket(eventID, rid, 1, "k")
 	if err := repo.Create(ctx, tk); err != nil {
 		t.Fatalf("create: %v", err)
+	}
+	// The refund-policy snapshot must survive the round-trip: the terms are only
+	// keepable if the row remembers the rules it was sold under.
+	stored, err := repo.GetByID(ctx, tk.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.RefundPolicy() != (domain.TicketRefundPolicy{Refundable: true, CutoffMinutes: 120}) {
+		t.Fatalf("refund policy snapshot not persisted: %+v", stored.RefundPolicy())
 	}
 	if err := repo.CompareAndSwapStatus(ctx, tk.ID, domain.TicketPending, domain.TicketPaid, time.Now()); err != nil {
 		t.Fatalf("first cas: %v", err)

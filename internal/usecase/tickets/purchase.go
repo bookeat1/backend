@@ -195,6 +195,12 @@ func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domai
 		Currency:               domain.CurrencyKZT,
 		Status:                 domain.TicketPending,
 		PurchaseIdempotencyKey: in.IdempotencyKey,
+		// Freeze the venue's refund rules onto the ticket, exactly like the
+		// price above: the terms promise the guest that a later change by the
+		// venue does not apply to a ticket already bought, so the refund path
+		// reads this snapshot and never the event's current columns.
+		RefundPolicyRefundable:    event.TicketsRefundable,
+		RefundPolicyCutoffMinutes: event.TicketRefundCutoffMinutes,
 	}
 
 	var raced *domain.EventTicket

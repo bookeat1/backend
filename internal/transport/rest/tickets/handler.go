@@ -108,6 +108,11 @@ func (h *Handler) purchaseTickets(c *gin.Context) {
 
 type refundRequest struct {
 	Reason string `json:"reason"`
+	// Override is the venue's explicit "refund anyway" outside the event's
+	// refund policy. Honoured only for staff holding payment.refund at the
+	// event's restaurant (enforced in usecase/tickets); a guest sending it
+	// gains nothing.
+	Override bool `json:"override"`
 }
 
 func (h *Handler) refundTicket(c *gin.Context) {
@@ -124,6 +129,7 @@ func (h *Handler) refundTicket(c *gin.Context) {
 	t, err := h.refund.Refund(c.Request.Context(), actorFrom(c), tid, uc.RefundInput{
 		Reason:         reason,
 		IdempotencyKey: c.GetHeader(idempotencyHeader),
+		Override:       req.Override,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)

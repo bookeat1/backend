@@ -23,7 +23,14 @@ type ticketResponse struct {
 	GuestPhone     string     `json:"guest_phone,omitempty"`
 	GuestEmail     string     `json:"guest_email,omitempty"`
 	PaymentID      *uuid.UUID `json:"payment_id,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	// The refund rules this ticket was SOLD under (the purchase-time snapshot,
+	// NOT the event's current settings). Always present: a "false" is a rule the
+	// app must be able to show. The concrete deadline is starts_at minus the
+	// cutoff — the app computes it from the event it already renders, so this
+	// shape needs no join.
+	RefundPolicyRefundable    bool      `json:"refund_policy_refundable"`
+	RefundPolicyCutoffMinutes int       `json:"refund_policy_cutoff_minutes"`
+	CreatedAt                 time.Time `json:"created_at"`
 }
 
 func ticketToResponse(t domain.EventTicket) ticketResponse {
@@ -33,6 +40,8 @@ func ticketToResponse(t domain.EventTicket) ticketResponse {
 		Currency: string(t.Currency), Status: string(t.Status),
 		GuestName: t.GuestName, GuestPhone: t.GuestPhone, GuestEmail: t.GuestEmail,
 		PaymentID: t.PaymentID, CreatedAt: t.CreatedAt,
+		RefundPolicyRefundable:    t.RefundPolicyRefundable,
+		RefundPolicyCutoffMinutes: t.RefundPolicyCutoffMinutes,
 	}
 }
 
