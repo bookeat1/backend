@@ -227,6 +227,16 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 // declared capacity. ReplaceForBooking rather than Create: a venue that has
 // switched modes back and forth must not trip over the holds of the previous
 // round.
+//
+// A booking that already owns real booking_tables links gets holds too, and
+// keeps those links. That is deliberate, and it is NOT the mirror of what
+// seatCapacityBookings does in the other direction: in seats mode the table
+// engine is not the authority — availabilityUseCase.Day takes the seats branch
+// and reads restaurant_capacity_buckets only, and create.go's seats path never
+// calls ListBusy — so a booking with a link but no hold would be invisible and
+// its seats sold a second time. The leftover links are inert while the venue is
+// table-less (nothing in seats mode reads them); seatCapacityBookings is what
+// clears the holds on the way back.
 func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID, policy domain.BookingPolicy) error {
 	list, err := u.liveBookings(ctx, restaurantID, policy)
 	if err != nil {
@@ -276,7 +286,8 @@ func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID
 //     everybody else. A waitlisted booking with no links at all would come back
 //     from the waiting list confirmed and invisible to the constraint.
 //
-// The booking's capacity holds are dropped once it holds a table: the seats
+// The booking's capacity holds are dropped once it holds a table — whether this
+// switch seated it or it arrived already placed: the seats
 // ledger no longer governs this venue, nothing maintains those rows any more (a
 // later amendment in table mode moves the links, not the holds), and a stale
 // hold reports occupancy at a time the guest is no longer expected. A switch
@@ -313,6 +324,18 @@ func (u *policyUseCase) seatCapacityBookings(
 			// placement from before the venue ever went table-less, or from an
 			// earlier round of switching. Re-seating it would move a guest for
 			// no reason.
+			//
+			// The capacity side still has to be reconciled, and skipping it here
+			// was a leak (re-review of the previous commit): a booking created in
+			// TABLES mode keeps its real link through a tables → seats switch
+			// (rebuildHolds deliberately does not move it — in seats mode the
+			// ledger is the sole authority and those guests must still occupy
+			// seats), so on the way back it arrives with BOTH a link and holds.
+			// Left alone, its holds outlive the mode that maintained them and the
+			// buckets report occupancy nobody is taking.
+			if err := u.capacity.ReplaceForBooking(ctx, b.ID, nil); err != nil {
+				return err
+			}
 			continue
 		}
 		from, to := occupancyWindow(b.StartsAt, policy)

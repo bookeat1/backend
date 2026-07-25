@@ -709,3 +709,149 @@ func TestModeSwitchBackToTablesPlacesWaitlistedBookingsInactive(t *testing.T) {
 		t.Fatalf("confirm into a taken table = %v, want ErrAlreadyExists", err)
 	}
 }
+
+// seatAt gives the booking a real placement at `tableID` over its own occupancy
+// window, the way an ordinary table-mode create would. Written through the
+// repository (not raw SQL) so migration 0058 derives `active` from the booking's
+// status exactly as it does in production.
+func (h *guaranteeHarness) seatAt(t *testing.T, b *domain.Booking, tableID uuid.UUID, start time.Time) {
+	t.Helper()
+	from, to := occupancyWindow(start, domain.BookingPolicy{Duration: 2 * time.Hour, Buffer: 15 * time.Minute})
+	if err := bookingrepo.NewTables(h.pool).Create(context.Background(), []domain.BookingTable{{
+		ID: uuid.New(), BookingID: b.ID, TableID: tableID,
+		SlotStart: from, SlotEnd: to, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("seat booking at table: %v", err)
+	}
+}
+
+// availability builds the real read-only seats/tables availability engine over
+// the same venue. Used where the question is not "what is in the ledger" but
+// "what does the engine that sells the next booking believe".
+func (h *guaranteeHarness) availability() AvailabilityUseCase {
+	return NewAvailabilityUseCase(bookingrepo.NewTables(h.pool), h.capacity, h.restRepo, h.related, testConfig())
+}
+
+// slotOn returns the slot of `start` from the venue's own availability answer.
+func (h *guaranteeHarness) slotOn(t *testing.T, start time.Time, guests int) Slot {
+	t.Helper()
+	loc, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Fatalf("load tz: %v", err)
+	}
+	day, err := h.availability().Day(context.Background(), h.restaurantID,
+		start.In(loc).Format(DateLayout), guests)
+	if err != nil {
+		t.Fatalf("availability: %v", err)
+	}
+	for _, s := range day.Slots {
+		if s.StartsAt.Equal(start) {
+			return s
+		}
+	}
+	t.Fatalf("availability returned no slot at %s (got %d slots)", start, len(day.Slots))
+	return Slot{}
+}
+
+// BLOCKING (re-review of b02d815, 25.07.2026). The ROUND TRIP leaks capacity
+// holds, and neither mode-switch test above covered it.
+//
+// A booking created in TABLES mode owns a real booking_tables link. The
+// tables → seats direction (rebuildHolds) gives it capacity holds and
+// deliberately does NOT touch that link — it must not, see the guard test below.
+// So while the venue is table-less such a booking is legitimately recorded in
+// both tables: the ledger is the authority, the leftover link is inert because
+// nothing in seats mode reads booking_tables.
+//
+// Switching BACK to tables was where it broke: seatCapacityBookings saw
+// len(own) > 0, `continue`d — and skipped the ReplaceForBooking(nil) that drops
+// the holds. The booking kept counting against a seats ledger that no longer
+// governs the venue: restaurant_capacity_buckets reported phantom occupancy for
+// its window until it reached a terminal status or a third switch overwrote it.
+//
+// Not a double-sell (a table-mode create never reads the ledger), but the bucket
+// counters feed reports and the capacity guard of any later switch, so a phantom
+// there is a lie the product acts on.
+func TestModeSwitchRoundTripDropsTheStaleCapacityHolds(t *testing.T) {
+	h := newGuaranteeHarness(t, "tables", 0)
+	ctx := context.Background()
+	start := h.slotAt(t, 19)
+
+	// 1. Tables mode: a confirmed booking of four sitting at a real table.
+	tableID := h.addTable(t, "T1", 4)
+	b := h.seedBooking(t, start, 4, domain.BookingConfirmed)
+	h.seatAt(t, b, tableID, start)
+
+	// 2. The venue goes table-less. The booking is backfilled into the ledger
+	//    and keeps its (now inert) placement — both are correct, see below.
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, seatsOverride(10)); err != nil {
+		t.Fatalf("switch to seats: %v", err)
+	}
+	if hs := h.holds(t, b.ID); len(hs) == 0 {
+		t.Fatal("the tables-origin booking got no holds in seats mode: the room would read empty")
+	}
+	if got := h.links(t, b.ID); len(got) == 0 {
+		t.Fatal("the switch to seats dropped the real placement; this test's premise is gone")
+	}
+
+	// 3. And back to tables. booking_tables is the authority again, so the
+	//    ledger must be left empty for this booking.
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, toTables()); err != nil {
+		t.Fatalf("switch back to tables: %v", err)
+	}
+	if hs := h.holds(t, b.ID); len(hs) != 0 {
+		t.Fatalf("back in tables mode the booking still holds %d capacity rows: the buckets report seats nobody is taking", len(hs))
+	}
+	if taken, _ := h.peak(t); taken != 0 {
+		t.Fatalf("seats_taken after returning to tables mode = %d, want 0 (phantom occupancy)", taken)
+	}
+	// Its real placement is untouched: the guest was never moved, and the table
+	// engine still sees the seats as taken.
+	placed := h.links(t, b.ID)
+	if len(placed) != 1 || placed[0].TableID != tableID || !placed[0].Active {
+		t.Fatalf("the round trip disturbed the real placement: %+v", placed)
+	}
+}
+
+// The guard that forbids the OTHER fix for the leak above. It is tempting to
+// close it at the source — have rebuildHolds skip bookings that already hold
+// real active table links, so nothing is ever accounted twice. That opens a
+// worse hole, and this test is what fails if anyone tries.
+//
+// In seats mode the table engine is NOT the authority: availabilityUseCase.Day
+// takes the seats branch and reads restaurant_capacity_buckets ONLY (see
+// availability.go), and create.go's seats path likewise never calls ListBusy. A
+// tables-origin booking with no capacity hold would therefore be invisible while
+// the venue is table-less — its guests are in the room, the ledger says the
+// seats are free, and the next guest is sold them. Under-counting is a real
+// overbooking; the phantom hold the round-trip test guards against is only a
+// wrong number in a report. Hence the fix belongs on the seats → tables side.
+func TestTablesOriginBookingStillOccupiesSeatsInSeatsMode(t *testing.T) {
+	h := newGuaranteeHarness(t, "tables", 0)
+	ctx := context.Background()
+	start := h.slotAt(t, 19)
+
+	tableID := h.addTable(t, "T1", 4)
+	b := h.seedBooking(t, start, 4, domain.BookingConfirmed)
+	h.seatAt(t, b, tableID, start)
+
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, seatsOverride(10)); err != nil {
+		t.Fatalf("switch to seats: %v", err)
+	}
+
+	// The ledger — the only thing the seats engine reads — must show the four
+	// guests already in the room.
+	if taken, _ := h.peak(t); taken != 4 {
+		t.Fatalf("seats_taken in seats mode = %d, want 4: a tables-origin booking stopped counting", taken)
+	}
+	// And the engine that sells the next booking must agree: six seats left, so
+	// a party of six fits and a party of seven does not.
+	if s := h.slotOn(t, start, 6); !s.Available {
+		t.Fatalf("a party of 6 into the 6 free seats is refused: %+v", s)
+	}
+	if s := h.slotOn(t, start, 7); s.Available {
+		t.Fatalf("a party of 7 sold into 6 free seats: %+v", s)
+	} else if s.RemainingSeats == nil || *s.RemainingSeats != 6 {
+		t.Fatalf("remaining seats = %v, want 6", s.RemainingSeats)
+	}
+}
