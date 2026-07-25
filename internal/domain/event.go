@@ -71,6 +71,46 @@ type Event struct {
 	UpdatedAt                 time.Time
 }
 
+// EventRestaurant is the minimal venue identity carried next to an event in the
+// cross-venue public listing: enough for the guest app's Explore card (who
+// hosts it and where) without pulling the whole restaurant aggregate. Name is
+// localized exactly like the catalog — a base scalar (ru) plus NameI18n.
+type EventRestaurant struct {
+	ID       uuid.UUID
+	Name     string
+	NameI18n I18n
+	City     City
+}
+
+// EventListItem is one row of the cross-venue public events listing: the event
+// itself plus the venue that hosts it. The venue is named Restaurant, not
+// Venue, because Event.Venue already means something else (the free-text room
+// inside the restaurant).
+type EventListItem struct {
+	Event
+	Restaurant EventRestaurant
+}
+
+// PublicEventFilter narrows the cross-venue public events listing. Every filter
+// is optional; the zero value lists every visible event on the platform.
+// Visibility itself is NOT a filter — published, not-yet-ended, at an active
+// venue is always enforced (see EventRepository.ListPublicUpcoming).
+type PublicEventFilter struct {
+	// City filters by the HOST RESTAURANT's city (events carry no city of
+	// their own). An unknown city value simply matches nothing.
+	City *City
+	// RestaurantID narrows to one venue.
+	RestaurantID *uuid.UUID
+	// From/To bound the event's START time (inclusive on both ends). They
+	// narrow the always-on "not finished yet" rule, never widen it: a From in
+	// the past does not resurrect an event that already ended.
+	From *time.Time
+	To   *time.Time
+	Page int // 1-based; <=0 means 1
+	// PerPage <=0 means the default (20). The transport layer caps it.
+	PerPage int
+}
+
 // EventRepository persists restaurant events. Get* return ErrNotFound when
 // absent.
 type EventRepository interface {
@@ -93,4 +133,11 @@ type EventRepository interface {
 	// not yet ended (ends_at > now), soonest first with id as a stable
 	// tie-breaker, paginated, plus the total count. This is the public listing.
 	ListPublishedUpcoming(ctx context.Context, restaurantID uuid.UUID, now time.Time, page, perPage int) ([]Event, int, error)
+	// ListPublicUpcoming is the CROSS-VENUE public listing behind the guest
+	// app's Explore screen: PUBLISHED events that have not yet ended
+	// (ends_at > now) hosted by an ACTIVE restaurant, soonest first with id as
+	// a stable tie-breaker, narrowed by f, paginated, plus the total count.
+	// The venue is joined in (EventListItem.Restaurant) so the screen needs no
+	// per-card follow-up query, same choice as the feed read model.
+	ListPublicUpcoming(ctx context.Context, f PublicEventFilter, now time.Time) ([]EventListItem, int, error)
 }

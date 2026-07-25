@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -160,6 +162,79 @@ func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uui
 	return collect(rows, total)
 }
 
+// listCols is selectCols qualified with the `e` alias, plus the host venue's
+// identity, for the cross-venue listing's join. It must stay in the same order
+// as selectCols — scanListItemRow reuses that order.
+const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e.description_i18n,
+	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
+	e.ticket_price_minor, e.capacity, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
+	e.created_at, e.updated_at,
+	r.name, r.name_i18n, r.city`
+
+// ListPublicUpcoming implements the cross-venue public listing. Visibility is
+// enforced in SQL and is not negotiable by a filter: published, not yet ended,
+// and hosted by an active restaurant — a deactivated venue disappears from the
+// guest app together with its events, the same rule the catalog listing keeps
+// (restaurants.ListActive). hidden_from_home is deliberately NOT applied: it
+// hides a venue from the main screen only, not from the catalog, and this is a
+// catalog-style listing.
+func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter, now time.Time) ([]domain.EventListItem, int, error) {
+	where := []string{"e.status = 'published'", "r.is_active = true"}
+	args := []any{now}
+	where = append(where, "e.ends_at > $1")
+	add := func(cond string, val any) {
+		args = append(args, val)
+		where = append(where, fmt.Sprintf(cond, len(args)))
+	}
+	if f.City != nil {
+		add("r.city = $%d", string(*f.City))
+	}
+	if f.RestaurantID != nil {
+		add("e.restaurant_id = $%d", *f.RestaurantID)
+	}
+	if f.From != nil {
+		add("e.starts_at >= $%d", *f.From)
+	}
+	if f.To != nil {
+		add("e.starts_at <= $%d", *f.To)
+	}
+	whereSQL := strings.Join(where, " AND ")
+	from := ` FROM events e JOIN restaurants r ON r.id = e.restaurant_id WHERE ` + whereSQL
+
+	q := sqltx.From(ctx, r.pool)
+	var total int
+	if err := q.QueryRow(ctx, `SELECT count(*)`+from, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count public events: %w", err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+
+	page, perPage := normalizePage(f.Page, f.PerPage)
+	args = append(args, perPage, (page-1)*perPage)
+	rows, err := q.Query(ctx,
+		`SELECT `+listCols+from+`
+		 ORDER BY e.starts_at ASC, e.id ASC
+		 LIMIT $`+strconv.Itoa(len(args)-1)+` OFFSET $`+strconv.Itoa(len(args)), args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list public events: %w", err)
+	}
+	defer rows.Close()
+
+	var items []domain.EventListItem
+	for rows.Next() {
+		it, err := scanListItemRow(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan public event: %w", err)
+		}
+		items = append(items, *it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate public events: %w", err)
+	}
+	return items, total, nil
+}
+
 func collect(rows pgx.Rows, total int) ([]domain.Event, int, error) {
 	defer rows.Close()
 	var items []domain.Event
@@ -199,6 +274,24 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
 	return &e, nil
+}
+
+func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
+	var it domain.EventListItem
+	e := &it.Event
+	var titleI18n, descI18n, venueNameI18n []byte
+	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
+		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
+		&e.TicketPriceMinor, &e.Capacity, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
+		&e.CreatedAt, &e.UpdatedAt,
+		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
+		return nil, err
+	}
+	e.TitleI18n = i18nFromDB(titleI18n)
+	e.DescriptionI18n = i18nFromDB(descI18n)
+	it.Restaurant.ID = e.RestaurantID
+	it.Restaurant.NameI18n = i18nFromDB(venueNameI18n)
+	return &it, nil
 }
 
 func statusStrings(statuses []domain.EventStatus) []string {

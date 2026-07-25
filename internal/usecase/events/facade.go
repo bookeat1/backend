@@ -66,6 +66,11 @@ type Facade interface {
 	// GetPublic returns one published event that belongs to restaurantID.
 	// A draft/hidden event, or one of another restaurant, is ErrNotFound.
 	GetPublic(ctx context.Context, restaurantID, eventID uuid.UUID) (*domain.Event, error)
+	// ListPublicUpcoming is the cross-venue guest listing (Explore screen):
+	// published, not-yet-ended events at active venues, soonest first,
+	// narrowed by f and paginated. No authorization. An inverted date range is
+	// ErrValidation, never a silently empty page.
+	ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter) ([]domain.EventListItem, int, error)
 }
 
 // CreateInput carries a new event's fields. Status defaults to draft when empty.
@@ -266,6 +271,19 @@ func (f *facade) ListAdmin(ctx context.Context, actor Actor, restaurantID uuid.U
 
 func (f *facade) ListPublic(ctx context.Context, restaurantID uuid.UUID, page, perPage int) ([]domain.Event, int, error) {
 	return f.repo.ListPublishedUpcoming(ctx, restaurantID, f.clock(), page, perPage)
+}
+
+// ListPublicUpcoming reads the cross-venue listing. The "what a guest may see"
+// rule (published, not yet ended, active venue) lives in the repository query
+// so it cannot be paginated or filtered away here; this method only validates
+// the caller's filters and supplies the clock, exactly like ListPublic.
+func (f *facade) ListPublicUpcoming(ctx context.Context, flt domain.PublicEventFilter) ([]domain.EventListItem, int, error) {
+	// An inverted range can only ever return nothing, so it is a mistake worth
+	// naming rather than an empty page the client has to explain to itself.
+	if flt.From != nil && flt.To != nil && flt.To.Before(*flt.From) {
+		return nil, 0, fmt.Errorf("%w: to must not be before from", domain.ErrValidation)
+	}
+	return f.repo.ListPublicUpcoming(ctx, flt, f.clock())
 }
 
 func (f *facade) GetPublic(ctx context.Context, restaurantID, eventID uuid.UUID) (*domain.Event, error) {
