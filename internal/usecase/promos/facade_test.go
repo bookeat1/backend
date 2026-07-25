@@ -212,3 +212,32 @@ func TestUpdate_AbortsWhenTheDemotionFails(t *testing.T) {
 		t.Fatal("no content must be written when the feed placement could not be demoted")
 	}
 }
+
+// A venue hiding and re-publishing its own approved promo must NOT be sent back
+// to the moderation queue: Status is its own lever, and nothing a moderator read
+// has changed. The text-edit case (which MUST demote) is covered above.
+func TestUpdate_StatusOnlyChangeKeepsTheApproval(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	now := time.Now()
+	pr := &domain.Promo{
+		ID: uuid.New(), RestaurantID: rid, Title: "Кофе за полцены",
+		Description: "до конца недели", Terms: "только в зале",
+		StartsAt: now, EndsAt: now.Add(48 * time.Hour), Status: domain.PromoPublished,
+	}
+	repo.byID[pr.ID] = pr
+	fd := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), fd)
+
+	in := UpdateInput{
+		Title: pr.Title, Description: pr.Description, Terms: pr.Terms,
+		StartsAt: pr.StartsAt, EndsAt: pr.EndsAt,
+		Status: domain.PromoDraft, // hiding it — the only change
+	}
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, in); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(fd.demoted) != 0 {
+		t.Fatalf("a status-only change demoted the feed approval: %v", fd.demoted)
+	}
+}
