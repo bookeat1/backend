@@ -27,10 +27,24 @@ import (
 // the mobile app read a lost slot race as "your earlier submit went through" and
 // sent the guest looking for a reservation that does not exist.
 //
-// Both conflicts here are produced by the real usecases over the real Postgres
-// repositories — the slot one by the GiST exclusion constraint on
-// booking_tables, the idempotency one by the unique index on idempotency_keys.
-// Nothing about the failure is stubbed.
+// What these tests actually exercise, precisely:
+//
+//   - the slot conflict is raised by Postgres itself — the GiST exclusion
+//     constraint on booking_tables rejects the INSERT;
+//   - the idempotency conflict is NOT a constraint violation. The stored key is
+//     read back with a plain SELECT (idempotency.replay → keys.Get) and the
+//     request hash is compared in Go; the 409 is a decision the usecase makes,
+//     not an error the database returns.
+//
+// Both run over the real usecases and the real Postgres repositories — no
+// usecase, repository or error is stubbed.
+//
+// NOT covered here, and not covered anywhere on this branch: the concurrent
+// first-attempt race, where two simultaneous requests collide on the unique
+// index of idempotency_keys and the loser replays the winner's stored response
+// (described at idempotency.go:40-46, handled at :96-106). Reproducing it needs
+// two in-flight transactions whose bookings do NOT collide on tables first, so
+// it does not belong in this file; treat that path as untested.
 
 var conflictTables = []string{
 	"booking_outbox", "booking_status_history", "booking_rate_log",

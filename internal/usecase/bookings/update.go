@@ -133,6 +133,9 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 		return nil, err
 	}
 
+	// Set only by the relink below — same reasoning as in create.go: the
+	// slot_taken label must name the statement that raised the conflict.
+	var slotConflict bool
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.bookings.Update(ctx, b); err != nil {
 			return err
@@ -142,13 +145,14 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 			// exclusion constraint cannot fire against the booking's previous
 			// slot when it is merely shifted by a few minutes.
 			if err := u.links.ReplaceForBooking(ctx, b.ID, links); err != nil {
+				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
 				return err
 			}
 		}
 		return publish(ctx, u.outbox, b, domain.EventBookingUpdated, b.UpdatedAt)
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrAlreadyExists) {
+		if slotConflict {
 			// Same lost race as on create: the booking was not moved.
 			return nil, domain.WithCode(domain.CodeSlotTaken,
 				fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists))
