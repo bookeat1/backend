@@ -25,7 +25,7 @@ const payoutCols = `id, restaurant_id, amount_minor, currency, status, method, d
 	destination_customer_ref, provider_ref, idempotency_key, failure_code, failure_reason,
 	status_changed_at, reconcile_attempts, last_reconcile_attempt_at, needs_manual_review,
 	sent_at, paid_at, failed_at, created_at, updated_at,
-	gross_amount_minor, fee_minor, fee_bearer, period_date, period_end_at`
+	gross_amount_minor, fee_minor, fee_bearer, period_date, period_end_at, forced_by_age`
 
 // Create inserts a new payout. A duplicate idempotency_key surfaces as
 // domain.ErrAlreadyExists (uq_payouts_idempotency).
@@ -54,12 +54,12 @@ func (r *Payouts) Create(ctx context.Context, p *domain.Payout) error {
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO payouts (`+payoutCols+`)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
-		         $22,$23,$24,$25,$26)`,
+		         $22,$23,$24,$25,$26,$27)`,
 		p.ID, p.RestaurantID, p.AmountMinor, string(p.Currency), string(p.Status), string(p.Method),
 		p.DestinationToken, p.DestinationCustomerRef, p.ProviderRef, p.IdempotencyKey, p.FailureCode,
 		p.FailureReason, p.StatusChangedAt, p.ReconcileAttempts, p.LastReconcileAttemptAt,
 		p.NeedsManualReview, p.SentAt, p.PaidAt, p.FailedAt, p.CreatedAt, p.UpdatedAt,
-		p.GrossAmountMinor, p.FeeMinor, string(p.FeeBearer), p.PeriodDate, p.PeriodEndAt)
+		p.GrossAmountMinor, p.FeeMinor, string(p.FeeBearer), p.PeriodDate, p.PeriodEndAt, p.ForcedByAge)
 	if err != nil {
 		// A duplicate here is one of TWO unique constraints, both mapped to
 		// domain.ErrAlreadyExists: uq_payouts_idempotency (a replayed send) and
@@ -229,7 +229,8 @@ func scanPayout(row scanner) (*domain.Payout, error) {
 		&p.DestinationToken, &p.DestinationCustomerRef, &p.ProviderRef, &p.IdempotencyKey, &p.FailureCode,
 		&p.FailureReason, &p.StatusChangedAt, &p.ReconcileAttempts, &p.LastReconcileAttemptAt,
 		&p.NeedsManualReview, &p.SentAt, &p.PaidAt, &p.FailedAt, &p.CreatedAt, &p.UpdatedAt,
-		&p.GrossAmountMinor, &p.FeeMinor, &feeBearer, &p.PeriodDate, &p.PeriodEndAt); err != nil {
+		&p.GrossAmountMinor, &p.FeeMinor, &feeBearer, &p.PeriodDate, &p.PeriodEndAt,
+		&p.ForcedByAge); err != nil {
 		return nil, err
 	}
 	p.Currency = domain.Currency(currency)

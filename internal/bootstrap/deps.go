@@ -390,6 +390,7 @@ func newPayoutPorts(db *pgxpool.Pool, perms permissionCheckerPort, txm domain.Tx
 		Owed:         payoutrepo.NewOwed(db),
 		Ledger:       payoutrepo.NewLedger(db),
 		Venues:       payoutrepo.NewVenues(db),
+		Settings:     payoutrepo.NewSettings(db),
 		Gateway:      newPayoutGateway(log),
 		Tx:           txm,
 	}
@@ -410,6 +411,13 @@ func newPayoutsConfig(cfg Config) payouts.Config {
 		FeeBps:          cfg.Payouts.FeeBps,
 		FeeMinimumMinor: cfg.Payouts.FeeMinimumMinor,
 		FeeBearer:       domain.PayoutFeeBearer(strings.ToLower(strings.TrimSpace(cfg.Payouts.FeeBearer))),
+		// The PLATFORM policy — the fallback for a venue with no
+		// restaurant_payout_settings row of its own, and the base every
+		// per-venue override is layered onto.
+		PlatformPolicy: domain.PayoutPolicy{
+			MinPayoutMinor: cfg.Payouts.MinPayoutMinor,
+			MaxHoldDays:    cfg.Payouts.MaxHoldDays,
+		},
 	}
 }
 
@@ -422,9 +430,11 @@ func NewDailyPayoutRunner(cfg Config, db *pgxpool.Pool, log *slog.Logger) *payou
 	ports := newPayoutPorts(db, nil, sqltx.NewManager(db), log)
 	uc := payouts.NewUseCase(ports, newPayoutsConfig(cfg), log)
 	return payouts.NewDailyRunner(uc, ports.Venues, payouts.DailyConfig{
-		TickInterval:   cfg.Payouts.DailyTickInterval,
-		SendEnabled:    cfg.Payouts.DailySendEnabled,
-		MinPayoutMinor: cfg.Payouts.MinPayoutMinor,
+		TickInterval: cfg.Payouts.DailyTickInterval,
+		SendEnabled:  cfg.Payouts.DailySendEnabled,
+		// The payout threshold and the max-hold window are NOT here: they are
+		// part of the usecase's money policy (newPayoutsConfig) because they
+		// are per-venue overridable and must be resolved in one place.
 		// The venue's own timezone wins; this is only the fallback for a venue
 		// that has none, and it is the platform's booking fallback so payouts
 		// and bookings agree on what "a day" means for such a venue.

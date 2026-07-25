@@ -41,13 +41,21 @@ func seedVenue(t *testing.T, h *harness, tz string, entries ...domain.OwedEntry)
 }
 
 // owedAt builds one owed ledger entry created at a given instant.
+//
+// The instant is recorded twice on purpose, because it plays two different
+// roles: entryTimes drives the fake's period CUTOFF (which entries are in scope
+// for the day being settled), while OwedEntry.CreatedAt is the AGE the real
+// repository returns and the max-hold rule measures against.
 func owedAt(h *harness, amountMinor int64, at time.Time) domain.OwedEntry {
 	id := uuid.New()
 	if h.owed.entryTimes == nil {
 		h.owed.entryTimes = map[uuid.UUID]time.Time{}
 	}
 	h.owed.entryTimes[id] = at
-	return domain.OwedEntry{LedgerEntryID: id, AmountSignedMinor: amountMinor, Currency: domain.CurrencyKZT}
+	return domain.OwedEntry{
+		LedgerEntryID: id, AmountSignedMinor: amountMinor,
+		Currency: domain.CurrencyKZT, CreatedAt: at,
+	}
 }
 
 func mustLoad(t *testing.T, name string) *time.Location {

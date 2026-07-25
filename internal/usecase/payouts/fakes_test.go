@@ -330,6 +330,78 @@ func (f *fakeOwed) OwedForRestaurantUpTo(_ context.Context, restaurantID uuid.UU
 
 func (f *fakeOwed) OwedRestaurantIDs(_ context.Context) ([]uuid.UUID, error) { return f.ids, nil }
 
+// fakeSettings is an in-memory domain.PayoutSettingsRepository. It reproduces
+// the two properties the usecase depends on: a venue with no row is ABSENT
+// (not a zero value), and ForRestaurants answers in one call.
+type fakeSettings struct {
+	mu sync.Mutex
+	m  map[uuid.UUID]domain.PayoutSettings
+	// batchCalls counts ForRestaurants calls so a test can assert the daily
+	// pass does not do one lookup per venue.
+	batchCalls int
+	// err, when set, fails every read — the "policy unreadable" path.
+	err error
+}
+
+func newFakeSettings() *fakeSettings {
+	return &fakeSettings{m: map[uuid.UUID]domain.PayoutSettings{}}
+}
+
+func (f *fakeSettings) Get(_ context.Context, restaurantID uuid.UUID) (*domain.PayoutSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	if s, ok := f.m[restaurantID]; ok {
+		cp := s
+		return &cp, nil
+	}
+	return nil, domain.ErrNotFound
+}
+
+func (f *fakeSettings) Upsert(_ context.Context, s *domain.PayoutSettings) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	now := time.Now()
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now
+	}
+	s.UpdatedAt = now
+	f.m[s.RestaurantID] = *s
+	return nil
+}
+
+func (f *fakeSettings) ForRestaurants(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.PayoutSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batchCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make(map[uuid.UUID]domain.PayoutSettings, len(ids))
+	for _, id := range ids {
+		if s, ok := f.m[id]; ok {
+			out[id] = s
+		}
+	}
+	return out, nil
+}
+
+// setVenuePolicy gives one venue its own overrides. A nil pointer means "this
+// venue keeps following the platform for that knob".
+func (h *harness) setVenuePolicy(rid uuid.UUID, minMinor *int64, maxHoldDays *int) {
+	h.settings.m[rid] = domain.PayoutSettings{
+		RestaurantID: rid, MinPayoutMinor: minMinor, MaxHoldDays: maxHoldDays,
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
+func ptrInt(v int) *int       { return &v }
+
 // fakeVenues is an in-memory domain.PayoutVenueReader.
 type fakeVenues struct{ tz map[uuid.UUID]string }
 
@@ -414,15 +486,16 @@ func (f *fakeGateway) GetPayout(_ context.Context, orderID string) (*domain.Gate
 
 // harness builds a UseCase over the fakes.
 type harness struct {
-	uc      *UseCase
-	perms   *fakePerms
-	dest    *fakeDestinations
-	payouts *fakePayouts
-	items   *fakeItems
-	owed    *fakeOwed
-	venues  *fakeVenues
-	ledger  *fakeLedger
-	gw      *fakeGateway
+	uc       *UseCase
+	perms    *fakePerms
+	dest     *fakeDestinations
+	payouts  *fakePayouts
+	items    *fakeItems
+	owed     *fakeOwed
+	venues   *fakeVenues
+	settings *fakeSettings
+	ledger   *fakeLedger
+	gw       *fakeGateway
 }
 
 func newHarness() *harness { return newHarnessWithConfig(Config{}) }
@@ -437,6 +510,7 @@ func newHarnessWithConfig(cfg Config) *harness {
 	items := newFakeItems()
 	owed := &fakeOwed{byRestaurant: map[uuid.UUID][]domain.OwedBalance{}, claims: items}
 	venues := &fakeVenues{tz: map[uuid.UUID]string{}}
+	settings := newFakeSettings()
 	ledger := newFakeLedger()
 	gw := &fakeGateway{}
 	uc := NewUseCase(Ports{
@@ -446,12 +520,13 @@ func newHarnessWithConfig(cfg Config) *harness {
 		Items:        items,
 		Owed:         owed,
 		Venues:       venues,
+		Settings:     settings,
 		Ledger:       ledger,
 		Gateway:      gw,
 		Tx:           fakeTx{},
 	}, cfg, nil)
 	return &harness{uc: uc, perms: perms, dest: dest, payouts: pays, items: items,
-		owed: owed, venues: venues, ledger: ledger, gw: gw}
+		owed: owed, venues: venues, settings: settings, ledger: ledger, gw: gw}
 }
 
 // daily builds the scheduled pass over the same fakes, with a frozen clock so a

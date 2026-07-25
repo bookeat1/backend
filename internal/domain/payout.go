@@ -228,6 +228,14 @@ type Payout struct {
 	// there is no matching PeriodStartAt: the lower bound of a payout is "not
 	// yet claimed", not a date.
 	PeriodEndAt *time.Time
+	// ForcedByAge marks a payout the daily pass produced even though the
+	// venue's balance was BELOW its payout threshold, because the venue's
+	// oldest unpaid money had been held for its full max-hold window. Such a
+	// payout still pays the acquirer's fee — that is the deliberate trade of
+	// the setting (a small, relatively expensive payout beats holding a venue's
+	// money indefinitely), so it is recorded on the row and shown on the
+	// statement rather than left to be inferred from the amount.
+	ForcedByAge bool
 	Currency    Currency
 	Status      PayoutStatus
 	Method      PayoutMethod
@@ -306,6 +314,33 @@ type OwedEntry struct {
 	LedgerEntryID     uuid.UUID
 	AmountSignedMinor int64 // credit positive, debit negative
 	Currency          Currency
+	// CreatedAt is when the ledger entry was booked — i.e. HOW LONG this money
+	// has been waiting to be paid out. It is what the daily pass's max-hold
+	// rule measures; zero means the source could not tell us, and the age rule
+	// then deliberately does not fire (see OwedBalance.OldestEntryAt).
+	CreatedAt time.Time
+}
+
+// OldestEntryAt returns when the OLDEST money in this balance was booked — the
+// age the max-hold rule is measured against.
+//
+// Derived from the entries rather than stored as a field on purpose: the
+// entries ARE the balance, so a separate field could drift out of sync with
+// them. Entries with a zero CreatedAt (a source that does not carry the
+// instant) are ignored, and a balance with no usable timestamp at all returns
+// the zero time — which callers must read as "age unknown, do not force a
+// payout", never as "infinitely old".
+func (b OwedBalance) OldestEntryAt() time.Time {
+	var oldest time.Time
+	for _, e := range b.Entries {
+		if e.CreatedAt.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || e.CreatedAt.Before(oldest) {
+			oldest = e.CreatedAt
+		}
+	}
+	return oldest
 }
 
 // PayoutRepository persists payouts. Get* return ErrNotFound when absent.

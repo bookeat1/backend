@@ -37,17 +37,28 @@ import (
 //     ledger entries are simply still unclaimed tomorrow and are picked up by
 //     the next pass. There is no carry-forward record that could be lost,
 //     double-counted, or drift out of sync with the ledger.
+//  4. That roll-over is BOUNDED. Once a venue's oldest unpaid money has been
+//     held for its full max-hold window, the pass pays out anyway — below the
+//     threshold, fee and all. A venue whose turnover never reaches the minimum
+//     must not have its money held indefinitely; the fee is the accepted price
+//     of that, and the payout is marked ForcedByAge so the statement says why.
+//
+// The threshold and the hold window are PER VENUE (restaurant_payout_settings,
+// migration 0053) with the platform env values as the fallback — resolved once
+// per pass through UseCase.effectivePolicyFor, the same function the venue-
+// facing read endpoint uses.
 //
 // Safe to run twice, safe to restart: every pass recomputes from the ledger and
 // every write is guarded by a DB constraint.
 type DailyRunner struct {
-	uc     *UseCase
-	owed   domain.OwedReader
-	venues domain.PayoutVenueReader
-	dest   domain.PayoutDestinationRepository
-	cfg    DailyConfig
-	log    *slog.Logger
-	now    func() time.Time
+	uc       *UseCase
+	owed     domain.OwedReader
+	venues   domain.PayoutVenueReader
+	settings domain.PayoutSettingsRepository
+	dest     domain.PayoutDestinationRepository
+	cfg      DailyConfig
+	log      *slog.Logger
+	now      func() time.Time
 }
 
 // DailyConfig is the schedule and the money thresholds of the daily pass.
@@ -65,10 +76,10 @@ type DailyConfig struct {
 	// product to be live. With it off the pass still produces pending payouts,
 	// which an operator can inspect and release.
 	SendEnabled bool
-	// MinPayoutMinor is the amount below which a venue's money rolls into the
-	// next day instead of being paid. See defaultMinPayoutMinor for the
-	// reasoning behind the default.
-	MinPayoutMinor int64
+	// The payout threshold and the max-hold window are NOT here: they moved to
+	// Config.PlatformPolicy, because they are now per-venue overridable and the
+	// runner must resolve exactly the same effective policy the API reports.
+	//
 	// TimezoneFallback is the IANA zone used for a venue with no timezone of
 	// its own. Explicit rather than time.Local: the server's zone is an
 	// accident of deployment and must never decide when a venue gets paid.
@@ -80,20 +91,14 @@ const (
 	// settled within a quarter of an hour of its local midnight, cheap enough
 	// that a tick with nothing to do is two small queries.
 	defaultDailyTickInterval = 15 * time.Minute
-	// defaultMinPayoutMinor — 10 000 ₸ (1 000 000 tiyn).
+	// The payout threshold's default and its reasoning live next to the rest of
+	// the money policy, in ports.go (defaultMinPayoutMinor / defaultMaxHoldDays).
 	//
-	// The 300 ₸ floor makes the fee a percentage that falls as the payout
-	// grows: 300 ₸ on 10 000 ₸ is 3.0%, on 5 000 ₸ it is 6%, on 1 000 ₸ it is
-	// 30%. 3% is the worst case the owner already accepted when choosing daily
-	// batching over per-booking payouts, so 10 000 ₸ is the threshold that
-	// holds the cost at that accepted ceiling without holding a venue's money
-	// longer than necessary.
+	// The threshold alternative worth naming: at 15 790 ₸ the 1.9% rate finally
+	// exceeds the floor, so a threshold there would mean NEVER paying the floor
+	// premium at all — cheapest for the platform, but it delays small venues'
+	// money noticeably. That is an owner decision, listed in the PR notes.
 	//
-	// The alternative worth naming: at 15 790 ₸ the 1.9% rate finally exceeds
-	// the floor, so a threshold there would mean NEVER paying the floor premium
-	// at all — cheapest for the platform, but it delays small venues' money
-	// noticeably. That is an owner decision, listed in the PR notes.
-	defaultMinPayoutMinor int64 = 1_000_000
 	// defaultTimezoneFallback matches bookings' own fallback (spec: the
 	// platform operates in Kazakhstan).
 	defaultTimezoneFallback = "Asia/Almaty"
@@ -102,9 +107,6 @@ const (
 func (c DailyConfig) withDefaults() DailyConfig {
 	if c.TickInterval <= 0 {
 		c.TickInterval = defaultDailyTickInterval
-	}
-	if c.MinPayoutMinor <= 0 {
-		c.MinPayoutMinor = defaultMinPayoutMinor
 	}
 	if c.TimezoneFallback == "" {
 		c.TimezoneFallback = defaultTimezoneFallback
@@ -124,10 +126,13 @@ func NewDailyRunner(uc *UseCase, venues domain.PayoutVenueReader, cfg DailyConfi
 		uc:     uc,
 		owed:   uc.owed,
 		venues: venues,
-		dest:   uc.destinations,
-		cfg:    cfg.withDefaults(),
-		log:    log,
-		now:    time.Now,
+		// Taken from the usecase, not from a parameter: the manual path and the
+		// scheduled path must read the same per-venue policy.
+		settings: uc.settings,
+		dest:     uc.destinations,
+		cfg:      cfg.withDefaults(),
+		log:      log,
+		now:      time.Now,
 	}
 }
 
@@ -135,7 +140,8 @@ func NewDailyRunner(uc *UseCase, venues domain.PayoutVenueReader, cfg DailyConfi
 // bucket per currency, so the numbers add up in a log line.
 type DailyResult struct {
 	Venues     int // venues with an unpaid balance this pass looked at
-	Generated  int // payouts created
+	Generated  int // payouts created (threshold-driven AND age-forced)
+	Forced     int // of those, created by the max-hold rule while below threshold
 	Sent       int // payouts dispatched (SendEnabled only)
 	RolledOver int // balances left unclaimed because they were below the minimum
 	Skipped    int // already paid for the period, or no destination configured
@@ -157,8 +163,8 @@ func (d *DailyRunner) Run(ctx context.Context) error {
 			}
 			if res.Generated > 0 || res.RolledOver > 0 {
 				d.log.Info("daily payout pass",
-					"venues", res.Venues, "generated", res.Generated, "sent", res.Sent,
-					"rolled_over", res.RolledOver, "skipped", res.Skipped)
+					"venues", res.Venues, "generated", res.Generated, "forced_by_age", res.Forced,
+					"sent", res.Sent, "rolled_over", res.RolledOver, "skipped", res.Skipped)
 			}
 		}
 	}
@@ -184,10 +190,25 @@ func (d *DailyRunner) Tick(ctx context.Context) (DailyResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("resolve venue timezones: %w", err)
 	}
+	// One query for every owed venue's policy, same shape as the timezone read:
+	// a pass over N venues must not do N settings lookups. A venue with no
+	// overrides is simply absent from the map.
+	settings, err := d.settingsFor(ctx, ids)
+	if err != nil {
+		// The policy decides WHEN money leaves. Unlike a single venue's failure
+		// this is not isolatable — running the whole pass on platform defaults
+		// would ignore every venue's override — so the pass aborts and retries
+		// on the next tick rather than paying under a policy nobody chose.
+		return res, fmt.Errorf("resolve venue payout settings: %w", err)
+	}
 
 	for _, id := range ids {
 		res.Venues++
-		if err := d.runVenue(ctx, id, zones[id], &res); err != nil {
+		policy := d.uc.cfg.PlatformPolicy
+		if s, ok := settings[id]; ok {
+			policy = d.uc.effectivePolicyFor(&s)
+		}
+		if err := d.runVenue(ctx, id, zones[id], policy, &res); err != nil {
 			d.log.Error("daily payout for venue failed, other venues continue",
 				"restaurant_id", id, "err", err.Error())
 		}
@@ -195,8 +216,20 @@ func (d *DailyRunner) Tick(ctx context.Context) (DailyResult, error) {
 	return res, nil
 }
 
-// runVenue settles one venue's last completed local day.
-func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz string, res *DailyResult) error {
+// settingsFor batch-reads the per-venue payout overrides. With no repository
+// wired every venue follows the platform policy — the exact behaviour before
+// per-venue settings existed, expressed as an empty map rather than a branch in
+// the loop below.
+func (d *DailyRunner) settingsFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]domain.PayoutSettings, error) {
+	if d.settings == nil {
+		return map[uuid.UUID]domain.PayoutSettings{}, nil
+	}
+	return d.settings.ForRestaurants(ctx, ids)
+}
+
+// runVenue settles one venue's last completed local day under the EFFECTIVE
+// policy for that venue (its own overrides on top of the platform default).
+func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz string, policy domain.PayoutPolicy, res *DailyResult) error {
 	loc := d.location(tz, restaurantID)
 	period := lastCompletedLocalDay(d.now(), loc)
 
@@ -220,20 +253,43 @@ func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz s
 	}
 
 	for _, bal := range balances {
-		if bal.AmountMinor < d.cfg.MinPayoutMinor {
-			// ROLL OVER, by doing nothing: no payout row, no claim, so these
-			// exact ledger entries are still unclaimed tomorrow and the next
-			// pass sees them again together with the new day's money. Nothing
-			// to lose, nothing to double-count.
-			res.RolledOver++
-			d.log.Info("venue balance below the payout minimum, rolling into the next day",
+		forced := false
+		if bal.AmountMinor < policy.MinPayoutMinor {
+			held := heldDays(bal.OldestEntryAt(), loc, period)
+			if policy.MaxHoldDays <= 0 || held < policy.MaxHoldDays {
+				// ROLL OVER, by doing nothing: no payout row, no claim, so
+				// these exact ledger entries are still unclaimed tomorrow and
+				// the next pass sees them again together with the new day's
+				// money. Nothing to lose, nothing to double-count.
+				res.RolledOver++
+				d.log.Info("venue balance below the payout minimum, rolling into the next day",
+					"restaurant_id", restaurantID, "amount_minor", bal.AmountMinor,
+					"minimum_minor", policy.MinPayoutMinor, "held_days", held,
+					"max_hold_days", policy.MaxHoldDays, "currency", string(bal.Currency),
+					"period", period.Date.Format(time.DateOnly))
+				continue
+			}
+			// The hold window is up: pay it anyway. This payout is small, so
+			// the acquirer's floor is a large share of it — that is the
+			// deliberate cost of the setting, and it is exactly why the row is
+			// marked so the venue's statement can say the payout happened
+			// because the money got old, not because a threshold was met.
+			forced = true
+			d.log.Info("venue balance below the payout minimum but held too long, paying anyway",
 				"restaurant_id", restaurantID, "amount_minor", bal.AmountMinor,
-				"minimum_minor", d.cfg.MinPayoutMinor, "currency", string(bal.Currency),
+				"minimum_minor", policy.MinPayoutMinor, "held_days", held,
+				"max_hold_days", policy.MaxHoldDays, "currency", string(bal.Currency),
 				"period", period.Date.Format(time.DateOnly))
-			continue
 		}
 
-		p, err := d.uc.createOnePayout(ctx, restaurantID, dest, bal, &period)
+		// Whether it was the threshold or the age that triggered it, the payout
+		// takes the SAME path: same period, same claim, same once-per-venue-day
+		// unique index. A forced payout therefore cannot double-pay any more
+		// than a normal one can — there is no second code path to get wrong.
+		venuePeriod := period
+		venuePeriod.ForcedByAge = forced
+
+		p, err := d.uc.createOnePayout(ctx, restaurantID, dest, bal, &venuePeriod)
 		if err != nil {
 			if errors.Is(err, domain.ErrAlreadyExists) {
 				// Either this venue-day already has a live payout, or a
@@ -248,6 +304,9 @@ func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz s
 			return fmt.Errorf("generate payout: %w", err)
 		}
 		res.Generated++
+		if forced {
+			res.Forced++
+		}
 
 		if !d.cfg.SendEnabled {
 			continue
@@ -308,4 +367,32 @@ func lastCompletedLocalDay(now time.Time, loc *time.Location) payoutPeriod {
 		Date:  time.Date(prev.Year(), prev.Month(), prev.Day(), 0, 0, 0, 0, time.UTC),
 		EndAt: todayStart,
 	}
+}
+
+// heldDays returns how many WHOLE venue-local days the venue's oldest unpaid
+// money has been held by the end of the period being settled.
+//
+// Counted in CALENDAR days, not in elapsed hours: both sides are reduced to a
+// venue-local calendar date normalised to UTC midnight, so the subtraction is
+// exact and a DST transition (a 23- or 25-hour local day) cannot shift the
+// answer by one. Money booked on day D therefore reads 0 when day D is settled,
+// 1 on D+1, and with max_hold_days = 7 it is forced out when the pass settles
+// D+7 — i.e. after seven full days of holding.
+//
+// A zero `oldest` means the balance carries no usable timestamp. It returns 0,
+// which reads as "brand new" and so NEVER forces a payout: an unknown age must
+// fail towards rolling over, not towards spending money on a fee.
+func heldDays(oldest time.Time, loc *time.Location, period payoutPeriod) int {
+	if oldest.IsZero() {
+		return 0
+	}
+	local := oldest.In(loc)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+	held := int(period.Date.Sub(day) / (24 * time.Hour))
+	if held < 0 {
+		// Money dated after the period being settled (a clock skew, a
+		// backdated import). Not old, by definition.
+		return 0
+	}
+	return held
 }

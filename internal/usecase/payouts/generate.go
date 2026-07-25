@@ -96,6 +96,12 @@ func (u *UseCase) GenerateAll(ctx context.Context, actor Actor) ([]domain.Payout
 type payoutPeriod struct {
 	Date  time.Time
 	EndAt time.Time
+	// ForcedByAge marks a period the daily pass settled under the max-hold rule
+	// (the venue was below its threshold, but its oldest money had waited long
+	// enough). It rides on the period rather than being a separate argument
+	// because only a SCHEDULED payout can be forced — a manual generation
+	// carries no period and therefore cannot claim it was age-driven.
+	ForcedByAge bool
 }
 
 // createOnePayout writes one pending payout and its item claims in ONE
@@ -150,6 +156,7 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 	if period != nil {
 		date, endAt := period.Date, period.EndAt
 		p.PeriodDate, p.PeriodEndAt = &date, &endAt
+		p.ForcedByAge = period.ForcedByAge
 	}
 	items := make([]domain.PayoutItem, 0, len(bal.Entries))
 	for _, e := range bal.Entries {
@@ -181,7 +188,8 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 		"payout_id", id, "restaurant_id", restaurantID,
 		"amount_minor", p.AmountMinor, "gross_minor", p.GrossAmountMinor,
 		"fee_minor", p.FeeMinor, "fee_bearer", string(p.FeeBearer),
-		"currency", string(p.Currency), "items", len(items), "period", periodLabel(period))
+		"currency", string(p.Currency), "items", len(items), "period", periodLabel(period),
+		"forced_by_age", p.ForcedByAge)
 	return p, nil
 }
 
