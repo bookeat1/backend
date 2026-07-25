@@ -145,6 +145,11 @@ type DailyResult struct {
 	Sent       int // payouts dispatched (SendEnabled only)
 	RolledOver int // balances left unclaimed because they were below the minimum
 	Skipped    int // already paid for the period, or no destination configured
+	// Stuck counts balances that are PAST their hold limit and still cannot be
+	// paid, because the acquirer's fee would be at least the balance itself.
+	// They keep waiting. This number is the one a human has to look at: it is
+	// money the platform is holding and cannot economically send.
+	Stuck int
 }
 
 // Run loops until ctx is cancelled, exactly like the other workers.
@@ -161,10 +166,11 @@ func (d *DailyRunner) Run(ctx context.Context) error {
 				d.log.Error("daily payout tick failed", "err", err.Error())
 				continue
 			}
-			if res.Generated > 0 || res.RolledOver > 0 {
+			if res.Generated > 0 || res.RolledOver > 0 || res.Stuck > 0 {
 				d.log.Info("daily payout pass",
 					"venues", res.Venues, "generated", res.Generated, "forced_by_age", res.Forced,
-					"sent", res.Sent, "rolled_over", res.RolledOver, "skipped", res.Skipped)
+					"sent", res.Sent, "rolled_over", res.RolledOver, "skipped", res.Skipped,
+					"stuck", res.Stuck)
 			}
 		}
 	}
@@ -269,10 +275,31 @@ func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz s
 					"period", period.Date.Format(time.DateOnly))
 				continue
 			}
-			// The hold window is up: pay it anyway. This payout is small, so
-			// the acquirer's floor is a large share of it — that is the
-			// deliberate cost of the setting, and it is exactly why the row is
-			// marked so the venue's statement can say the payout happened
+			// The hold window is up — but paying is not automatically the right
+			// answer. Owner decision (2026-07-25): never send a payout the fee
+			// would eat. Below the fee itself the transfer destroys more of the
+			// venue's money than holding it does (300 ₸ taken out of a 400 ₸
+			// balance), so such a balance keeps waiting and is reported as
+			// STUCK — a venue nobody can pay economically is an operator
+			// problem, not something to burn quietly.
+			fee, feeErr := domain.PayoutFee(
+				domain.Money{AmountMinor: bal.AmountMinor, Currency: bal.Currency},
+				d.uc.cfg.FeeBps, d.uc.cfg.FeeMinimumMinor)
+			if feeErr != nil {
+				return fmt.Errorf("compute payout fee for %s: %w", restaurantID, feeErr)
+			}
+			if bal.AmountMinor <= fee.AmountMinor {
+				res.Stuck++
+				d.log.Warn("venue balance held past the limit but too small to pay: the fee would exceed it",
+					"restaurant_id", restaurantID, "amount_minor", bal.AmountMinor,
+					"fee_minor", fee.AmountMinor, "held_days", held, "max_hold_days", policy.MaxHoldDays,
+					"currency", string(bal.Currency), "period", period.Date.Format(time.DateOnly))
+				continue
+			}
+			// The hold window is up and the payout is worth making. It is still
+			// small, so the acquirer's floor is a large share of it — that is
+			// the deliberate cost of the setting, and it is why the row is
+			// marked, so the venue's statement can say the payout happened
 			// because the money got old, not because a threshold was met.
 			forced = true
 			d.log.Info("venue balance below the payout minimum but held too long, paying anyway",

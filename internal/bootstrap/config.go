@@ -343,12 +343,12 @@ type PayoutsConfig struct {
 	// PLATFORM DEFAULT only — a venue may override it
 	// (restaurant_payout_settings.min_payout_minor, migration 0053).
 	MinPayoutMinor int64 // env: PAYOUTS_MIN_AMOUNT_MINOR
-	// MaxHoldDays bounds that roll-over: once a venue's OLDEST unpaid money has
-	// been held this many whole venue-local days, the next pass pays out even
-	// below the threshold (fee included, and the payout is marked as forced by
-	// age). Without it a venue whose turnover never reaches the threshold would
-	// have its money held indefinitely. Also a platform default a venue may
-	// override; 0 disables the cap.
+	// MaxHoldDays forces a payout after this many days even when the venue
+	// never reaches its threshold, so the platform never sits on a venue's
+	// money indefinitely. NOTE: 0 here does NOT mean "never force" — an unset
+	// or non-positive env value falls back to 7 days (see payouts.Config
+	// withDefaults). "Never force" is expressed PER VENUE, as an explicit 0 in
+	// that venue's payout settings.
 	MaxHoldDays int // env: PAYOUTS_MAX_HOLD_DAYS
 	// FeeBps / FeeMinimumMinor are the acquirer's payout tariff.
 	FeeBps          int   // env: PAYOUTS_FEE_BPS
