@@ -195,6 +195,12 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 	}
 
 	return u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// Same per-venue lock a booking create takes, and taken FIRST: the
+		// policy write and the holds rebuilt from it must not interleave with a
+		// create that read the previous policy.
+		if err := u.capacity.LockVenue(ctx, restaurantID); err != nil {
+			return err
+		}
 		if err := u.policies.UpdateBookingPolicy(ctx, restaurantID, in); err != nil {
 			return err
 		}
@@ -208,7 +214,18 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 // switched modes back and forth must not trip over the holds of the previous
 // round.
 func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID, policy domain.BookingPolicy) error {
-	from := time.Now()
+	// A booking that STARTED before now but has not finished still occupies the
+	// room, so the backfill has to reach backwards, not just forward. Listing
+	// from now (the filter means starts_at >= from) silently dropped every
+	// in-progress visit: switch a 40-seat venue to seats mode at 20:30 while a
+	// party of 30 is seated until 22:00, and the ledger reads empty for those
+	// buckets — the next party of 30 is accepted and the room is oversold by
+	// exactly the guests already sitting in it. Reaching back one full
+	// occupancy window (duration + both buffers, plus one bucket for the
+	// outward rounding) covers any booking whose window still touches the
+	// future; anything older cannot be holding a seat now.
+	lookback := policy.Duration + 2*policy.Buffer + domain.CapacityBucket
+	from := time.Now().Add(-lookback)
 	for page := 1; ; page++ {
 		list, total, err := u.bookings.List(ctx, domain.BookingFilter{
 			RestaurantID: &restaurantID,

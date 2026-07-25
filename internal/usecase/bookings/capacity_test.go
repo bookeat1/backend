@@ -399,3 +399,24 @@ func TestPolicyLowerCapacityBelowSoldSeats(t *testing.T) {
 		t.Fatalf("lowering to a value that still fits = %v, want accepted", err)
 	}
 }
+
+// A create must take the venue's capacity lock and re-read the policy INSIDE
+// its transaction. Without that, a create that read "capacity 100" outside the
+// tx re-stamps buckets a concurrent policy change just lowered to 80 — the
+// venue believes 80 and has 98. The fake cannot reproduce the interleaving, so
+// what is pinned here is the thing that makes it impossible: the lock is taken,
+// and it is taken on THIS venue.
+func TestCreateSeatsModeLocksTheVenue(t *testing.T) {
+	h := newSeatsCreateHarness(t, 20)
+	ctx := context.Background()
+
+	in := h.input()
+	in.Guests = 4
+	if _, err := h.uc.Create(ctx, h.guest, in); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(h.capacity.locked) != 1 || h.capacity.locked[0] != in.RestaurantID {
+		t.Fatalf("capacity lock taken %v, want exactly [%s] — an unlocked create can be overtaken by a policy change",
+			h.capacity.locked, in.RestaurantID)
+	}
+}

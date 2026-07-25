@@ -151,6 +151,18 @@ type capacityReader interface {
 	PeakTaken(ctx context.Context, restaurantID uuid.UUID, from time.Time) (*domain.CapacityUsage, error)
 }
 
+// venueLocker serialises the two writers that can disagree about a venue's
+// capacity policy: a booking being created, and the policy itself being
+// changed. Both read the policy and then write rows derived from it, so without
+// a common lock the two interleave — a create that read "capacity 100" can
+// re-stamp buckets a policy change just rewrote to 80, and a create that read
+// "tables mode" can commit an unheld booking into a venue that has meanwhile
+// become seats mode, invisible to the ledger. The lock is per venue and lives
+// for the transaction, so venues never queue behind each other.
+type venueLocker interface {
+	LockVenue(ctx context.Context, restaurantID uuid.UUID) error
+}
+
 // checkCapacityGuests rejects a party the venue cannot seat at all before any
 // availability data is read. The DB would refuse it anyway (the hold's seats
 // exceed seats_limit, so the bucket CHECK trips), but a validation error is the

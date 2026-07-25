@@ -375,8 +375,20 @@ func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
 // a unit test can cover the branch without a database. The real guarantee is
 // the DB CHECK; see capacity_integration_test.go for the test that proves it.
 type fakeCapacity struct {
-	holds map[uuid.UUID][]domain.BookingCapacityHold // by booking
-	err   error
+	holds  map[uuid.UUID][]domain.BookingCapacityHold // by booking
+	err    error
+	locked []uuid.UUID // venues whose capacity lock was taken, in order
+}
+
+// LockVenue records that the lock was taken. The fake cannot reproduce the real
+// serialisation, but a usecase that forgets to lock is still caught: the
+// counter is asserted where the ordering matters.
+func (f *fakeCapacity) LockVenue(_ context.Context, restaurantID uuid.UUID) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.locked = append(f.locked, restaurantID)
+	return nil
 }
 
 func newFakeCapacity() *fakeCapacity {

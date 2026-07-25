@@ -248,12 +248,33 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 				return err
 			}
 		}
+		// The policy read above happened OUTSIDE this transaction, so by now the
+		// venue may have changed its capacity — or its whole mode. Re-read it
+		// under the venue lock and act on that value: otherwise a create that
+		// read "capacity 100" re-stamps buckets a concurrent change just
+		// rewrote to 80, and a create that read "tables mode" commits a booking
+		// with no holds into a venue that is now seats-mode — invisible to the
+		// ledger, sold twice. The lock is taken before the re-read, so the
+		// policy cannot move between reading and writing.
+		if u.capacity != nil {
+			if err := u.capacity.LockVenue(ctx, in.RestaurantID); err != nil {
+				return err
+			}
+			fresh, err := u.restaurants.GetByID(ctx, in.RestaurantID)
+			if err != nil {
+				return err
+			}
+			policy = resolvePolicy(fresh.Restaurant, u.cfg)
+		}
 		if policy.CapacityMode == domain.CapacityModeSeats {
 			if u.capacity == nil {
 				// Refuse rather than write a booking that holds nothing: an
 				// unheld booking is invisible to the capacity CHECK and the
 				// venue would be sold the same seats twice.
 				return fmt.Errorf("%w: capacity bookings are not configured", domain.ErrValidation)
+			}
+			if b.Guests > policy.CapacitySeats {
+				return fmt.Errorf("%w: the venue seats %d guests at a time", domain.ErrValidation, policy.CapacitySeats)
 			}
 			// The DB decides here. An overbooking arrives as ErrAlreadyExists
 			// from the bucket CHECK and is translated below into the same

@@ -91,6 +91,13 @@ type BookingCapacityRepository interface {
 	// BucketStart (the repository enforces it) so concurrent bookings lock the
 	// bucket rows in the same order and cannot deadlock. Returns
 	// ErrAlreadyExists when the venue's capacity is already taken.
+	// LockVenue takes a per-venue lock for the rest of the transaction. Both a
+	// booking create and a capacity-policy change must take it before deriving
+	// anything from the venue's policy: they each read the policy and then
+	// write rows computed from it, so without a shared lock a create can
+	// re-stamp buckets a policy change just rewrote, or commit an unheld
+	// booking into a venue that became seats-mode mid-flight.
+	LockVenue(ctx context.Context, restaurantID uuid.UUID) error
 	Create(ctx context.Context, holds []BookingCapacityHold) error
 	// ReplaceForBooking deletes the booking's holds and inserts the given set
 	// (call inside a TxManager). Same conflict semantics as Create.

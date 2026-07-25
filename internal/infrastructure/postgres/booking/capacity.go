@@ -31,6 +31,18 @@ var _ domain.BookingCapacityRepository = (*Capacity)(nil)
 
 const capacityHoldCols = `id, booking_id, restaurant_id, bucket_start, seats, seats_limit, active, created_at`
 
+// LockVenue serialises this venue's capacity writers for the rest of the
+// transaction (see domain.BookingCapacityRepository). The same advisory-lock
+// key shape the working-hours import uses, so the pattern is one thing in this
+// codebase rather than two.
+func (r *Capacity) LockVenue(ctx context.Context, restaurantID uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, restaurantID.String()); err != nil {
+		return fmt.Errorf("lock venue %s for capacity: %w", restaurantID, err)
+	}
+	return nil
+}
+
 func (r *Capacity) Create(ctx context.Context, holds []domain.BookingCapacityHold) error {
 	if len(holds) == 0 {
 		return nil
