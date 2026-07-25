@@ -196,7 +196,7 @@ func (u *refundUseCase) Settle(ctx context.Context, actor Actor, bookingID uuid.
 	}
 
 	settlement, err := domain.SettleRefund(*p, in.Trigger, cancelledAt, cancelDeadline,
-		domain.RefundPolicy{AcquiringBps: u.cfg.RefundAcquiringBps})
+		domain.RefundPolicy{AcquiringBps: u.cfg.refundAcquiringBpsFor(p.Provider)})
 	if err != nil {
 		return nil, err
 	}

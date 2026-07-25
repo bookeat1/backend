@@ -205,8 +205,18 @@ type PaymentsConfig struct {
 
 	// RefundAcquiringBps is what is withheld from a refund to cover the cost of
 	// moving money back, in basis points of the total (100 = 1%). It is a cost
-	// booked to the `acquirer` ledger account, not platform revenue.
+	// booked to the `acquirer` ledger account, not platform revenue. Owner
+	// decision (2026-07-25): 0 by default — nothing is taken off the guest's
+	// refund unless an acquirer genuinely charges for the reversal.
 	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
+
+	// RefundAcquiringBpsByProvider overrides RefundAcquiringBps per acquirer,
+	// because the rate is a property of the acquirer, not of the platform: one
+	// returns its fee on a reversal (0 bps), another keeps it (some non-zero
+	// rate). A provider absent from this map falls back to RefundAcquiringBps.
+	// env: PAYMENTS_REFUND_ACQUIRING_BPS_<PROVIDER>, e.g.
+	// PAYMENTS_REFUND_ACQUIRING_BPS_FREEDOMPAY=0.
+	RefundAcquiringBpsByProvider map[string]int
 
 	// DepositDefaultMinor is the deposit charged per booking, in tiyn, when the
 	// venue requires one but sets no amount of its own.
@@ -321,6 +331,15 @@ func NewConfig() (Config, error) {
 	// directly by the shell, Docker, or the orchestrator).
 	_ = godotenv.Load()
 
+	// Parsed before the struct literal because, unlike every other knob here, a
+	// value that is SET BUT INVALID is refused rather than defaulted: this one
+	// decides how much of a guest's money is kept on a refund (see
+	// refundAcquiringByProvider).
+	refundAcquiring, err := refundAcquiringByProvider()
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		App: AppConfig{
 			Name:               getEnv("APP_NAME", "backend-core"),
@@ -375,16 +394,17 @@ func NewConfig() (Config, error) {
 			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 		Payments: PaymentsConfig{
-			Enabled:                 getEnvBool("PAYMENTS_ENABLED", false),
-			DefaultProvider:         getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
-			ServiceFeeBps:           getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
-			RefundAcquiringBps:      getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
-			DepositDefaultMinor:     getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
-			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
-			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
-			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
-			FreeCancelWindow:        getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
-			PublicBaseURL:           strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
+			Enabled:                      getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:              getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:                getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:           getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
+			RefundAcquiringBpsByProvider: refundAcquiring,
+			DepositDefaultMinor:          getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
+			PreorderPaymentRequired:      getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
+			HoldTTL:                      getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			FreeCancelWindow:             getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
+			PublicBaseURL:                strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
 		},
 		PaymentsReconciler: PaymentsReconcilerConfig{
 			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),
@@ -475,6 +495,51 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// knownPaymentProviders mirrors domain.PaymentProvider's constants. It lives
+// here as plain strings so the config layer keeps its "env in, struct out"
+// shape without importing the domain; a provider added to the domain and
+// forgotten here simply has no per-provider env knob and falls back to the
+// global rate, which is the safe direction.
+var knownPaymentProviders = []string{"freedompay", "tiptoppay", "partnerspay"}
+
+// maxBasisPoints is 100% — the domain's ApplyBasisPoints refuses anything
+// above it, so a larger configured rate could only ever fail at settle time.
+const maxBasisPoints = 10000
+
+// refundAcquiringByProvider reads PAYMENTS_REFUND_ACQUIRING_BPS_<PROVIDER> for
+// every known acquirer. Only variables that are actually SET land in the map —
+// an unset provider must fall back to the global rate, so a missing key and an
+// explicit 0 have to stay distinguishable.
+//
+// Unlike the getEnv* helpers, a value that is present but unusable is an ERROR,
+// not a silent fallback. This knob decides how much of a guest's refund is kept:
+// "2.9" typed instead of "290" would quietly hand the acquirer's cost to the
+// platform, and 29000 would make every refund for that provider fail at settle
+// time (ApplyBasisPoints caps at 100%). Both are ops mistakes that must surface
+// at boot, where they are a non-event, rather than in the money path.
+func refundAcquiringByProvider() (map[string]int, error) {
+	var out map[string]int
+	for _, p := range knownPaymentProviders {
+		key := "PAYMENTS_REFUND_ACQUIRING_BPS_" + strings.ToUpper(p)
+		v, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: want whole basis points (290 = 2.9%%)", key, v)
+		}
+		if n < 0 || n > maxBasisPoints {
+			return nil, fmt.Errorf("%s=%d: basis points must be within 0..%d", key, n, maxBasisPoints)
+		}
+		if out == nil {
+			out = make(map[string]int, len(knownPaymentProviders))
+		}
+		out[p] = n
+	}
+	return out, nil
 }
 
 // getEnvInt returns the integer value of the environment variable named by

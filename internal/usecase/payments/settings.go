@@ -24,14 +24,20 @@ import (
 // fields close that: they are the same env-driven global default every other
 // Config field already has.
 type Config struct {
-	Enabled                 bool
-	DefaultProvider         domain.PaymentProvider
-	ServiceFeeBps           int
-	RefundAcquiringBps      int
-	DepositDefaultMinor     int64
-	DepositRequired         bool
-	PreorderPaymentRequired bool
-	HoldTTL                 time.Duration
+	Enabled            bool
+	DefaultProvider    domain.PaymentProvider
+	ServiceFeeBps      int
+	RefundAcquiringBps int
+	// RefundAcquiringBpsByProvider overrides RefundAcquiringBps for a specific
+	// acquirer: what is kept when money travels back is the acquirer's rule,
+	// not ours, and it differs between them. A provider that is absent from the
+	// map uses RefundAcquiringBps. Read through refundAcquiringBpsFor, never
+	// directly — a missing key and a stored 0 mean different things.
+	RefundAcquiringBpsByProvider map[domain.PaymentProvider]int
+	DepositDefaultMinor          int64
+	DepositRequired              bool
+	PreorderPaymentRequired      bool
+	HoldTTL                      time.Duration
 	// FreeCancelWindow is the global default free-cancellation window for the
 	// money path, applied to any restaurant that has not overridden
 	// free_cancel_window_minutes. Owner-confirmed default 120 minutes (see
@@ -42,7 +48,7 @@ type Config struct {
 // Package-level fallbacks, applied to any zero-valued Config field — same
 // pattern as bookings.Config.withDefaults.
 const (
-	defaultServiceFeeBps      = 350               // 3.5%
+	defaultServiceFeeBps = 350 // 3.5%
 	// Owner decision (2026-07-25): nothing is withheld from a guest's refund —
 	// a timely cancellation returns the full charged amount and the acquirer's
 	// cost is absorbed off the guest's side. Kept configurable for the day that
@@ -70,7 +76,33 @@ func (c Config) withDefaults() Config {
 	if c.FreeCancelWindow <= 0 {
 		c.FreeCancelWindow = defaultFreeCancelWindow
 	}
+	// A per-provider rate that is negative is dropped rather than clamped: the
+	// provider then falls back to the global rate, which is what an
+	// unconfigured provider gets anyway. Filtered into a NEW map — Config is a
+	// value, but a map inside it is shared, and withDefaults must not mutate
+	// what the caller handed us.
+	if len(c.RefundAcquiringBpsByProvider) > 0 {
+		clean := make(map[domain.PaymentProvider]int, len(c.RefundAcquiringBpsByProvider))
+		for p, bps := range c.RefundAcquiringBpsByProvider {
+			if bps >= 0 {
+				clean[p] = bps
+			}
+		}
+		c.RefundAcquiringBpsByProvider = clean
+	}
 	return c
+}
+
+// refundAcquiringBpsFor is the rate withheld from a refund on THIS payment's
+// acquirer: the provider's own entry when it has one, otherwise the global
+// rate. Callers must never read RefundAcquiringBpsByProvider directly — a
+// provider with an explicit 0 and a provider that was never configured look
+// identical in the map otherwise.
+func (c Config) refundAcquiringBpsFor(p domain.PaymentProvider) int {
+	if bps, ok := c.RefundAcquiringBpsByProvider[p]; ok {
+		return bps
+	}
+	return c.RefundAcquiringBps
 }
 
 // GlobalOnlySettings is a restaurantPaymentSettings that never has a venue

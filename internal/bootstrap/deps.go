@@ -412,16 +412,36 @@ func NewPayoutReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) *payout
 // layer's own Config, same arrangement as newBookingConfig.
 func newPaymentsConfig(cfg Config) payments.Config {
 	return payments.Config{
-		Enabled:                 cfg.Payments.Enabled,
-		DefaultProvider:         domain.PaymentProvider(cfg.Payments.DefaultProvider),
-		ServiceFeeBps:           cfg.Payments.ServiceFeeBps,
-		RefundAcquiringBps:      cfg.Payments.RefundAcquiringBps,
-		DepositDefaultMinor:     cfg.Payments.DepositDefaultMinor,
-		DepositRequired:         cfg.Payments.DepositRequired,
-		PreorderPaymentRequired: cfg.Payments.PreorderPaymentRequired,
-		HoldTTL:                 cfg.Payments.HoldTTL,
-		FreeCancelWindow:        cfg.Payments.FreeCancelWindow,
+		Enabled:                      cfg.Payments.Enabled,
+		DefaultProvider:              domain.PaymentProvider(cfg.Payments.DefaultProvider),
+		ServiceFeeBps:                cfg.Payments.ServiceFeeBps,
+		RefundAcquiringBps:           cfg.Payments.RefundAcquiringBps,
+		RefundAcquiringBpsByProvider: refundAcquiringBpsByProvider(cfg.Payments.RefundAcquiringBpsByProvider),
+		DepositDefaultMinor:          cfg.Payments.DepositDefaultMinor,
+		DepositRequired:              cfg.Payments.DepositRequired,
+		PreorderPaymentRequired:      cfg.Payments.PreorderPaymentRequired,
+		HoldTTL:                      cfg.Payments.HoldTTL,
+		FreeCancelWindow:             cfg.Payments.FreeCancelWindow,
 	}
+}
+
+// refundAcquiringBpsByProvider converts the config layer's plain string keys
+// into domain providers, dropping any name the domain does not know (a typo in
+// an env var must not become a silent, unreachable entry — the payment's real
+// provider would then quietly fall back to the global rate anyway).
+func refundAcquiringBpsByProvider(raw map[string]int) map[domain.PaymentProvider]int {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[domain.PaymentProvider]int, len(raw))
+	for name, bps := range raw {
+		p := domain.PaymentProvider(name)
+		if !p.Valid() {
+			continue
+		}
+		out[p] = bps
+	}
+	return out
 }
 
 // paymentSettingsReader is the slice of the restaurant repo the money-path
