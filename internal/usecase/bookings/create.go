@@ -62,6 +62,7 @@ type ItemInput struct {
 type createUseCase struct {
 	bookings    domain.BookingRepository
 	links       domain.BookingTableRepository
+	capacity    domain.BookingCapacityRepository
 	items       domain.BookingItemRepository
 	history     domain.BookingStatusHistoryRepository
 	outbox      domain.BookingOutboxRepository
@@ -78,6 +79,7 @@ type createUseCase struct {
 func NewCreateUseCase(
 	bookings domain.BookingRepository,
 	links domain.BookingTableRepository,
+	capacity domain.BookingCapacityRepository,
 	items domain.BookingItemRepository,
 	history domain.BookingStatusHistoryRepository,
 	outbox domain.BookingOutboxRepository,
@@ -90,7 +92,7 @@ func NewCreateUseCase(
 	cfg Config,
 ) CreateUseCase {
 	return &createUseCase{
-		bookings: bookings, links: links, items: items, history: history,
+		bookings: bookings, links: links, capacity: capacity, items: items, history: history,
 		outbox: outbox, blacklist: blacklist, rateLog: rateLog,
 		restaurants: restaurants, schedule: schedule, managers: managers,
 		tx: tx, cfg: cfg.withDefaults(),
@@ -136,6 +138,25 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	policy := resolvePolicy(rest.Restaurant, u.cfg)
 	if in.Guests > policy.MaxGuestsPerBooking {
 		return nil, fmt.Errorf("%w: at most %d guests per booking", domain.ErrValidation, policy.MaxGuestsPerBooking)
+	}
+	if policy.CapacityMode == domain.CapacityModeSeats {
+		// A table-less venue has no tables to name and nothing to force a
+		// guest onto. Both staff powers are refused rather than quietly
+		// ignored: silently dropping TableIDs would tell a manager the guest
+		// was seated where they asked, and a "forced" booking with no
+		// capacity hold would be invisible to the bucket CHECK — the same hole
+		// that force-without-tables opens in table mode.
+		if len(in.TableIDs) > 0 {
+			return nil, fmt.Errorf("%w: this restaurant books by total capacity and has no tables to assign",
+				domain.ErrValidation)
+		}
+		if in.Force {
+			return nil, fmt.Errorf("%w: forced placement is not available for a restaurant booking by total capacity",
+				domain.ErrValidation)
+		}
+		if err := checkCapacityGuests(in.Guests, policy); err != nil {
+			return nil, err
+		}
 	}
 
 	normalizedPhone := phone.Normalize(in.Phone)
@@ -186,9 +207,16 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		return nil, err
 	}
 
-	tables, err := u.selectTables(ctx, in, policy, sched, startsAt)
-	if err != nil {
-		return nil, err
+	// In capacity mode nothing is selected up front on purpose: there is no
+	// scarce resource to pick, and the only meaningful check ("do the seats
+	// still fit?") is the one the database performs when the holds are
+	// inserted. Reading the buckets here first would just be the losing half of
+	// a race.
+	var tables []domain.RestaurantTable
+	if policy.CapacityMode == domain.CapacityModeTables {
+		if tables, err = u.selectTables(ctx, in, policy, sched, startsAt); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()
@@ -217,6 +245,20 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 				})
 			}
 			if err := u.links.Create(ctx, links); err != nil {
+				return err
+			}
+		}
+		if policy.CapacityMode == domain.CapacityModeSeats {
+			if u.capacity == nil {
+				// Refuse rather than write a booking that holds nothing: an
+				// unheld booking is invisible to the capacity CHECK and the
+				// venue would be sold the same seats twice.
+				return fmt.Errorf("%w: capacity bookings are not configured", domain.ErrValidation)
+			}
+			// The DB decides here. An overbooking arrives as ErrAlreadyExists
+			// from the bucket CHECK and is translated below into the same
+			// "the slot was just taken" answer a lost table race produces.
+			if err := u.capacity.Create(ctx, buildCapacityHolds(b, policy, now)); err != nil {
 				return err
 			}
 		}

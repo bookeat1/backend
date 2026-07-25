@@ -42,6 +42,17 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 		ConfirmSLA:          cfg.DefaultConfirmSLA,
 		MaxGuestsPerBooking: cfg.DefaultMaxGuests,
 		AutoConfirm:         cfg.DefaultAutoConfirm,
+		// DEFAULT DECISION (owner, 25.07.2026): table mode. A NULL
+		// booking_capacity_mode — which is every venue that existed before
+		// migration 0054 — resolves to exactly the behaviour it had yesterday.
+		// Nobody is switched silently: a venue with tables keeps its tables,
+		// and a venue without tables stays as unbookable as it was until
+		// someone deliberately declares a capacity through the admin API. The
+		// alternative (defaulting the tableless venues to capacity mode) would
+		// have required the platform to INVENT a seat count for a venue it has
+		// never measured, and a made-up capacity is exactly the kind of number
+		// that turns into a double-booked Saturday.
+		CapacityMode: domain.CapacityModeTables,
 	}
 
 	if o.Timezone != nil && *o.Timezone != "" {
@@ -72,6 +83,17 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 	}
 	if o.AutoConfirm != nil {
 		p.AutoConfirm = *o.AutoConfirm
+	}
+	// Capacity mode is only honoured together with a usable seat count: a row
+	// claiming 'seats' with a NULL/absurd capacity would make the venue silently
+	// unbookable, which is the very failure this feature exists to remove. The
+	// DB CHECKs of 0054 make that pair impossible going forward; this guard
+	// covers rows written before them (or by hand).
+	if v := o.BookingCapacityMode; v != nil && *v == domain.CapacityModeSeats {
+		if s := o.BookingCapacitySeats; s != nil && *s > 0 && *s <= maxCapacitySeats {
+			p.CapacityMode = domain.CapacityModeSeats
+			p.CapacitySeats = *s
+		}
 	}
 	return p
 }

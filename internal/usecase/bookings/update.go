@@ -37,6 +37,7 @@ type UpdateInput struct {
 type updateUseCase struct {
 	bookings    domain.BookingRepository
 	links       domain.BookingTableRepository
+	capacity    domain.BookingCapacityRepository
 	outbox      domain.BookingOutboxRepository
 	restaurants restaurantReader
 	schedule    scheduleReader
@@ -49,6 +50,7 @@ type updateUseCase struct {
 func NewUpdateUseCase(
 	bookings domain.BookingRepository,
 	links domain.BookingTableRepository,
+	capacity domain.BookingCapacityRepository,
 	outbox domain.BookingOutboxRepository,
 	restaurants restaurantReader,
 	schedule scheduleReader,
@@ -57,7 +59,7 @@ func NewUpdateUseCase(
 	cfg Config,
 ) UpdateUseCase {
 	return &updateUseCase{
-		bookings: bookings, links: links, outbox: outbox, restaurants: restaurants,
+		bookings: bookings, links: links, capacity: capacity, outbox: outbox, restaurants: restaurants,
 		schedule: schedule, managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
 }
@@ -128,14 +130,45 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 	}
 	b.UpdatedAt = time.Now()
 
-	links, relink, err := u.resolveLinks(ctx, b, in, policy, sched, moved)
-	if err != nil {
-		return nil, err
+	// Capacity mode: there is nothing to re-seat, but the seats held must follow
+	// the amendment. Rebuilding the holds from scratch (delete + insert in one
+	// transaction) is what lets a booking be shifted by ten minutes without
+	// racing against its own previous holds.
+	seatsMode := policy.CapacityMode == domain.CapacityModeSeats
+	if seatsMode {
+		if len(in.TableIDs) > 0 || in.Force {
+			return nil, fmt.Errorf("%w: this restaurant books by total capacity and has no tables to assign",
+				domain.ErrValidation)
+		}
+		if err := checkCapacityGuests(b.Guests, policy); err != nil {
+			return nil, err
+		}
+		if u.capacity == nil {
+			return nil, fmt.Errorf("%w: capacity bookings are not configured", domain.ErrValidation)
+		}
+	}
+
+	// resolveLinks only ever produces table links, and in capacity mode it would
+	// fail looking for a table the venue does not have — so it is skipped
+	// entirely and `moved` alone decides whether the holds are rewritten.
+	var (
+		links  []domain.BookingTable
+		relink bool
+	)
+	if !seatsMode {
+		if links, relink, err = u.resolveLinks(ctx, b, in, policy, sched, moved); err != nil {
+			return nil, err
+		}
 	}
 
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.bookings.Update(ctx, b); err != nil {
 			return err
+		}
+		if seatsMode && moved {
+			if err := u.capacity.ReplaceForBooking(ctx, b.ID, buildCapacityHolds(b, policy, b.UpdatedAt)); err != nil {
+				return err
+			}
 		}
 		if relink {
 			// ReplaceForBooking deletes this booking's own links first, so the

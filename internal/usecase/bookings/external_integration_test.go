@@ -98,7 +98,8 @@ func newExternalHarness(t *testing.T) *externalHarness {
 	perms := fakePerms{allow: map[[2]uuid.UUID]bool{{staffUID, rid}: true}}
 
 	create := NewCreateUseCase(
-		bookingrepo.New(pool), bookingrepo.NewTables(pool), bookingrepo.NewItems(pool),
+		bookingrepo.New(pool), bookingrepo.NewTables(pool), bookingrepo.NewCapacity(pool),
+		bookingrepo.NewItems(pool),
 		bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool), newFakeManagers(), txm, cfg,
@@ -107,7 +108,8 @@ func newExternalHarness(t *testing.T) *externalHarness {
 		bookingrepo.NewExternalReservations(pool), restrepo.New(pool),
 		restrepo.NewRelated(pool), perms, txm,
 	)
-	avail := NewAvailabilityUseCase(bookingrepo.NewTables(pool), restrepo.New(pool), restrepo.NewRelated(pool), cfg)
+	avail := NewAvailabilityUseCase(bookingrepo.NewTables(pool), bookingrepo.NewCapacity(pool),
+		restrepo.New(pool), restrepo.NewRelated(pool), cfg)
 
 	loc, err := time.LoadLocation("Asia/Almaty")
 	if err != nil {

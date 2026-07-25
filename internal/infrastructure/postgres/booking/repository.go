@@ -156,7 +156,11 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	q := `UPDATE bookings SET ` + strings.Join(set, ", ") + ` WHERE id=$1`
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id, string(status), at)
 	if err != nil {
-		return fmt.Errorf("update booking status: %w", err)
+		// A status write is not an innocent UPDATE: the triggers of 0004/0054
+		// re-claim the booking's tables or its capacity holds. Moving a
+		// waitlisted booking back into an active status can therefore lose the
+		// race for a seat the venue has meanwhile sold — a conflict, not a 500.
+		return mapCapacityWrite(err, "update booking status")
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound

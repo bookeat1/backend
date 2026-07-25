@@ -209,6 +209,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
+	bookingCapacity := bookingrepo.NewCapacity(db)
 	bookingItems := bookingrepo.NewItems(db)
 	bookingMessages := bookingrepo.NewMessages(db)
 	bookingSurveys := bookingrepo.NewSurveys(db)
@@ -221,7 +222,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingCfg := newBookingConfig(cfg)
 
-	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingItems,
+	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
 		restRelated, restaurantManagers, txm, bookingCfg)
 
@@ -334,13 +335,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingCreate:      bookingCreate,
 		BookingIdempotent:  bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
 		BookingStatus:      bookingStatus,
-		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingOutbox,
+		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingOutbox,
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
-		BookingAvail:     bookings.NewAvailabilityUseCase(bookingLinks, restRepo, restRelated, bookingCfg),
+		BookingAvail: bookings.NewAvailabilityUseCase(bookingLinks, bookingCapacity, restRepo,
+			restRelated, bookingCfg),
 		BookingBlacklist: bookings.NewBlacklistUseCase(bookingBlacklist, restaurantManagers),
-		BookingPolicy:    bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers, bookingCfg),
-		AdminPanel:       adminPanel,
-		Dashboard:        dashboardUC,
+		BookingPolicy: bookings.NewPolicyUseCase(restRepo, restRepo, restaurantManagers,
+			restRelated, bookingCapacity, bookingRepo, txm, bookingCfg),
+		AdminPanel: adminPanel,
+		Dashboard:  dashboardUC,
 		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
 			restRelated, restaurantManagers, txm),
 		// Pre-order (roadmap #1): the guest attaches menu items to a booking to be

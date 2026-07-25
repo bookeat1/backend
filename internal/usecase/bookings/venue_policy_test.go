@@ -55,13 +55,22 @@ func (f *fakePolicyWriter) UpdateBookingPolicy(_ context.Context, _ uuid.UUID, o
 	if o.AutoConfirm != nil {
 		p.AutoConfirm = o.AutoConfirm
 	}
+	if o.BookingCapacityMode != nil {
+		p.BookingCapacityMode = o.BookingCapacityMode
+	}
+	if o.BookingCapacitySeats != nil {
+		p.BookingCapacitySeats = o.BookingCapacitySeats
+	}
 	return nil
 }
 
 type policyHarness struct {
-	uc     PolicyUseCase
-	writer *fakePolicyWriter
-	rid    uuid.UUID
+	uc       PolicyUseCase
+	writer   *fakePolicyWriter
+	rid      uuid.UUID
+	schedule *fakeSchedule
+	capacity *fakeCapacity
+	bookings *fakeBookings
 }
 
 func newPolicyHarness(t *testing.T, managerID uuid.UUID) *policyHarness {
@@ -74,13 +83,17 @@ func newPolicyHarness(t *testing.T, managerID uuid.UUID) *policyHarness {
 		DefaultHorizonDays: 60, DefaultConfirmSLA: 120 * time.Minute,
 		DefaultMaxGuests: 20, DefaultAutoConfirm: true, TimezoneFallback: "Asia/Almaty",
 	}
+	sched := &fakeSchedule{}
+	capacity := newFakeCapacity()
+	bookings := newFakeBookings()
 	uc := NewPolicyUseCase(
 		&fakeRestaurants{agg: agg},
 		writer,
 		newFakeManagers([2]uuid.UUID{managerID, rid}),
+		sched, capacity, bookings, &fakeTx{},
 		cfg,
 	)
-	return &policyHarness{uc: uc, writer: writer, rid: rid}
+	return &policyHarness{uc: uc, writer: writer, rid: rid, schedule: sched, capacity: capacity, bookings: bookings}
 }
 
 func TestPolicyUpdateAuthorization(t *testing.T) {

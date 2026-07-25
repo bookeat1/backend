@@ -41,7 +41,8 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 // stays untouched.
 const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 	booking_lead_minutes, booking_horizon_days, cancel_deadline_minutes,
-	confirm_sla_minutes, max_guests_per_booking, auto_confirm`
+	confirm_sla_minutes, max_guests_per_booking, auto_confirm,
+	booking_capacity_mode, booking_capacity_seats`
 
 func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	now := time.Now()
@@ -138,6 +139,12 @@ func (r *Repository) UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o do
 	}
 	if v := o.AutoConfirm; v != nil {
 		set("auto_confirm", *v)
+	}
+	if v := o.BookingCapacityMode; v != nil {
+		set("booking_capacity_mode", string(*v))
+	}
+	if v := o.BookingCapacitySeats; v != nil {
+		set("booking_capacity_seats", *v)
 	}
 
 	if len(sets) == 0 {
@@ -420,6 +427,10 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 	var m domain.Restaurant
 	var city, price string
 	var name, desc, cuisine, addr, opening []byte
+	// Scanned as *string, not as *domain.CapacityMode: pgx has no reason to
+	// know about a domain type, and a legacy/unknown label must reach
+	// resolvePolicy (which ignores it) rather than fail the scan.
+	var capacityMode *string
 	p := &m.BookingPolicy
 	if err := row.Scan(
 		&m.ID, &m.CategoryID, &m.Name, &name, &m.Description, &desc,
@@ -430,8 +441,13 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm,
+		&capacityMode, &p.BookingCapacitySeats,
 	); err != nil {
 		return nil, err
+	}
+	if capacityMode != nil {
+		mode := domain.CapacityMode(*capacityMode)
+		p.BookingCapacityMode = &mode
 	}
 	m.City = domain.City(city)
 	m.PriceCategory = domain.PriceCategory(price)

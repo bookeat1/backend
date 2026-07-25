@@ -19,19 +19,34 @@ const DateLayout = "2006-01-02"
 // Reasons a slot is not bookable. Returned to the client so the UI can explain
 // itself instead of showing an unexplained greyed-out slot.
 const (
-	ReasonTooSoon  = "too_soon"       // closer than policy.Lead
-	ReasonHorizon  = "beyond_horizon" // further than policy.HorizonDays
-	ReasonOccupied = "occupied"       // no free table (or combination) left
-	ReasonCapacity = "capacity"       // venue has no tables that can seat the party at all
+	ReasonTooSoon = "too_soon"       // closer than policy.Lead
+	ReasonHorizon = "beyond_horizon" // further than policy.HorizonDays
+	// ReasonOccupied — the venue could seat the party, but not now: no free
+	// table (or combination) left in table mode, no free seats in capacity mode.
+	ReasonOccupied = "occupied"
+	// ReasonCapacity — the venue could never seat this party: no table or
+	// combination is big enough in table mode, the declared total capacity is
+	// smaller than the request in capacity mode.
+	ReasonCapacity = "capacity"
 )
 
 // Slot is one bookable start time of a day.
 type Slot struct {
-	StartsAt   time.Time
-	EndsAt     time.Time
-	Available  bool
-	FreeTables int    // tables free for the whole slot (incl. buffer)
-	Reason     string // empty when Available
+	StartsAt  time.Time
+	EndsAt    time.Time
+	Available bool
+	// FreeTables is, in table mode, the tables free for the whole slot
+	// (buffer included). In capacity mode the venue HAS no tables, so it
+	// carries how many further parties OF THIS SIZE still fit — a number with
+	// the same two properties the field always had (zero exactly when the slot
+	// is unavailable, larger when there is more room) and without claiming a
+	// table that does not exist. Read RemainingSeats for the honest figure.
+	FreeTables int
+	// RemainingSeats is the guests that still fit in this slot. Set only in
+	// capacity mode; nil in table mode, where "seats left" is not a number the
+	// venue's table layout can answer.
+	RemainingSeats *int
+	Reason         string // empty when Available
 }
 
 // DayAvailability is the answer of GET /api/restaurants/{id}/availability.
@@ -41,7 +56,15 @@ type DayAvailability struct {
 	Timezone        string
 	Guests          int
 	DurationMinutes int
-	Slots           []Slot
+	// CapacityMode tells the client HOW to read the slots below: "tables" =
+	// FreeTables is a table count, "seats" = the venue is table-less and
+	// RemainingSeats is the meaningful figure.
+	CapacityMode domain.CapacityMode
+	// CapacitySeats is the venue's declared total capacity, non-zero only in
+	// capacity mode. It lets the client render "5 of 40 seats left" without a
+	// second request.
+	CapacitySeats int
+	Slots         []Slot
 }
 
 // AvailabilityUseCase computes bookable slots for one calendar day (spec §6).
@@ -52,19 +75,26 @@ type AvailabilityUseCase interface {
 
 type availabilityUseCase struct {
 	links       domain.BookingTableRepository
+	capacity    capacityReader
 	restaurants restaurantReader
 	schedule    scheduleReader
 	cfg         Config
 }
 
-// NewAvailabilityUseCase constructs the availability engine.
+// NewAvailabilityUseCase constructs the availability engine. capacity may be
+// nil, in which case a venue configured for table-less mode simply reports no
+// bookable slot — the engine never guesses at occupancy it cannot read.
 func NewAvailabilityUseCase(
 	links domain.BookingTableRepository,
+	capacity capacityReader,
 	restaurants restaurantReader,
 	schedule scheduleReader,
 	cfg Config,
 ) AvailabilityUseCase {
-	return &availabilityUseCase{links: links, restaurants: restaurants, schedule: schedule, cfg: cfg.withDefaults()}
+	return &availabilityUseCase{
+		links: links, capacity: capacity, restaurants: restaurants,
+		schedule: schedule, cfg: cfg.withDefaults(),
+	}
 }
 
 func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, date string, guests int) (*DayAvailability, error) {
@@ -94,26 +124,53 @@ func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, d
 		Timezone:        policy.Timezone,
 		Guests:          guests,
 		DurationMinutes: int(policy.Duration / time.Minute),
+		CapacityMode:    policy.CapacityMode,
+		CapacitySeats:   policy.CapacitySeats,
 		Slots:           make([]Slot, 0, len(starts)),
 	}
 	if len(starts) == 0 {
 		return out, nil
 	}
 
-	// One busy query for the whole day, widened by the occupancy window so a
-	// booking starting the previous evening still shows up.
+	// One occupancy query for the whole day, widened by the occupancy window so
+	// a booking starting the previous evening still shows up.
 	span := policy.Duration + 2*policy.Buffer
-	busy, err := u.links.ListBusy(ctx, restaurantID,
-		starts[0].Add(-span), starts[len(starts)-1].Add(span))
+	from, to := starts[0].Add(-span), starts[len(starts)-1].Add(span)
+	now := time.Now()
+
+	if policy.CapacityMode == domain.CapacityModeSeats {
+		usage, err := u.loadUsage(ctx, restaurantID, from, to)
+		if err != nil {
+			return nil, err
+		}
+		for _, start := range starts {
+			out.Slots = append(out.Slots, evaluateSeatsSlot(start, guests, policy, usage, now))
+		}
+		return out, nil
+	}
+
+	busy, err := u.links.ListBusy(ctx, restaurantID, from, to)
 	if err != nil {
 		return nil, err
 	}
-
-	now := time.Now()
 	for _, start := range starts {
 		out.Slots = append(out.Slots, evaluateSlot(start, guests, policy, sched.tables, busy, now))
 	}
 	return out, nil
+}
+
+// loadUsage reads the venue's sold seats for the day. With no capacity
+// repository wired the engine refuses to answer rather than report an empty —
+// i.e. wide open — day for a venue whose occupancy it cannot see.
+func (u *availabilityUseCase) loadUsage(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) (map[time.Time]domain.CapacityUsage, error) {
+	if u.capacity == nil {
+		return nil, fmt.Errorf("%w: capacity availability is not configured", domain.ErrValidation)
+	}
+	rows, err := u.capacity.ListUsage(ctx, restaurantID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return usageIndex(rows), nil
 }
 
 // schedule is the venue's day-shape inputs, loaded once per request.

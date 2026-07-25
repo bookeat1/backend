@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -367,3 +368,107 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 }
 
 func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
+
+// fakeCapacity is an in-memory domain.BookingCapacityRepository. It reproduces
+// the ONE behaviour the usecases depend on — the venue's declared capacity is
+// enforced per bucket and an overflow comes back as ErrAlreadyExists — so that
+// a unit test can cover the branch without a database. The real guarantee is
+// the DB CHECK; see capacity_integration_test.go for the test that proves it.
+type fakeCapacity struct {
+	holds map[uuid.UUID][]domain.BookingCapacityHold // by booking
+	err   error
+}
+
+func newFakeCapacity() *fakeCapacity {
+	return &fakeCapacity{holds: map[uuid.UUID][]domain.BookingCapacityHold{}}
+}
+
+func (f *fakeCapacity) taken(exclude uuid.UUID) map[time.Time]int {
+	out := map[time.Time]int{}
+	for bookingID, hs := range f.holds {
+		if bookingID == exclude {
+			continue
+		}
+		for _, h := range hs {
+			if h.Active {
+				out[h.BucketStart.UTC()] += h.Seats
+			}
+		}
+	}
+	return out
+}
+
+func (f *fakeCapacity) Create(_ context.Context, holds []domain.BookingCapacityHold) error {
+	if f.err != nil {
+		return f.err
+	}
+	if len(holds) == 0 {
+		return nil
+	}
+	taken := f.taken(holds[0].BookingID)
+	for _, h := range holds {
+		if taken[h.BucketStart.UTC()]+h.Seats > h.SeatsLimit {
+			return fmt.Errorf("%w: capacity", domain.ErrAlreadyExists)
+		}
+	}
+	for _, h := range holds {
+		h.Active = true
+		f.holds[h.BookingID] = append(f.holds[h.BookingID], h)
+	}
+	return nil
+}
+
+func (f *fakeCapacity) ReplaceForBooking(ctx context.Context, bookingID uuid.UUID, holds []domain.BookingCapacityHold) error {
+	prev := f.holds[bookingID]
+	delete(f.holds, bookingID)
+	for i := range holds {
+		holds[i].BookingID = bookingID
+	}
+	if err := f.Create(ctx, holds); err != nil {
+		f.holds[bookingID] = prev
+		return err
+	}
+	return nil
+}
+
+func (f *fakeCapacity) ListByBooking(_ context.Context, bookingID uuid.UUID) ([]domain.BookingCapacityHold, error) {
+	return f.holds[bookingID], f.err
+}
+
+func (f *fakeCapacity) ListUsage(_ context.Context, _ uuid.UUID, from, to time.Time) ([]domain.CapacityUsage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	limits := map[time.Time]int{}
+	for _, hs := range f.holds {
+		for _, h := range hs {
+			if h.Active {
+				limits[h.BucketStart.UTC()] = h.SeatsLimit
+			}
+		}
+	}
+	var out []domain.CapacityUsage
+	for bucket, seats := range f.taken(uuid.Nil) {
+		if bucket.Before(from) || !bucket.Before(to) {
+			continue
+		}
+		out = append(out, domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats, SeatsLimit: limits[bucket]})
+	}
+	return out, nil
+}
+
+func (f *fakeCapacity) PeakTaken(_ context.Context, _ uuid.UUID, from time.Time) (*domain.CapacityUsage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var peak *domain.CapacityUsage
+	for bucket, seats := range f.taken(uuid.Nil) {
+		if bucket.Before(from) {
+			continue
+		}
+		if peak == nil || seats > peak.SeatsTaken {
+			peak = &domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats}
+		}
+	}
+	return peak, nil
+}

@@ -76,7 +76,8 @@ func newRealCreateHarness(t *testing.T) *realCreateHarness {
 
 	txm := sqltx.NewManager(pool)
 	create := NewCreateUseCase(
-		bookingrepo.New(pool), bookingrepo.NewTables(pool), bookingrepo.NewItems(pool),
+		bookingrepo.New(pool), bookingrepo.NewTables(pool), bookingrepo.NewCapacity(pool),
+		bookingrepo.NewItems(pool),
 		bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool),

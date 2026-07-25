@@ -33,6 +33,13 @@ func (s BookingStatus) HoldsTable() bool {
 	return s == BookingPending || s == BookingConfirmed || s == BookingArrived
 }
 
+// StatusesHoldingTable lists the statuses HoldsTable reports true for, for
+// callers that need them as a filter value rather than as a predicate (e.g.
+// "every booking of this venue that still occupies a seat").
+func StatusesHoldingTable() []BookingStatus {
+	return []BookingStatus{BookingPending, BookingConfirmed, BookingArrived}
+}
+
 // Terminal reports whether no further transition is allowed from s.
 func (s BookingStatus) Terminal() bool { return len(bookingTransitions[s]) == 0 }
 
@@ -142,6 +149,12 @@ type BookingPolicy struct {
 	ConfirmSLA          time.Duration // pending → auto-confirm / escalation after this
 	MaxGuestsPerBooking int
 	AutoConfirm         bool
+	// CapacityMode selects the availability engine for this venue; see
+	// CapacityMode. Always a valid value after resolution (never empty).
+	CapacityMode CapacityMode
+	// CapacitySeats is the guests the venue can seat at once. Meaningful only
+	// when CapacityMode is CapacityModeSeats; zero otherwise.
+	CapacitySeats int
 }
 
 // BookingPolicyOverride is a restaurant's optional per-field override of the
@@ -156,6 +169,13 @@ type BookingPolicyOverride struct {
 	ConfirmSLAMinutes      *int
 	MaxGuestsPerBooking    *int
 	AutoConfirm            *bool
+	// BookingCapacityMode / BookingCapacitySeats are the table-less switch
+	// (migration 0054). They follow the same PATCH semantics as the fields
+	// above — nil means "leave this column alone" — but a NULL
+	// booking_capacity_mode is not an env-backed default: it simply means
+	// CapacityModeTables, the behaviour every venue had before 0054.
+	BookingCapacityMode  *CapacityMode
+	BookingCapacitySeats *int
 }
 
 // Booking is a table reservation. ID equals the original Supabase id for
