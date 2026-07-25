@@ -77,6 +77,34 @@ definitions:
         example: 9c8b7a6f-4d3e-2b1a-...-refresh
         type: string
     type: object
+  consent.preferenceRequest:
+    properties:
+      email_enabled:
+        example: true
+        type: boolean
+      notifications_enabled:
+        example: true
+        type: boolean
+      push_enabled:
+        example: true
+        type: boolean
+    type: object
+  consent.recordRequest:
+    properties:
+      consent_type:
+        example: privacy_policy
+        type: string
+      granted:
+        example: true
+        type: boolean
+      source:
+        description: 'Source is where the decision was captured: "app" or "web".'
+        example: app
+        type: string
+      version:
+        example: "2026-07-01"
+        type: string
+    type: object
   payments.createPaymentRequest:
     properties:
       return_url:
@@ -154,11 +182,60 @@ definitions:
       reason:
         type: string
     type: object
+  pushsubscriptions.registerRequest:
+    properties:
+      endpoint:
+        type: string
+      keys:
+        properties:
+          auth:
+            type: string
+          p256dh:
+            type: string
+        required:
+        - auth
+        - p256dh
+        type: object
+      restaurant_id:
+        type: string
+    required:
+    - endpoint
+    - keys
+    - restaurant_id
+    type: object
+  pushsubscriptions.unregisterRequest:
+    properties:
+      endpoint:
+        type: string
+    required:
+    - endpoint
+    type: object
   response.Envelope:
     properties:
       data: {}
       error:
         type: string
+    type: object
+  reviews.moderateRequest:
+    properties:
+      status:
+        type: string
+    required:
+    - status
+    type: object
+  reviews.replyRequest:
+    properties:
+      reply:
+        type: string
+    required:
+    - reply
+    type: object
+  reviews.submitRequest:
+    properties:
+      body:
+        type: string
+      rating:
+        type: integer
     type: object
   users.updateMeRequest:
     properties:
@@ -267,6 +344,154 @@ paths:
       summary: JWKS
       tags:
       - system
+  /api/v1/admin/dashboard/bookings:
+    get:
+      parameters:
+      - description: period start (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: from
+        type: string
+      - description: period end (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: to
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: forbidden
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid period
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Bookings breakdown by status over a period (superadmin)
+      tags:
+      - admin
+  /api/v1/admin/dashboard/overview:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: forbidden
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Platform overview counters (superadmin)
+      tags:
+      - admin
+  /api/v1/admin/dashboard/payments:
+    get:
+      parameters:
+      - description: period start (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: from
+        type: string
+      - description: period end (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: to
+        type: string
+      - description: ISO currency, default KZT
+        in: query
+        name: currency
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: forbidden
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid period
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Payments GMV and refunds over a period (superadmin)
+      tags:
+      - admin
+  /api/v1/admin/dashboard/top-restaurants:
+    get:
+      parameters:
+      - description: period start (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: from
+        type: string
+      - description: period end (RFC3339 or YYYY-MM-DD)
+        in: query
+        name: to
+        type: string
+      - description: 'ranking: bookings (default) or gmv'
+        in: query
+        name: by
+        type: string
+      - description: ISO currency for by=gmv, default KZT
+        in: query
+        name: currency
+        type: string
+      - description: max rows, default 10, max 50
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: forbidden
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid period or ranking
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Top restaurants by bookings or GMV over a period (superadmin)
+      tags:
+      - admin
+  /api/v1/admin/my-restaurants:
+    get:
+      description: |-
+        Restaurants where the caller is owner/manager/hostess, with their
+        role at each. A superadmin gets every restaurant (role "admin").
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: List restaurants I am staff of
+      tags:
+      - admin
   /api/v1/auth/login:
     post:
       consumes:
@@ -695,6 +920,60 @@ paths:
       summary: Release a booking's held payment
       tags:
       - payments
+  /api/v1/consents:
+    get:
+      description: Latest grant/revoke record per consent type for the authenticated
+        user.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Get my current consent state
+      tags:
+      - consent
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Appends one grant or revoke of a consent type at a policy version.
+        Append-only: prior records are never mutated, so the full history
+        is preserved as evidence.
+      parameters:
+      - description: Consent decision
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/consent.recordRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Record a consent decision
+      tags:
+      - consent
   /api/v1/favorites:
     get:
       produces:
@@ -772,6 +1051,54 @@ paths:
       summary: Add a restaurant to my favorites
       tags:
       - favorites
+  /api/v1/notification-preferences:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Get my notification preferences
+      tags:
+      - consent
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: Notification preferences
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/consent.preferenceRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: validation failed
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Set my notification preferences
+      tags:
+      - consent
   /api/v1/payments/{id}:
     get:
       description: The payment's own owner, venue staff/admin of its restaurant, or
@@ -801,6 +1128,273 @@ paths:
       summary: Get a payment
       tags:
       - payments
+  /api/v1/push/subscriptions:
+    delete:
+      consumes:
+      - application/json
+      parameters:
+      - description: The endpoint to remove
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/pushsubscriptions.unregisterRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Unregister my browser push subscription
+      tags:
+      - push
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: PushSubscription + target restaurant
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/pushsubscriptions.registerRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: not staff of this restaurant
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Register my browser push subscription
+      tags:
+      - push
+  /api/v1/restaurants/{id}/reviews:
+    get:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: 1-based page
+        in: query
+        name: page
+        type: integer
+      - description: page size (max 100)
+        in: query
+        name: per_page
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: List a restaurant's published reviews
+      tags:
+      - reviews
+  /api/v1/restaurants/{id}/reviews/me:
+    delete:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Delete my review
+      tags:
+      - reviews
+    get:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "404":
+          description: no review yet
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Get my review for a restaurant
+      tags:
+      - reviews
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: review
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/reviews.submitRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: no completed booking at this restaurant
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "404":
+          description: restaurant not found
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid rating or body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Create or edit my review
+      tags:
+      - reviews
+  /api/v1/restaurants/{id}/reviews/summary:
+    get:
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Restaurant aggregate rating
+      tags:
+      - reviews
+  /api/v1/reviews/{reviewId}/reply:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Review id
+        in: path
+        name: reviewId
+        required: true
+        type: string
+      - description: reply
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/reviews.replyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: not staff of this restaurant
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "404":
+          description: review not found
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Reply to a review (staff)
+      tags:
+      - reviews
+  /api/v1/reviews/{reviewId}/status:
+    patch:
+      consumes:
+      - application/json
+      parameters:
+      - description: Review id
+        in: path
+        name: reviewId
+        required: true
+        type: string
+      - description: status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/reviews.moderateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "403":
+          description: not staff of this restaurant
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "404":
+          description: review not found
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid status
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Hide/unhide a review (staff)
+      tags:
+      - reviews
   /api/v1/users/me:
     delete:
       description: |-
