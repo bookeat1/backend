@@ -1,5 +1,5 @@
 // Package feed is the Postgres implementation of domain.FeedRepository — the
-// merchandising feed's read model over promos + events (migration 0049) plus
+// merchandising feed's read model over promos + events (migration 0050) plus
 // the platform's moderation writes.
 //
 // The read model is deliberately a UNION ALL of two nearly identical SELECTs

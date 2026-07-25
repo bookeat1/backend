@@ -191,7 +191,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// the real published Event/Promo on approval inside one transaction (txm).
 	//
 	// The merchandising feed (main-screen "Акции") is a READ MODEL over those
-	// same promos/events plus a platform moderation decision (migration 0049) —
+	// same promos/events plus a platform moderation decision (migration 0050) —
 	// no third entity. The feed repository is additionally injected into the
 	// events/promos facades as their `feedModerator` port: editing an item's
 	// content pulls it back into the review queue, so an approved card can

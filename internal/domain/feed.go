@@ -9,7 +9,7 @@ import (
 
 // FeedItemKind says which venue-supplied entity a feed card is made of. There
 // is deliberately no third "feed item" entity: the merchandising feed is a READ
-// MODEL over the promos and events a venue already created (migration 0049), so
+// MODEL over the promos and events a venue already created (migration 0050), so
 // a card is always one of these two rows.
 type FeedItemKind string
 
@@ -67,7 +67,7 @@ const MaxFeedPlacementWeight = 100
 
 // FeedPlacement is the platform-controlled merchandising state of ONE promo or
 // event: the moderation decision plus the paid-placement weight. It is stored
-// as columns on the item's own row (migration 0049), not as a separate entity —
+// as columns on the item's own row (migration 0050), not as a separate entity —
 // one item holds exactly one placement.
 type FeedPlacement struct {
 	Status FeedStatus
