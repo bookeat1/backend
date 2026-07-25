@@ -1,5 +1,17 @@
 -- +goose Up
 
+-- LOCK SAFETY. This migration takes ACCESS EXCLUSIVE on `restaurants` (ALTER
+-- TABLE … ADD COLUMN) and SHARE ROW EXCLUSIVE on `bookings` (CREATE TRIGGER).
+-- The first conflicts with every reader and writer of the venue catalog, the
+-- second with every writer of `bookings` — so both queue behind any transaction
+-- still holding a lock on those tables, and while queued they block the traffic
+-- piling up behind THEM. On a live database that is a booking outage lasting as
+-- long as the oldest open transaction. With a lock_timeout the migration gives
+-- up after 3s instead: the deploy fails loudly, traffic never stops, and the
+-- migration is simply retried at a quieter moment. RESET keeps the timeout from
+-- leaking into the migrations that run after this one in the same session.
+SET lock_timeout = '3s';
+
 -- TABLE-LESS ("capacity") BOOKING MODE (owner decision, 25.07.2026).
 --
 -- WHY THIS EXISTS. The new backend seats a guest at a SPECIFIC table: a booking
@@ -212,6 +224,8 @@ CREATE TRIGGER trg_bookings_sync_capacity_holds_active
     FOR EACH ROW
     WHEN (OLD.status IS DISTINCT FROM NEW.status)
 EXECUTE FUNCTION sync_booking_capacity_holds_active();
+
+RESET lock_timeout;
 
 -- +goose Down
 DROP TRIGGER trg_bookings_sync_capacity_holds_active ON bookings;

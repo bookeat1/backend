@@ -1,5 +1,16 @@
 -- +goose Up
 
+-- LOCK SAFETY. CREATE TRIGGER takes SHARE ROW EXCLUSIVE on `booking_tables`,
+-- which conflicts with every writer of that table — so it queues behind any
+-- transaction that has touched a placement and has not committed yet, and while
+-- queued it blocks the writers piling up behind ITSELF. On a live database that
+-- stops every booking create and amendment for as long as the oldest open
+-- transaction lasts. With a lock_timeout the migration gives up after 3s
+-- instead: the deploy fails loudly, traffic never stops, and the migration is
+-- simply retried at a quieter moment. RESET keeps the timeout from leaking into
+-- the migrations that run after this one in the same session.
+SET lock_timeout = '3s';
+
 -- booking_tables.active DERIVED FROM THE BOOKING STATUS ON INSERT — the mirror
 -- of what 0057 did for booking_capacity_holds, and needed for the same reason.
 --
@@ -60,6 +71,8 @@ EXECUTE FUNCTION booking_table_active();
 
 COMMENT ON COLUMN booking_tables.active IS
     'Whether this link currently occupies the table (and is therefore seen by the GiST exclusion constraint). Never written by application code: derived from the booking status on INSERT (0058) and flipped by the status trigger (0004). Rows owned by an external reservation keep the value their own lifecycle sets.';
+
+RESET lock_timeout;
 
 -- +goose Down
 DROP TRIGGER trg_booking_tables_active_default ON booking_tables;
