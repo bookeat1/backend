@@ -51,6 +51,10 @@ type Ports struct {
 	// Venues resolves each venue's IANA timezone for the venue-local day
 	// boundary. Used only by the daily pass; nil elsewhere.
 	Venues domain.PayoutVenueReader
+	// Settings holds per-venue overrides of the platform payout policy.
+	// Optional: when nil every venue simply gets the platform default, which is
+	// exactly the behaviour before per-venue settings existed.
+	Settings domain.PayoutSettingsRepository
 }
 
 // Config is the money policy of the payout usecase: what a payout costs and who
@@ -66,6 +70,15 @@ type Config struct {
 	// FeeBearer is the WHO-PAYS policy. Defaults to the platform: a venue then
 	// always receives exactly the amount its statement showed.
 	FeeBearer domain.PayoutFeeBearer
+	// PlatformPolicy is the payout threshold + max-hold cap that applies to a
+	// venue with no settings of its own (env: PAYOUTS_MIN_AMOUNT_MINOR,
+	// PAYOUTS_MAX_HOLD_DAYS).
+	//
+	// It lives on the usecase Config, not on DailyConfig, on purpose: the daily
+	// runner ENFORCES the effective policy and the venue-facing read endpoint
+	// REPORTS it, and those two numbers drifting apart would mean showing a
+	// venue a rule it is not actually paid by. One struct, one source.
+	PlatformPolicy domain.PayoutPolicy
 }
 
 const (
@@ -75,6 +88,21 @@ const (
 	// defaultPayoutFeeMinimumMinor is the same tariff's per-payout floor:
 	// 300 ₸ = 30000 tiyn.
 	defaultPayoutFeeMinimumMinor int64 = 30000
+	// defaultMinPayoutMinor — 10 000 ₸ (1 000 000 tiyn), the platform-wide
+	// payout threshold (owner decision, unchanged by per-venue settings).
+	//
+	// The 300 ₸ floor makes the fee a percentage that falls as the payout
+	// grows: 300 ₸ on 10 000 ₸ is 3.0%, on 5 000 ₸ it is 6%, on 1 000 ₸ it is
+	// 30%. 3% is the worst case the owner already accepted when choosing daily
+	// batching over per-booking payouts, so 10 000 ₸ is the threshold that
+	// holds the cost at that accepted ceiling without holding a venue's money
+	// longer than necessary.
+	defaultMinPayoutMinor int64 = 1_000_000
+	// defaultMaxHoldDays — 7 days (owner decision, 25.07.2026). A venue whose
+	// turnover never reaches the threshold still gets paid weekly; the payout
+	// pays the acquirer's floor, and that is the accepted price of not sitting
+	// on someone else's money.
+	defaultMaxHoldDays = 7
 )
 
 // withDefaults fills the FreedomPay tariff and the safe bearer policy.
@@ -94,6 +122,16 @@ func (c Config) withDefaults() Config {
 	}
 	if !c.FeeBearer.Valid() {
 		c.FeeBearer = domain.PayoutFeeBearerPlatform
+	}
+	if c.PlatformPolicy.MinPayoutMinor <= 0 {
+		c.PlatformPolicy.MinPayoutMinor = defaultMinPayoutMinor
+	}
+	if c.PlatformPolicy.MaxHoldDays <= 0 {
+		// Same direction of safety as the fee: an unconfigured hold cap must
+		// mean "we do eventually pay", never "we may hold forever". A
+		// deployment that genuinely wants unlimited holding expresses it
+		// per-venue (max_hold_days = 0), which is an explicit, audited row.
+		c.PlatformPolicy.MaxHoldDays = defaultMaxHoldDays
 	}
 	return c
 }

@@ -36,6 +36,11 @@ func (h *Handler) RegisterStaffRoutes(rg *gin.RouterGroup) {
 	rg.PUT("/admin/restaurants/:id/payout-destination", h.setDestination)
 	rg.GET("/admin/restaurants/:id/payout-destination", h.getDestination)
 	rg.GET("/admin/restaurants/:id/payouts", h.listPayouts)
+	// READ-ONLY here on purpose: a venue may see the threshold and hold window
+	// it is paid by, but the matching PUT lives on the superadmin group below.
+	// A venue that could write these would control when its own money leaves
+	// the platform.
+	rg.GET("/admin/restaurants/:id/payout-settings", h.getSettings)
 }
 
 // RegisterSuperadminRoutes mounts the money-OUT routes. Mount on a group running
@@ -48,6 +53,9 @@ func (h *Handler) RegisterSuperadminRoutes(rg *gin.RouterGroup) {
 	rg.POST("/admin/payouts/generate", h.generateAll)
 	// Send one already-generated pending payout.
 	rg.POST("/admin/payouts/:payoutId/send", h.sendPayout)
+	// Set a venue's payout policy (threshold + max hold window). Platform-only:
+	// it decides when and above what amount that venue's money is disbursed.
+	rg.PUT("/admin/restaurants/:id/payout-settings", h.setSettings)
 }
 
 // ---- destination -----------------------------------------------------------
@@ -94,6 +102,39 @@ func (h *Handler) listPayouts(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, payoutsToResponse(list))
+}
+
+// ---- per-venue payout settings ---------------------------------------------
+
+func (h *Handler) getSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	v, err := h.payouts.GetPayoutSettings(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, settingsToResponse(v))
+}
+
+func (h *Handler) setSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req payoutSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	v, err := h.payouts.SetPayoutSettings(c.Request.Context(), actor, rid, req.toInput())
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, settingsToResponse(v))
 }
 
 // ---- generate / send -------------------------------------------------------

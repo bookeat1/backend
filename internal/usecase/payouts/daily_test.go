@@ -41,13 +41,21 @@ func seedVenue(t *testing.T, h *harness, tz string, entries ...domain.OwedEntry)
 }
 
 // owedAt builds one owed ledger entry created at a given instant.
+//
+// The instant is recorded twice on purpose, because it plays two different
+// roles: entryTimes drives the fake's period CUTOFF (which entries are in scope
+// for the day being settled), while OwedEntry.CreatedAt is the AGE the real
+// repository returns and the max-hold rule measures against.
 func owedAt(h *harness, amountMinor int64, at time.Time) domain.OwedEntry {
 	id := uuid.New()
 	if h.owed.entryTimes == nil {
 		h.owed.entryTimes = map[uuid.UUID]time.Time{}
 	}
 	h.owed.entryTimes[id] = at
-	return domain.OwedEntry{LedgerEntryID: id, AmountSignedMinor: amountMinor, Currency: domain.CurrencyKZT}
+	return domain.OwedEntry{
+		LedgerEntryID: id, AmountSignedMinor: amountMinor,
+		Currency: domain.CurrencyKZT, CreatedAt: at,
+	}
 }
 
 func mustLoad(t *testing.T, name string) *time.Location {
@@ -620,5 +628,58 @@ func TestDaily_SendDisabledGeneratesButMovesNoMoney(t *testing.T) {
 	list, _ := h.payouts.List(context.Background(), rid, 10)
 	if len(list) != 1 || list[0].Status != domain.PayoutPending {
 		t.Fatalf("expected one PENDING payout, got %+v", list)
+	}
+}
+
+// Owner decision (2026-07-25): the hold cap must never send a payout the fee
+// would eat. 250 ₸ held past the limit cannot even cover the 300 ₸ transfer, so
+// it keeps waiting and is counted as STUCK — the number an operator is meant to
+// act on, rather than money quietly destroyed by its own transfer.
+func TestDaily_HeldTooLongButTooSmallToPayIsNotForced(t *testing.T) {
+	h := newHarness()
+	almaty := mustLoad(t, tzAlmaty)
+	now := time.Date(2026, 7, 25, 9, 0, 0, 0, almaty)
+
+	// 250 ₸, twenty days old: past any hold cap, below the 300 ₸ fee floor.
+	rid := seedVenue(t, h, tzAlmaty, owedAt(h, 25_000, time.Date(2026, 7, 5, 12, 0, 0, 0, almaty)))
+
+	d := h.daily(DailyConfig{}, now)
+	res, err := d.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Generated != 0 || res.Forced != 0 {
+		t.Fatalf("an uneconomic balance was paid anyway: generated=%d forced=%d", res.Generated, res.Forced)
+	}
+	if res.Stuck != 1 {
+		t.Fatalf("stuck = %d, want 1 — money nobody can pay economically must be surfaced, not silently held", res.Stuck)
+	}
+	if list, _ := h.payouts.List(context.Background(), rid, 10); len(list) != 0 {
+		t.Fatalf("expected no payout row, got %d", len(list))
+	}
+}
+
+// The rule is "smaller than the fee", not "small": a balance the fee does not
+// swallow is still force-paid when it gets old, which is the whole point of the
+// hold cap.
+func TestDaily_HeldTooLongAndWorthPayingIsStillForced(t *testing.T) {
+	h := newHarness()
+	almaty := mustLoad(t, tzAlmaty)
+	now := time.Date(2026, 7, 25, 9, 0, 0, 0, almaty)
+
+	// 5 000 ₸: below the 10 000 ₸ threshold, comfortably above the 300 ₸ fee.
+	rid := seedVenue(t, h, tzAlmaty, owedAt(h, 500_000, time.Date(2026, 7, 5, 12, 0, 0, 0, almaty)))
+
+	d := h.daily(DailyConfig{}, now)
+	res, err := d.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if res.Forced != 1 || res.Stuck != 0 {
+		t.Fatalf("forced=%d stuck=%d, want forced=1 stuck=0", res.Forced, res.Stuck)
+	}
+	list, _ := h.payouts.List(context.Background(), rid, 10)
+	if len(list) != 1 || !list[0].ForcedByAge {
+		t.Fatalf("expected one payout marked forced_by_age, got %+v", list)
 	}
 }

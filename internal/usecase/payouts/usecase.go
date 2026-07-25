@@ -18,6 +18,7 @@ type UseCase struct {
 	payouts      domain.PayoutRepository
 	items        domain.PayoutItemRepository
 	owed         domain.OwedReader
+	settings     domain.PayoutSettingsRepository
 	gateway      domain.PayoutGateway
 	tx           domain.TxManager
 	ledger       domain.PayoutLedgerRepository
@@ -37,6 +38,7 @@ func NewUseCase(p Ports, cfg Config, log *slog.Logger) *UseCase {
 		payouts:      p.Payouts,
 		items:        p.Items,
 		owed:         p.Owed,
+		settings:     p.Settings,
 		gateway:      p.Gateway,
 		tx:           p.Tx,
 		ledger:       p.Ledger,

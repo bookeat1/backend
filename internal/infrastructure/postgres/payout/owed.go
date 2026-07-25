@@ -51,7 +51,11 @@ func (r *Owed) OwedForRestaurant(ctx context.Context, restaurantID uuid.UUID) ([
 // its own and therefore cannot drift from the ledger.
 func (r *Owed) OwedForRestaurantUpTo(ctx context.Context, restaurantID uuid.UUID, before time.Time) ([]domain.OwedBalance, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT le.id, le.currency, `+signedExpr+` AS signed
+		// le.created_at is selected because it is the AGE of the money: the
+		// daily pass's max-hold rule ("this venue never reaches its threshold,
+		// pay it anyway") is measured against the oldest unclaimed entry, and
+		// that age can only come from the same read that produced the balance.
+		`SELECT le.id, le.currency, `+signedExpr+` AS signed, le.created_at
 		 FROM payment_ledger_entries le
 		 JOIN payments p ON p.id = le.payment_id
 		 WHERE le.account = 'restaurant'
@@ -71,7 +75,8 @@ func (r *Owed) OwedForRestaurantUpTo(ctx context.Context, restaurantID uuid.UUID
 		var entryID uuid.UUID
 		var currency string
 		var signed int64
-		if err := rows.Scan(&entryID, &currency, &signed); err != nil {
+		var createdAt time.Time
+		if err := rows.Scan(&entryID, &currency, &signed, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan owed entry: %w", err)
 		}
 		cur := domain.Currency(currency)
@@ -86,6 +91,7 @@ func (r *Owed) OwedForRestaurantUpTo(ctx context.Context, restaurantID uuid.UUID
 			LedgerEntryID:     entryID,
 			AmountSignedMinor: signed,
 			Currency:          cur,
+			CreatedAt:         createdAt,
 		})
 	}
 	if err := rows.Err(); err != nil {

@@ -340,7 +340,16 @@ type PayoutsConfig struct {
 	DailySendEnabled bool // env: PAYOUTS_DAILY_SEND_ENABLED
 	// MinPayoutMinor is the roll-over threshold: below it a venue's money waits
 	// for the next day instead of paying a 300 ₸ floor on a small amount.
+	// PLATFORM DEFAULT only — a venue may override it
+	// (restaurant_payout_settings.min_payout_minor, migration 0053).
 	MinPayoutMinor int64 // env: PAYOUTS_MIN_AMOUNT_MINOR
+	// MaxHoldDays forces a payout after this many days even when the venue
+	// never reaches its threshold, so the platform never sits on a venue's
+	// money indefinitely. NOTE: 0 here does NOT mean "never force" — an unset
+	// or non-positive env value falls back to 7 days (see payouts.Config
+	// withDefaults). "Never force" is expressed PER VENUE, as an explicit 0 in
+	// that venue's payout settings.
+	MaxHoldDays int // env: PAYOUTS_MAX_HOLD_DAYS
 	// FeeBps / FeeMinimumMinor are the acquirer's payout tariff.
 	FeeBps          int   // env: PAYOUTS_FEE_BPS
 	FeeMinimumMinor int64 // env: PAYOUTS_FEE_MIN_MINOR
@@ -506,6 +515,9 @@ func NewConfig() (Config, error) {
 			// 10 000 ₸: the amount at which the 300 ₸ floor is 3% — the worst
 			// case the owner already accepted by choosing daily batching.
 			MinPayoutMinor: getEnvInt64("PAYOUTS_MIN_AMOUNT_MINOR", 1_000_000),
+			// 7 days (owner decision, 25.07.2026): a venue that never reaches
+			// the threshold is still paid weekly rather than indefinitely held.
+			MaxHoldDays: getEnvInt("PAYOUTS_MAX_HOLD_DAYS", 7),
 			// FreedomPay, KZ bank card, questionnaire of 14.07.2026.
 			FeeBps:          getEnvInt("PAYOUTS_FEE_BPS", 190),
 			FeeMinimumMinor: getEnvInt64("PAYOUTS_FEE_MIN_MINOR", 30_000),
