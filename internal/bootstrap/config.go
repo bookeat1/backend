@@ -331,6 +331,15 @@ func NewConfig() (Config, error) {
 	// directly by the shell, Docker, or the orchestrator).
 	_ = godotenv.Load()
 
+	// Parsed before the struct literal because, unlike every other knob here, a
+	// value that is SET BUT INVALID is refused rather than defaulted: this one
+	// decides how much of a guest's money is kept on a refund (see
+	// refundAcquiringByProvider).
+	refundAcquiring, err := refundAcquiringByProvider()
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		App: AppConfig{
 			Name:               getEnv("APP_NAME", "backend-core"),
@@ -389,7 +398,7 @@ func NewConfig() (Config, error) {
 			DefaultProvider:              getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
 			ServiceFeeBps:                getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
 			RefundAcquiringBps:           getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
-			RefundAcquiringBpsByProvider: refundAcquiringByProvider(),
+			RefundAcquiringBpsByProvider: refundAcquiring,
 			DepositDefaultMinor:          getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
 			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired:      getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
@@ -488,8 +497,6 @@ func getEnv(key, def string) string {
 	return def
 }
 
-// getEnvInt returns the integer value of the environment variable named by
-// key, or def when the variable is unset or not a valid integer.
 // knownPaymentProviders mirrors domain.PaymentProvider's constants. It lives
 // here as plain strings so the config layer keeps its "env in, struct out"
 // shape without importing the domain; a provider added to the domain and
@@ -497,31 +504,46 @@ func getEnv(key, def string) string {
 // global rate, which is the safe direction.
 var knownPaymentProviders = []string{"freedompay", "tiptoppay", "partnerspay"}
 
+// maxBasisPoints is 100% — the domain's ApplyBasisPoints refuses anything
+// above it, so a larger configured rate could only ever fail at settle time.
+const maxBasisPoints = 10000
+
 // refundAcquiringByProvider reads PAYMENTS_REFUND_ACQUIRING_BPS_<PROVIDER> for
 // every known acquirer. Only variables that are actually SET land in the map —
 // an unset provider must fall back to the global rate, so a missing key and an
-// explicit 0 have to stay distinguishable. A negative or unparseable value is
-// ignored (same posture as getEnvInt) rather than silently paying the guest
-// more than was charged.
-func refundAcquiringByProvider() map[string]int {
+// explicit 0 have to stay distinguishable.
+//
+// Unlike the getEnv* helpers, a value that is present but unusable is an ERROR,
+// not a silent fallback. This knob decides how much of a guest's refund is kept:
+// "2.9" typed instead of "290" would quietly hand the acquirer's cost to the
+// platform, and 29000 would make every refund for that provider fail at settle
+// time (ApplyBasisPoints caps at 100%). Both are ops mistakes that must surface
+// at boot, where they are a non-event, rather than in the money path.
+func refundAcquiringByProvider() (map[string]int, error) {
 	var out map[string]int
 	for _, p := range knownPaymentProviders {
-		v, ok := os.LookupEnv("PAYMENTS_REFUND_ACQUIRING_BPS_" + strings.ToUpper(p))
+		key := "PAYMENTS_REFUND_ACQUIRING_BPS_" + strings.ToUpper(p)
+		v, ok := os.LookupEnv(key)
 		if !ok {
 			continue
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(v))
-		if err != nil || n < 0 {
-			continue
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: want whole basis points (290 = 2.9%%)", key, v)
+		}
+		if n < 0 || n > maxBasisPoints {
+			return nil, fmt.Errorf("%s=%d: basis points must be within 0..%d", key, n, maxBasisPoints)
 		}
 		if out == nil {
 			out = make(map[string]int, len(knownPaymentProviders))
 		}
 		out[p] = n
 	}
-	return out
+	return out, nil
 }
 
+// getEnvInt returns the integer value of the environment variable named by
+// key, or def when the variable is unset or not a valid integer.
 func getEnvInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
