@@ -35,6 +35,13 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
+// feedModerator pulls an item off the main-screen feed when its content
+// changes. Minimal local port (bound to the feed repository in bootstrap): the
+// events usecase must not know the whole FeedRepository, only this one effect.
+type feedModerator interface {
+	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+}
+
 // Facade exposes admin CRUD and public read operations for events.
 type Facade interface {
 	Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Event, error)
@@ -111,12 +118,13 @@ type UpdateInput struct {
 type facade struct {
 	repo  domain.EventRepository
 	perms permissionChecker
+	feed  feedModerator
 	clock func() time.Time
 }
 
 // NewFacade constructs the events Facade.
-func NewFacade(repo domain.EventRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms, clock: time.Now}
+func NewFacade(repo domain.EventRepository, perms permissionChecker, feed feedModerator) Facade {
+	return &facade{repo: repo, perms: perms, feed: feed, clock: time.Now}
 }
 
 func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Event, error) {
@@ -162,6 +170,12 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
 		return nil, err
 	}
+	// Decided before anything is overwritten: only a change to what a moderator
+	// actually read counts as an edit. Publishing or hiding an event travels
+	// through this same method, and re-queueing a venue for that would punish
+	// them for using their own visibility switch. Same rule as usecase/promos.
+	contentChanged := eventContentChanged(*e, in)
+
 	e.Title = strings.TrimSpace(in.Title)
 	e.TitleI18n = in.TitleI18n
 	e.Description = in.Description
@@ -180,6 +194,16 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	}
 	if err := validateEvent(e); err != nil {
 		return nil, err
+	}
+	// Demote BEFORE writing the new content: the platform approved specific
+	// words and dates, so changing them invalidates the decision. This ordering
+	// makes both failure modes safe — a failed edit after a successful demotion
+	// only costs the venue a re-review, while the reverse order could leave
+	// unreviewed text live on the main screen. See usecase/promos.Update.
+	if contentChanged {
+		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemEvent, eventID); err != nil {
+			return nil, err
+		}
 	}
 	if err := f.repo.Update(ctx, e); err != nil {
 		return nil, err
@@ -314,4 +338,61 @@ func validateRefundPolicy(p domain.TicketRefundPolicy) error {
 			domain.ErrValidation, minRefundCutoffMinutes, maxRefundCutoffMinutes)
 	}
 	return nil
+}
+
+// eventContentChanged reports whether this update touches anything shown on the
+// feed card or reviewed by a moderator: the words, the dates, the venue line,
+// the cover, or the ticketing terms a guest sees before paying. Status,
+// deliberately, is not one of them.
+func eventContentChanged(cur domain.Event, in UpdateInput) bool {
+	switch {
+	case strings.TrimSpace(in.Title) != cur.Title,
+		in.Description != cur.Description,
+		in.Venue != cur.Venue,
+		!in.StartsAt.Equal(cur.StartsAt),
+		!in.EndsAt.Equal(cur.EndsAt),
+		in.Ticketed != cur.Ticketed,
+		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL),
+		!int64PtrEqual(in.TicketPriceMinor, cur.TicketPriceMinor),
+		!intPtrEqual(in.Capacity, cur.Capacity),
+		!i18nEqual(in.TitleI18n, cur.TitleI18n),
+		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n):
+		return true
+	}
+	return false
+}
+
+// i18nEqual compares localized maps by content: nil and empty read the same to a
+// guest, so they must not count as an edit.
+func i18nEqual(a, b domain.I18n) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func strPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func int64PtrEqual(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func intPtrEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }

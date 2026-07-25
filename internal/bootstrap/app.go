@@ -23,6 +23,7 @@ import (
 	devicetokensrest "backend-core/internal/transport/rest/devicetokens"
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
+	feedrest "backend-core/internal/transport/rest/feed"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
@@ -100,6 +101,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
 
+	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
+	// SAME OptionalAuth group and for the same reason as the catalog: it is a
+	// public screen, but a signed-in guest gets their cuisine preferences folded
+	// into the ranking. The venue and platform sides mount further down.
+	feedHandler := feedrest.NewHandler(deps.FeedFacade)
+	feedHandler.RegisterPublic(restPublic)
+
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	authed.Use(middleware.LogUserContext())
@@ -158,6 +166,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	contentrest.NewHandler(deps.ContentFacade).RegisterStaffRoutes(authed)
 
+	// Venue side of the feed: submit an item for the main screen and see where
+	// the submission stands. Item-scoped (the path carries a promo/event id, not
+	// a restaurant id), so the PermRestaurantManage gate is resolved inside
+	// usecase/feed — same reason the events/promos admin routes need no
+	// RequireRestaurantManager here.
+	feedHandler.RegisterVenueRoutes(authed)
+
 	bookingHandler := bookingsrest.NewHandler(deps.BookingsFacade, deps.BookingCreate,
 		deps.BookingIdempotent, deps.BookingStatus, deps.BookingUpdate,
 		deps.BookingAvail, deps.BookingBlacklist, deps.BookingPolicy, deps.BookingExternal)
@@ -183,6 +198,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// superadmin passes; a restaurant owner/manager/hostess or a guest gets 403.
 	// The usecase re-checks the superadmin role as defense-in-depth.
 	dashboardrest.NewHandler(deps.Dashboard).RegisterRoutes(adminGlobal)
+
+	// Platform side of the feed: the moderation queue, approve/reject, and the
+	// paid-placement dial. Superadmin ONLY — mounted on the RequireRole(RoleAdmin)
+	// group so a venue owner cannot reach it, and re-checked in usecase/feed as
+	// defense-in-depth. A venue must never be able to price its own placement.
+	feedHandler.RegisterPlatformRoutes(adminGlobal)
 
 	// Restaurant payouts (выплаты заведениям). The money-OUT routes (generate +
 	// send) are mounted on the superadmin group; the venue-scoped routes

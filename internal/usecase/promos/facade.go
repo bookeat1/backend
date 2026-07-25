@@ -27,6 +27,13 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
+// feedModerator pulls an item off the main-screen feed when its content
+// changes. Minimal local port (bound to the feed repository in bootstrap): the
+// promos usecase must not know the whole FeedRepository, only this one effect.
+type feedModerator interface {
+	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+}
+
 // Facade exposes admin CRUD and public read operations for promos.
 type Facade interface {
 	Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Promo, error)
@@ -68,12 +75,13 @@ type UpdateInput struct {
 type facade struct {
 	repo  domain.PromoRepository
 	perms permissionChecker
+	feed  feedModerator
 	clock func() time.Time
 }
 
 // NewFacade constructs the promos Facade.
-func NewFacade(repo domain.PromoRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms, clock: time.Now}
+func NewFacade(repo domain.PromoRepository, perms permissionChecker, feed feedModerator) Facade {
+	return &facade{repo: repo, perms: perms, feed: feed, clock: time.Now}
 }
 
 func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Promo, error) {
@@ -112,6 +120,13 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	if err := f.authorize(ctx, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
+	// Whether the CARD's content actually changed is decided before anything is
+	// overwritten. Update carries Status too, and hiding then re-publishing an
+	// approved promo goes through this same method — demoting for that would
+	// send a venue back to the moderation queue for touching nothing a
+	// moderator ever read.
+	contentChanged := promoContentChanged(*p, in)
+
 	p.Title = strings.TrimSpace(in.Title)
 	p.TitleI18n = in.TitleI18n
 	p.Description = in.Description
@@ -122,6 +137,21 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	p.Status = in.Status
 	if err := validatePromo(p); err != nil {
 		return nil, err
+	}
+	// Demote BEFORE writing the new content, not after: the platform approved
+	// specific words, so changing them invalidates the decision. Ordered this
+	// way the failure modes are both safe — a failed edit after a successful
+	// demotion only costs the venue a re-review, whereas a failed demotion
+	// after a successful edit would leave unreviewed text live on the main
+	// screen. A transaction is deliberately not used: the safe ordering already
+	// gives the guarantee that matters, without dragging a tx manager into a
+	// simple CRUD facade. The residual window (a moderator approving in the
+	// milliseconds between the demotion and the write) is known, self-healing on
+	// the next edit, and judged not worth a tx here.
+	if contentChanged {
+		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemPromo, promoID); err != nil {
+			return nil, err
+		}
 	}
 	if err := f.repo.Update(ctx, p); err != nil {
 		return nil, err
@@ -190,4 +220,32 @@ func validatePromo(p *domain.Promo) error {
 		return fmt.Errorf("%w: ends_at must be after starts_at", domain.ErrValidation)
 	}
 	return nil
+}
+
+// promoContentChanged reports whether this update touches anything a moderator
+// actually reviewed: the words shown on the card and the window it runs in.
+// Status is excluded on purpose — publishing or hiding is the venue's own
+// lever over its card and changes nothing a moderator read.
+func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
+	return strings.TrimSpace(in.Title) != cur.Title ||
+		in.Description != cur.Description ||
+		in.Terms != cur.Terms ||
+		!in.StartsAt.Equal(cur.StartsAt) ||
+		!in.EndsAt.Equal(cur.EndsAt) ||
+		!i18nEqual(in.TitleI18n, cur.TitleI18n) ||
+		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n)
+}
+
+// i18nEqual compares two localized maps by content: a nil map and an empty one
+// mean the same thing to a reader, so they must not count as an edit.
+func i18nEqual(a, b domain.I18n) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
