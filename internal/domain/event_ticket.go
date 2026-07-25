@@ -83,9 +83,12 @@ func CanTicketTransition(from, to TicketStatus) bool {
 // denormalised out of the event so admin listings and RBAC scoping never need a
 // join.
 //
-// UserID is nil for a guest checkout without an account; GuestName/GuestPhone/
-// GuestEmail carry the contact details in that case (and a convenience copy for
-// an account buyer). Money is integer minor units, never a float.
+// UserID is nil only on LEGACY rows: tickets used to be buyable without an
+// account, and since 2026-07-25 they are not — every new ticket carries its
+// buyer's account. Such a legacy ticket has no self-service path at all (no
+// replay, no self-refund) and is handled by the venue. GuestName/GuestPhone/
+// GuestEmail are contact details, never ownership proof. Money is integer minor
+// units, never a float.
 type EventTicket struct {
 	ID             uuid.UUID
 	EventID        uuid.UUID

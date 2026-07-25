@@ -86,12 +86,20 @@ func TestTicketRefundAllowed(t *testing.T) {
 			wantDeadline: start,
 		},
 		{
-			name:         "the platform default grants nobody a self-refund",
+			name:         "the platform default allows a refund a month out",
 			policy:       DefaultTicketRefundPolicy,
 			now:          start.Add(-30 * 24 * time.Hour),
+			wantAllowed:  true,
+			wantReason:   TicketRefundDenyNone,
+			wantDeadline: start.Add(-24 * time.Hour),
+		},
+		{
+			name:         "the platform default closes 24 hours before the start",
+			policy:       DefaultTicketRefundPolicy,
+			now:          start.Add(-23 * time.Hour),
 			wantAllowed:  false,
-			wantReason:   TicketRefundDenyNotRefundable,
-			wantDeadline: time.Time{},
+			wantReason:   TicketRefundDenyWindowClosed,
+			wantDeadline: start.Add(-24 * time.Hour),
 		},
 	}
 

@@ -338,10 +338,13 @@ type refundPolicyRequest struct {
 	CutoffMinutes     int  `json:"ticket_refund_cutoff_minutes"`
 }
 
-// refundPolicy is the CREATE reading: an absent field is the conservative
-// default, so a client that knows nothing about refunds cannot open them.
+// refundPolicy is the CREATE reading: an absent field falls back to the ONE
+// platform default (domain.DefaultTicketRefundPolicy), so an event created by a
+// client that knows nothing about refunds gets the same rules as one created
+// through the DB default — a review caught this drifting into a third,
+// stricter default that contradicted the owner's decision.
 func (r eventRequest) refundPolicy() domain.TicketRefundPolicy {
-	p := domain.TicketRefundPolicy{}
+	p := domain.DefaultTicketRefundPolicy
 	if r.TicketsRefundable != nil {
 		p.Refundable = *r.TicketsRefundable
 	}

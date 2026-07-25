@@ -1,10 +1,12 @@
 // Package tickets exposes the HTTP endpoints for event-ticket purchasing.
 //
 // Guest routes (buy, view own, cancel) mount on a group running
-// middleware.OptionalAuth: a logged-in guest is attached, an anonymous buyer is
-// let through (the transport builds a zero Actor, the usecase enforces contact
-// scoping) — the same access model as the payments checkout, since a ticket
-// purchase creates a payment. Admin routes (tickets sold for an event) mount on
+// middleware.OptionalAuth, shared with the payments checkout. That group lets an
+// anonymous caller REACH the handler, but a ticket is sold to an account only
+// (owner decision, 2026-07-25): usecase/tickets refuses a purchase without a
+// signed-in user with domain.ErrUnauthorized → 401. The rule lives in the
+// usecase on purpose, so it holds for every caller and not just this route.
+// Admin routes (tickets sold for an event) mount on
 // a group running middleware.Auth; the RBAC gate (PermRestaurantManage at the
 // event's own restaurant) is resolved inside usecase/tickets, so transport only
 // builds the Actor and parses ids. Acquirer webhooks are handled by the existing

@@ -23,10 +23,12 @@ type TicketRefundPolicy struct {
 }
 
 // DefaultTicketRefundPolicy is the platform fallback for an event whose venue
-// has not chosen anything yet. It deliberately reproduces the behaviour that
-// existed before this feature (no guest self-refund at all) rather than
-// granting guests a new right by default — mirrors the migration 0047 backfill.
-var DefaultTicketRefundPolicy = TicketRefundPolicy{Refundable: false, CutoffMinutes: 1440}
+// has not chosen anything yet: refundable up to 24 hours before the start
+// (owner decision, 2026-07-25). A venue that wants a stricter rule sets it on
+// its own event. This is the ONE place the platform default lives — the
+// migration backfill/DEFAULT (0047/0048) and the API's create fallback must
+// agree with it, or an event's rules would depend on which door it came through.
+var DefaultTicketRefundPolicy = TicketRefundPolicy{Refundable: true, CutoffMinutes: 1440}
 
 // TicketRefundDenyReason explains a refusal in a machine-readable way, so the
 // app can show the right message ("this event's tickets are non-refundable" vs
