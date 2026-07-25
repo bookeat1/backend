@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/logging"
 )
 
@@ -46,14 +47,17 @@ func (c Config) withDefaults() Config {
 type Worker struct {
 	source Source
 	sink   Sink
+	tx     domain.TxManager
 	cfg    Config
 	log    *slog.Logger
 }
 
 // NewWorker builds the sync worker. source must be a READ-ONLY view of the old
-// DB; sink writes the new DB.
-func NewWorker(source Source, sink Sink, cfg Config, log *slog.Logger) *Worker {
-	return &Worker{source: source, sink: sink, cfg: cfg.withDefaults(), log: log}
+// DB; sink writes the new DB. tx wraps the working-hours fill of ONE venue, so
+// the "does the venue own these hours" check and the write it authorises cannot
+// be split by a concurrent admin edit.
+func NewWorker(source Source, sink Sink, tx domain.TxManager, cfg Config, log *slog.Logger) *Worker {
+	return &Worker{source: source, sink: sink, tx: tx, cfg: cfg.withDefaults(), log: log}
 }
 
 // EntityResult counts what one entity's pass did.
@@ -126,6 +130,14 @@ func (w *Worker) Tick(ctx context.Context) error {
 				slog.Int("skipped", res.Skipped))
 		}
 	}
+	// Working hours run last and are NOT part of the steps loop: they are not
+	// cursored, they are derived from the restaurants rows the pass above has
+	// just written, and they report their own counters (see workinghours.go).
+	hours, err := w.syncWorkingHours(ctx)
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	w.logWorkingHours(hours)
 	return firstErr
 }
 

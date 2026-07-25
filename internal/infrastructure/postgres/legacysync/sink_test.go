@@ -10,6 +10,7 @@ import (
 
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	"backend-core/internal/infrastructure/postgres/testdb"
+	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/logger"
 	uc "backend-core/internal/usecase/legacysync"
 )
@@ -140,7 +141,7 @@ func newFakeSource() *fakeSource {
 
 func newWorker(src uc.Source, pool *pgxpool.Pool) *uc.Worker {
 	log := logger.New("error", "text")
-	return uc.NewWorker(src, legacysink.NewSink(pool), uc.Config{
+	return uc.NewWorker(src, legacysink.NewSink(pool), sqltx.NewManager(pool), uc.Config{
 		TickInterval: time.Hour, BatchSize: 100, DefaultDuration: 90 * time.Minute,
 	}, log)
 }
@@ -148,7 +149,8 @@ func newWorker(src uc.Source, pool *pgxpool.Pool) *uc.Worker {
 func reset(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	testdb.Truncate(t, pool, "booking_tables", "bookings", "menu_items",
-		"menu_categories", "restaurant_tables", "restaurants", "users", "legacy_sync_cursor")
+		"menu_categories", "restaurant_tables", "restaurant_working_hours", "legacy_working_hours_import",
+		"restaurants", "users", "legacy_sync_cursor")
 	if _, err := pool.Exec(context.Background(), `INSERT INTO users (id) VALUES ($1)`, usr1); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
@@ -450,7 +452,7 @@ func TestSyncBookingTablesKeysetNoLoss(t *testing.T) {
 
 	// Batch size 2 forces the shared-timestamp group to straddle batch boundaries.
 	log := logger.New("error", "text")
-	w := uc.NewWorker(src, legacysink.NewSink(pool), uc.Config{
+	w := uc.NewWorker(src, legacysink.NewSink(pool), sqltx.NewManager(pool), uc.Config{
 		TickInterval: time.Hour, BatchSize: 2, DefaultDuration: 90 * time.Minute,
 	}, log)
 
@@ -464,5 +466,109 @@ func TestSyncBookingTablesKeysetNoLoss(t *testing.T) {
 	// The original join row (bt1, book1->tbl1) plus the n new distinct-table rows.
 	if got := count(t, pool, "booking_tables"); got != n+1 {
 		t.Fatalf("booking_tables=%d want %d (every keyset row written exactly once)", got, n+1)
+	}
+}
+
+// TestWorkingHoursFillAgainstRealSchema exercises the working-hours backfill end
+// to end against a real database: the seven rows land, the import record is
+// written, a re-run changes nothing, and — the rule that matters — a venue's own
+// edit is never overwritten, not even when the legacy text changes afterwards.
+func TestWorkingHoursFillAgainstRealSchema(t *testing.T) {
+	pool := testdb.Connect(t)
+	ctx := context.Background()
+	reset(t, pool)
+
+	src := newFakeSource()
+	src.restaurants[0].OpeningHours = "Пн — Вт Выходной, Ср — Вс: 17:00–03:00"
+	w := newWorker(src, pool)
+
+	if err := w.Tick(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if got := count(t, pool, "restaurant_working_hours"); got != 7 {
+		t.Fatalf("working hours rows=%d want 7 (one per weekday)", got)
+	}
+	var status, fingerprint string
+	if err := pool.QueryRow(ctx,
+		`SELECT status, fingerprint FROM legacy_working_hours_import WHERE restaurant_id=$1`, rest1).
+		Scan(&status, &fingerprint); err != nil {
+		t.Fatalf("import record: %v", err)
+	}
+	if status != uc.HoursImportFilled || fingerprint == "" {
+		t.Fatalf("import = %q/%q want filled with a fingerprint", status, fingerprint)
+	}
+	// Monday is Выходной: stored as a closed row, not omitted.
+	var isOpen bool
+	var openTime *string
+	if err := pool.QueryRow(ctx,
+		`SELECT is_open, open_time FROM restaurant_working_hours WHERE restaurant_id=$1 AND day_of_week=1`, rest1).
+		Scan(&isOpen, &openTime); err != nil {
+		t.Fatalf("monday row: %v", err)
+	}
+	if isOpen || openTime != nil {
+		t.Fatalf("monday = open %v %v, want a closed row with NULL times", isOpen, openTime)
+	}
+
+	// Re-run with unchanged text: idempotent, no churn.
+	if err := w.Tick(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if got := count(t, pool, "restaurant_working_hours"); got != 7 {
+		t.Fatalf("working hours rows=%d after a re-run, want 7", got)
+	}
+
+	// The venue edits Wednesday in the admin panel, and the legacy text changes
+	// too. The venue's edit must win: nothing may be rewritten.
+	if _, err := pool.Exec(ctx,
+		`UPDATE restaurant_working_hours SET open_time='19:00' WHERE restaurant_id=$1 AND day_of_week=3`, rest1); err != nil {
+		t.Fatalf("simulate admin edit: %v", err)
+	}
+	src.restaurants[0].OpeningHours = "Пн-Вс: 08:00-23:00"
+	src.restaurants[0].UpdatedAt = t0(30) // move the cursor so the row re-syncs
+	if err := w.Tick(ctx); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	var wednesday string
+	if err := pool.QueryRow(ctx,
+		`SELECT open_time FROM restaurant_working_hours WHERE restaurant_id=$1 AND day_of_week=3`, rest1).
+		Scan(&wednesday); err != nil {
+		t.Fatalf("wednesday row: %v", err)
+	}
+	if wednesday != "19:00" {
+		t.Fatalf("wednesday open_time=%q — the sync overwrote the venue's own edit", wednesday)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM legacy_working_hours_import WHERE restaurant_id=$1`, rest1).Scan(&status); err != nil {
+		t.Fatalf("import record after the edit: %v", err)
+	}
+	if status != uc.HoursImportVenueOwned {
+		t.Fatalf("import status=%q want %q", status, uc.HoursImportVenueOwned)
+	}
+}
+
+// TestWorkingHoursRefusalIsRecordedInDB pins the visible-failure path: an
+// unparseable legacy string writes no hours and leaves a refusal with a reason
+// for the operator to work from.
+func TestWorkingHoursRefusalIsRecordedInDB(t *testing.T) {
+	pool := testdb.Connect(t)
+	ctx := context.Background()
+	reset(t, pool)
+
+	src := newFakeSource()
+	src.restaurants[0].OpeningHours = "10-22" // no weekday information at all
+	if err := newWorker(src, pool).Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if got := count(t, pool, "restaurant_working_hours"); got != 0 {
+		t.Fatalf("working hours rows=%d, want none for an unparseable string", got)
+	}
+	var status, reason string
+	if err := pool.QueryRow(ctx,
+		`SELECT status, COALESCE(reason,'') FROM legacy_working_hours_import WHERE restaurant_id=$1`, rest1).
+		Scan(&status, &reason); err != nil {
+		t.Fatalf("import record: %v", err)
+	}
+	if status != uc.HoursImportRefused || reason == "" {
+		t.Fatalf("import = %q/%q, want a refusal with a reason", status, reason)
 	}
 }
