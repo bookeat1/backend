@@ -28,6 +28,15 @@ type Event struct {
 	GuestName     string
 	Guests        int
 	StartsAt      time.Time
+	// GuestUserID is the booking's account owner, nil for a booking made without
+	// an account (phone / admin-entered). Guest-facing channels need it to find
+	// the devices to notify and to consult the guest's opt-out; staff channels
+	// ignore it.
+	GuestUserID *uuid.UUID
+	// CancelledBy says who cancelled, and is empty on every other event type.
+	// The guest channel uses it to avoid echoing a cancellation the guest
+	// themselves just performed in the app.
+	CancelledBy domain.CancelledBy
 }
 
 // Notifier is one outbound channel. Notify MUST be idempotent under redelivery
@@ -49,10 +58,12 @@ type Notifier interface {
 // is the contract between the booking usecase (producer) and this dispatcher
 // (consumer), so only additive changes are safe on either side.
 type outboxPayload struct {
-	RestaurantID uuid.UUID `json:"restaurant_id"`
-	Name         string    `json:"name"`
-	Guests       int       `json:"guests"`
-	StartsAt     time.Time `json:"starts_at"`
+	RestaurantID uuid.UUID          `json:"restaurant_id"`
+	UserID       *uuid.UUID         `json:"user_id,omitempty"`
+	Name         string             `json:"name"`
+	Guests       int                `json:"guests"`
+	StartsAt     time.Time          `json:"starts_at"`
+	CancelledBy  domain.CancelledBy `json:"cancelled_by,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -69,5 +80,7 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		GuestName:     p.Name,
 		Guests:        p.Guests,
 		StartsAt:      p.StartsAt,
+		GuestUserID:   p.UserID,
+		CancelledBy:   p.CancelledBy,
 	}, nil
 }

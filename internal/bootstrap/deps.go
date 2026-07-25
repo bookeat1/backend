@@ -14,6 +14,7 @@ import (
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/amplitude"
+	"backend-core/internal/infrastructure/expopush"
 	"backend-core/internal/infrastructure/legacysource"
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
@@ -79,6 +80,7 @@ type Deps struct {
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
+	DeviceTokens       *notifications.DeviceTokenUseCase
 	FavoritesFacade    favorites.Facade
 	ConsentFacade      consent.Facade
 	ReviewsFacade      reviews.Facade
@@ -172,6 +174,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
 	pushSubscriptions := notifications.NewSubscriptionUseCase(notificationrepo.NewSubscriptions(db), restManagers)
+	// Guest mobile push tokens: no restaurant, no RBAC — a guest device is
+	// notified about the guest's own bookings, so owning the account IS the
+	// authorization.
+	deviceTokens := notifications.NewDeviceTokenUseCase(notificationrepo.NewDeviceTokens(db))
 	favoritesRepo := favoriterepo.New(db)
 	favoritesFacade := favorites.NewFacade(favoritesRepo)
 	consentFacade := consent.NewFacade(
@@ -311,6 +317,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantManagers: restaurantManagers,
 		MyRestaurants:      myRestaurants,
 		PushSubscriptions:  pushSubscriptions,
+		DeviceTokens:       deviceTokens,
 		FavoritesFacade:    favoritesFacade,
 		ConsentFacade:      consentFacade,
 		ReviewsFacade:      reviewsFacade,
@@ -553,8 +560,15 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	wcfg := bookings.WorkerConfig{
 		TickInterval: cfg.Worker.TickInterval,
 		NoShowGrace:  cfg.Worker.NoShowGrace,
+		ReminderLead: cfg.Worker.ReminderLead,
 		BatchSize:    cfg.Worker.BatchSize,
 	}
+	// The pre-visit guest reminder pass. Wired unconditionally: it emits an
+	// outbox event, and whether that event reaches a phone is the guest push
+	// channel's business (a no-op without GUEST_PUSH_PROVIDER). Gating it on the
+	// provider would mean bookings silently miss their reminder window in the
+	// interval between provisioning push and redeploying the worker.
+	reminders := bookings.WithGuestReminders(bookingrepo.NewReminders(db))
 
 	// The worker settles the held deposit of the bookings it closes (a no-show
 	// forfeits it, an abandonment releases it). Building the acquirer registry
@@ -567,7 +581,7 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 			slog.String("error", gwErr.Error()))
 		return bookings.NewWorker(
 			bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
-			restRepo, txm, newBookingConfig(cfg), wcfg, log)
+			restRepo, txm, newBookingConfig(cfg), wcfg, log, reminders)
 	}
 	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), txm)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}
@@ -583,7 +597,7 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	return bookings.NewWorker(
 		bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
 		restRepo, txm, newBookingConfig(cfg), wcfg, log,
-		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}))
+		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}), reminders)
 }
 
 // newPaymentGateways builds the acquirer registry from whatever adapters this
@@ -739,12 +753,43 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		log,
 	)
 
+	// Guest channel: a THIRD notifier on the same dispatcher — the first one
+	// addressed to the guest rather than to venue staff, so it is the only one
+	// that consults the guest opt-out gate. Absent GUEST_PUSH_PROVIDER → built
+	// disabled and no-ops (like web push without VAPID keys).
+	var guestSender notifications.MobilePushSender
+	if cfg.Push.GuestPushConfigured() {
+		switch strings.ToLower(strings.TrimSpace(cfg.Push.GuestPushProvider)) {
+		case "expo":
+			guestSender = expopush.NewSender(expopush.Config{
+				AccessToken: cfg.Push.ExpoAccessToken,
+				Endpoint:    cfg.Push.ExpoEndpoint,
+			}).Send
+		default:
+			// An unknown provider name is a config typo, not a reason to crash the
+			// worker: the channel stays a no-op and says so, loudly.
+			log.Error("unknown GUEST_PUSH_PROVIDER — the guest push channel will no-op",
+				slog.String("provider", cfg.Push.GuestPushProvider))
+		}
+	} else {
+		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
+	}
+	guestPush := notifications.NewGuestPushNotifier(
+		notificationrepo.NewDeviceTokens(db),
+		notificationrepo.NewDeliveries(db),
+		notifications.NewGuestNotificationGate(consentrepo.NewPreferenceRepository(db)),
+		notificationrepo.NewVenues(db),
+		guestSender,
+		guestSender != nil,
+		log,
+	)
+
 	return notifications.NewDispatcher(
 		bookingrepo.NewOutbox(db), txm,
 		notifications.DispatcherConfig{
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
-		}, log, webPush, telegram)
+		}, log, webPush, telegram, guestPush)
 }
 
 // NewAnalyticsDispatcher wires the background Amplitude analytics worker. It

@@ -13,19 +13,21 @@ import (
 // on a given channel, honoring their opt-out
 // (domain.UserNotificationPreferenceRepository / user_notification_preferences).
 //
-// WHY THIS EXISTS BUT IS NOT WIRED INTO THE DISPATCHER YET:
+// WHO CONSULTS IT, AND WHO MUST NOT:
 //
-// The increment-1 dispatcher and its notifiers (WebPushNotifier, Telegram) fan
-// booking events out to STAFF — the target is a restaurant's registered push
-// subscriptions / Telegram chat, scoped by restaurant_id, never the guest. The
-// guest opt-out therefore does NOT apply to any of today's sends, and this gate
-// is deliberately left OUT of the staff path so it cannot break it.
+// The STAFF notifiers (WebPushNotifier, TelegramNotifier) fan booking events out
+// to a restaurant's registered push subscriptions / Telegram chat, scoped by
+// restaurant_id, never to the guest. The guest opt-out does not apply to them,
+// and this gate is deliberately kept OUT of the staff path so it cannot break
+// it — a venue must keep hearing about its own bookings whatever its guests
+// decided about their own phones.
 //
-// It is the seam every FUTURE guest-facing notifier (e.g. "your booking was
-// confirmed" push/email to the guest's own devices) MUST consult before
-// sending: build the notifier with a GuestNotificationGate and call Allows with
-// the guest's user id first; on false, skip that guest without erroring the
-// event. See the PR description for the go-live checklist.
+// Every GUEST-facing notifier MUST consult it before sending. GuestPushNotifier
+// (mobile push to the guest's own devices) is the first: it calls Allows with
+// the booking's user id before reading a single token, and on false SKIPS the
+// guest, returning nil — an opted-out guest must never leave the event
+// unpublished, or a permanent opt-out would jam the outbox forever. Any future
+// guest channel (email, SMS) follows the same shape.
 type GuestNotificationGate struct {
 	prefs domain.UserNotificationPreferenceRepository
 }

@@ -82,7 +82,10 @@ func (p NotificationPreference) Allows(channel NotificationChannel) bool {
 		return false
 	}
 	switch channel {
-	case ChannelWebPush:
+	case ChannelWebPush, ChannelMobilePush:
+		// Both are "push" as the guest understands it in the settings screen —
+		// one toggle governs the browser and the phone alike. Splitting them
+		// would need a new column and a new question for the guest to answer.
 		return p.PushEnabled
 	default:
 		return true

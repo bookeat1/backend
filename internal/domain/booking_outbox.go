@@ -22,6 +22,12 @@ const (
 	EventBookingUpdated   BookingEventType = "booking.updated"
 	EventBookingEscalated BookingEventType = "booking.confirm_sla_breached"
 	EventBookingMessage   BookingEventType = "booking.message_created"
+	// EventBookingReminder is the pre-visit reminder for the GUEST. Unlike every
+	// other event here it does not describe a status change: it is emitted by
+	// the booking worker's reminder pass when the visit draws near, in the same
+	// transaction that stamps bookings.guest_reminder_sent_at — so it is emitted
+	// at most once per booking, restart or no restart.
+	EventBookingReminder BookingEventType = "booking.reminder"
 )
 
 // BookingOutboxEvent is a transactional-outbox row. It is inserted in the same
