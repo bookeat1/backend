@@ -35,6 +35,13 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
+// feedModerator pulls an item off the main-screen feed when its content
+// changes. Minimal local port (bound to the feed repository in bootstrap): the
+// events usecase must not know the whole FeedRepository, only this one effect.
+type feedModerator interface {
+	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+}
+
 // Facade exposes admin CRUD and public read operations for events.
 type Facade interface {
 	Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Event, error)
@@ -111,12 +118,13 @@ type UpdateInput struct {
 type facade struct {
 	repo  domain.EventRepository
 	perms permissionChecker
+	feed  feedModerator
 	clock func() time.Time
 }
 
 // NewFacade constructs the events Facade.
-func NewFacade(repo domain.EventRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms, clock: time.Now}
+func NewFacade(repo domain.EventRepository, perms permissionChecker, feed feedModerator) Facade {
+	return &facade{repo: repo, perms: perms, feed: feed, clock: time.Now}
 }
 
 func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Event, error) {
@@ -179,6 +187,14 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
 	}
 	if err := validateEvent(e); err != nil {
+		return nil, err
+	}
+	// Demote BEFORE writing the new content: the platform approved specific
+	// words and dates, so changing them invalidates the decision. This ordering
+	// makes both failure modes safe — a failed edit after a successful demotion
+	// only costs the venue a re-review, while the reverse order could leave
+	// unreviewed text live on the main screen. See usecase/promos.Update.
+	if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemEvent, eventID); err != nil {
 		return nil, err
 	}
 	if err := f.repo.Update(ctx, e); err != nil {

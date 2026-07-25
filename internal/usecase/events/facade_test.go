@@ -88,6 +88,14 @@ func (f *fakePerms) HasPermission(_ context.Context, userID, restaurantID uuid.U
 	return role.HasPermission(perm), nil
 }
 
+// fakeFeed records the demotions the facade asks for when content changes.
+type fakeFeed struct{ demoted []uuid.UUID }
+
+func (f *fakeFeed) DemoteAfterContentEdit(_ context.Context, _ domain.FeedItemKind, itemID uuid.UUID) error {
+	f.demoted = append(f.demoted, itemID)
+	return nil
+}
+
 func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
 	return &fakePerms{roles: map[[2]uuid.UUID]domain.StaffRole{{userID, rid}: role}}
 }
@@ -107,7 +115,7 @@ func TestCreate_HostessForbidden(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleHostess))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleHostess), &fakeFeed{})
 
 	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validCreate(rid))
 	if !errors.Is(err, domain.ErrForbidden) {
@@ -122,7 +130,7 @@ func TestCreate_ManagerAllowed(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
 
 	e, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validCreate(rid))
 	if err != nil {
@@ -144,7 +152,7 @@ func TestUpdate_CrossTenantForbidden(t *testing.T) {
 	// Event belongs to rid; actor is a manager of a DIFFERENT restaurant.
 	ev := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft}
 	repo.byID[ev.ID] = ev
-	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleManager), &fakeFeed{})
 
 	in := UpdateInput{Title: "y", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.EventPublished}
 	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, in)
@@ -169,7 +177,7 @@ func TestUpdate_AbsentRefundPolicyKeepsTheVenuesRules(t *testing.T) {
 		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
 	}
 	repo.byID[ev.ID] = ev
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
 
 	in := UpdateInput{
 		Title: "новое название", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour),
@@ -196,7 +204,7 @@ func TestUpdate_PresentRefundPolicyReplacesTheRules(t *testing.T) {
 		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
 	}
 	repo.byID[ev.ID] = ev
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
 
 	in := UpdateInput{
 		Title: "x", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.EventDraft,
@@ -218,7 +226,7 @@ func TestDelete_AdminBypassesPermLookup(t *testing.T) {
 	ev := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft}
 	repo.byID[ev.ID] = ev
 	// perms would error if consulted — a superadmin must not need it.
-	f := NewFacade(repo, &fakePerms{err: errors.New("must not be called")})
+	f := NewFacade(repo, &fakePerms{err: errors.New("must not be called")}, &fakeFeed{})
 
 	if err := f.Delete(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleAdmin}, ev.ID); err != nil {
 		t.Fatalf("superadmin must delete without a perm lookup: %v", err)
@@ -234,7 +242,7 @@ func TestCreate_InvalidWindowRejected(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleOwner))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleOwner), &fakeFeed{})
 
 	in := validCreate(rid)
 	in.EndsAt = in.StartsAt.Add(-time.Hour) // ends before starts
@@ -251,7 +259,7 @@ func TestCreate_EmptyTitleRejected(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleOwner))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleOwner), &fakeFeed{})
 
 	in := validCreate(rid)
 	in.Title = "   "
@@ -270,7 +278,7 @@ func TestGetPublic_HidesDraftAndCrossTenant(t *testing.T) {
 	pub := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "p", Status: domain.EventPublished}
 	repo.byID[draft.ID] = draft
 	repo.byID[pub.ID] = pub
-	f := NewFacade(repo, &fakePerms{})
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
 
 	if _, err := f.GetPublic(context.Background(), rid, draft.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("a draft must not be publicly readable, got %v", err)

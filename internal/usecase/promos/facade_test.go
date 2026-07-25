@@ -79,6 +79,24 @@ func (f *fakePerms) HasPermission(_ context.Context, userID, restaurantID uuid.U
 	return role.HasPermission(perm), nil
 }
 
+// fakeFeed records the demotions the facade asks for when content changes, and
+// can fail on demand so the "demote first" ordering can be asserted.
+type fakeFeed struct {
+	demoted []uuid.UUID
+	err     error
+}
+
+func (f *fakeFeed) DemoteAfterContentEdit(_ context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error {
+	if kind != domain.FeedItemPromo {
+		return errors.New("promos must demote a promo, not " + string(kind))
+	}
+	if f.err != nil {
+		return f.err
+	}
+	f.demoted = append(f.demoted, itemID)
+	return nil
+}
+
 func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
 	return &fakePerms{roles: map[[2]uuid.UUID]domain.StaffRole{{userID, rid}: role}}
 }
@@ -96,7 +114,7 @@ func TestCreate_HostessForbidden(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleHostess))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleHostess), &fakeFeed{})
 
 	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validCreate(rid))
 	if !errors.Is(err, domain.ErrForbidden) {
@@ -111,7 +129,7 @@ func TestCreate_ManagerAllowed(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
 
 	p, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validCreate(rid))
 	if err != nil {
@@ -129,7 +147,7 @@ func TestUpdate_CrossTenantForbidden(t *testing.T) {
 	repo := newFakeRepo()
 	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoDraft}
 	repo.byID[pr.ID] = pr
-	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleOwner))
+	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleOwner), &fakeFeed{})
 
 	in := UpdateInput{Title: "y", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.PromoPublished}
 	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, in)
@@ -145,12 +163,52 @@ func TestCreate_InvalidWindowRejected(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
 
 	in := validCreate(rid)
 	in.EndsAt = in.StartsAt // empty window
 	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("empty window must be ErrValidation, got %v", err)
+	}
+}
+
+// A venue that edits an approved promo must lose the approval: otherwise
+// "get something innocuous approved, then rewrite it" is an open door onto the
+// main screen.
+func TestUpdate_DemotesFeedApprovalBeforeWriting(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoPublished}
+	repo.byID[pr.ID] = pr
+	fd := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), fd)
+
+	in := UpdateInput{Title: "y", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.PromoPublished}
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, in); err != nil {
+		t.Fatalf("a manager must be able to edit their promo: %v", err)
+	}
+	if len(fd.demoted) != 1 || fd.demoted[0] != pr.ID {
+		t.Fatalf("editing a promo must demote its feed placement, got %v", fd.demoted)
+	}
+}
+
+// The ordering guarantee: if the demotion cannot be recorded, the edit must NOT
+// happen — the reverse would leave unreviewed text live on the main screen.
+func TestUpdate_AbortsWhenTheDemotionFails(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoPublished}
+	repo.byID[pr.ID] = pr
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{err: errors.New("db down")})
+
+	in := UpdateInput{Title: "y", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.PromoPublished}
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, in); err == nil {
+		t.Fatal("the edit must fail when the feed demotion fails")
+	}
+	if repo.updated != nil {
+		t.Fatal("no content must be written when the feed placement could not be demoted")
 	}
 }

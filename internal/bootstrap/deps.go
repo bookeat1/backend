@@ -27,6 +27,7 @@ import (
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
+	feedrepo "backend-core/internal/infrastructure/postgres/feed"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
@@ -56,6 +57,7 @@ import (
 	"backend-core/internal/usecase/dashboard"
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
+	"backend-core/internal/usecase/feed"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
@@ -85,6 +87,7 @@ type Deps struct {
 	EventsFacade       events.Facade
 	PromosFacade       promos.Facade
 	ContentFacade      content.Facade
+	FeedFacade         feed.Facade
 	MenuFacade         menu.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
@@ -186,8 +189,17 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// shared RBAC matrix (PermRestaurantManage) via restaurantManagers. The
 	// content-draft review queue reuses the same permission gate and creates
 	// the real published Event/Promo on approval inside one transaction (txm).
-	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers)
-	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers)
+	//
+	// The merchandising feed (main-screen "Акции") is a READ MODEL over those
+	// same promos/events plus a platform moderation decision (migration 0049) —
+	// no third entity. The feed repository is additionally injected into the
+	// events/promos facades as their `feedModerator` port: editing an item's
+	// content pulls it back into the review queue, so an approved card can
+	// never be rewritten into something nobody approved.
+	feedRepo := feedrepo.New(db)
+	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers, feedRepo)
+	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
+	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
@@ -317,6 +329,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		EventsFacade:       eventsFacade,
 		PromosFacade:       promosFacade,
 		ContentFacade:      contentFacade,
+		FeedFacade:         feedFacade,
 		MenuFacade:         menuFacade,
 		BookingsFacade:     bookingsFacade,
 		BookingCreate:      bookingCreate,

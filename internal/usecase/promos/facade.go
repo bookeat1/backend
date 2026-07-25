@@ -27,6 +27,13 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
+// feedModerator pulls an item off the main-screen feed when its content
+// changes. Minimal local port (bound to the feed repository in bootstrap): the
+// promos usecase must not know the whole FeedRepository, only this one effect.
+type feedModerator interface {
+	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+}
+
 // Facade exposes admin CRUD and public read operations for promos.
 type Facade interface {
 	Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Promo, error)
@@ -68,12 +75,13 @@ type UpdateInput struct {
 type facade struct {
 	repo  domain.PromoRepository
 	perms permissionChecker
+	feed  feedModerator
 	clock func() time.Time
 }
 
 // NewFacade constructs the promos Facade.
-func NewFacade(repo domain.PromoRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms, clock: time.Now}
+func NewFacade(repo domain.PromoRepository, perms permissionChecker, feed feedModerator) Facade {
+	return &facade{repo: repo, perms: perms, feed: feed, clock: time.Now}
 }
 
 func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Promo, error) {
@@ -121,6 +129,17 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	p.Terms = in.Terms
 	p.Status = in.Status
 	if err := validatePromo(p); err != nil {
+		return nil, err
+	}
+	// Demote BEFORE writing the new content, not after: the platform approved
+	// specific words, so changing them invalidates the decision. Ordered this
+	// way the failure modes are both safe — a failed edit after a successful
+	// demotion only costs the venue a re-review, whereas a failed demotion
+	// after a successful edit would leave unreviewed text live on the main
+	// screen. A transaction is deliberately not used: the safe ordering already
+	// gives the guarantee that matters, without dragging a tx manager into a
+	// simple CRUD facade.
+	if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemPromo, promoID); err != nil {
 		return nil, err
 	}
 	if err := f.repo.Update(ctx, p); err != nil {
