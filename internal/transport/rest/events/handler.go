@@ -145,6 +145,12 @@ func (h *Handler) update(c *gin.Context) {
 	if !ok {
 		return
 	}
+	refundPolicy, ok := req.refundPolicyUpdate()
+	if !ok {
+		response.Error(c.Writer, http.StatusUnprocessableEntity,
+			"tickets_refundable and ticket_refund_cutoff_minutes must be sent together; use PUT /admin/events/{id}/refund-policy to change only the refund rules")
+		return
+	}
 	e, err := h.facade.Update(c.Request.Context(), actor, eid, uc.UpdateInput{
 		Title:            req.Title,
 		TitleI18n:        domain.I18n(req.TitleI18n),
@@ -158,7 +164,7 @@ func (h *Handler) update(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
-		RefundPolicy:     req.refundPolicy(),
+		RefundPolicy:     refundPolicy,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -316,11 +322,14 @@ type eventRequest struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor"`
 	Capacity         *int              `json:"capacity"`
-	// The venue's own refund rules for this event. Absent fields mean the
-	// conservative default (not refundable) — an older client that does not know
-	// about them can never accidentally open refunds.
-	TicketsRefundable         bool `json:"tickets_refundable"`
-	TicketRefundCutoffMinutes int  `json:"ticket_refund_cutoff_minutes"`
+	// The venue's own refund rules for this event. POINTERS on purpose: this is a
+	// full-replace payload, and a cabinet build that predates the feature sends
+	// the event without these fields. On create, absent means the conservative
+	// default (not refundable). On update, absent means "leave the rules alone" —
+	// otherwise editing a title from an older client would silently switch
+	// refunds off for everyone who buys next.
+	TicketsRefundable         *bool `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes *int  `json:"ticket_refund_cutoff_minutes"`
 }
 
 // refundPolicyRequest is the narrow "just the refund rules" admin payload.
@@ -329,11 +338,32 @@ type refundPolicyRequest struct {
 	CutoffMinutes     int  `json:"ticket_refund_cutoff_minutes"`
 }
 
+// refundPolicy is the CREATE reading: an absent field is the conservative
+// default, so a client that knows nothing about refunds cannot open them.
 func (r eventRequest) refundPolicy() domain.TicketRefundPolicy {
-	return domain.TicketRefundPolicy{
-		Refundable:    r.TicketsRefundable,
-		CutoffMinutes: r.TicketRefundCutoffMinutes,
+	p := domain.TicketRefundPolicy{}
+	if r.TicketsRefundable != nil {
+		p.Refundable = *r.TicketsRefundable
 	}
+	if r.TicketRefundCutoffMinutes != nil {
+		p.CutoffMinutes = *r.TicketRefundCutoffMinutes
+	}
+	return p
+}
+
+// refundPolicyUpdate is the UPDATE reading: nil means "keep what the event
+// already has". ok=false means the caller sent HALF a policy, which this
+// endpoint refuses rather than guessing the other half — the narrow
+// PUT .../refund-policy endpoint is the way to change one setting.
+func (r eventRequest) refundPolicyUpdate() (policy *domain.TicketRefundPolicy, ok bool) {
+	switch {
+	case r.TicketsRefundable == nil && r.TicketRefundCutoffMinutes == nil:
+		return nil, true
+	case r.TicketsRefundable == nil || r.TicketRefundCutoffMinutes == nil:
+		return nil, false
+	}
+	p := r.refundPolicy()
+	return &p, true
 }
 
 // parseWindow parses starts_at/ends_at as RFC3339. On a malformed/empty value it

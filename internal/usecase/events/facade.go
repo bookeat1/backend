@@ -98,9 +98,14 @@ type UpdateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
-	// RefundPolicy replaces the event's refund rules (Update is a full replace,
-	// like every other field here).
-	RefundPolicy domain.TicketRefundPolicy
+	// RefundPolicy replaces the event's refund rules. Unlike every other field
+	// here, it is OPTIONAL: nil means "leave the rules as they are". Update is a
+	// full replace, and a cabinet build that predates this feature sends the
+	// whole event without these fields — treating that as "set false/0" would
+	// silently switch refunds off for future buyers every time someone edited a
+	// title. Money settings do not get turned off as a side effect of an
+	// unrelated edit.
+	RefundPolicy *domain.TicketRefundPolicy
 }
 
 type facade struct {
@@ -169,8 +174,10 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.Ticketed = in.Ticketed
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
-	e.TicketsRefundable = in.RefundPolicy.Refundable
-	e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
+	if in.RefundPolicy != nil {
+		e.TicketsRefundable = in.RefundPolicy.Refundable
+		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
+	}
 	if err := validateEvent(e); err != nil {
 		return nil, err
 	}

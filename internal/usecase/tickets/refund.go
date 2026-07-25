@@ -63,6 +63,18 @@ func (u *refundUseCase) Refund(ctx context.Context, actor Actor, ticketID uuid.U
 	if err != nil {
 		return nil, err
 	}
+	// WHO the caller is comes first — before the idempotent return, before any
+	// status branch. Everything after this point either moves money or hands
+	// back the ticket, which carries the buyer's name, phone and email; a bare
+	// ticket id is not proof of anything (that is the whole premise of this
+	// endpoint), so answering an unauthorized caller at all — even with a
+	// friendly "already refunded" — would leak a stranger's contacts and let
+	// anyone probe ticket ids for their status.
+	staff, err := u.authorizeCaller(ctx, actor, t)
+	if err != nil {
+		return nil, err
+	}
+
 	if t.Status == domain.TicketRefunded {
 		return t, nil // already refunded — idempotent
 	}
@@ -73,7 +85,9 @@ func (u *refundUseCase) Refund(ctx context.Context, actor Actor, ticketID uuid.U
 		return nil, fmt.Errorf("%w: ticket %s has no payment to refund", domain.ErrValidation, t.ID)
 	}
 
-	if err := u.authorizeRefund(ctx, actor, t, in); err != nil {
+	// The POLICY question is only meaningful for a ticket that is still paid,
+	// so it stays here, after the status branches.
+	if err := u.enforceRefundPolicy(ctx, staff, t, in); err != nil {
 		return nil, err
 	}
 
@@ -101,28 +115,17 @@ func (u *refundUseCase) Refund(ctx context.Context, actor Actor, ticketID uuid.U
 	return t, nil
 }
 
-// authorizeRefund splits the two paths. Staff first: a caller with the venue's
-// refund permission is the exception path and may go outside the window, but
-// only with an explicit override — without it they are held to the same policy
-// as the guest, so a "refund this" click in the cabinet cannot quietly become a
-// policy waiver. Everyone else is the buyer, and the buyer is bound by the
-// policy the ticket was SOLD under.
-func (u *refundUseCase) authorizeRefund(ctx context.Context, actor Actor, t *domain.EventTicket, in RefundInput) error {
-	decision, err := u.decide(ctx, t)
-	if err != nil {
-		return err
-	}
-
+// authorizeCaller answers only "may this caller act on this ticket at all",
+// with no reference to the refund policy or to the ticket's status, so it can
+// run first. It reports whether the caller is venue staff, which decides which
+// rules enforceRefundPolicy then holds them to.
+func (u *refundUseCase) authorizeCaller(ctx context.Context, actor Actor, t *domain.EventTicket) (bool, error) {
 	staff, err := u.isRefundStaff(ctx, actor, t.RestaurantID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if staff {
-		if !decision.Allowed && !in.Override {
-			return fmt.Errorf("%w: this event's refund policy refuses this refund (%s) — repeat with an explicit override to refund anyway",
-				domain.ErrForbidden, decision.Reason)
-		}
-		return nil
+		return true, nil
 	}
 
 	// Guest path. Ownership must be PROVEN, not assumed: a ticket bought under
@@ -132,19 +135,38 @@ func (u *refundUseCase) authorizeRefund(ctx context.Context, actor Actor, t *dom
 	// go through the venue. Better a support request than a stranger cancelling
 	// somebody else's ticket.
 	if t.UserID == nil {
-		return fmt.Errorf("%w: a ticket bought without an account can only be refunded by the venue", domain.ErrForbidden)
+		return false, fmt.Errorf("%w: a ticket bought without an account can only be refunded by the venue", domain.ErrForbidden)
 	}
 	if actor.UserID == nil || *actor.UserID != *t.UserID {
-		return fmt.Errorf("%w: this ticket belongs to another guest", domain.ErrForbidden)
+		return false, fmt.Errorf("%w: this ticket belongs to another guest", domain.ErrForbidden)
 	}
-	if !decision.Allowed {
-		if decision.Reason == domain.TicketRefundDenyNotRefundable {
-			return fmt.Errorf("%w: tickets for this event are non-refundable", domain.ErrForbidden)
+	return false, nil
+}
+
+// enforceRefundPolicy holds the caller to the policy the ticket was SOLD under.
+// Staff are the exception path and may go outside the window, but only with an
+// explicit override — without it they are held to the same policy as the guest,
+// so a "refund this" click in the cabinet cannot quietly become a policy waiver.
+func (u *refundUseCase) enforceRefundPolicy(ctx context.Context, staff bool, t *domain.EventTicket, in RefundInput) error {
+	decision, err := u.decide(ctx, t)
+	if err != nil {
+		return err
+	}
+	if decision.Allowed {
+		return nil
+	}
+	if staff {
+		if in.Override {
+			return nil
 		}
-		return fmt.Errorf("%w: the refund window for this event closed at %s",
-			domain.ErrForbidden, decision.Deadline.Format(time.RFC3339))
+		return fmt.Errorf("%w: this event's refund policy refuses this refund (%s) — repeat with an explicit override to refund anyway",
+			domain.ErrForbidden, decision.Reason)
 	}
-	return nil
+	if decision.Reason == domain.TicketRefundDenyNotRefundable {
+		return fmt.Errorf("%w: tickets for this event are non-refundable", domain.ErrForbidden)
+	}
+	return fmt.Errorf("%w: the refund window for this event closed at %s",
+		domain.ErrForbidden, decision.Deadline.Format(time.RFC3339))
 }
 
 // decide evaluates the ticket's OWN frozen policy against the event's start.

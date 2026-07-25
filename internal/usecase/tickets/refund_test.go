@@ -60,10 +60,13 @@ func TestRefundReturnsCapacity(t *testing.T) {
 // refunded.
 func TestRefundRejectsUnpaidTicket(t *testing.T) {
 	repo := newFakeTicketRepo()
-	pending := &domain.EventTicket{ID: uuid.New(), EventID: uuid.New(), Status: domain.TicketPending, Quantity: 1}
+	buyer := uuid.New()
+	pending := &domain.EventTicket{ID: uuid.New(), EventID: uuid.New(), UserID: &buyer, Status: domain.TicketPending, Quantity: 1}
 	repo.byID[pending.ID] = pending
 	uc := NewRefundUseCase(repo, newFakeEvents(), &fakeTicketPayments{}, &fakePerms{})
-	_, err := uc.Refund(context.Background(), Actor{}, pending.ID, RefundInput{IdempotencyKey: "r"})
+	// The buyer themselves: the caller is authorized, so the status rule is what
+	// rejects this, not the ownership check.
+	_, err := uc.Refund(context.Background(), Actor{UserID: &buyer}, pending.ID, RefundInput{IdempotencyKey: "r"})
 	if !errors.Is(err, domain.ErrInvalidStatus) {
 		t.Fatalf("err = %v, want ErrInvalidStatus", err)
 	}
@@ -74,15 +77,45 @@ func TestRefundRejectsUnpaidTicket(t *testing.T) {
 func TestRefundIdempotent(t *testing.T) {
 	repo := newFakeTicketRepo()
 	pay := &fakeTicketPayments{}
-	refunded := &domain.EventTicket{ID: uuid.New(), EventID: uuid.New(), Status: domain.TicketRefunded, Quantity: 1}
+	buyer := uuid.New()
+	refunded := &domain.EventTicket{ID: uuid.New(), EventID: uuid.New(), UserID: &buyer, Status: domain.TicketRefunded, Quantity: 1}
 	repo.byID[refunded.ID] = refunded
 	uc := NewRefundUseCase(repo, newFakeEvents(), pay, &fakePerms{})
-	tk, err := uc.Refund(context.Background(), Actor{}, refunded.ID, RefundInput{IdempotencyKey: "r"})
+	tk, err := uc.Refund(context.Background(), Actor{UserID: &buyer}, refunded.ID, RefundInput{IdempotencyKey: "r"})
 	if err != nil {
 		t.Fatalf("Refund: %v", err)
 	}
 	if tk.Status != domain.TicketRefunded || pay.refundN != 0 {
 		t.Fatalf("idempotent refund broke: status=%s refundN=%d", tk.Status, pay.refundN)
+	}
+}
+
+// TestRefundRefundedTicketStillChecksTheCaller closes the leak a review caught:
+// the idempotent "already refunded" answer used to be given BEFORE anyone asked
+// who was calling, so a stranger holding a refunded ticket's id got a 200 with
+// the buyer's name, phone and email — and could probe ids for their status.
+// Authorization must come first, whatever the ticket's status is.
+func TestRefundRefundedTicketStillChecksTheCaller(t *testing.T) {
+	repo := newFakeTicketRepo()
+	pay := &fakeTicketPayments{}
+	buyer, stranger := uuid.New(), uuid.New()
+	refunded := &domain.EventTicket{ID: uuid.New(), EventID: uuid.New(), UserID: &buyer, Status: domain.TicketRefunded, Quantity: 1}
+	repo.byID[refunded.ID] = refunded
+	uc := NewRefundUseCase(repo, newFakeEvents(), pay, &fakePerms{})
+
+	for name, actor := range map[string]Actor{
+		"anonymous": {},
+		"stranger":  {UserID: &stranger},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tk, err := uc.Refund(context.Background(), actor, refunded.ID, RefundInput{IdempotencyKey: "r"})
+			if !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("err = %v, want ErrForbidden", err)
+			}
+			if tk != nil {
+				t.Fatalf("ticket handed back to an unauthorized caller: %+v", tk)
+			}
+		})
 	}
 }
 

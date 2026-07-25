@@ -156,6 +156,62 @@ func TestUpdate_CrossTenantForbidden(t *testing.T) {
 	}
 }
 
+// A full-replace Update that says nothing about the refund rules must LEAVE
+// THEM ALONE. Without this, an older cabinet build editing a title would switch
+// a venue's refunds off for every future buyer, silently — the failure a review
+// flagged on the money path.
+func TestUpdate_AbsentRefundPolicyKeepsTheVenuesRules(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft,
+		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
+	}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := UpdateInput{
+		Title: "новое название", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour),
+		Status: domain.EventDraft, RefundPolicy: nil, // the older client sends no rules
+	}
+	got, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, in)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !got.TicketsRefundable || got.TicketRefundCutoffMinutes != 1440 {
+		t.Fatalf("refund rules were clobbered by an unrelated edit: refundable=%v cutoff=%d",
+			got.TicketsRefundable, got.TicketRefundCutoffMinutes)
+	}
+}
+
+// The same call WITH rules attached still replaces them — the venue can turn
+// refunds off deliberately, it just cannot do it by accident.
+func TestUpdate_PresentRefundPolicyReplacesTheRules(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft,
+		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
+	}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := UpdateInput{
+		Title: "x", StartsAt: time.Now(), EndsAt: time.Now().Add(time.Hour), Status: domain.EventDraft,
+		RefundPolicy: &domain.TicketRefundPolicy{Refundable: false, CutoffMinutes: 0},
+	}
+	got, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, in)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got.TicketsRefundable || got.TicketRefundCutoffMinutes != 0 {
+		t.Fatalf("an explicit policy must win: refundable=%v cutoff=%d",
+			got.TicketsRefundable, got.TicketRefundCutoffMinutes)
+	}
+}
+
 func TestDelete_AdminBypassesPermLookup(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()
