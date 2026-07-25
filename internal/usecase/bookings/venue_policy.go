@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 )
 
 // PolicyUseCase reads and edits one venue's booking-policy overrides (spec §4.2
@@ -116,7 +118,7 @@ func (u *policyUseCase) Update(ctx context.Context, actor Actor, restaurantID uu
 		}
 		return u.view(ctx, restaurantID)
 	}
-	if err := u.applyCapacityChange(ctx, restaurantID, in); err != nil {
+	if err := u.applyCapacityChange(ctx, actor, restaurantID, in); err != nil {
 		return nil, err
 	}
 	return u.view(ctx, restaurantID)
@@ -147,13 +149,63 @@ func (u *policyUseCase) Update(ctx context.Context, actor Actor, restaurantID uu
 //     touched. Lowering below what is already sold for a future moment is
 //     refused, because the alternative is a booking the venue has confirmed and
 //     can no longer honour.
-func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uuid.UUID, in domain.BookingPolicyOverride) error {
+//
+// This wrapper only does the logging: the switch is the single most consequential
+// thing the venue cabinet can do to existing reservations (it rewrites holds or
+// seats parties at tables), and until now it left no trace at all. The success
+// line is emitted AFTER WithinTx has returned, i.e. after the commit — a line
+// written inside the transaction would survive a rollback and claim a switch
+// that never happened.
+func (u *policyUseCase) applyCapacityChange(ctx context.Context, actor Actor, restaurantID uuid.UUID, in domain.BookingPolicyOverride) error {
+	started := time.Now()
+	rep, err := u.capacityChange(ctx, restaurantID, in)
+	fields := []any{
+		slog.String("restaurant_id", restaurantID.String()),
+		slog.String("actor_id", actor.UserID.String()),
+		slog.String("from_mode", string(rep.fromMode)),
+		slog.String("to_mode", string(rep.toMode)),
+		slog.Int("seats_before", rep.seatsBefore),
+		slog.Int("seats_after", rep.seatsAfter),
+		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+	}
+	log := logging.FromContext(ctx)
+	if err != nil {
+		// Warn, not Error: most refusals are the venue being told its own data
+		// does not allow the change. The reason is the message staff saw, so the
+		// log answers "why did the toggle not work" without a reproduction.
+		log.Warn(logging.EventVenueCapacityModeRefused, append(fields, slog.String("reason", err.Error()))...)
+		return err
+	}
+	log.Warn(logging.EventVenueCapacityModeChanged,
+		append(fields, slog.Int("bookings_reconciled", rep.reconciled))...)
+	return nil
+}
+
+// capacityChangeReport is what the log line is built from. It is filled as the
+// change proceeds and returned even on failure, so a refusal is logged with the
+// state it was refused in rather than with blanks.
+type capacityChangeReport struct {
+	fromMode, toMode        domain.CapacityMode
+	seatsBefore, seatsAfter int
+	reconciled              int
+}
+
+func (u *policyUseCase) capacityChange(ctx context.Context, restaurantID uuid.UUID, in domain.BookingPolicyOverride) (capacityChangeReport, error) {
+	var rep capacityChangeReport
+	// Pre-filled from the request so a failure that happens before the venue is
+	// even read still logs what was being asked for.
+	if in.BookingCapacityMode != nil {
+		rep.toMode = *in.BookingCapacityMode
+	}
+	if in.BookingCapacitySeats != nil {
+		rep.seatsAfter = *in.BookingCapacitySeats
+	}
 	if u.capacity == nil || u.links == nil || u.bookings == nil || u.tx == nil || u.schedule == nil {
-		return fmt.Errorf("%w: capacity mode is not configured on this deployment", domain.ErrValidation)
+		return rep, fmt.Errorf("%w: capacity mode is not configured on this deployment", domain.ErrValidation)
 	}
 	agg, err := u.restaurants.GetByID(ctx, restaurantID)
 	if err != nil {
-		return err
+		return rep, err
 	}
 	current := resolvePolicy(agg.Restaurant, u.cfg)
 
@@ -166,21 +218,26 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 	if in.BookingCapacitySeats != nil {
 		target.CapacitySeats = *in.BookingCapacitySeats
 	}
+	rep.fromMode, rep.toMode = current.CapacityMode, target.CapacityMode
+	rep.seatsBefore, rep.seatsAfter = current.CapacitySeats, target.CapacitySeats
 	if target.CapacityMode == domain.CapacityModeSeats && target.CapacitySeats <= 0 {
-		return fmt.Errorf("%w: booking_capacity_seats is required to book by total capacity",
+		return rep, fmt.Errorf("%w: booking_capacity_seats is required to book by total capacity",
 			domain.ErrValidation)
 	}
 
 	if target.CapacityMode == domain.CapacityModeTables {
 		tables, err := u.activeTables(ctx, restaurantID)
 		if err != nil {
-			return err
+			return rep, err
 		}
 		if len(tables) == 0 {
-			return fmt.Errorf("%w: this restaurant has no active tables, so booking by tables would make every slot unbookable",
+			return rep, fmt.Errorf("%w: this restaurant has no active tables, so booking by tables would make every slot unbookable",
 				domain.ErrValidation)
 		}
-		return u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// The count is written into rep from inside the closure, and rep is
+		// returned by a statement of its own afterwards: `return rep, WithinTx(…)`
+		// would evaluate rep BEFORE the closure runs and always log zero.
+		err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 			// Same lock, taken FIRST, and for the same reason as the seats
 			// branch below: this switch reads the venue's live bookings and
 			// writes the placement derived from them, so it must not interleave
@@ -194,21 +251,29 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 			if err := u.policies.UpdateBookingPolicy(ctx, restaurantID, in); err != nil {
 				return err
 			}
-			return u.seatCapacityBookings(ctx, restaurantID, target, tables)
+			n, err := u.seatCapacityBookings(ctx, restaurantID, target, tables)
+			rep.reconciled = n
+			return err
 		})
+		if err != nil {
+			// A rolled-back switch reconciled nothing, whatever the loop had
+			// managed before it failed.
+			rep.reconciled = 0
+		}
+		return rep, err
 	}
 
 	// Lowering the capacity: refuse while the venue has more guests already
 	// booked for a future moment than the new number allows. Checked before the
 	// write for a readable error; the bucket CHECK would refuse it anyway.
 	if peak, err := u.capacity.PeakTaken(ctx, restaurantID, time.Now()); err != nil {
-		return err
+		return rep, err
 	} else if peak != nil && peak.SeatsTaken > target.CapacitySeats {
-		return fmt.Errorf("%w: %d guests are already booked for %s; capacity cannot be set below that",
+		return rep, fmt.Errorf("%w: %d guests are already booked for %s; capacity cannot be set below that",
 			domain.ErrValidation, peak.SeatsTaken, peak.BucketStart.UTC().Format(time.RFC3339))
 	}
 
-	return u.tx.WithinTx(ctx, func(ctx context.Context) error {
+	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		// Same per-venue lock a booking create takes, and taken FIRST: the
 		// policy write and the holds rebuilt from it must not interleave with a
 		// create that read the previous policy.
@@ -218,8 +283,14 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 		if err := u.policies.UpdateBookingPolicy(ctx, restaurantID, in); err != nil {
 			return err
 		}
-		return u.rebuildHolds(ctx, restaurantID, target)
+		n, err := u.rebuildHolds(ctx, restaurantID, target)
+		rep.reconciled = n
+		return err
 	})
+	if err != nil {
+		rep.reconciled = 0
+	}
+	return rep, err
 }
 
 // rebuildHolds (re)writes the capacity holds of every future booking that still
@@ -237,27 +308,39 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, restaurantID uu
 // its seats sold a second time. The leftover links are inert while the venue is
 // table-less (nothing in seats mode reads them); seatCapacityBookings is what
 // clears the holds on the way back.
-func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID, policy domain.BookingPolicy) error {
+//
+// It returns how many bookings it rewrote, for the log line.
+func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID, policy domain.BookingPolicy) (int, error) {
 	list, err := u.liveBookings(ctx, restaurantID, policy)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for i := range list {
 		b := list[i]
+		// Both refusals below name the booking, not just its time: a venue with
+		// two parties in the same slot cannot act on "a booking of 6 guests at
+		// 19:00" — see the mirror message in seatCapacityBookings.
 		if b.Guests > policy.CapacitySeats {
-			return fmt.Errorf("%w: booking of %d guests on %s does not fit a capacity of %d",
-				domain.ErrValidation, b.Guests, b.StartsAt.UTC().Format(time.RFC3339), policy.CapacitySeats)
+			return 0, fmt.Errorf("%w: the booking of %d guests on %s (%s) does not fit a capacity of %d",
+				domain.ErrValidation, b.Guests, b.StartsAt.UTC().Format(time.RFC3339), b.ID, policy.CapacitySeats)
 		}
 		holds := buildCapacityHolds(&b, policy, time.Now())
 		if err := u.capacity.ReplaceForBooking(ctx, b.ID, holds); err != nil {
 			if errors.Is(err, domain.ErrAlreadyExists) {
-				return fmt.Errorf("%w: the bookings already accepted for %s exceed a capacity of %d",
-					domain.ErrValidation, b.StartsAt.UTC().Format(time.RFC3339), policy.CapacitySeats)
+				// The bucket CHECK refused THIS booking's holds, so the offending
+				// booking is the one in hand and the overloaded moment lies inside
+				// its own occupancy window. Both are free to report — no extra
+				// query — and without them staff are told a capacity is too small
+				// but not for which reservation.
+				from, to := occupancyWindow(b.StartsAt, policy)
+				return 0, fmt.Errorf("%w: the booking of %d guests on %s (%s) does not fit a capacity of %d — the bookings already accepted between %s and %s fill it; cancel or move a booking in that window, or set a higher capacity",
+					domain.ErrValidation, b.Guests, b.StartsAt.UTC().Format(time.RFC3339), b.ID,
+					policy.CapacitySeats, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339))
 			}
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(list), nil
 }
 
 // seatCapacityBookings is the seats → tables counterpart of rebuildHolds, and it
@@ -297,15 +380,18 @@ func (u *policyUseCase) seatCapacityBookings(
 	restaurantID uuid.UUID,
 	policy domain.BookingPolicy,
 	tables []domain.RestaurantTable,
-) error {
+) (int, error) {
 	list, err := u.liveBookings(ctx, restaurantID, policy)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// Earliest first, ties broken by id: which table a party ends up at must not
-	// depend on the page order of a listing. Placement order also decides
-	// whether a tight table list fits at all, so it has to be reproducible — a
-	// venue that retries the same switch must get the same answer.
+	// depend on the order a listing happened to return. Placement order also
+	// decides whether a tight table list fits at all, so it has to be
+	// reproducible — a venue that retries the same switch must get the same
+	// answer. liveBookings already reads in exactly this order; the sort is kept
+	// so the guarantee belongs to this function and not to an ORDER BY somebody
+	// may later "optimise" a layer away.
 	sort.SliceStable(list, func(i, j int) bool {
 		if !list[i].StartsAt.Equal(list[j].StartsAt) {
 			return list[i].StartsAt.Before(list[j].StartsAt)
@@ -317,7 +403,7 @@ func (u *policyUseCase) seatCapacityBookings(
 		b := &list[i]
 		own, err := u.links.ListByBooking(ctx, b.ID)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if len(own) > 0 {
 			// Already governed by the exclusion constraint — a leftover
@@ -334,7 +420,7 @@ func (u *policyUseCase) seatCapacityBookings(
 			// Left alone, its holds outlive the mode that maintained them and the
 			// buckets report occupancy nobody is taking.
 			if err := u.capacity.ReplaceForBooking(ctx, b.ID, nil); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
@@ -343,11 +429,11 @@ func (u *policyUseCase) seatCapacityBookings(
 		// moment ago in this same loop are part of "busy".
 		busy, err := u.links.ListBusy(ctx, restaurantID, from, to)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		picked := pickTables(freeTables(tables, busy, from, to), b.Guests)
 		if len(picked) == 0 {
-			return fmt.Errorf("%w: the booking of %d guests on %s (%s) cannot be seated at any free table; add tables that fit it, or move or cancel it, before switching to booking by tables",
+			return 0, fmt.Errorf("%w: the booking of %d guests on %s (%s) cannot be seated at any free table; add tables that fit it, or move or cancel it, before switching to booking by tables",
 				domain.ErrValidation, b.Guests, b.StartsAt.UTC().Format(time.RFC3339), b.ID)
 		}
 		links := make([]domain.BookingTable, 0, len(picked))
@@ -361,13 +447,13 @@ func (u *policyUseCase) seatCapacityBookings(
 		// taken meanwhile the exclusion constraint says so and the whole switch
 		// rolls back.
 		if err := u.links.Create(ctx, links); err != nil {
-			return err
+			return 0, err
 		}
 		if err := u.capacity.ReplaceForBooking(ctx, b.ID, nil); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(list), nil
 }
 
 // liveBookings lists every booking of the venue that may still be holding space
@@ -383,10 +469,26 @@ func (u *policyUseCase) seatCapacityBookings(
 // one bucket for the outward rounding) covers any booking whose window still
 // touches the future; anything older cannot be holding a seat now.
 //
-// The whole set is loaded rather than streamed page by page, because the
-// seats → tables direction has to place the bookings in a deterministic global
-// order. It is bounded by one venue's live bookings inside its booking horizon,
-// and this runs on an owner clicking a settings toggle, not on a request path.
+// The whole set is read by ONE statement — never paged. Two reasons, and the
+// first one is a correctness bug this replaced (review finding, 25.07.2026):
+//
+//   - the enclosing transaction is READ COMMITTED (sqltx.Manager takes no
+//     TxOptions), so each statement gets a fresh snapshot. The old loop asked
+//     for `ORDER BY starts_at DESC, id LIMIT 100 OFFSET n`, and LockVenue does
+//     not serialize STATUS changes — status.go never takes it. So a guest
+//     cancelling a booking that sat on an earlier page, while a venue with more
+//     than 100 live bookings switched mode, shifted the offset window by one and
+//     exactly one booking was never returned. That booking then came out of the
+//     switch with no capacity holds (seats mode: invisible to the ledger) or no
+//     booking_tables row (tables mode: invisible to the GiST constraint), and
+//     its seats were sold a second time. One snapshot cannot skip a row.
+//   - the seats → tables direction has to place the bookings in a deterministic
+//     global order, which a set assembled from independent snapshots does not
+//     have either.
+//
+// The price of a single statement is that the set must be bounded, hence the
+// hard limit: a venue that reaches it is refused loudly instead of quietly
+// running past the 15s write timeout with the venue lock in hand.
 func (u *policyUseCase) liveBookings(
 	ctx context.Context,
 	restaurantID uuid.UUID,
@@ -394,23 +496,18 @@ func (u *policyUseCase) liveBookings(
 ) ([]domain.Booking, error) {
 	lookback := policy.Duration + 2*policy.Buffer + domain.CapacityBucket
 	from := time.Now().Add(-lookback)
-	var out []domain.Booking
-	for page := 1; ; page++ {
-		list, total, err := u.bookings.List(ctx, domain.BookingFilter{
-			RestaurantID: &restaurantID,
-			Statuses:     statusesNeedingHolds(),
-			From:         &from,
-			Page:         page,
-			PerPage:      capacityBackfillPage,
-		})
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, list...)
-		if len(list) == 0 || page*capacityBackfillPage >= total {
-			return out, nil
-		}
+	out, err := u.bookings.ListLiveForReconcile(
+		ctx, restaurantID, from, statusesNeedingHolds(), domain.MaxReconcileBookings)
+	if err != nil {
+		return nil, err
 	}
+	if len(out) >= domain.MaxReconcileBookings {
+		// Reaching the limit means the set may be truncated, so nothing about it
+		// can be trusted — refuse before touching a single hold or link.
+		return nil, fmt.Errorf("%w: this restaurant has %d or more live bookings in the affected period, and a capacity-mode change can only be reconciled for up to %d at once; nothing was changed — please contact support to have the change applied for a venue this size",
+			domain.ErrValidation, len(out), domain.MaxReconcileBookings)
+	}
+	return out, nil
 }
 
 // activeTables is the venue's bookable table list: active, and with a capacity
@@ -429,11 +526,6 @@ func (u *policyUseCase) activeTables(ctx context.Context, restaurantID uuid.UUID
 	}
 	return out, nil
 }
-
-// capacityBackfillPage is the page size of the mode-switch backfill. It matches
-// the repository's own cap (100), so asking for more would silently return
-// fewer rows than the loop expects.
-const capacityBackfillPage = 100
 
 // statusesNeedingHolds is the set of bookings the mode-switch backfill must give
 // capacity holds to. It is StatusesHoldingTable PLUS waitlist, and the waitlist

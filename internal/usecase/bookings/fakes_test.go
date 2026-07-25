@@ -27,6 +27,9 @@ type fakeBookings struct {
 	createTx error
 	claims   []claimCall
 	claimErr error
+
+	reconcileCalls []reconcileCall
+	reconcileErr   error
 }
 
 type statusWrite struct {
@@ -77,6 +80,59 @@ func (f *fakeBookings) GetByID(_ context.Context, id uuid.UUID) (*domain.Booking
 func (f *fakeBookings) List(_ context.Context, flt domain.BookingFilter) ([]domain.Booking, int, error) {
 	f.lastFlt = flt
 	return f.list, f.total, nil
+}
+
+// reconcileCall records one ListLiveForReconcile invocation. It is a slice, not
+// a "last call" field, because the point of that method is that the caller reads
+// the whole set in ONE statement — a test has to be able to prove there was
+// exactly one call.
+type reconcileCall struct {
+	restaurantID uuid.UUID
+	from         time.Time
+	statuses     []domain.BookingStatus
+	limit        int
+}
+
+// ListLiveForReconcile mirrors the real query rather than returning f.list
+// wholesale: same predicates (venue, status, starts_at >= from), same total
+// ascending order, same cap. A fake that ignored the filter would let a usecase
+// bug through precisely where the real query is strict.
+func (f *fakeBookings) ListLiveForReconcile(
+	_ context.Context,
+	restaurantID uuid.UUID,
+	from time.Time,
+	statuses []domain.BookingStatus,
+	limit int,
+) ([]domain.Booking, error) {
+	f.reconcileCalls = append(f.reconcileCalls, reconcileCall{
+		restaurantID: restaurantID, from: from, statuses: statuses, limit: limit})
+	if f.reconcileErr != nil {
+		return nil, f.reconcileErr
+	}
+	if limit <= 0 || limit > domain.MaxReconcileBookings {
+		limit = domain.MaxReconcileBookings
+	}
+	wanted := map[domain.BookingStatus]bool{}
+	for _, s := range statuses {
+		wanted[s] = true
+	}
+	out := make([]domain.Booking, 0, len(f.list))
+	for _, b := range f.list {
+		if b.RestaurantID != restaurantID || !wanted[b.Status] || b.StartsAt.Before(from) {
+			continue
+		}
+		out = append(out, b)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].StartsAt.Equal(out[j].StartsAt) {
+			return out[i].StartsAt.Before(out[j].StartsAt)
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.BookingStatus, at time.Time) error {

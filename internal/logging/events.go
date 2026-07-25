@@ -21,6 +21,16 @@ const (
 	// without polling the table.
 	EventBookingOverbooked = "booking.overbooked"
 
+	// Venue capacity mode (spec §4.2 level 2, migration 0054). The switch
+	// between booking-by-tables and booking-by-total-capacity is the one venue
+	// setting that REWRITES existing reservations — it backfills capacity holds
+	// or seats table-less parties at real tables inside one transaction — so both
+	// outcomes are logged at Warn: an alert on the refusal means staff are stuck
+	// on a toggle, and the "changed" line is the only record of how many
+	// reservations were rewritten and how long it took under the venue lock.
+	EventVenueCapacityModeChanged = "venue.capacity_mode_changed"
+	EventVenueCapacityModeRefused = "venue.capacity_mode_refused"
+
 	// Anti-fraud, currently only the booking-creation rate limit (spec §4.4).
 	EventAntifraudRejected = "antifraud.rejected"
 

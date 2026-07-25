@@ -326,14 +326,35 @@ func TestPolicySwitchToSeatsBackfillsExistingBookings(t *testing.T) {
 			t.Fatalf("backfilled hold = %+v, want 6 seats under a limit of 20", hold)
 		}
 	}
+	// The read must happen in exactly ONE statement. Paging it (the original
+	// implementation) is a correctness bug, not a style question: the enclosing
+	// transaction is READ COMMITTED, so a cancellation committing between two
+	// pages shifts the OFFSET window and one booking is never reconciled at all
+	// — left with neither holds nor tables, i.e. its seats sold twice.
+	if n := len(h.bookings.reconcileCalls); n != 1 {
+		t.Fatalf("backfill issued %d reads, want exactly 1 (a paged read can skip a booking)", n)
+	}
+	call := h.bookings.reconcileCalls[0]
+	if call.restaurantID != h.rid {
+		t.Errorf("backfill read venue %s, want %s", call.restaurantID, h.rid)
+	}
+	// The set must be bounded, and bounded by the shared limit: the usecase
+	// refuses when the answer reaches it, which only means "possibly truncated"
+	// if both sides speak about the same number.
+	if call.limit != domain.MaxReconcileBookings {
+		t.Errorf("backfill limit = %d, want %d", call.limit, domain.MaxReconcileBookings)
+	}
 	// The filter must pick every booking that will ever need a hold and nothing
 	// else: the three statuses that hold a seat now, PLUS waitlist (confirming a
 	// waitlisted booking re-claims a seat by flipping holds it must therefore
 	// already own — see statusesNeedingHolds), and only recent/future ones — a
 	// backfill of last year's cancelled bookings would block the venue.
-	got := h.bookings.lastFlt
-	if got.From == nil {
-		t.Fatalf("backfill filter has no lower bound: %+v", got)
+	got := struct {
+		Statuses []domain.BookingStatus
+		From     time.Time
+	}{call.statuses, call.from}
+	if got.From.IsZero() || got.From.After(time.Now()) {
+		t.Fatalf("backfill lower bound = %v, want a bound slightly in the past (in-progress visits still hold seats)", got.From)
 	}
 	want := map[domain.BookingStatus]bool{
 		domain.BookingPending: false, domain.BookingConfirmed: false,

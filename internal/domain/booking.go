@@ -243,7 +243,36 @@ type BookingRepository interface {
 	// first, so a batch smaller than the candidate set never starves the rows
 	// that have been waiting longest.
 	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
+	// ListLiveForReconcile returns, in ONE statement, every booking of the venue
+	// in the given statuses whose starts_at >= from, ordered by starts_at then
+	// id, capped at limit (and at MaxReconcileBookings whatever the caller asks
+	// for).
+	//
+	// It exists because List's OFFSET pagination cannot be used to read a set
+	// that must be reconciled as a whole: the enclosing transaction is READ
+	// COMMITTED, so every page is a fresh snapshot, and a status change that
+	// commits between two pages (a guest cancelling — status.go takes no venue
+	// lock) shifts the window and one row is never returned at all. A single
+	// statement sees a single snapshot, which is the property the caller needs.
+	//
+	// The order is ascending and total (starts_at, then id) because the caller
+	// makes decisions whose outcome depends on the order it walks the set in,
+	// and a retry of the same operation must reach the same answer.
+	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []BookingStatus, limit int) ([]Booking, error)
 }
+
+// MaxReconcileBookings is the hard cap on how many bookings one whole-set
+// reconciliation (a capacity-mode switch) may load and rewrite.
+//
+// It is a real product limit, not a paging size: the switch runs 4-5 statements
+// per booking under the venue's advisory lock, inside an HTTP request whose
+// write timeout is 15s (bootstrap/app.go). Past some size the switch cannot
+// finish in time — and the failure mode without a cap is the worst one
+// available: the request dies on timeout, the transaction rolls back, and the
+// venue lock is held meanwhile so ordinary booking creates block behind a
+// switch that will never succeed. With the cap the switch is refused
+// immediately, loudly, and with something staff can act on.
+const MaxReconcileBookings = 300
 
 // BookingReminderRepository backs the pre-visit guest reminder pass. It is a
 // port of its own, separate from BookingRepository, because the reminder marker
