@@ -107,6 +107,9 @@ func (f *fakeEventRepo) ListByRestaurant(context.Context, uuid.UUID, []domain.Ev
 func (f *fakeEventRepo) ListPublishedUpcoming(context.Context, uuid.UUID, time.Time, int, int) ([]domain.Event, int, error) {
 	return nil, 0, nil
 }
+func (f *fakeEventRepo) ListPublicUpcoming(context.Context, domain.PublicEventFilter, time.Time) ([]domain.EventListItem, int, error) {
+	return nil, 0, nil
+}
 
 type fakePromoRepo struct{ created *domain.Promo }
 

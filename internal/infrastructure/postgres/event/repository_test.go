@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/postgres/restaurant"
@@ -139,5 +140,250 @@ func TestUpdateDelete_RoundTrip(t *testing.T) {
 	}
 	if err := repo.Delete(ctx, e.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("second delete must be NotFound, got %v", err)
+	}
+}
+
+// --- cross-venue public listing (Explore screen) ---
+
+func seedRestaurantIn(ctx context.Context, t *testing.T, pool sqltx.Querier, name string, city domain.City, active bool) uuid.UUID {
+	t.Helper()
+	repo := restaurant.New(pool)
+	r := &domain.Restaurant{ID: uuid.New(), Name: name, City: city, PriceCategory: domain.PriceMid, IsActive: active}
+	if err := repo.Create(ctx, r); err != nil {
+		t.Fatalf("seed restaurant %s: %v", name, err)
+	}
+	return r.ID
+}
+
+// publicFixture builds the world the listing is read against: two active venues
+// in different cities plus one deactivated venue, each with a mix of visible and
+// invisible events.
+type publicFixture struct {
+	almaty, astana, closed uuid.UUID
+	// visible, soonest first
+	soonAlmaty, laterAstana, ongoingAlmaty *domain.Event
+	// invisible, one per reason
+	draft, hidden, finished, atClosedVenue *domain.Event
+}
+
+func seedPublicFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool) publicFixture {
+	t.Helper()
+	repo := New(pool)
+	f := publicFixture{
+		almaty: seedRestaurantIn(ctx, t, pool, "Almaty Bistro", domain.CityAlmaty, true),
+		astana: seedRestaurantIn(ctx, t, pool, "Astana Grill", domain.CityAstana, true),
+		closed: seedRestaurantIn(ctx, t, pool, "Closed Place", domain.CityAlmaty, false),
+	}
+	f.ongoingAlmaty = mkEvent(f.almaty, domain.EventPublished, -1*time.Hour, 3*time.Hour)
+	f.soonAlmaty = mkEvent(f.almaty, domain.EventPublished, 24*time.Hour, 2*time.Hour)
+	f.laterAstana = mkEvent(f.astana, domain.EventPublished, 72*time.Hour, 2*time.Hour)
+	f.draft = mkEvent(f.almaty, domain.EventDraft, 24*time.Hour, 2*time.Hour)
+	f.hidden = mkEvent(f.almaty, domain.EventHidden, 24*time.Hour, 2*time.Hour)
+	f.finished = mkEvent(f.almaty, domain.EventPublished, -48*time.Hour, 2*time.Hour)
+	f.atClosedVenue = mkEvent(f.closed, domain.EventPublished, 24*time.Hour, 2*time.Hour)
+	for _, e := range []*domain.Event{
+		f.ongoingAlmaty, f.soonAlmaty, f.laterAstana, f.draft, f.hidden, f.finished, f.atClosedVenue,
+	} {
+		if err := repo.Create(ctx, e); err != nil {
+			t.Fatalf("create event: %v", err)
+		}
+	}
+	return f
+}
+
+func ids(items []domain.EventListItem) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.ID)
+	}
+	return out
+}
+
+func sameIDs(got []domain.EventListItem, want []uuid.UUID) bool {
+	g := ids(got)
+	if len(g) != len(want) {
+		return false
+	}
+	for i := range g {
+		if g[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// The heart of the endpoint: what a guest may see, and in what order. Each row
+// is a filter; the expectation is the exact id sequence, so ordering is asserted
+// everywhere, not only in the "sorting" row.
+func TestListPublicUpcoming_VisibilityFiltersAndOrder(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	fx := seedPublicFixture(ctx, t, pool)
+	repo := New(pool)
+	now := time.Now()
+
+	almaty := domain.CityAlmaty
+	astana := domain.CityAstana
+	unknownCity := domain.City("Атлантида")
+	otherVenue := fx.astana
+	// Windows relative to the fixture's start offsets (-1h, +24h, +72h).
+	inTwoDays := now.Add(48 * time.Hour)
+	inFourDays := now.Add(96 * time.Hour)
+
+	cases := []struct {
+		name   string
+		filter domain.PublicEventFilter
+		want   []uuid.UUID
+	}{
+		{
+			// Only published + not finished + at an active venue, soonest first.
+			name:   "no filters: only visible events, soonest first",
+			filter: domain.PublicEventFilter{},
+			want:   []uuid.UUID{fx.ongoingAlmaty.ID, fx.soonAlmaty.ID, fx.laterAstana.ID},
+		},
+		{
+			name:   "city narrows by the HOST venue's city",
+			filter: domain.PublicEventFilter{City: &almaty},
+			want:   []uuid.UUID{fx.ongoingAlmaty.ID, fx.soonAlmaty.ID},
+		},
+		{
+			name:   "city: the other city",
+			filter: domain.PublicEventFilter{City: &astana},
+			want:   []uuid.UUID{fx.laterAstana.ID},
+		},
+		{
+			name:   "unknown city matches nothing",
+			filter: domain.PublicEventFilter{City: &unknownCity},
+			want:   nil,
+		},
+		{
+			name:   "restaurant id narrows to one venue",
+			filter: domain.PublicEventFilter{RestaurantID: &otherVenue},
+			want:   []uuid.UUID{fx.laterAstana.ID},
+		},
+		{
+			name:   "from: only events starting at or after the bound",
+			filter: domain.PublicEventFilter{From: &inTwoDays},
+			want:   []uuid.UUID{fx.laterAstana.ID},
+		},
+		{
+			name:   "to: only events starting at or before the bound",
+			filter: domain.PublicEventFilter{To: &inTwoDays},
+			want:   []uuid.UUID{fx.ongoingAlmaty.ID, fx.soonAlmaty.ID},
+		},
+		{
+			name:   "from+to: a window",
+			filter: domain.PublicEventFilter{From: &inTwoDays, To: &inFourDays},
+			want:   []uuid.UUID{fx.laterAstana.ID},
+		},
+		{
+			name:   "filters combine (AND), not widen",
+			filter: domain.PublicEventFilter{City: &almaty, From: &inTwoDays},
+			want:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			items, total, err := repo.ListPublicUpcoming(ctx, tc.filter, now)
+			if err != nil {
+				t.Fatalf("ListPublicUpcoming: %v", err)
+			}
+			if total != len(tc.want) {
+				t.Fatalf("total = %d, want %d", total, len(tc.want))
+			}
+			if !sameIDs(items, tc.want) {
+				t.Fatalf("ids = %v, want %v", ids(items), tc.want)
+			}
+		})
+	}
+}
+
+// The invisible events must be invisible for the RIGHT reason — spelled out one
+// by one so a future change that, say, starts serving hidden events fails here
+// with a readable message.
+func TestListPublicUpcoming_ExcludesEachKindOfInvisibleEvent(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	fx := seedPublicFixture(ctx, t, pool)
+	repo := New(pool)
+
+	items, _, err := repo.ListPublicUpcoming(ctx, domain.PublicEventFilter{PerPage: 100}, time.Now())
+	if err != nil {
+		t.Fatalf("ListPublicUpcoming: %v", err)
+	}
+	got := map[uuid.UUID]bool{}
+	for _, it := range items {
+		got[it.ID] = true
+	}
+	for reason, id := range map[string]uuid.UUID{
+		"a draft event":                   fx.draft.ID,
+		"an event withdrawn from view":    fx.hidden.ID,
+		"an event that already finished":  fx.finished.ID,
+		"an event at a deactivated venue": fx.atClosedVenue.ID,
+	} {
+		if got[id] {
+			t.Errorf("%s must not be listed publicly (%s)", reason, id)
+		}
+	}
+}
+
+// Each item carries the venue the Explore card renders, so the app needs no
+// second query per row.
+func TestListPublicUpcoming_CarriesTheHostVenue(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	fx := seedPublicFixture(ctx, t, pool)
+	repo := New(pool)
+
+	astana := domain.CityAstana
+	items, _, err := repo.ListPublicUpcoming(ctx, domain.PublicEventFilter{City: &astana}, time.Now())
+	if err != nil {
+		t.Fatalf("ListPublicUpcoming: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	v := items[0].Restaurant
+	if v.ID != fx.astana || v.Name != "Astana Grill" || v.City != domain.CityAstana {
+		t.Fatalf("venue = %+v, want the Astana venue", v)
+	}
+	if v.ID != items[0].RestaurantID {
+		t.Fatalf("venue id %s does not match the event's restaurant_id %s", v.ID, items[0].RestaurantID)
+	}
+}
+
+// Pagination walks the same total in the same order, with no row served twice
+// and none skipped.
+func TestListPublicUpcoming_Pagination(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	fx := seedPublicFixture(ctx, t, pool)
+	repo := New(pool)
+	now := time.Now()
+
+	want := []uuid.UUID{fx.ongoingAlmaty.ID, fx.soonAlmaty.ID, fx.laterAstana.ID}
+	var seen []uuid.UUID
+	for page := 1; page <= 3; page++ {
+		items, total, err := repo.ListPublicUpcoming(ctx, domain.PublicEventFilter{Page: page, PerPage: 2}, now)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if total != 3 {
+			t.Fatalf("page %d: total = %d, want 3 (the full count, not the page size)", page, total)
+		}
+		seen = append(seen, ids(items)...)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("walked %d rows across 3 pages, want 3: %v", len(seen), seen)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("paginated order = %v, want %v", seen, want)
+		}
 	}
 }

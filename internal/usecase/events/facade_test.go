@@ -20,6 +20,14 @@ type fakeEventRepo struct {
 	deleted   []uuid.UUID
 	published []domain.Event
 	createErr error
+
+	// cross-venue public listing: what the repository was asked for, and what
+	// it answers with.
+	publicItems  []domain.EventListItem
+	publicFilter domain.PublicEventFilter
+	publicNow    time.Time
+	publicCalls  int
+	publicErr    error
 }
 
 func newFakeRepo() *fakeEventRepo { return &fakeEventRepo{byID: map[uuid.UUID]*domain.Event{}} }
@@ -69,6 +77,16 @@ func (f *fakeEventRepo) ListByRestaurant(_ context.Context, _ uuid.UUID, _ []dom
 
 func (f *fakeEventRepo) ListPublishedUpcoming(_ context.Context, _ uuid.UUID, _ time.Time, _, _ int) ([]domain.Event, int, error) {
 	return f.published, len(f.published), nil
+}
+
+func (f *fakeEventRepo) ListPublicUpcoming(_ context.Context, flt domain.PublicEventFilter, now time.Time) ([]domain.EventListItem, int, error) {
+	f.publicCalls++
+	f.publicFilter = flt
+	f.publicNow = now
+	if f.publicErr != nil {
+		return nil, 0, f.publicErr
+	}
+	return f.publicItems, len(f.publicItems), nil
 }
 
 // fakePerms answers HasPermission from a fixed (userID,restaurantID)->role map.
@@ -293,4 +311,115 @@ func TestGetPublic_HidesDraftAndCrossTenant(t *testing.T) {
 	if got.ID != pub.ID {
 		t.Fatal("wrong event returned")
 	}
+}
+
+// --- cross-venue public listing (Explore screen) ---
+
+// The rule "what a guest may see" (published, not yet ended, active venue) is
+// enforced in SQL, so what this layer must be held to is narrower and just as
+// important: it passes the caller's filters through UNCHANGED, adds no
+// visibility knob of its own, and supplies the clock the repository compares
+// ends_at against. A regression here would either widen visibility or freeze
+// the "finished" cut-off.
+func TestListPublicUpcoming_FiltersReachTheRepositoryUnchanged(t *testing.T) {
+	rid := uuid.New()
+	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 8, 31, 23, 59, 59, 0, time.UTC)
+	city := domain.CityAlmaty
+
+	cases := map[string]domain.PublicEventFilter{
+		"no filters":      {Page: 1, PerPage: 20},
+		"city":            {City: &city, Page: 1, PerPage: 20},
+		"restaurant":      {RestaurantID: &rid, Page: 1, PerPage: 20},
+		"date range":      {From: &from, To: &to, Page: 1, PerPage: 20},
+		"open-ended from": {From: &from, Page: 1, PerPage: 20},
+		"open-ended to":   {To: &to, Page: 1, PerPage: 20},
+		"everything at once": {
+			City: &city, RestaurantID: &rid, From: &from, To: &to, Page: 3, PerPage: 5,
+		},
+	}
+	for name, flt := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo := newFakeRepo()
+			f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
+			fixed := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+			f.(*facade).clock = func() time.Time { return fixed }
+
+			if _, _, err := f.ListPublicUpcoming(context.Background(), flt); err != nil {
+				t.Fatalf("ListPublicUpcoming: %v", err)
+			}
+			if repo.publicCalls != 1 {
+				t.Fatalf("repository calls = %d, want exactly 1", repo.publicCalls)
+			}
+			if !filterEqual(repo.publicFilter, flt) {
+				t.Fatalf("filter reached the repository as %+v, want %+v", repo.publicFilter, flt)
+			}
+			if !repo.publicNow.Equal(fixed) {
+				t.Fatalf("now = %v, want the facade clock %v", repo.publicNow, fixed)
+			}
+		})
+	}
+}
+
+// An inverted range is a caller mistake, not an empty page: it must be named
+// (422) and must never reach the database.
+func TestListPublicUpcoming_InvertedRangeRejected(t *testing.T) {
+	from := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	to := from.Add(-24 * time.Hour)
+	repo := newFakeRepo()
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
+
+	_, _, err := f.ListPublicUpcoming(context.Background(), domain.PublicEventFilter{From: &from, To: &to})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("to before from must be ErrValidation, got %v", err)
+	}
+	if repo.publicCalls != 0 {
+		t.Fatal("an invalid range must not reach the repository")
+	}
+	// The degenerate from == to is a legitimate one-instant query, not an error.
+	same := from
+	if _, _, err := f.ListPublicUpcoming(context.Background(), domain.PublicEventFilter{From: &from, To: &same}); err != nil {
+		t.Fatalf("from == to must be accepted, got %v", err)
+	}
+}
+
+// The listing carries the host venue with each item — the Explore card needs it
+// and must not have to fetch a restaurant per row.
+func TestListPublicUpcoming_ItemsCarryTheirVenue(t *testing.T) {
+	rid := uuid.New()
+	repo := newFakeRepo()
+	repo.publicItems = []domain.EventListItem{{
+		Event:      domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "Wine Dinner", Status: domain.EventPublished},
+		Restaurant: domain.EventRestaurant{ID: rid, Name: "Bistro", City: domain.CityAlmaty},
+	}}
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
+
+	items, total, err := f.ListPublicUpcoming(context.Background(), domain.PublicEventFilter{})
+	if err != nil {
+		t.Fatalf("ListPublicUpcoming: %v", err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Fatalf("total=%d len=%d, want 1/1", total, len(items))
+	}
+	if items[0].Restaurant.ID != rid || items[0].Restaurant.Name != "Bistro" || items[0].Restaurant.City != domain.CityAlmaty {
+		t.Fatalf("venue not carried through: %+v", items[0].Restaurant)
+	}
+}
+
+func TestListPublicUpcoming_RepositoryErrorPropagates(t *testing.T) {
+	repo := newFakeRepo()
+	repo.publicErr = errors.New("boom")
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
+
+	if _, _, err := f.ListPublicUpcoming(context.Background(), domain.PublicEventFilter{}); err == nil {
+		t.Fatal("a repository failure must not be swallowed into an empty page")
+	}
+}
+
+func filterEqual(a, b domain.PublicEventFilter) bool {
+	cityEq := (a.City == nil) == (b.City == nil) && (a.City == nil || *a.City == *b.City)
+	ridEq := (a.RestaurantID == nil) == (b.RestaurantID == nil) && (a.RestaurantID == nil || *a.RestaurantID == *b.RestaurantID)
+	fromEq := (a.From == nil) == (b.From == nil) && (a.From == nil || a.From.Equal(*b.From))
+	toEq := (a.To == nil) == (b.To == nil) && (a.To == nil || a.To.Equal(*b.To))
+	return cityEq && ridEq && fromEq && toEq && a.Page == b.Page && a.PerPage == b.PerPage
 }
