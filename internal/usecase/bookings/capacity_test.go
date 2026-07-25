@@ -326,10 +326,33 @@ func TestPolicySwitchToSeatsBackfillsExistingBookings(t *testing.T) {
 			t.Fatalf("backfilled hold = %+v, want 6 seats under a limit of 20", hold)
 		}
 	}
-	// The filter must only pick bookings that still hold a seat, and only future
-	// ones — a backfill of last year's cancelled bookings would block the venue.
-	if got := h.bookings.lastFlt; got.From == nil || len(got.Statuses) != 3 {
-		t.Fatalf("backfill filter = %+v", got)
+	// The filter must pick every booking that will ever need a hold and nothing
+	// else: the three statuses that hold a seat now, PLUS waitlist (confirming a
+	// waitlisted booking re-claims a seat by flipping holds it must therefore
+	// already own — see statusesNeedingHolds), and only recent/future ones — a
+	// backfill of last year's cancelled bookings would block the venue.
+	got := h.bookings.lastFlt
+	if got.From == nil {
+		t.Fatalf("backfill filter has no lower bound: %+v", got)
+	}
+	want := map[domain.BookingStatus]bool{
+		domain.BookingPending: false, domain.BookingConfirmed: false,
+		domain.BookingArrived: false, domain.BookingWaitlist: false,
+	}
+	for _, s := range got.Statuses {
+		seen, ok := want[s]
+		if !ok {
+			t.Fatalf("backfill filter includes %q, which never needs a hold", s)
+		}
+		if seen {
+			t.Fatalf("backfill filter repeats %q", s)
+		}
+		want[s] = true
+	}
+	for s, seen := range want {
+		if !seen {
+			t.Fatalf("backfill filter misses %q: %+v", s, got.Statuses)
+		}
 	}
 }
 

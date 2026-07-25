@@ -229,7 +229,7 @@ func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID
 	for page := 1; ; page++ {
 		list, total, err := u.bookings.List(ctx, domain.BookingFilter{
 			RestaurantID: &restaurantID,
-			Statuses:     domain.StatusesHoldingTable(),
+			Statuses:     statusesNeedingHolds(),
 			From:         &from,
 			Page:         page,
 			PerPage:      capacityBackfillPage,
@@ -262,6 +262,22 @@ func (u *policyUseCase) rebuildHolds(ctx context.Context, restaurantID uuid.UUID
 // the repository's own cap (100), so asking for more would silently return
 // fewer rows than the loop expects.
 const capacityBackfillPage = 100
+
+// statusesNeedingHolds is the set of bookings the mode-switch backfill must give
+// capacity holds to. It is StatusesHoldingTable PLUS waitlist, and the waitlist
+// is the whole point: a waitlisted booking holds no seat TODAY, but confirming
+// it re-claims one, and the re-claim is expressed as flipping its holds back to
+// active. A booking with no hold rows at all flips nothing — it would come back
+// from the waiting list confirmed and completely invisible to the ledger, which
+// is exactly the hole review found.
+//
+// The holds written for a waitlisted booking cost nothing: migration 0057
+// derives `active` from the booking's status inside the database, so they land
+// inactive and only start counting when the booking is confirmed — under the
+// venue's capacity as it stands at that moment.
+func statusesNeedingHolds() []domain.BookingStatus {
+	return append(domain.StatusesHoldingTable(), domain.BookingWaitlist)
+}
 
 func (u *policyUseCase) view(ctx context.Context, restaurantID uuid.UUID) (*PolicyView, error) {
 	agg, err := u.restaurants.GetByID(ctx, restaurantID)

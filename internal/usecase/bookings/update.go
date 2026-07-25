@@ -140,8 +140,14 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 			return nil, fmt.Errorf("%w: this restaurant books by total capacity and has no tables to assign",
 				domain.ErrValidation)
 		}
-		if err := checkCapacityGuests(b.Guests, policy); err != nil {
-			return nil, err
+		// Only when the party or the time actually changes. A booking seated
+		// beyond the capacity on purpose (0056) legitimately has more guests
+		// than the venue declares, and refusing to edit its NOTES for the rest
+		// of its life would be a silly consequence of an intended override.
+		if moved {
+			if err := checkCapacityGuests(b.Guests, policy); err != nil {
+				return nil, err
+			}
 		}
 		if u.capacity == nil {
 			return nil, fmt.Errorf("%w: capacity bookings are not configured", domain.ErrValidation)
@@ -162,10 +168,49 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 	}
 
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// Everything above was decided from a policy read OUTSIDE this
+		// transaction, and this usecase writes capacity buckets — so it is the
+		// same unlocked read-then-write that was closed for create in 709a992,
+		// and it is closed here the same way: take the per-venue lock FIRST,
+		// then re-read the policy under it and act on that value. Without it a
+		// capacity lowered from 100 to 80 concurrently would be re-stamped back
+		// to 100 by this booking's holds, and a tables→seats switch committing
+		// in the gap would leave this booking's holds sitting at its OLD time.
+		if u.capacity != nil {
+			if err := u.capacity.LockVenue(ctx, b.RestaurantID); err != nil {
+				return err
+			}
+			fresh, err := u.restaurants.GetByID(ctx, b.RestaurantID)
+			if err != nil {
+				return err
+			}
+			policy = resolvePolicy(fresh.Restaurant, u.cfg)
+		}
+		if freshSeatsMode := policy.CapacityMode == domain.CapacityModeSeats; freshSeatsMode != seatsMode {
+			// The venue changed HOW it takes bookings between the read and this
+			// transaction, so the placement resolved above is the wrong shape
+			// entirely — table links for a venue that now counts seats, or holds
+			// for one that now needs a table. Neither can be salvaged here; the
+			// honest answer is the same conflict a lost race produces, and the
+			// client retries against the new mode.
+			return fmt.Errorf("%w: the restaurant changed how it takes bookings, please retry",
+				domain.ErrAlreadyExists)
+		}
+		if seatsMode && moved {
+			// Re-checked under the fresh policy: the venue may have shrunk while
+			// this request was in flight, and the DB CHECK would refuse the
+			// holds anyway — a validation error is the truthful answer.
+			if err := checkCapacityGuests(b.Guests, policy); err != nil {
+				return err
+			}
+		}
 		if err := u.bookings.Update(ctx, b); err != nil {
 			return err
 		}
 		if seatsMode && moved {
+			// buildCapacityHolds stamps the FRESH declared capacity onto every
+			// hold, which is what stops this amendment from re-stamping a bucket
+			// with a limit the venue no longer offers.
 			if err := u.capacity.ReplaceForBooking(ctx, b.ID, buildCapacityHolds(b, policy, b.UpdatedAt)); err != nil {
 				return err
 			}
