@@ -24,7 +24,9 @@ import (
 // integration test below; it never actually sends anything.
 type realStubSender struct{}
 
-func (realStubSender) Send(_ context.Context, _, _ string) (string, error) { return "test", nil }
+func (realStubSender) Send(_ context.Context, _, _ string, _ domain.OTPSendHint) (string, error) {
+	return "test", nil
+}
 
 // newRealTestOTP wires the OTPUseCase against the real Postgres-backed repos and
 // the real sqltx.Manager, so that transaction rollback behavior is exercised for

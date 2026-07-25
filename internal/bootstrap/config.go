@@ -67,6 +67,70 @@ type Config struct {
 	// advances its cursor, it just ships nothing until the owner provisions a
 	// key (same discipline as web push without VAPID keys).
 	Analytics AnalyticsConfig
+
+	// OTPDelivery configures the login-code delivery waterfall (Telegram
+	// Gateway → WhatsApp → SMS). Each channel is enabled ONLY by the presence
+	// of its credentials; absent credentials are not an error, they just mean
+	// the channel does not exist. With none of them configured the application
+	// keeps today's stub behaviour (dev logs the code, everything else warns),
+	// so the tokens can arrive one at a time without a deploy in between.
+	OTPDelivery OTPDeliveryConfig
+}
+
+// OTPDeliveryConfig holds the credentials and knobs of every OTP channel. All
+// tokens come from env only and are never logged (same discipline as acquirer
+// keys / VAPID keys); see infrastructure/otpsender for where each one goes.
+type OTPDeliveryConfig struct {
+	// ChannelOrder is the fallback order, cheapest-and-most-certain first.
+	// Names are the domain.OTPChannel* values. A name whose channel is not
+	// configured is skipped; an unknown name is ignored with a loud log rather
+	// than crashing the server on a typo in one env var.
+	// env: OTP_CHANNEL_ORDER (default "telegram_gateway,whatsapp,sms")
+	ChannelOrder []string
+	// SendTimeout caps ONE channel's attempt, so a hung provider cannot eat the
+	// whole login request and starve the channels below it.
+	// env: OTP_SEND_TIMEOUT
+	SendTimeout time.Duration
+	// DeliveryBudget caps the WHOLE waterfall (every fallback hop together). It
+	// must stay under the HTTP server's WriteTimeout (15s, see bootstrap.app),
+	// or a slow waterfall would keep spending money on a guest whose connection
+	// has already been closed.
+	// env: OTP_DELIVERY_BUDGET
+	DeliveryBudget time.Duration
+
+	// Telegram Gateway (https://gateway.telegram.org) — the paid product that
+	// delivers a code to a PHONE NUMBER, not the notifications bot.
+	TelegramGatewayToken  string // env: OTP_TELEGRAM_GATEWAY_TOKEN
+	TelegramSenderUser    string // env: OTP_TELEGRAM_GATEWAY_SENDER_USERNAME (optional, verified channel)
+	TelegramGatewayAPIURL string // env: OTP_TELEGRAM_GATEWAY_API_URL (tests/staging override)
+
+	// WhatsApp Cloud API (Meta).
+	WhatsAppAccessToken   string // env: OTP_WHATSAPP_ACCESS_TOKEN (System User token)
+	WhatsAppPhoneNumberID string // env: OTP_WHATSAPP_PHONE_NUMBER_ID
+	WhatsAppTemplateName  string // env: OTP_WHATSAPP_TEMPLATE_NAME (approved AUTHENTICATION template)
+	WhatsAppTemplateLang  string // env: OTP_WHATSAPP_TEMPLATE_LANG
+	WhatsAppAPIVersion    string // env: OTP_WHATSAPP_API_VERSION
+	// WhatsAppCopyButton must match the approved template: an authentication
+	// template WITH a "Copy code" button needs a button parameter, one without
+	// it rejects the same request. Wrong value = every WhatsApp send fails.
+	WhatsAppCopyButton bool   // env: OTP_WHATSAPP_COPY_CODE_BUTTON
+	WhatsAppAPIURL     string // env: OTP_WHATSAPP_API_URL (tests/staging override)
+
+	// SMSProvider selects the SMS backend: "" (none) | "twilio" | "mobizon".
+	// It is an explicit switch rather than a guess from whichever credentials
+	// happen to be present, so an old key left in the environment can never
+	// silently take over the most expensive channel.
+	SMSProvider string // env: OTP_SMS_PROVIDER
+
+	TwilioAccountSID   string // env: OTP_SMS_TWILIO_ACCOUNT_SID
+	TwilioAuthToken    string // env: OTP_SMS_TWILIO_AUTH_TOKEN
+	TwilioFrom         string // env: OTP_SMS_TWILIO_FROM (E.164, or use the messaging service)
+	TwilioMessagingSID string // env: OTP_SMS_TWILIO_MESSAGING_SERVICE_SID
+	TwilioAPIURL       string // env: OTP_SMS_TWILIO_API_URL (tests override)
+
+	MobizonAPIKey string // env: OTP_SMS_MOBIZON_API_KEY
+	MobizonSender string // env: OTP_SMS_MOBIZON_SENDER (approved alphanumeric sender, optional)
+	MobizonAPIURL string // env: OTP_SMS_MOBIZON_API_URL (tests override)
 }
 
 // AnalyticsConfig holds the Amplitude project credentials and the analytics
@@ -585,6 +649,47 @@ func NewConfig() (Config, error) {
 			DispatchTick:  getEnvDuration("ANALYTICS_DISPATCH_TICK_INTERVAL", 30*time.Second),
 			DispatchBatch: getEnvInt("ANALYTICS_DISPATCH_BATCH_SIZE", 100),
 			HTTPTimeout:   getEnvDuration("ANALYTICS_HTTP_TIMEOUT", 10*time.Second),
+		},
+
+		OTPDelivery: OTPDeliveryConfig{
+			// Default order: the pre-checkable channel first (a miss costs
+			// nothing), the optimistic one second, the expensive certain one
+			// last.
+			ChannelOrder:   getEnvList("OTP_CHANNEL_ORDER", "telegram_gateway,whatsapp,sms"),
+			SendTimeout:    getEnvDuration("OTP_SEND_TIMEOUT", 5*time.Second),
+			DeliveryBudget: getEnvDuration("OTP_DELIVERY_BUDGET", 12*time.Second),
+
+			TelegramGatewayToken:  getEnv("OTP_TELEGRAM_GATEWAY_TOKEN", ""),
+			TelegramSenderUser:    getEnv("OTP_TELEGRAM_GATEWAY_SENDER_USERNAME", ""),
+			TelegramGatewayAPIURL: getEnv("OTP_TELEGRAM_GATEWAY_API_URL", ""),
+
+			WhatsAppAccessToken:   getEnv("OTP_WHATSAPP_ACCESS_TOKEN", ""),
+			WhatsAppPhoneNumberID: getEnv("OTP_WHATSAPP_PHONE_NUMBER_ID", ""),
+			// The template that was verified against the live number on
+			// 2026-07-25, kept as the default so the owner only has to supply
+			// the two credentials.
+			// TODO(verify): проверить в Business Manager — язык шаблона
+			// bookeat_otp_en может быть заведён как "en_US", а не "en";
+			// несовпадение = отказ на каждой отправке.
+			WhatsAppTemplateName: getEnv("OTP_WHATSAPP_TEMPLATE_NAME", "bookeat_otp_en"),
+			WhatsAppTemplateLang: getEnv("OTP_WHATSAPP_TEMPLATE_LANG", "en"),
+			// v22.0 is the version the live send was verified on.
+			WhatsAppAPIVersion: getEnv("OTP_WHATSAPP_API_VERSION", "v22.0"),
+			// Meta's authentication templates carry the "Copy code" button by
+			// default, and the old system's working payload sends its parameter.
+			WhatsAppCopyButton: getEnvBool("OTP_WHATSAPP_COPY_CODE_BUTTON", true),
+			WhatsAppAPIURL:     getEnv("OTP_WHATSAPP_API_URL", ""),
+
+			SMSProvider:        getEnv("OTP_SMS_PROVIDER", ""),
+			TwilioAccountSID:   getEnv("OTP_SMS_TWILIO_ACCOUNT_SID", ""),
+			TwilioAuthToken:    getEnv("OTP_SMS_TWILIO_AUTH_TOKEN", ""),
+			TwilioFrom:         getEnv("OTP_SMS_TWILIO_FROM", ""),
+			TwilioMessagingSID: getEnv("OTP_SMS_TWILIO_MESSAGING_SERVICE_SID", ""),
+			TwilioAPIURL:       getEnv("OTP_SMS_TWILIO_API_URL", ""),
+
+			MobizonAPIKey: getEnv("OTP_SMS_MOBIZON_API_KEY", ""),
+			MobizonSender: getEnv("OTP_SMS_MOBIZON_SENDER", ""),
+			MobizonAPIURL: getEnv("OTP_SMS_MOBIZON_API_URL", ""),
 		},
 	}
 

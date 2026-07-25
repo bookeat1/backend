@@ -105,6 +105,23 @@ definitions:
         example: "2026-07-01"
         type: string
     type: object
+  devicetokens.registerRequest:
+    properties:
+      platform:
+        type: string
+      token:
+        type: string
+    required:
+    - platform
+    - token
+    type: object
+  devicetokens.unregisterRequest:
+    properties:
+      token:
+        type: string
+    required:
+    - token
+    type: object
   payments.createPaymentRequest:
     properties:
       return_url:
@@ -566,6 +583,12 @@ paths:
         Generates a one-time code and delivers it to the phone. Rate-limited
         (per-minute and per-hour); over the limit returns 422. The response
         "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
+
+        When no delivery channel accepts the code the answer is a plain 500
+        with the generic body — identical for a number nobody can reach and
+        for a provider outage. That is deliberate: a response that varied by
+        channel would let anyone enumerate which numbers have Telegram or
+        WhatsApp. The per-channel reasons live in our logs, phone masked.
       parameters:
       - description: Phone number
         in: body
@@ -587,6 +610,10 @@ paths:
               type: object
         "422":
           description: validation failed / rate limited
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "500":
+          description: the code could not be delivered on any channel
           schema:
             $ref: '#/definitions/response.Envelope'
       summary: Request an OTP code
@@ -974,6 +1001,67 @@ paths:
       summary: Record a consent decision
       tags:
       - consent
+  /api/v1/devices/push-tokens:
+    delete:
+      consumes:
+      - application/json
+      parameters:
+      - description: The token to silence
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/devicetokens.unregisterRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Unregister my device from push notifications
+      tags:
+      - push
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Provider push token + platform
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/devicetokens.registerRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "401":
+          description: unauthorized
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: invalid body
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      security:
+      - BearerAuth: []
+      summary: Register my device for push notifications
+      tags:
+      - push
   /api/v1/favorites:
     get:
       produces:
