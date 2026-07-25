@@ -43,7 +43,11 @@ type Config struct {
 // pattern as bookings.Config.withDefaults.
 const (
 	defaultServiceFeeBps      = 350               // 3.5%
-	defaultRefundAcquiringBps = 100               // 1%
+	// Owner decision (2026-07-25): nothing is withheld from a guest's refund —
+	// a timely cancellation returns the full charged amount and the acquirer's
+	// cost is absorbed off the guest's side. Kept configurable for the day that
+	// changes, but 0 is the default and an explicit 0 must survive withDefaults.
+	defaultRefundAcquiringBps = 0
 	defaultHoldTTL            = 96 * time.Hour    // stays below FreedomPay's 5-day auto-clear
 	defaultFreeCancelWindow   = 120 * time.Minute // owner-confirmed default (migration 0034)
 )
@@ -55,7 +59,9 @@ func (c Config) withDefaults() Config {
 	if c.ServiceFeeBps <= 0 {
 		c.ServiceFeeBps = defaultServiceFeeBps
 	}
-	if c.RefundAcquiringBps <= 0 {
+	// Only a NEGATIVE value is nonsense here: 0 is the intended production
+	// setting ("withhold nothing"), so it must not be replaced by a fallback.
+	if c.RefundAcquiringBps < 0 {
 		c.RefundAcquiringBps = defaultRefundAcquiringBps
 	}
 	if c.HoldTTL <= 0 {
