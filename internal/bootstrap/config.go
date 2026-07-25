@@ -205,8 +205,18 @@ type PaymentsConfig struct {
 
 	// RefundAcquiringBps is what is withheld from a refund to cover the cost of
 	// moving money back, in basis points of the total (100 = 1%). It is a cost
-	// booked to the `acquirer` ledger account, not platform revenue.
+	// booked to the `acquirer` ledger account, not platform revenue. Owner
+	// decision (2026-07-25): 0 by default — nothing is taken off the guest's
+	// refund unless an acquirer genuinely charges for the reversal.
 	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
+
+	// RefundAcquiringBpsByProvider overrides RefundAcquiringBps per acquirer,
+	// because the rate is a property of the acquirer, not of the platform: one
+	// returns its fee on a reversal (0 bps), another keeps it (some non-zero
+	// rate). A provider absent from this map falls back to RefundAcquiringBps.
+	// env: PAYMENTS_REFUND_ACQUIRING_BPS_<PROVIDER>, e.g.
+	// PAYMENTS_REFUND_ACQUIRING_BPS_FREEDOMPAY=0.
+	RefundAcquiringBpsByProvider map[string]int
 
 	// DepositDefaultMinor is the deposit charged per booking, in tiyn, when the
 	// venue requires one but sets no amount of its own.
@@ -375,16 +385,17 @@ func NewConfig() (Config, error) {
 			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 		Payments: PaymentsConfig{
-			Enabled:                 getEnvBool("PAYMENTS_ENABLED", false),
-			DefaultProvider:         getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
-			ServiceFeeBps:           getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
-			RefundAcquiringBps:      getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
-			DepositDefaultMinor:     getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
-			DepositRequired:         getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
-			PreorderPaymentRequired: getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
-			HoldTTL:                 getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
-			FreeCancelWindow:        getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
-			PublicBaseURL:           strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
+			Enabled:                      getEnvBool("PAYMENTS_ENABLED", false),
+			DefaultProvider:              getEnv("PAYMENTS_DEFAULT_PROVIDER", "freedompay"),
+			ServiceFeeBps:                getEnvInt("PAYMENTS_SERVICE_FEE_BPS", 350),
+			RefundAcquiringBps:           getEnvInt("PAYMENTS_REFUND_ACQUIRING_BPS", 0),
+			RefundAcquiringBpsByProvider: refundAcquiringByProvider(),
+			DepositDefaultMinor:          getEnvInt64("PAYMENTS_DEPOSIT_DEFAULT_MINOR", 0),
+			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
+			PreorderPaymentRequired:      getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
+			HoldTTL:                      getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			FreeCancelWindow:             getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
+			PublicBaseURL:                strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
 		},
 		PaymentsReconciler: PaymentsReconcilerConfig{
 			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),
@@ -479,6 +490,38 @@ func getEnv(key, def string) string {
 
 // getEnvInt returns the integer value of the environment variable named by
 // key, or def when the variable is unset or not a valid integer.
+// knownPaymentProviders mirrors domain.PaymentProvider's constants. It lives
+// here as plain strings so the config layer keeps its "env in, struct out"
+// shape without importing the domain; a provider added to the domain and
+// forgotten here simply has no per-provider env knob and falls back to the
+// global rate, which is the safe direction.
+var knownPaymentProviders = []string{"freedompay", "tiptoppay", "partnerspay"}
+
+// refundAcquiringByProvider reads PAYMENTS_REFUND_ACQUIRING_BPS_<PROVIDER> for
+// every known acquirer. Only variables that are actually SET land in the map —
+// an unset provider must fall back to the global rate, so a missing key and an
+// explicit 0 have to stay distinguishable. A negative or unparseable value is
+// ignored (same posture as getEnvInt) rather than silently paying the guest
+// more than was charged.
+func refundAcquiringByProvider() map[string]int {
+	var out map[string]int
+	for _, p := range knownPaymentProviders {
+		v, ok := os.LookupEnv("PAYMENTS_REFUND_ACQUIRING_BPS_" + strings.ToUpper(p))
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n < 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]int, len(knownPaymentProviders))
+		}
+		out[p] = n
+	}
+	return out
+}
+
 func getEnvInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
