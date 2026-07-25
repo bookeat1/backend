@@ -46,6 +46,15 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// no payout is stale — Tick returns immediately.
 	payoutReconciler := NewPayoutReconciler(cfg, db, log)
 
+	// The daily payout pass generates ONE payout per venue per VENUE-LOCAL day
+	// for that venue's settled money. Started unconditionally, same safe-idle
+	// rationale as the reconcilers, plus two of its own: with
+	// PAYOUTS_DAILY_SEND_ENABLED unset it only creates pending payouts and
+	// moves no money at all, and the once-per-venue-per-day guarantee is a
+	// UNIQUE index, so a second worker instance or a restart mid-pass cannot
+	// pay anyone twice.
+	dailyPayouts := NewDailyPayoutRunner(cfg, db, log)
+
 	// The pending-ticket sweeper releases seats held by pending event tickets
 	// whose payment never completed (or was never created). Started
 	// unconditionally, same safe-idle rationale as the reconciler: with no stale
@@ -77,8 +86,8 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	defer stop()
 
 	var wg sync.WaitGroup
-	var bookingErr, paymentsErr, notifyErr, payoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	wg.Add(6)
+	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
+	wg.Add(7)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -94,6 +103,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	go func() {
 		defer wg.Done()
 		payoutErr = payoutReconciler.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		dailyPayoutErr = dailyPayouts.Run(ctx)
 	}()
 	go func() {
 		defer wg.Done()
@@ -123,6 +136,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if payoutErr != nil {
 		return fmt.Errorf("payout reconciler: %w", payoutErr)
+	}
+	if dailyPayoutErr != nil {
+		return fmt.Errorf("daily payout pass: %w", dailyPayoutErr)
 	}
 	if ticketSweepErr != nil {
 		return fmt.Errorf("ticket sweeper: %w", ticketSweepErr)

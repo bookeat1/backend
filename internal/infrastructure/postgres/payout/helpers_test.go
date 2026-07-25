@@ -17,7 +17,7 @@ import (
 // payoutTables lists the tables these tests own, children first. restaurants,
 // users, bookings, payments and ledger entries are seeded with fresh UUIDs and
 // NOT truncated, same convention as the payment package's own tests.
-var payoutTables = []string{"payout_items", "payouts", "restaurant_payout_destinations"}
+var payoutTables = []string{"payout_ledger_entries", "payout_items", "payouts", "restaurant_payout_destinations"}
 
 func setup(t *testing.T) (*pgxpool.Pool, context.Context) {
 	t.Helper()

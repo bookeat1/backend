@@ -15,6 +15,7 @@ package payout
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -56,3 +57,13 @@ func window(limit int) int {
 }
 
 type scanner interface{ Scan(dest ...any) error }
+
+// nullableTime maps a zero time.Time to a SQL NULL, so one statement can serve
+// both "bounded by an instant" and "unbounded" without string-building two
+// variants of the query.
+func nullableTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}

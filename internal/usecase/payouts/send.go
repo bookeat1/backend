@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -30,6 +32,13 @@ func (u *UseCase) SendPayout(ctx context.Context, actor Actor, payoutID uuid.UUI
 	if err := u.authorizeSuperadmin(actor); err != nil {
 		return nil, err
 	}
+	return u.sendPayout(ctx, payoutID)
+}
+
+// sendPayout is SendPayout without the RBAC gate — the body shared with the
+// scheduled daily pass, which runs as the platform itself and has no Actor to
+// check. Every caller outside this package goes through SendPayout.
+func (u *UseCase) sendPayout(ctx context.Context, payoutID uuid.UUID) (*domain.Payout, error) {
 	p, err := u.payouts.GetByID(ctx, payoutID)
 	if err != nil {
 		return nil, err
@@ -81,7 +90,11 @@ func (u *UseCase) resolveSendSuccess(ctx context.Context, payoutID uuid.UUID, re
 		if ref != "" {
 			patch.ProviderRef = &ref
 		}
-		if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, domain.PayoutSent, domain.PayoutPaid, patch, now); err != nil {
+		p, err := u.payouts.GetByID(ctx, payoutID)
+		if err != nil {
+			return nil, err
+		}
+		if err := bookPaid(ctx, u.payouts, u.ledger, u.tx, *p, patch, now, u.log); err != nil {
 			// A reconciler pass may have resolved it first — not a conflict.
 			if errors.Is(err, domain.ErrAlreadyExists) {
 				return u.payouts.GetByID(ctx, payoutID)
@@ -119,6 +132,36 @@ func (u *UseCase) resolveSendError(ctx context.Context, payoutID uuid.UUID, gwEr
 	u.log.Warn("payout send outcome unknown, left sent for reconciliation",
 		"payout_id", payoutID, "err", gwErr.Error())
 	return nil, fmt.Errorf("payout %s dispatched, outcome unknown: %w", payoutID, gwErr)
+}
+
+// bookPaid moves a payout sent→paid AND appends its double-entry ledger lines
+// (the money and the acquirer's fee) in ONE transaction, so a confirmed payout
+// and the record of what it cost can never disagree.
+//
+// Shared by SendPayout's success path and by the reconciler, because a payout
+// can reach `paid` down either route and the cost must be booked exactly once
+// either way. The CAS admits a single winner; the ledger's
+// UNIQUE(payout_id, account, direction, entry_type) is the DB-level second
+// line of defence against a replay booking the fee twice.
+//
+// A nil ledger port degrades to "fee recorded on the payout row only" with a
+// loud warning — never a silent loss of the cost record.
+func bookPaid(ctx context.Context, repo domain.PayoutRepository, ledger domain.PayoutLedgerRepository, tx domain.TxManager, p domain.Payout, patch domain.PayoutStatusPatch, at time.Time, log *slog.Logger) error {
+	entries := domain.PayoutLedgerEntries(p, at)
+	return tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PayoutSent, domain.PayoutPaid, patch, at); err != nil {
+			return err
+		}
+		if ledger == nil {
+			log.Warn("no payout ledger wired: this payout's fee is recorded on the payout row only",
+				"payout_id", p.ID, "fee_minor", p.FeeMinor)
+			return nil
+		}
+		if err := domain.ValidatePayoutLedgerBalance(entries); err != nil {
+			return fmt.Errorf("payout ledger batch for %s: %w", p.ID, err)
+		}
+		return ledger.CreateBatch(ctx, entries)
+	})
 }
 
 // markFailedAndRelease moves a payout sent→failed and releases its claimed

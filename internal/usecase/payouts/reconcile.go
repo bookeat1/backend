@@ -29,9 +29,13 @@ type Reconciler struct {
 	items   domain.PayoutItemRepository
 	gateway domain.PayoutGateway
 	tx      domain.TxManager
-	cfg     ReconcilerConfig
-	log     *slog.Logger
-	now     func() time.Time
+	// ledger books the money and the fee when a stranded payout resolves to
+	// paid, exactly as the synchronous send path does. Optional (nil = row-only
+	// fee record, warned about).
+	ledger domain.PayoutLedgerRepository
+	cfg    ReconcilerConfig
+	log    *slog.Logger
+	now    func() time.Time
 }
 
 // ReconcilerConfig is the worker's scheduling and safety configuration.
@@ -66,7 +70,7 @@ func (c ReconcilerConfig) withDefaults() ReconcilerConfig {
 }
 
 // NewReconciler builds the payout reconciler.
-func NewReconciler(payouts domain.PayoutRepository, items domain.PayoutItemRepository, gateway domain.PayoutGateway, tx domain.TxManager, cfg ReconcilerConfig, log *slog.Logger) *Reconciler {
+func NewReconciler(payouts domain.PayoutRepository, items domain.PayoutItemRepository, ledger domain.PayoutLedgerRepository, gateway domain.PayoutGateway, tx domain.TxManager, cfg ReconcilerConfig, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -75,6 +79,7 @@ func NewReconciler(payouts domain.PayoutRepository, items domain.PayoutItemRepos
 		items:   items,
 		gateway: gateway,
 		tx:      tx,
+		ledger:  ledger,
 		cfg:     cfg.withDefaults(),
 		log:     log,
 		now:     time.Now,
@@ -156,7 +161,11 @@ func (r *Reconciler) resolveOne(ctx context.Context, p *domain.Payout) (bool, er
 			ref := resp.ProviderRef
 			patch.ProviderRef = &ref
 		}
-		if err := r.payouts.CompareAndSwapStatus(ctx, p.ID, domain.PayoutSent, domain.PayoutPaid, patch, now); err != nil {
+		// Same helper as SendPayout's success path: the status change and the
+		// ledger lines (money + acquirer fee) land in one transaction, so a
+		// payout reconciled to paid is as fully booked as one that answered
+		// synchronously.
+		if err := bookPaid(ctx, r.payouts, r.ledger, r.tx, *p, patch, now, r.log); err != nil {
 			if errors.Is(err, domain.ErrAlreadyExists) {
 				return true, nil // another pass/send resolved it — fine
 			}

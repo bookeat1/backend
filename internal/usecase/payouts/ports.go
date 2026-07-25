@@ -44,4 +44,56 @@ type Ports struct {
 	Owed         domain.OwedReader
 	Gateway      domain.PayoutGateway // increment 1: FreedomPay only
 	Tx           domain.TxManager
+	// Ledger books the money and the fee of a CONFIRMED payout. Optional: when
+	// it is nil the fee is still recorded on the payout row, only the
+	// double-entry mirror is skipped (logged loudly, never silently).
+	Ledger domain.PayoutLedgerRepository
+	// Venues resolves each venue's IANA timezone for the venue-local day
+	// boundary. Used only by the daily pass; nil elsewhere.
+	Venues domain.PayoutVenueReader
+}
+
+// Config is the money policy of the payout usecase: what a payout costs and who
+// pays for it. Both come from env (see bootstrap.PayoutsConfig) with the
+// FreedomPay tariff of 14.07.2026 as defaults.
+type Config struct {
+	// FeeBps is the acquirer's payout rate in basis points. 190 = 1.9%.
+	FeeBps int
+	// FeeMinimumMinor is the per-payout floor in minor units. 30000 = 300 ₸.
+	// This floor, not the rate, is what makes small payouts expensive and daily
+	// batching worth doing.
+	FeeMinimumMinor int64
+	// FeeBearer is the WHO-PAYS policy. Defaults to the platform: a venue then
+	// always receives exactly the amount its statement showed.
+	FeeBearer domain.PayoutFeeBearer
+}
+
+const (
+	// defaultPayoutFeeBps is FreedomPay's payout rate for a KZ bank card,
+	// merchant questionnaire of 14.07.2026: 1.9%.
+	defaultPayoutFeeBps = 190
+	// defaultPayoutFeeMinimumMinor is the same tariff's per-payout floor:
+	// 300 ₸ = 30000 tiyn.
+	defaultPayoutFeeMinimumMinor int64 = 30000
+)
+
+// withDefaults fills the FreedomPay tariff and the safe bearer policy.
+//
+// Known limit, stated rather than hidden: a zero-value field means "not
+// configured", so a deployment that genuinely wants a ZERO payout fee cannot
+// express it here — it would get the tariff defaults back. That is the
+// deliberate direction of the safety: forgetting to configure the fee must
+// over-state the cost, never under-state it. A real zero-fee tariff would be
+// modelled as an explicit flag, not as a zero.
+func (c Config) withDefaults() Config {
+	if c.FeeBps <= 0 {
+		c.FeeBps = defaultPayoutFeeBps
+	}
+	if c.FeeMinimumMinor <= 0 {
+		c.FeeMinimumMinor = defaultPayoutFeeMinimumMinor
+	}
+	if !c.FeeBearer.Valid() {
+		c.FeeBearer = domain.PayoutFeeBearerPlatform
+	}
+	return c
 }

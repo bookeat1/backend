@@ -310,15 +310,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// generated (pending) but only SENT once the payout product is enabled and
 	// verified. RBAC (owner/manager for destinations, superadmin for money out)
 	// lives in the usecase.
-	payoutUC := payouts.NewUseCase(payouts.Ports{
-		Perms:        restaurantManagers,
-		Destinations: payoutrepo.NewDestinations(db),
-		Payouts:      payoutrepo.NewPayouts(db),
-		Items:        payoutrepo.NewItems(db),
-		Owed:         payoutrepo.NewOwed(db),
-		Gateway:      newPayoutGateway(log),
-		Tx:           txm,
-	}, log)
+	payoutUC := payouts.NewUseCase(newPayoutPorts(db, restaurantManagers, txm, log), newPayoutsConfig(cfg), log)
 
 	return &Deps{
 		AuthFacade:         authFacade,
@@ -385,6 +377,61 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	}, nil
 }
 
+// newPayoutPorts wires the payout usecase's repositories. Extracted so the HTTP
+// stack (NewDeps) and the worker (NewDailyPayoutRunner) build the SAME set of
+// ports — a scheduled payout and a manual one must not be able to drift apart.
+// perms may be nil for the worker: it never authorizes an Actor.
+func newPayoutPorts(db *pgxpool.Pool, perms permissionCheckerPort, txm domain.TxManager, log *slog.Logger) payouts.Ports {
+	return payouts.Ports{
+		Perms:        perms,
+		Destinations: payoutrepo.NewDestinations(db),
+		Payouts:      payoutrepo.NewPayouts(db),
+		Items:        payoutrepo.NewItems(db),
+		Owed:         payoutrepo.NewOwed(db),
+		Ledger:       payoutrepo.NewLedger(db),
+		Venues:       payoutrepo.NewVenues(db),
+		Gateway:      newPayoutGateway(log),
+		Tx:           txm,
+	}
+}
+
+// permissionCheckerPort mirrors the payouts usecase's unexported RBAC port so
+// newPayoutPorts can accept a nil one without importing an unexported type.
+type permissionCheckerPort interface {
+	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
+}
+
+// newPayoutsConfig maps the env-level payout money policy into the usecase's
+// own Config. The fee bearer is validated here: an unrecognised
+// PAYOUTS_FEE_BEARER falls back to "platform" (the safe policy) rather than
+// silently deducting from venues.
+func newPayoutsConfig(cfg Config) payouts.Config {
+	return payouts.Config{
+		FeeBps:          cfg.Payouts.FeeBps,
+		FeeMinimumMinor: cfg.Payouts.FeeMinimumMinor,
+		FeeBearer:       domain.PayoutFeeBearer(strings.ToLower(strings.TrimSpace(cfg.Payouts.FeeBearer))),
+	}
+}
+
+// NewDailyPayoutRunner wires the scheduled end-of-day payout pass: one payout
+// per venue per VENUE-LOCAL day. Like the reconcilers it lives outside NewDeps
+// (no HTTP stack) and is safe to start unconditionally — with no venue owed
+// money every tick is a single cheap query, and with PAYOUTS_DAILY_SEND_ENABLED
+// unset it only GENERATES pending payouts, moving no money.
+func NewDailyPayoutRunner(cfg Config, db *pgxpool.Pool, log *slog.Logger) *payouts.DailyRunner {
+	ports := newPayoutPorts(db, nil, sqltx.NewManager(db), log)
+	uc := payouts.NewUseCase(ports, newPayoutsConfig(cfg), log)
+	return payouts.NewDailyRunner(uc, ports.Venues, payouts.DailyConfig{
+		TickInterval:   cfg.Payouts.DailyTickInterval,
+		SendEnabled:    cfg.Payouts.DailySendEnabled,
+		MinPayoutMinor: cfg.Payouts.MinPayoutMinor,
+		// The venue's own timezone wins; this is only the fallback for a venue
+		// that has none, and it is the platform's booking fallback so payouts
+		// and bookings agree on what "a day" means for such a venue.
+		TimezoneFallback: cfg.Booking.TimezoneFallback,
+	}, log)
+}
+
 // newPayoutGateway builds the FreedomPay payout adapter, OFF by default. It
 // returns a genuine nil interface (not a typed-nil) unless
 // FREEDOMPAY_PAYOUT_ENABLED=true AND the FreedomPay credentials validate — so
@@ -419,7 +466,8 @@ func newPayoutGateway(log *slog.Logger) domain.PayoutGateway {
 // gateway is disabled (nil): Tick returns immediately.
 func NewPayoutReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) *payouts.Reconciler {
 	return payouts.NewReconciler(
-		payoutrepo.NewPayouts(db), payoutrepo.NewItems(db), newPayoutGateway(log), sqltx.NewManager(db),
+		payoutrepo.NewPayouts(db), payoutrepo.NewItems(db), payoutrepo.NewLedger(db),
+		newPayoutGateway(log), sqltx.NewManager(db),
 		payouts.ReconcilerConfig{
 			TickInterval: cfg.PaymentsReconciler.TickInterval,
 			StuckAfter:   cfg.PaymentsReconciler.StuckAfter,

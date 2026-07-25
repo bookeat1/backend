@@ -20,12 +20,14 @@ type UseCase struct {
 	owed         domain.OwedReader
 	gateway      domain.PayoutGateway
 	tx           domain.TxManager
+	ledger       domain.PayoutLedgerRepository
+	cfg          Config
 	log          *slog.Logger
 	now          func() time.Time
 }
 
 // NewUseCase builds the payout usecase.
-func NewUseCase(p Ports, log *slog.Logger) *UseCase {
+func NewUseCase(p Ports, cfg Config, log *slog.Logger) *UseCase {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -37,6 +39,8 @@ func NewUseCase(p Ports, log *slog.Logger) *UseCase {
 		owed:         p.Owed,
 		gateway:      p.Gateway,
 		tx:           p.Tx,
+		ledger:       p.Ledger,
+		cfg:          cfg.withDefaults(),
 		log:          log,
 		now:          time.Now,
 	}

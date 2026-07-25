@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -43,7 +44,11 @@ func (u *UseCase) GenerateForRestaurant(ctx context.Context, actor Actor, restau
 
 	var created []domain.Payout
 	for _, bal := range balances {
-		p, err := u.createOnePayout(ctx, restaurantID, dest, bal)
+		// nil period: a manual generation settles "everything owed now" and
+		// deliberately consumes no venue-local day, so it can never block the
+		// scheduled end-of-day pass (see uq_payouts_venue_period, which ignores
+		// NULL period_date rows).
+		p, err := u.createOnePayout(ctx, restaurantID, dest, bal, nil)
 		if err != nil {
 			// A concurrent generation claimed these entries first: skip this
 			// currency, it is now owed by that other payout. Not an error.
@@ -85,19 +90,54 @@ func (u *UseCase) GenerateAll(ctx context.Context, actor Actor) ([]domain.Payout
 	return created, nil
 }
 
+// payoutPeriod is the venue-local day a scheduled payout settles. Date is a
+// pure calendar label normalised to UTC midnight (so it never drifts with the
+// server's zone); EndAt is the real instant that local day ended.
+type payoutPeriod struct {
+	Date  time.Time
+	EndAt time.Time
+}
+
 // createOnePayout writes one pending payout and its item claims in ONE
 // transaction. If the item claim loses the race on any entry, the whole tx
 // (payout row included) rolls back.
-func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, dest *domain.PayoutDestination, bal domain.OwedBalance) (*domain.Payout, error) {
+//
+// period is nil for a manual generation and set for a scheduled end-of-day
+// pass; when set, the row carries the venue's local day and the DB refuses a
+// second live payout for it (uq_payouts_venue_period) — the once-per-day
+// guarantee is the index, not this code.
+//
+// The acquirer's payout fee is computed HERE and frozen on the row: the amount
+// actually dispatched depends on who bears it, and a payout that has already
+// been generated must keep the cost and the policy it was generated under even
+// if the tariff or the policy changes tomorrow.
+func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, dest *domain.PayoutDestination, bal domain.OwedBalance, period *payoutPeriod) (*domain.Payout, error) {
 	if bal.AmountMinor <= 0 || len(bal.Entries) == 0 {
 		return nil, fmt.Errorf("%w: non-positive or empty owed balance", domain.ErrValidation)
 	}
+	gross := domain.Money{AmountMinor: bal.AmountMinor, Currency: bal.Currency}
+	fee, err := domain.PayoutFee(gross, u.cfg.FeeBps, u.cfg.FeeMinimumMinor)
+	if err != nil {
+		return nil, fmt.Errorf("compute payout fee: %w", err)
+	}
+	net, err := domain.NetPayoutAmount(gross, fee, u.cfg.FeeBearer)
+	if err != nil {
+		// Only reachable under the venue-bears policy on a payout smaller than
+		// the fee floor. The daily pass's minimum-payout guard normally keeps
+		// such a balance rolling over instead; this is the last line of defence
+		// so a nonsense transfer is never dispatched.
+		return nil, fmt.Errorf("payout net amount for restaurant %s: %w", restaurantID, err)
+	}
+
 	now := u.now()
 	id := uuid.New()
 	p := &domain.Payout{
 		ID:                     id,
 		RestaurantID:           restaurantID,
-		AmountMinor:            bal.AmountMinor,
+		AmountMinor:            net.AmountMinor,
+		GrossAmountMinor:       gross.AmountMinor,
+		FeeMinor:               fee.AmountMinor,
+		FeeBearer:              u.cfg.FeeBearer,
 		Currency:               bal.Currency,
 		Status:                 domain.PayoutPending,
 		Method:                 dest.Method,
@@ -106,6 +146,10 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 		IdempotencyKey:         "payout:" + id.String(),
 		StatusChangedAt:        now,
 		CreatedAt:              now,
+	}
+	if period != nil {
+		date, endAt := period.Date, period.EndAt
+		p.PeriodDate, p.PeriodEndAt = &date, &endAt
 	}
 	items := make([]domain.PayoutItem, 0, len(bal.Entries))
 	for _, e := range bal.Entries {
@@ -119,6 +163,10 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 	}
 
 	if err := u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// Create can now fail on TWO unique constraints, both mapped to
+		// ErrAlreadyExists: the idempotency key, and — for a scheduled payout —
+		// uq_payouts_venue_period, which is the losing tick in a two-worker
+		// race for the same venue-day.
 		if err := u.payouts.Create(ctx, p); err != nil {
 			return err
 		}
@@ -131,6 +179,16 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 	}
 	u.log.Info("payout generated",
 		"payout_id", id, "restaurant_id", restaurantID,
-		"amount_minor", p.AmountMinor, "currency", string(p.Currency), "items", len(items))
+		"amount_minor", p.AmountMinor, "gross_minor", p.GrossAmountMinor,
+		"fee_minor", p.FeeMinor, "fee_bearer", string(p.FeeBearer),
+		"currency", string(p.Currency), "items", len(items), "period", periodLabel(period))
 	return p, nil
+}
+
+// periodLabel renders a period for a log line; "manual" when there is none.
+func periodLabel(period *payoutPeriod) string {
+	if period == nil {
+		return "manual"
+	}
+	return period.Date.Format(time.DateOnly)
 }
