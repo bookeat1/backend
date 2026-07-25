@@ -80,10 +80,30 @@ func (f *fakePayouts) Create(_ context.Context, p *domain.Payout) error {
 		if existing.IdempotencyKey == p.IdempotencyKey {
 			return domain.ErrAlreadyExists
 		}
+		// Mirror of uq_payouts_venue_period (migration 0052): at most ONE
+		// non-failed payout per (restaurant, currency, venue-local day). A
+		// failed payout releases the day, and a NULL period (manual payout)
+		// is unconstrained — NULLs are distinct in a unique index.
+		if existing.Status != domain.PayoutFailed &&
+			existing.RestaurantID == p.RestaurantID &&
+			existing.Currency == p.Currency &&
+			samePeriod(existing.PeriodDate, p.PeriodDate) {
+			return domain.ErrAlreadyExists
+		}
 	}
 	cp := *p
 	f.m[p.ID] = &cp
 	return nil
+}
+
+// samePeriod reports whether two period dates collide in the unique index.
+// Two NULLs never collide — that is SQL's rule and the reason a manual payout
+// never blocks a scheduled one.
+func samePeriod(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Equal(*b)
 }
 
 func (f *fakePayouts) GetByID(_ context.Context, id uuid.UUID) (*domain.Payout, error) {
@@ -231,6 +251,14 @@ func (f *fakeItems) CreateBatch(_ context.Context, items []domain.PayoutItem) er
 	return nil
 }
 
+// isClaimed reports whether a ledger entry is already owned by a live payout.
+func (f *fakeItems) isClaimed(entryID uuid.UUID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.byEntry[entryID]
+	return ok
+}
+
 func (f *fakeItems) DeleteByPayout(_ context.Context, payoutID uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -248,16 +276,110 @@ func (f *fakeItems) ListByPayout(_ context.Context, payoutID uuid.UUID) ([]domai
 	return append([]domain.PayoutItem(nil), f.byPayout[payoutID]...), nil
 }
 
-// fakeOwed returns preconfigured balances.
+// fakeOwed returns preconfigured balances, honouring the payout_items claim
+// table so a second read after a successful generation sees the entries gone —
+// which is what makes the roll-over and idempotency tests meaningful rather
+// than a replay of a static fixture.
 type fakeOwed struct {
 	byRestaurant map[uuid.UUID][]domain.OwedBalance
 	ids          []uuid.UUID
+	// claims, when set, is consulted to drop already-claimed ledger entries.
+	claims *fakeItems
+	// entryTimes, when set, gives each ledger entry a creation instant so the
+	// venue-local day boundary can actually be exercised. An entry with no time
+	// is treated as "long ago" (always in scope).
+	entryTimes map[uuid.UUID]time.Time
+	// upToCalls records the cutoffs the caller asked for, per restaurant.
+	upToCalls map[uuid.UUID][]time.Time
+	mu        sync.Mutex
 }
 
-func (f *fakeOwed) OwedForRestaurant(_ context.Context, restaurantID uuid.UUID) ([]domain.OwedBalance, error) {
-	return f.byRestaurant[restaurantID], nil
+func (f *fakeOwed) OwedForRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.OwedBalance, error) {
+	return f.OwedForRestaurantUpTo(ctx, restaurantID, time.Time{})
 }
+
+func (f *fakeOwed) OwedForRestaurantUpTo(_ context.Context, restaurantID uuid.UUID, before time.Time) ([]domain.OwedBalance, error) {
+	f.mu.Lock()
+	if f.upToCalls == nil {
+		f.upToCalls = map[uuid.UUID][]time.Time{}
+	}
+	f.upToCalls[restaurantID] = append(f.upToCalls[restaurantID], before)
+	f.mu.Unlock()
+
+	var out []domain.OwedBalance
+	for _, bal := range f.byRestaurant[restaurantID] {
+		filtered := domain.OwedBalance{RestaurantID: bal.RestaurantID, Currency: bal.Currency}
+		for _, e := range bal.Entries {
+			if f.claims != nil && f.claims.isClaimed(e.LedgerEntryID) {
+				continue
+			}
+			if !before.IsZero() {
+				if at, ok := f.entryTimes[e.LedgerEntryID]; ok && !at.Before(before) {
+					continue
+				}
+			}
+			filtered.AmountMinor += e.AmountSignedMinor
+			filtered.Entries = append(filtered.Entries, e)
+		}
+		if filtered.AmountMinor > 0 {
+			out = append(out, filtered)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeOwed) OwedRestaurantIDs(_ context.Context) ([]uuid.UUID, error) { return f.ids, nil }
+
+// fakeVenues is an in-memory domain.PayoutVenueReader.
+type fakeVenues struct{ tz map[uuid.UUID]string }
+
+func (f *fakeVenues) TimezonesFor(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	for _, id := range ids {
+		if z, ok := f.tz[id]; ok && z != "" {
+			out[id] = z
+		}
+	}
+	return out, nil
+}
+
+// fakeLedger is an append-only payout ledger enforcing
+// UNIQUE(payout_id, account, direction, entry_type).
+type fakeLedger struct {
+	mu       sync.Mutex
+	byPayout map[uuid.UUID][]domain.PayoutLedgerEntry
+	seen     map[string]struct{}
+}
+
+func newFakeLedger() *fakeLedger {
+	return &fakeLedger{byPayout: map[uuid.UUID][]domain.PayoutLedgerEntry{}, seen: map[string]struct{}{}}
+}
+
+func (f *fakeLedger) CreateBatch(_ context.Context, entries []domain.PayoutLedgerEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		k := e.PayoutID.String() + "|" + string(e.Account) + "|" + string(e.Direction) + "|" + string(e.EntryType)
+		if _, dup := f.seen[k]; dup {
+			return domain.ErrAlreadyExists
+		}
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		f.seen[k] = struct{}{}
+	}
+	for _, e := range entries {
+		f.byPayout[e.PayoutID] = append(f.byPayout[e.PayoutID], e)
+	}
+	return nil
+}
+
+func (f *fakeLedger) ListByPayout(_ context.Context, payoutID uuid.UUID) ([]domain.PayoutLedgerEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.PayoutLedgerEntry(nil), f.byPayout[payoutID]...), nil
+}
 
 // fakeGateway counts payout dispatches and lets a test drive the outcome.
 type fakeGateway struct {
@@ -298,15 +420,24 @@ type harness struct {
 	payouts *fakePayouts
 	items   *fakeItems
 	owed    *fakeOwed
+	venues  *fakeVenues
+	ledger  *fakeLedger
 	gw      *fakeGateway
 }
 
-func newHarness() *harness {
+func newHarness() *harness { return newHarnessWithConfig(Config{}) }
+
+// newHarnessWithConfig builds the usecase over a specific money policy. A zero
+// Config gets the FreedomPay tariff defaults (190 bps / 300 ₸ floor, platform
+// bears), same as production.
+func newHarnessWithConfig(cfg Config) *harness {
 	perms := &fakePerms{allow: true}
 	dest := newFakeDestinations()
 	pays := newFakePayouts()
 	items := newFakeItems()
-	owed := &fakeOwed{byRestaurant: map[uuid.UUID][]domain.OwedBalance{}}
+	owed := &fakeOwed{byRestaurant: map[uuid.UUID][]domain.OwedBalance{}, claims: items}
+	venues := &fakeVenues{tz: map[uuid.UUID]string{}}
+	ledger := newFakeLedger()
 	gw := &fakeGateway{}
 	uc := NewUseCase(Ports{
 		Perms:        perms,
@@ -314,10 +445,22 @@ func newHarness() *harness {
 		Payouts:      pays,
 		Items:        items,
 		Owed:         owed,
+		Venues:       venues,
+		Ledger:       ledger,
 		Gateway:      gw,
 		Tx:           fakeTx{},
-	}, nil)
-	return &harness{uc: uc, perms: perms, dest: dest, payouts: pays, items: items, owed: owed, gw: gw}
+	}, cfg, nil)
+	return &harness{uc: uc, perms: perms, dest: dest, payouts: pays, items: items,
+		owed: owed, venues: venues, ledger: ledger, gw: gw}
+}
+
+// daily builds the scheduled pass over the same fakes, with a frozen clock so a
+// test can place "now" on either side of a venue's local midnight.
+func (h *harness) daily(cfg DailyConfig, now time.Time) *DailyRunner {
+	d := NewDailyRunner(h.uc, h.venues, cfg, nil)
+	d.now = func() time.Time { return now }
+	h.uc.now = func() time.Time { return now }
+	return d
 }
 
 func superadmin() Actor { return Actor{UserID: uuid.New(), Role: domain.RoleAdmin} }

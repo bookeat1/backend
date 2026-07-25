@@ -38,6 +38,11 @@ type Config struct {
 	// tickets whose payment never completed (or was never created).
 	TicketsSweep TicketsSweepConfig
 
+	// Payouts configures the scheduled daily payout pass (one payout per venue
+	// per venue-local day) and the money policy of a payout: the acquirer's
+	// fee, who bears it, and the minimum below which money rolls over.
+	Payouts PayoutsConfig
+
 	// Push configures the web-push notification channel (VAPID keys) and the
 	// notification dispatcher worker. Absent VAPID keys make the channel a
 	// clean no-op — the dispatcher still runs and drains the outbox, it just
@@ -308,6 +313,37 @@ type TicketsSweepConfig struct {
 	BatchSize    int           // env: TICKETS_SWEEP_BATCH_SIZE
 }
 
+// PayoutsConfig configures the scheduled daily payout pass and the money policy
+// of a payout: what moving it costs, who pays that cost, and how little is too
+// little to be worth moving.
+//
+// The fee defaults are FreedomPay's tariff for a payout to a KZ bank card
+// (merchant questionnaire, 14.07.2026): 1.9% with a minimum of 300 ₸ per
+// payout. They are env-configurable because a tariff is a contract term, not a
+// constant — but the DEFAULTS are the real numbers, so a deployment that
+// configures nothing still models the true cost instead of pretending payouts
+// are free.
+type PayoutsConfig struct {
+	// DailyTickInterval is how often the pass checks whether a venue's local
+	// day has ended. NOT the payout cadence — that is one per venue per local
+	// day, enforced by a UNIQUE index (migration 0052).
+	DailyTickInterval time.Duration // env: PAYOUTS_DAILY_TICK_INTERVAL
+	// DailySendEnabled additionally DISPATCHES what the pass generates. Off by
+	// default: generating moves no money, sending does, and sending also
+	// requires FREEDOMPAY_PAYOUT_ENABLED and a verified payout product.
+	DailySendEnabled bool // env: PAYOUTS_DAILY_SEND_ENABLED
+	// MinPayoutMinor is the roll-over threshold: below it a venue's money waits
+	// for the next day instead of paying a 300 ₸ floor on a small amount.
+	MinPayoutMinor int64 // env: PAYOUTS_MIN_AMOUNT_MINOR
+	// FeeBps / FeeMinimumMinor are the acquirer's payout tariff.
+	FeeBps          int   // env: PAYOUTS_FEE_BPS
+	FeeMinimumMinor int64 // env: PAYOUTS_FEE_MIN_MINOR
+	// FeeBearer is WHO absorbs the fee: "platform" (default) or "venue".
+	// OPEN OWNER DECISION — the default is the one that cannot surprise a venue
+	// with a payout smaller than the statement it already read.
+	FeeBearer string // env: PAYOUTS_FEE_BEARER
+}
+
 // PushConfig holds the web-push channel's VAPID keys and the notification
 // dispatcher's scheduling. The VAPID keys come from env only and are never
 // logged (same discipline as acquirer credentials). When the keys are absent
@@ -456,6 +492,17 @@ func NewConfig() (Config, error) {
 			TickInterval: getEnvDuration("TICKETS_SWEEP_TICK_INTERVAL", 5*time.Minute),
 			StaleAfter:   getEnvDuration("TICKETS_SWEEP_STALE_AFTER", 100*time.Hour),
 			BatchSize:    getEnvInt("TICKETS_SWEEP_BATCH_SIZE", 100),
+		},
+		Payouts: PayoutsConfig{
+			DailyTickInterval: getEnvDuration("PAYOUTS_DAILY_TICK_INTERVAL", 15*time.Minute),
+			DailySendEnabled:  getEnvBool("PAYOUTS_DAILY_SEND_ENABLED", false),
+			// 10 000 ₸: the amount at which the 300 ₸ floor is 3% — the worst
+			// case the owner already accepted by choosing daily batching.
+			MinPayoutMinor: getEnvInt64("PAYOUTS_MIN_AMOUNT_MINOR", 1_000_000),
+			// FreedomPay, KZ bank card, questionnaire of 14.07.2026.
+			FeeBps:          getEnvInt("PAYOUTS_FEE_BPS", 190),
+			FeeMinimumMinor: getEnvInt64("PAYOUTS_FEE_MIN_MINOR", 30_000),
+			FeeBearer:       getEnv("PAYOUTS_FEE_BEARER", "platform"),
 		},
 		Push: PushConfig{
 			VAPIDPublicKey:   getEnv("PUSH_VAPID_PUBLIC_KEY", ""),

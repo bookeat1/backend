@@ -3,6 +3,7 @@ package payout
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -35,15 +36,30 @@ const signedExpr = `CASE WHEN le.direction = 'credit' THEN le.amount_minor ELSE 
 // exactly them into a payout in the same logical operation, closing the gap
 // between "what I summed" and "what I claim".
 func (r *Owed) OwedForRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.OwedBalance, error) {
+	// A zero cutoff means "no upper bound" — see OwedForRestaurantUpTo.
+	return r.OwedForRestaurantUpTo(ctx, restaurantID, time.Time{})
+}
+
+// OwedForRestaurantUpTo is OwedForRestaurant bounded by the end of a period:
+// only ledger entries created STRICTLY BEFORE before are considered, which is
+// what makes a scheduled payout mean "the venue's local day that has finished".
+// A zero `before` disables the bound (the manual, unbounded path).
+//
+// There is deliberately no lower bound: an entry left unclaimed by an earlier
+// day (below the payout minimum, or released by a failed payout) is still owed
+// and is picked up here automatically — the roll-over needs no bookkeeping of
+// its own and therefore cannot drift from the ledger.
+func (r *Owed) OwedForRestaurantUpTo(ctx context.Context, restaurantID uuid.UUID, before time.Time) ([]domain.OwedBalance, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT le.id, le.currency, `+signedExpr+` AS signed
 		 FROM payment_ledger_entries le
 		 JOIN payments p ON p.id = le.payment_id
 		 WHERE le.account = 'restaurant'
 		   AND p.restaurant_id = $1
+		   AND ($2::timestamptz IS NULL OR le.created_at < $2::timestamptz)
 		   AND NOT EXISTS (SELECT 1 FROM payout_items pi WHERE pi.ledger_entry_id = le.id)
 		 ORDER BY le.currency, le.created_at, le.id`,
-		restaurantID)
+		restaurantID, nullableTime(before))
 	if err != nil {
 		return nil, fmt.Errorf("read owed for restaurant: %w", err)
 	}

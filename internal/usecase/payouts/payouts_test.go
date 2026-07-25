@@ -348,7 +348,7 @@ func TestReconcile_ResolvesStuckPayoutToPaid(t *testing.T) {
 		return &domain.GatewayPayout{ProviderRef: "prov-1", Status: domain.PayoutPaid}, nil
 	}
 
-	rec := NewReconciler(pays, items, gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute}, nil)
+	rec := NewReconciler(pays, items, newFakeLedger(), gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute}, nil)
 	res, err := rec.Tick(ctx)
 	if err != nil {
 		t.Fatalf("tick: %v", err)
@@ -381,7 +381,7 @@ func TestReconcile_ResolvesStuckPayoutToFailedAndReleases(t *testing.T) {
 	gw.getFn = func(string) (*domain.GatewayPayout, error) {
 		return &domain.GatewayPayout{Status: domain.PayoutFailed, FailureMessage: "insufficient balance"}, nil
 	}
-	rec := NewReconciler(pays, items, gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute}, nil)
+	rec := NewReconciler(pays, items, newFakeLedger(), gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute}, nil)
 	if _, err := rec.Tick(ctx); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestReconcile_UnknownBumpsAndKeepsSent(t *testing.T) {
 	})
 	gw.getFn = func(string) (*domain.GatewayPayout, error) { return nil, domain.ErrProviderOutcomeUnknown }
 
-	rec := NewReconciler(pays, items, gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute, MaxAttempts: 3}, nil)
+	rec := NewReconciler(pays, items, newFakeLedger(), gw, fakeTx{}, ReconcilerConfig{StuckAfter: time.Minute, MaxAttempts: 3}, nil)
 	res, err := rec.Tick(ctx)
 	if err != nil {
 		t.Fatalf("tick: %v", err)
