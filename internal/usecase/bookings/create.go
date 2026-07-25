@@ -204,6 +204,11 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	}
 
 	slotFrom, slotTo := occupancyWindow(startsAt, policy)
+	// Set only by the booking_tables insert below, so the slot_taken label
+	// describes the statement that actually raised the conflict rather than
+	// "some ErrAlreadyExists escaped the transaction". WithinTx runs the
+	// closure exactly once (no retry), so a plain flag is enough.
+	var slotConflict bool
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.bookings.Create(ctx, b); err != nil {
 			return err
@@ -217,6 +222,9 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 				})
 			}
 			if err := u.links.Create(ctx, links); err != nil {
+				// The GiST exclusion constraint on booking_tables: somebody
+				// else committed this table/slot first.
+				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
 				return err
 			}
 		}
@@ -244,8 +252,14 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			domain.ActorSystem, nil, strPtr("auto-confirm"), now)
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrAlreadyExists) {
-			return nil, fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists)
+		if slotConflict {
+			// A lost capacity race, NOT a duplicate submit: nothing was
+			// booked. The code is what lets the app say "pick another time"
+			// instead of "check your reservations". Any OTHER duplicate inside
+			// the transaction keeps the generic already_exists code — it is a
+			// bug on our side, not a slot the guest can pick around.
+			return nil, domain.WithCode(domain.CodeSlotTaken,
+				fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists))
 		}
 		return nil, err
 	}
@@ -394,8 +408,9 @@ func (u *createUseCase) selectTables(
 	}
 	picked := pickTables(freeTables(sched.tables, busy, from, to), in.Guests)
 	if len(picked) == 0 {
-		return nil, fmt.Errorf("%w: no table available for %d guests at this time",
-			domain.ErrAlreadyExists, in.Guests)
+		return nil, domain.WithCode(domain.CodeNoTableAvailable,
+			fmt.Errorf("%w: no table available for %d guests at this time",
+				domain.ErrAlreadyExists, in.Guests))
 	}
 	return picked, nil
 }
