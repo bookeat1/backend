@@ -92,12 +92,15 @@ func (u *purchaseUseCase) Purchase(ctx context.Context, actor Actor, in Purchase
 	if strings.TrimSpace(in.IdempotencyKey) == "" {
 		return nil, fmt.Errorf("%w: idempotency key required", domain.ErrValidation)
 	}
-	// An anonymous buyer MUST supply a phone: it is the contact for the ticket
-	// and the ONLY ownership proof an idempotency replay can check (an account
-	// buyer is proven by their user id instead). Without it a replay could not
-	// be safely scoped to its buyer.
-	if actor.UserID == nil && strings.TrimSpace(in.GuestPhone) == "" {
-		return nil, fmt.Errorf("%w: a guest phone is required to buy a ticket without an account", domain.ErrValidation)
+	// Owner decision (2026-07-25): a ticket is sold to an ACCOUNT, never to an
+	// anonymous caller. A ticket is money plus a seat plus a contact, and the
+	// only durable proof of who owns one is a verified account — a phone typed
+	// into a checkout form is not, which is exactly how a stranger holding a
+	// ticket id could once reach somebody else's purchase. Requiring the account
+	// here rather than only at the route keeps the rule true for every caller of
+	// this usecase.
+	if actor.UserID == nil {
+		return nil, fmt.Errorf("%w: buying a ticket requires a signed-in account", domain.ErrUnauthorized)
 	}
 
 	event, err := u.events.GetByID(ctx, in.EventID)

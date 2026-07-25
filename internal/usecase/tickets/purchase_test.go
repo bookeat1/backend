@@ -27,13 +27,18 @@ func (f *fakePaymentReader) GetByID(_ context.Context, id uuid.UUID) (*domain.Pa
 	return &domain.Payment{ID: id, Purpose: domain.PurposeTicket, Status: domain.PaymentCreated}, nil
 }
 
+// signedIn is the buyer identity every purchase now needs: a ticket is sold to
+// an ACCOUNT, never to an anonymous caller (owner decision 2026-07-25).
+func signedIn(id uuid.UUID) Actor { return Actor{UserID: &id, Role: domain.RoleUser} }
+
 // TestPurchaseHappyPath: a valid purchase reserves the seats (pending ticket),
 // creates the payment for quantity × price, and links it.
 func TestPurchaseHappyPath(t *testing.T) {
 	event := ticketedEvent(ptr(10), 35000)
 	uc, repo, pay := newPurchaseHarness(t, event)
+	buyer := uuid.New()
 
-	res, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	res, err := uc.Purchase(context.Background(), signedIn(buyer), PurchaseInput{
 		EventID: event.ID, Quantity: 2, GuestPhone: "+7700", IdempotencyKey: "k1", CallbackURL: "https://cb",
 	})
 	if err != nil {
@@ -61,13 +66,13 @@ func TestPurchaseCapacityEnforced(t *testing.T) {
 	event := ticketedEvent(ptr(3), 35000)
 	uc, _, _ := newPurchaseHarness(t, event)
 
-	if _, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	if _, err := uc.Purchase(context.Background(), signedIn(uuid.New()), PurchaseInput{
 		EventID: event.ID, Quantity: 2, GuestPhone: "+7700", IdempotencyKey: "a", CallbackURL: "https://cb",
 	}); err != nil {
 		t.Fatalf("first purchase: %v", err)
 	}
 	// 2 sold, capacity 3 → asking for 2 more must be rejected (only 1 remains).
-	_, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	_, err := uc.Purchase(context.Background(), signedIn(uuid.New()), PurchaseInput{
 		EventID: event.ID, Quantity: 2, GuestPhone: "+7700", IdempotencyKey: "b", CallbackURL: "https://cb",
 	})
 	if !errors.Is(err, domain.ErrAlreadyExists) {
@@ -82,7 +87,7 @@ func TestPurchasePaymentFailureReleasesCapacity(t *testing.T) {
 	uc, repo, pay := newPurchaseHarness(t, event)
 	pay.createErr = errors.New("acquirer down")
 
-	_, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	_, err := uc.Purchase(context.Background(), signedIn(uuid.New()), PurchaseInput{
 		EventID: event.ID, Quantity: 2, GuestPhone: "+7700", IdempotencyKey: "k", CallbackURL: "https://cb",
 	})
 	if err == nil {
@@ -99,14 +104,15 @@ func TestPurchasePaymentFailureReleasesCapacity(t *testing.T) {
 func TestPurchaseIdempotentReplay(t *testing.T) {
 	event := ticketedEvent(ptr(10), 35000)
 	uc, _, pay := newPurchaseHarness(t, event)
+	buyer := uuid.New()
 
-	r1, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	r1, err := uc.Purchase(context.Background(), signedIn(buyer), PurchaseInput{
 		EventID: event.ID, Quantity: 1, GuestPhone: "+7700", IdempotencyKey: "same", CallbackURL: "https://cb",
 	})
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	r2, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	r2, err := uc.Purchase(context.Background(), signedIn(buyer), PurchaseInput{
 		EventID: event.ID, Quantity: 1, GuestPhone: "+7700", IdempotencyKey: "same", CallbackURL: "https://cb",
 	})
 	if err != nil {
@@ -127,15 +133,16 @@ func TestPurchaseIdempotentReplay(t *testing.T) {
 func TestReplayRepairsMissingPayment(t *testing.T) {
 	event := ticketedEvent(ptr(10), 35000)
 	uc, repo, pay := newPurchaseHarness(t, event)
+	buyer := uuid.New()
 	// A pending ticket that never got a payment linked.
 	tk := &domain.EventTicket{
 		ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
 		UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
-		Status: domain.TicketPending, PurchaseIdempotencyKey: "k", GuestPhone: "+7700",
+		Status: domain.TicketPending, UserID: &buyer, PurchaseIdempotencyKey: "k", GuestPhone: "+7700",
 	}
 	repo.byID[tk.ID] = tk
 
-	res, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	res, err := uc.Purchase(context.Background(), signedIn(buyer), PurchaseInput{
 		EventID: event.ID, Quantity: 1, GuestPhone: "+7700", IdempotencyKey: "k", CallbackURL: "https://cb",
 	})
 	if err != nil {
@@ -175,8 +182,10 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 		}
 	})
 
-	// Anonymous buyer: a different phone is rejected; the same phone replays.
-	t.Run("anonymous buyer", func(t *testing.T) {
+	// A legacy ticket sold before accounts were required still cannot be reached
+	// by a typed-in phone: the anonymous path is gone entirely, so the caller is
+	// refused before ownership is even considered.
+	t.Run("anonymous caller is refused outright", func(t *testing.T) {
 		uc, repo, _ := newPurchaseHarness(t, event)
 		tk := &domain.EventTicket{
 			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
@@ -184,14 +193,28 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 			Status: domain.TicketPaid, PurchaseIdempotencyKey: "1", GuestPhone: "+7700111", GuestName: "Alice",
 		}
 		repo.byID[tk.ID] = tk
-		if _, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
-			EventID: event.ID, Quantity: 1, GuestPhone: "+7999999", IdempotencyKey: "1", CallbackURL: "https://cb",
-		}); !errors.Is(err, domain.ErrForbidden) {
-			t.Fatalf("foreign phone err = %v, want ErrForbidden", err)
+		// Knowing the buyer's own phone buys nothing any more.
+		for _, phone := range []string{"+7999999", "+7700111"} {
+			if _, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+				EventID: event.ID, Quantity: 1, GuestPhone: phone, IdempotencyKey: "1", CallbackURL: "https://cb",
+			}); !errors.Is(err, domain.ErrUnauthorized) {
+				t.Fatalf("anonymous purchase with phone %s: err = %v, want ErrUnauthorized", phone, err)
+			}
 		}
-		// Same phone → legitimate replay of the owner's own ticket.
-		res, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
-			EventID: event.ID, Quantity: 1, GuestPhone: "+7700111", IdempotencyKey: "1", CallbackURL: "https://cb",
+	})
+
+	// An account buyer replaying their OWN key still gets their own ticket back.
+	t.Run("owner replay", func(t *testing.T) {
+		uc, repo, _ := newPurchaseHarness(t, event)
+		owner := uuid.New()
+		tk := &domain.EventTicket{
+			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
+			Status: domain.TicketPaid, UserID: &owner, PurchaseIdempotencyKey: "1", GuestName: "Alice",
+		}
+		repo.byID[tk.ID] = tk
+		res, err := uc.Purchase(context.Background(), signedIn(owner), PurchaseInput{
+			EventID: event.ID, Quantity: 1, IdempotencyKey: "1", CallbackURL: "https://cb",
 		})
 		if err != nil {
 			t.Fatalf("owner replay: %v", err)
@@ -238,7 +261,9 @@ func TestReserveRaceRejectsForeignBuyer(t *testing.T) {
 		}
 	})
 
-	t.Run("anonymous victim not leaked", func(t *testing.T) {
+	// The same race, driven by an anonymous caller against a legacy account-less
+	// ticket: refused before any of the victim's data is touched.
+	t.Run("anonymous caller cannot race a legacy ticket", func(t *testing.T) {
 		event := ticketedEvent(ptr(10), 35000)
 		uc, repo, pay := newPurchaseHarness(t, event)
 		vTicket := &domain.EventTicket{
@@ -253,8 +278,8 @@ func TestReserveRaceRejectsForeignBuyer(t *testing.T) {
 		_, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
 			EventID: event.ID, Quantity: 1, GuestPhone: "+7999attacker", IdempotencyKey: "1", CallbackURL: "https://cb",
 		})
-		if !errors.Is(err, domain.ErrForbidden) {
-			t.Fatalf("reserve-race foreign phone err = %v, want ErrForbidden", err)
+		if !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("anonymous reserve-race err = %v, want ErrUnauthorized", err)
 		}
 		if repo.byID[vTicket.ID].Status != domain.TicketPending || pay.createN != 0 {
 			t.Fatalf("victim leaked/cancelled: status=%s createN=%d", repo.byID[vTicket.ID].Status, pay.createN)
@@ -272,7 +297,7 @@ func TestPurchaseRejectsNonTicketedAndUnpublished(t *testing.T) {
 	for name, ev := range cases {
 		t.Run(name, func(t *testing.T) {
 			uc, _, _ := newPurchaseHarness(t, ev)
-			_, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+			_, err := uc.Purchase(context.Background(), signedIn(uuid.New()), PurchaseInput{
 				EventID: ev.ID, Quantity: 1, GuestPhone: "+7700", IdempotencyKey: "k", CallbackURL: "https://cb",
 			})
 			if !errors.Is(err, domain.ErrValidation) {

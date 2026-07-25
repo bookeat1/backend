@@ -299,7 +299,7 @@ func TestRefundPolicySnapshotFrozenAtPurchase(t *testing.T) {
 	repo := newFakeTicketRepo()
 	uc := NewPurchaseUseCase(repo, newFakeEvents(event), &fakeTicketPayments{}, &fakePaymentReader{}, fakeTx{})
 
-	res, err := uc.Purchase(context.Background(), Actor{}, PurchaseInput{
+	res, err := uc.Purchase(context.Background(), signedIn(uuid.New()), PurchaseInput{
 		EventID: event.ID, Quantity: 1, GuestPhone: "+77010000000", IdempotencyKey: "p1",
 	})
 	if err != nil {

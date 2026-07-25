@@ -13,17 +13,20 @@
 -- DEFAULT and a CHECK. Each step stays trivially reversible and no in-flight
 -- write is rejected between the two.
 --
--- The backfilled default is TODAY'S behaviour, not a new right: until now
--- usecase/tickets had no policy at all and a guest could not self-refund. So
--- `false` grants nobody anything they did not have, and a venue opts in
--- explicitly. The cutoff default (1440 = 24h before the event) only starts to
--- matter once a venue turns refunds on.
+-- Owner decision (2026-07-25): the platform default is REFUNDABLE up to 24
+-- hours before the event. A guest buying a ticket expects at least that much,
+-- and a venue that wants a stricter rule sets it explicitly on its own event.
+-- The backfill therefore opens refunds on existing events too. This is safe in
+-- the only sense that matters — no money can leave for a purchase that was
+-- never charged — because ticket sales run on the payments contour, which has
+-- not been enabled in production (PAYMENTS_ENABLED=false); if that ever stops
+-- being true, revisit this backfill before running it.
 ALTER TABLE events
     ADD COLUMN tickets_refundable           boolean,
     ADD COLUMN ticket_refund_cutoff_minutes integer;
 
 UPDATE events
-SET tickets_refundable = false
+SET tickets_refundable = true
 WHERE tickets_refundable IS NULL;
 
 UPDATE events
@@ -39,8 +42,8 @@ ALTER TABLE event_tickets
     ADD COLUMN refund_policy_refundable     boolean,
     ADD COLUMN refund_policy_cutoff_minutes integer;
 
--- Existing tickets predate the feature: they were sold under "no self-refund",
--- which is exactly what the event backfill above says, so copy it across.
+-- Existing tickets take the same rules their event just got, so a ticket and
+-- its event never disagree about what the buyer was promised.
 UPDATE event_tickets t
 SET refund_policy_refundable     = e.tickets_refundable,
     refund_policy_cutoff_minutes = e.ticket_refund_cutoff_minutes
