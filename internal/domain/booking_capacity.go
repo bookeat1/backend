@@ -82,6 +82,58 @@ func (u CapacityUsage) Free() int {
 	return u.SeatsLimit - u.SeatsTaken
 }
 
+// FreeUnder is Free capped by the venue's CURRENT declared capacity, and it is
+// what availability must use.
+//
+// The bucket's own seats_limit is a snapshot of the limit that applied when it
+// was last incremented, and two situations make it disagree with the venue:
+//
+//   - a deliberate overbooking (migration 0056) raises the bucket's limit to
+//     exactly the seats it needed. Right after it, taken >= limit, so the answer
+//     is 0 either way — but once that booking is CANCELLED the raised limit
+//     lingers on the row (the release path deliberately never lowers a limit,
+//     see 0054), and reading it alone would advertise seats the venue does not
+//     have;
+//   - a venue that lowered its declared capacity has buckets still stamped with
+//     the old, larger number.
+//
+// In both the truthful answer is bounded by what the venue says it can seat
+// today. The result is never negative: "how many more guests fit" is a quantity
+// that can still be sold, and an oversold room sells nothing — the size of the
+// overshoot is answered by the audit trail, not by an availability calendar.
+func (u CapacityUsage) FreeUnder(declaredSeats int) int {
+	limit := u.SeatsLimit
+	if declaredSeats < limit {
+		limit = declaredSeats
+	}
+	if u.SeatsTaken >= limit {
+		return 0
+	}
+	return limit - u.SeatsTaken
+}
+
+// BookingCapacityOverride is one deliberate overbooking: staff seated a party
+// the venue's declared capacity did not fit ("we'll bring a chair"). It is
+// written once, in the same transaction as the booking and its holds, and never
+// updated or deleted — migration 0056 enforces that in the database.
+//
+// SeatsOver / PeakBucketStart / PeakSeatsTaken describe the WORST of the
+// booking's buckets: a visit spans about ten of them and each may be over by a
+// different amount, so a single number would have to be either a lie or a list.
+type BookingCapacityOverride struct {
+	ID              uuid.UUID
+	BookingID       uuid.UUID
+	RestaurantID    uuid.UUID
+	ActorUserID     uuid.UUID
+	ActorType       ActorType
+	Guests          int
+	DeclaredSeats   int
+	SeatsOver       int
+	PeakBucketStart time.Time
+	PeakSeatsTaken  int
+	CreatedAt       time.Time
+}
+
 // BookingCapacityRepository persists capacity holds. Every write goes through
 // the DB trigger that maintains restaurant_capacity_buckets, so an overbooking
 // surfaces here as ErrAlreadyExists — the same shape a lost race for a table
@@ -110,4 +162,15 @@ type BookingCapacityRepository interface {
 	// venue has nothing sold in the future. Used to refuse a capacity change
 	// that would strand bookings the venue has already accepted.
 	PeakTaken(ctx context.Context, restaurantID uuid.UUID, from time.Time) (*CapacityUsage, error)
+
+	// RecordOverride appends the audit row of one deliberate overbooking. Call
+	// inside the same transaction as the booking: an override that is not
+	// recorded must not exist. Returns ErrAlreadyExists if the booking already
+	// has one — the row is unique per booking, which is what makes the write
+	// exactly-once under a retry.
+	RecordOverride(ctx context.Context, o BookingCapacityOverride) error
+	// ListOverrides returns a venue's overbookings whose overloaded bucket lies
+	// in [from, to), newest first. This is the "who put 12 people in a 10-seat
+	// room last Saturday" query.
+	ListOverrides(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]BookingCapacityOverride, error)
 }

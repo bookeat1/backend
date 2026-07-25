@@ -175,7 +175,8 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	bookingHandler := bookingsrest.NewHandler(deps.BookingsFacade, deps.BookingCreate,
 		deps.BookingIdempotent, deps.BookingStatus, deps.BookingUpdate,
-		deps.BookingAvail, deps.BookingBlacklist, deps.BookingPolicy, deps.BookingExternal)
+		deps.BookingAvail, deps.BookingBlacklist, deps.BookingPolicy, deps.BookingExternal,
+		deps.BookingOverrides)
 	// The availability calendar is public — the storefront needs it before login.
 	bookingHandler.RegisterPublic(api)
 	// Booking-scoped routes carry a booking id, not a restaurant id, so

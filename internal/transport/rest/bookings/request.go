@@ -31,6 +31,10 @@ type createBookingRequest struct {
 	Items        []bookingItemRequest `json:"items"`
 	TableIDs     []string             `json:"table_ids"`
 	Force        bool                 `json:"force"`
+	// Overbook: seat this party even though a table-less venue's declared
+	// capacity does not fit it. Staff-only and blanked on the guest route, like
+	// Force — see createMine.
+	Overbook bool `json:"overbook"`
 }
 
 type bookingItemRequest struct {
@@ -45,7 +49,7 @@ type bookingItemRequest struct {
 func (r createBookingRequest) toInput() (uc.CreateInput, error) {
 	in := uc.CreateInput{
 		Name: r.Name, Phone: r.Phone, Email: r.Email, Guests: r.Guests,
-		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force,
+		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force, Overbook: r.Overbook,
 		Source: domain.SourceApp,
 	}
 	var err error

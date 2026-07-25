@@ -129,6 +129,59 @@ func (r *Capacity) PeakTaken(ctx context.Context, restaurantID uuid.UUID, from t
 	return &u, nil
 }
 
+const capacityOverrideCols = `id, booking_id, restaurant_id, actor_user_id, actor_type, guests,
+	declared_seats, seats_over, peak_bucket_start, peak_seats_taken, created_at`
+
+// RecordOverride appends one deliberate-overbooking audit row (migration 0056).
+//
+// No ON CONFLICT clause on purpose: the UNIQUE(booking_id) is the exactly-once
+// guarantee, and swallowing the conflict here would turn "this booking was
+// already recorded as an override" into silence. The caller gets
+// ErrAlreadyExists and decides.
+func (r *Capacity) RecordOverride(ctx context.Context, o domain.BookingCapacityOverride) error {
+	if o.ID == uuid.Nil {
+		o.ID = uuid.New()
+	}
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now()
+	}
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`INSERT INTO booking_capacity_overrides (`+capacityOverrideCols+`)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		o.ID, o.BookingID, o.RestaurantID, o.ActorUserID, string(o.ActorType), o.Guests,
+		o.DeclaredSeats, o.SeatsOver, o.PeakBucketStart, o.PeakSeatsTaken, o.CreatedAt); err != nil {
+		return mapCapacityWrite(err, "record capacity override")
+	}
+	return nil
+}
+
+func (r *Capacity) ListOverrides(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.BookingCapacityOverride, error) {
+	// Filtered on the OVERLOADED bucket, not on created_at: the venue owner asks
+	// about the evening that was oversold, not about the afternoon the booking
+	// was entered. Half-open [from, to) like every other occupancy query here.
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+capacityOverrideCols+` FROM booking_capacity_overrides
+		 WHERE restaurant_id=$1 AND peak_bucket_start >= $2 AND peak_bucket_start < $3
+		 ORDER BY peak_bucket_start DESC, created_at DESC`, restaurantID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("list capacity overrides: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.BookingCapacityOverride
+	for rows.Next() {
+		var o domain.BookingCapacityOverride
+		var actorType string
+		if err := rows.Scan(&o.ID, &o.BookingID, &o.RestaurantID, &o.ActorUserID, &actorType,
+			&o.Guests, &o.DeclaredSeats, &o.SeatsOver, &o.PeakBucketStart, &o.PeakSeatsTaken,
+			&o.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list capacity overrides: %w", err)
+		}
+		o.ActorType = domain.ActorType(actorType)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 // insertHolds builds one multi-row INSERT, rows sorted by bucket_start.
 //
 // The sort is not cosmetic: the AFTER ROW trigger fires in insertion order and

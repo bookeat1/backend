@@ -375,9 +375,16 @@ func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
 // a unit test can cover the branch without a database. The real guarantee is
 // the DB CHECK; see capacity_integration_test.go for the test that proves it.
 type fakeCapacity struct {
-	holds  map[uuid.UUID][]domain.BookingCapacityHold // by booking
-	err    error
-	locked []uuid.UUID // venues whose capacity lock was taken, in order
+	holds map[uuid.UUID][]domain.BookingCapacityHold // by booking
+	// limits mirrors restaurant_capacity_buckets.seats_limit: re-stamped by
+	// every accepted claim and never lowered by a release, exactly as
+	// apply_capacity_delta does. Without it the fake cannot show the one thing
+	// the override mechanism turns on — that a raised limit is NOT inherited by
+	// the next booking.
+	limits    map[time.Time]int
+	overrides []domain.BookingCapacityOverride
+	err       error
+	locked    []uuid.UUID // venues whose capacity lock was taken, in order
 }
 
 // LockVenue records that the lock was taken. The fake cannot reproduce the real
@@ -392,7 +399,10 @@ func (f *fakeCapacity) LockVenue(_ context.Context, restaurantID uuid.UUID) erro
 }
 
 func newFakeCapacity() *fakeCapacity {
-	return &fakeCapacity{holds: map[uuid.UUID][]domain.BookingCapacityHold{}}
+	return &fakeCapacity{
+		holds:  map[uuid.UUID][]domain.BookingCapacityHold{},
+		limits: map[time.Time]int{},
+	}
 }
 
 func (f *fakeCapacity) taken(exclude uuid.UUID) map[time.Time]int {
@@ -426,8 +436,37 @@ func (f *fakeCapacity) Create(_ context.Context, holds []domain.BookingCapacityH
 	for _, h := range holds {
 		h.Active = true
 		f.holds[h.BookingID] = append(f.holds[h.BookingID], h)
+		f.limits[h.BucketStart.UTC()] = h.SeatsLimit
 	}
 	return nil
+}
+
+// RecordOverride is append-only and unique per booking, like the table.
+func (f *fakeCapacity) RecordOverride(_ context.Context, o domain.BookingCapacityOverride) error {
+	if f.err != nil {
+		return f.err
+	}
+	for _, existing := range f.overrides {
+		if existing.BookingID == o.BookingID {
+			return fmt.Errorf("%w: capacity override", domain.ErrAlreadyExists)
+		}
+	}
+	f.overrides = append(f.overrides, o)
+	return nil
+}
+
+func (f *fakeCapacity) ListOverrides(_ context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.BookingCapacityOverride, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []domain.BookingCapacityOverride
+	for _, o := range f.overrides {
+		if o.RestaurantID == restaurantID &&
+			!o.PeakBucketStart.Before(from) && o.PeakBucketStart.Before(to) {
+			out = append(out, o)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeCapacity) ReplaceForBooking(ctx context.Context, bookingID uuid.UUID, holds []domain.BookingCapacityHold) error {
@@ -451,20 +490,12 @@ func (f *fakeCapacity) ListUsage(_ context.Context, _ uuid.UUID, from, to time.T
 	if f.err != nil {
 		return nil, f.err
 	}
-	limits := map[time.Time]int{}
-	for _, hs := range f.holds {
-		for _, h := range hs {
-			if h.Active {
-				limits[h.BucketStart.UTC()] = h.SeatsLimit
-			}
-		}
-	}
 	var out []domain.CapacityUsage
 	for bucket, seats := range f.taken(uuid.Nil) {
 		if bucket.Before(from) || !bucket.Before(to) {
 			continue
 		}
-		out = append(out, domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats, SeatsLimit: limits[bucket]})
+		out = append(out, domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats, SeatsLimit: f.limits[bucket]})
 	}
 	return out, nil
 }

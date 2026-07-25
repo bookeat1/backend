@@ -102,8 +102,12 @@ type Deps struct {
 	AdminPanel         *admin.UseCase
 	Dashboard          *dashboard.UseCase
 	BookingExternal    bookings.ExternalReservationUseCase
-	Preorder           *preorder.UseCase
-	Issuer             *token.RSAIssuer
+	// BookingOverrides is the read side of the deliberate-overbooking audit
+	// (migration 0056): the venue cabinet's answer to "who seated a party we
+	// could not fit, and when".
+	BookingOverrides bookings.CapacityOverrideUseCase
+	Preorder         *preorder.UseCase
+	Issuer           *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
 	// access (the reconciler in cmd/worker, ad-hoc tooling).
@@ -346,6 +350,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		Dashboard:  dashboardUC,
 		BookingExternal: bookings.NewExternalReservationUseCase(bookingExternal, restRepo,
 			restRelated, restaurantManagers, txm),
+		BookingOverrides: bookings.NewCapacityOverrideUseCase(bookingCapacity, restaurantManagers),
 		// Pre-order (roadmap #1): the guest attaches menu items to a booking to be
 		// prepared and PAID FOR upfront. Reuses booking_items for the lines; the
 		// total it computes server-side (never a client amount) is what

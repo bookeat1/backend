@@ -75,6 +75,10 @@ func buildCapacityHolds(b *domain.Booking, policy domain.BookingPolicy, now time
 //
 // A bucket absent from `usage` has nothing sold in it and therefore offers the
 // full declared capacity.
+// A bucket's own seats_limit is capped by the venue's current declared capacity
+// (CapacityUsage.FreeUnder): a bucket may carry a LARGER limit than the venue —
+// after a deliberate overbooking, or after the venue shrank — and neither means
+// there are seats to sell.
 func freeSeats(usage map[time.Time]domain.CapacityUsage, from, to time.Time, seatsLimit int) int {
 	free := seatsLimit
 	for _, bucket := range capacityBuckets(from, to) {
@@ -82,7 +86,7 @@ func freeSeats(usage map[time.Time]domain.CapacityUsage, from, to time.Time, sea
 		if !ok {
 			continue
 		}
-		if f := u.Free(); f < free {
+		if f := u.FreeUnder(seatsLimit); f < free {
 			free = f
 		}
 	}
@@ -161,6 +165,69 @@ type capacityReader interface {
 // for the transaction, so venues never queue behind each other.
 type venueLocker interface {
 	LockVenue(ctx context.Context, restaurantID uuid.UUID) error
+}
+
+// planCapacityOverride turns an ordinary set of holds into an OVERRIDING set:
+// staff have decided to seat this party even though the declared capacity does
+// not fit it (owner decision, 25.07.2026 — "we'll bring a chair").
+//
+// THE MECHANISM, and why it is this one. The holds are not exempted from
+// anything; the seats they take are counted in restaurant_capacity_buckets like
+// everybody else's, and chk_capacity_bucket_within_limit still decides. What
+// changes is the limit each OVERFLOWING bucket is stamped with: exactly
+// `already taken + this party`, i.e. precisely enough for this booking and not
+// one seat more. Three properties follow, and all three are the point:
+//
+//   - the overbooking is VISIBLE in the ledger. The next booking is not sold the
+//     same seats, because the bucket now reports zero room;
+//   - the raise cannot be inherited. apply_capacity_delta re-stamps seats_limit
+//     from the hold doing the increment, and an ordinary booking's holds carry
+//     the plain declared capacity — so the very next non-overridden booking
+//     trips the CHECK, whether or not the override was cancelled meanwhile;
+//   - buckets the party fits into normally are left at the declared capacity, so
+//     an "override" that turns out not to be needed changes nothing at all.
+//
+// Correctness rests on the caller holding the venue lock (LockVenue) before
+// reading `usage`: this computes a limit from a value it has just read, which is
+// exactly the read-then-write the rest of this package refuses to do without the
+// lock. Every writer of these buckets takes the same lock.
+//
+// Returns the audit record, or nil when the booking fit after all — a party that
+// fits is not an overbooking, and an audit trail that also records non-events is
+// one nobody trusts. `holds` is modified in place.
+func planCapacityOverride(
+	b *domain.Booking,
+	holds []domain.BookingCapacityHold,
+	usage map[time.Time]domain.CapacityUsage,
+	policy domain.BookingPolicy,
+	acc access,
+	actor Actor,
+	now time.Time,
+) *domain.BookingCapacityOverride {
+	var worst *domain.BookingCapacityOverride
+	for i := range holds {
+		taken := 0
+		if u, ok := usage[holds[i].BucketStart.UTC()]; ok {
+			taken = u.SeatsTaken
+		}
+		total := taken + holds[i].Seats
+		if total <= policy.CapacitySeats {
+			continue
+		}
+		holds[i].SeatsLimit = total
+		over := total - policy.CapacitySeats
+		if worst != nil && over <= worst.SeatsOver {
+			continue
+		}
+		worst = &domain.BookingCapacityOverride{
+			ID: uuid.New(), BookingID: b.ID, RestaurantID: b.RestaurantID,
+			ActorUserID: actor.UserID, ActorType: acc.actorType(),
+			Guests: b.Guests, DeclaredSeats: policy.CapacitySeats,
+			SeatsOver: over, PeakBucketStart: holds[i].BucketStart.UTC(),
+			PeakSeatsTaken: total, CreatedAt: now,
+		}
+	}
+	return worst
 }
 
 // checkCapacityGuests rejects a party the venue cannot seat at all before any

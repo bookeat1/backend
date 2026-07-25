@@ -15,6 +15,11 @@ const (
 	EventBookingStatusChanged = "booking.status_changed"
 	EventBookingCancelled     = "booking.cancelled"
 	EventBookingNoShow        = "booking.no_show"
+	// Staff deliberately seated a party beyond a table-less venue's declared
+	// capacity (migration 0056). The durable record is the
+	// booking_capacity_overrides row; this line exists so the event is alertable
+	// without polling the table.
+	EventBookingOverbooked = "booking.overbooked"
 
 	// Anti-fraud, currently only the booking-creation rate limit (spec §4.4).
 	EventAntifraudRejected = "antifraud.rejected"

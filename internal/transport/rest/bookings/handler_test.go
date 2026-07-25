@@ -29,6 +29,7 @@ type deps struct {
 	blacklist  *fakeBlacklist
 	policy     *fakePolicy
 	external   *fakeExternal
+	overrides  *fakeCapacityOverrides
 	role       domain.Role
 	manages    bool
 }
@@ -40,7 +41,8 @@ func newDeps() *deps {
 		idempotent: uc.NewIdempotentCreateUseCase(create, newFakeKeys(), fakeTx{}),
 		status:     &fakeStatus{}, update: &fakeUpdate{}, avail: &fakeAvail{},
 		blacklist: &fakeBlacklist{}, policy: &fakePolicy{}, external: &fakeExternal{},
-		role: domain.RoleUser, manages: false,
+		overrides: &fakeCapacityOverrides{},
+		role:      domain.RoleUser, manages: false,
 	}
 }
 
@@ -50,7 +52,7 @@ func newDeps() *deps {
 func newRouter(d *deps) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist, d.policy, d.external)
+	h := NewHandler(d.facade, d.create, d.idempotent, d.status, d.update, d.avail, d.blacklist, d.policy, d.external, d.overrides)
 
 	api := r.Group("/api/v1")
 	h.RegisterPublic(api)
@@ -109,6 +111,7 @@ func TestManagerOfAnotherRestaurantForbidden(t *testing.T) {
 			{http.MethodDelete, "/api/v1/restaurants/" + rid.String() + "/blacklist/" + uuid.New().String()},
 			{http.MethodGet, "/api/v1/restaurants/" + rid.String() + "/booking-policy"},
 			{http.MethodPatch, "/api/v1/restaurants/" + rid.String() + "/booking-policy"},
+			{http.MethodGet, "/api/v1/restaurants/" + rid.String() + "/capacity-overrides"},
 		}
 		for _, tc := range cases {
 			w := do(r, tc.method, tc.path, gin.H{}, authHeader(uid))
@@ -252,6 +255,7 @@ func TestGuestCannotForcePlacement(t *testing.T) {
 
 	body := createBody(uuid.New(), 2)
 	body["force"] = true
+	body["overbook"] = true
 	body["table_ids"] = []string{uuid.New().String()}
 	body["source"] = "admin"
 	body["user_id"] = uuid.New().String()
@@ -263,8 +267,9 @@ func TestGuestCannotForcePlacement(t *testing.T) {
 		t.Fatalf("status = %d, want 201 (body %s)", w.Code, w.Body)
 	}
 	got := captured.last
-	if got.Force || len(got.TableIDs) != 0 {
-		t.Errorf("guest placement fields leaked into the usecase: force=%v tables=%v", got.Force, got.TableIDs)
+	if got.Force || got.Overbook || len(got.TableIDs) != 0 {
+		t.Errorf("guest placement fields leaked into the usecase: force=%v overbook=%v tables=%v",
+			got.Force, got.Overbook, got.TableIDs)
 	}
 	if got.Source != domain.SourceApp {
 		t.Errorf("source = %q, want %q", got.Source, domain.SourceApp)
