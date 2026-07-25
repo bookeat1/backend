@@ -180,7 +180,14 @@ type WorkerConfig struct {
 	// ReminderLead is how long before starts_at the guest gets their pre-visit
 	// reminder (one per booking). env: WORKER_GUEST_REMINDER_LEAD
 	ReminderLead time.Duration
-	BatchSize    int // env: WORKER_BATCH_SIZE — bookings claimed per pass
+
+	// GuestRemindersEnabled switches the pre-visit reminder pass on. OFF by
+	// default: while the old Supabase system still reminds the same guests, ours
+	// would be the second (or third) message about one visit. Turning this on is
+	// the owner's deliberate act once the old reminder path is dead.
+	// env: WORKER_GUEST_REMINDERS_ENABLED
+	GuestRemindersEnabled bool
+	BatchSize             int // env: WORKER_BATCH_SIZE — bookings claimed per pass
 }
 
 // PaymentsConfig holds the global (level-1) payment settings. A restaurant may
@@ -413,10 +420,11 @@ func NewConfig() (Config, error) {
 			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
 		},
 		Worker: WorkerConfig{
-			TickInterval: getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
-			NoShowGrace:  getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
-			ReminderLead: getEnvDuration("WORKER_GUEST_REMINDER_LEAD", time.Hour),
-			BatchSize:    getEnvInt("WORKER_BATCH_SIZE", 100),
+			TickInterval:          getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
+			NoShowGrace:           getEnvDuration("WORKER_NO_SHOW_GRACE", 30*time.Minute),
+			GuestRemindersEnabled: getEnvBool("WORKER_GUEST_REMINDERS_ENABLED", false),
+			ReminderLead:          getEnvDuration("WORKER_GUEST_REMINDER_LEAD", time.Hour),
+			BatchSize:             getEnvInt("WORKER_BATCH_SIZE", 100),
 		},
 		Payments: PaymentsConfig{
 			Enabled:                      getEnvBool("PAYMENTS_ENABLED", false),

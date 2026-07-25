@@ -41,8 +41,18 @@ var reminderLiveStatuses = []string{
 // produced the SQLSTATE 42P08 we hit before).
 func (r *Reminders) ClaimDueReminders(ctx context.Context, from, to time.Time, limit int) ([]domain.Booking, error) {
 	limit, _ = window(limit, 0)
+	// A booking the OLD system already reminded (or will remind) is skipped
+	// entirely. Migration 0049 backfills those columns into
+	// guest_reminder_sent_at for rows that existed at migration time, but the
+	// legacy sync keeps importing NEW bookings while both systems run, and the
+	// old Supabase reminders (60' and 30') keep firing for them. Without this
+	// predicate such a guest would be reminded up to three times. It is
+	// self-clearing: bookings created on the new contour never carry these
+	// columns, so once the old system is off nothing is excluded any more.
 	q := `SELECT ` + cols + ` FROM bookings
 		WHERE guest_reminder_sent_at IS NULL
+		  AND reminder_60_sent_at IS NULL
+		  AND reminder_30_sent_at IS NULL
 		  AND user_id IS NOT NULL
 		  AND status = ANY($3)
 		  AND starts_at > $1

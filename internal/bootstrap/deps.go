@@ -563,12 +563,22 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 		ReminderLead: cfg.Worker.ReminderLead,
 		BatchSize:    cfg.Worker.BatchSize,
 	}
-	// The pre-visit guest reminder pass. Wired unconditionally: it emits an
-	// outbox event, and whether that event reaches a phone is the guest push
-	// channel's business (a no-op without GUEST_PUSH_PROVIDER). Gating it on the
-	// provider would mean bookings silently miss their reminder window in the
-	// interval between provisioning push and redeploying the worker.
-	reminders := bookings.WithGuestReminders(bookingrepo.NewReminders(db))
+	// The pre-visit guest reminder pass. OFF by default, and deliberately so:
+	// while the old Supabase system is still live it sends its own 60' and 30'
+	// reminders for the same bookings (the legacy sync keeps importing them),
+	// and a guest reminded by both systems is a complaint, not a feature. The
+	// claim predicate already skips bookings the old system has ALREADY
+	// reminded, but a freshly imported booking carries no such marker yet — only
+	// the owner knows when the old reminder path is switched off, so that
+	// knowledge lives in an env flag rather than in a guess.
+	//
+	// The pass is either on or absent: a disabled pass must not stamp
+	// guest_reminder_sent_at, otherwise turning it on later would find every
+	// upcoming booking already marked and silently remind nobody.
+	var reminders bookings.WorkerOption = func(*bookings.Worker) {}
+	if cfg.Worker.GuestRemindersEnabled {
+		reminders = bookings.WithGuestReminders(bookingrepo.NewReminders(db))
+	}
 
 	// The worker settles the held deposit of the bookings it closes (a no-show
 	// forfeits it, an abandonment releases it). Building the acquirer registry
