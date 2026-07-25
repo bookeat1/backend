@@ -799,6 +799,7 @@ func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legac
 	worker := legacysync.NewWorker(
 		legacysource.NewSource(pool),
 		legacysink.NewSink(db),
+		sqltx.NewManager(db),
 		legacysync.Config{
 			TickInterval:    cfg.LegacySync.TickInterval,
 			BatchSize:       cfg.LegacySync.BatchSize,

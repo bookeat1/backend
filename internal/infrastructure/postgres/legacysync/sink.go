@@ -9,11 +9,13 @@ package legacysync
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/usecase/legacysync"
 )
@@ -237,6 +239,152 @@ ON CONFLICT (id) DO UPDATE SET
  booking_id=EXCLUDED.booking_id, table_id=EXCLUDED.table_id, slot=EXCLUDED.slot,
  active=EXCLUDED.active`,
 		bt.ID, bt.BookingID, bt.TableID, bt.SlotStart, bt.SlotEnd, bt.Active, bt.CreatedAt)
+}
+
+// ---- working hours ---------------------------------------------------------
+
+// WorkingHoursCandidates returns the venues whose legacy free text differs from
+// the text of their last import attempt (or that were never attempted). Venues
+// whose text is unchanged — filled, refused or venue-owned alike — are filtered
+// out in SQL, so a steady state costs one index-less but tiny scan per tick and
+// writes nothing.
+func (s *Sink) WorkingHoursCandidates(ctx context.Context, limit int) ([]legacysync.WorkingHoursCandidate, error) {
+	rows, err := sqltx.From(ctx, s.pool).Query(ctx, `
+SELECT r.id, r.name, COALESCE(r.opening_hours, '')
+FROM restaurants r
+LEFT JOIN legacy_working_hours_import i ON i.restaurant_id = r.id
+WHERE i.restaurant_id IS NULL
+   OR i.source_text IS DISTINCT FROM COALESCE(r.opening_hours, '')
+ORDER BY r.id
+LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("working hours candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []legacysync.WorkingHoursCandidate
+	for rows.Next() {
+		var c legacysync.WorkingHoursCandidate
+		if err := rows.Scan(&c.RestaurantID, &c.Name, &c.SourceText); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// LoadWorkingHours reads the venue's current weekly rows and its import record.
+// Called inside the fill transaction (sqltx.From picks up the active tx), so the
+// ownership decision is taken on the same snapshot the write lands on.
+func (s *Sink) LoadWorkingHours(ctx context.Context, rid uuid.UUID) (legacysync.WorkingHoursState, error) {
+	q := sqltx.From(ctx, s.pool)
+	var st legacysync.WorkingHoursState
+
+	err := q.QueryRow(ctx,
+		`SELECT COALESCE(opening_hours, '') FROM restaurants WHERE id=$1`, rid).Scan(&st.SourceText)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The restaurant vanished between the candidate query and now: nothing
+		// to fill, and an empty state decides "write" on a venue that no longer
+		// exists — so report it as a missing row instead.
+		return st, fmt.Errorf("load working hours: restaurant %s not found", rid)
+	}
+	if err != nil {
+		return st, fmt.Errorf("load working hours: %w", err)
+	}
+
+	rows, err := q.Query(ctx,
+		`SELECT day_of_week, open_time, close_time, is_open
+		 FROM restaurant_working_hours WHERE restaurant_id=$1 ORDER BY day_of_week`, rid)
+	if err != nil {
+		return st, fmt.Errorf("load working hours: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		w := domain.WorkingHours{RestaurantID: rid}
+		if err := rows.Scan(&w.DayOfWeek, &w.OpenTime, &w.CloseTime, &w.IsOpen); err != nil {
+			return st, err
+		}
+		st.Rows = append(st.Rows, w)
+	}
+	if err := rows.Err(); err != nil {
+		return st, err
+	}
+
+	var imp legacysync.WorkingHoursImport
+	var fingerprint *string
+	err = q.QueryRow(ctx,
+		`SELECT source_text, status, fingerprint FROM legacy_working_hours_import WHERE restaurant_id=$1`, rid).
+		Scan(&imp.SourceText, &imp.Status, &fingerprint)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows): // never attempted
+	case err != nil:
+		return st, fmt.Errorf("load working hours import: %w", err)
+	default:
+		if fingerprint != nil {
+			imp.Fingerprint = *fingerprint
+		}
+		st.Import = &imp
+	}
+	return st, nil
+}
+
+// ReplaceSyncedWorkingHours swaps the venue's weekly rows for rows and marks the
+// import as filled. Delete + insert (not an upsert per weekday) mirrors what the
+// admin panel's ReplaceWorkingHours does, and the caller runs it in one
+// transaction, so no reader ever sees a half-written week.
+func (s *Sink) ReplaceSyncedWorkingHours(
+	ctx context.Context,
+	rid uuid.UUID,
+	rows []domain.WorkingHours,
+	sourceText, fingerprint string,
+) error {
+	q := sqltx.From(ctx, s.pool)
+	if _, err := q.Exec(ctx, `DELETE FROM restaurant_working_hours WHERE restaurant_id=$1`, rid); err != nil {
+		return fmt.Errorf("replace synced working hours: %w", err)
+	}
+	for _, w := range rows {
+		if _, err := q.Exec(ctx, `
+INSERT INTO restaurant_working_hours (id, restaurant_id, day_of_week, open_time, close_time, is_open, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,now(),now())`,
+			uuid.New(), rid, w.DayOfWeek, w.OpenTime, w.CloseTime, w.IsOpen); err != nil {
+			return fmt.Errorf("replace synced working hours: %w", err)
+		}
+	}
+	return upsertWorkingHoursImport(ctx, q, rid, sourceText, legacysync.HoursImportFilled, fingerprint, "")
+}
+
+// RecordWorkingHoursImport stores an attempt that wrote no hours (refused, or
+// the venue owns them).
+func (s *Sink) RecordWorkingHoursImport(ctx context.Context, rid uuid.UUID, sourceText, status, reason string) error {
+	return upsertWorkingHoursImport(ctx, sqltx.From(ctx, s.pool), rid, sourceText, status, "", reason)
+}
+
+func upsertWorkingHoursImport(
+	ctx context.Context,
+	q sqltx.Querier,
+	rid uuid.UUID,
+	sourceText, status, fingerprint, reason string,
+) error {
+	// fingerprint is NULL for every status but 'filled' — the table's CHECK
+	// enforces that pairing, so a bug here fails loudly instead of quietly
+	// creating a record that would let the sync overwrite a venue's own hours.
+	var fp, rs any
+	if fingerprint != "" {
+		fp = fingerprint
+	}
+	if reason != "" {
+		rs = reason
+	}
+	_, err := q.Exec(ctx, `
+INSERT INTO legacy_working_hours_import (restaurant_id, source_text, status, fingerprint, reason, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,now(),now())
+ON CONFLICT (restaurant_id) DO UPDATE SET
+ source_text=EXCLUDED.source_text, status=EXCLUDED.status,
+ fingerprint=EXCLUDED.fingerprint, reason=EXCLUDED.reason, updated_at=now()`,
+		rid, sourceText, status, fp, rs)
+	if err != nil {
+		return fmt.Errorf("record working hours import: %w", err)
+	}
+	return nil
 }
 
 // jsonb hands a raw JSON byte slice to a jsonb column, or NULL when empty. pgx's

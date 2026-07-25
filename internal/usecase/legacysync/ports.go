@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"backend-core/internal/domain"
 )
 
 // Entity names are the keys used in the legacy_sync_cursor table. They are a
@@ -33,6 +35,12 @@ const (
 	EntityBookings       = "bookings"
 	EntityBookingTables  = "booking_tables"
 )
+
+// EntityWorkingHours names the working-hours backfill pass in log lines. Unlike
+// the constants above it is NOT a cursor key: that pass is driven by comparing
+// each venue's legacy text with its last import attempt (see workinghours.go),
+// not by a high-water mark.
+const EntityWorkingHours = "restaurant_working_hours"
 
 // Cursor is a per-entity high-water mark: the (updated_at, id) of the last row
 // that was durably written. Rows are fetched and ordered by this pair so that
@@ -95,6 +103,27 @@ type Sink interface {
 	UpsertMenuItem(ctx context.Context, m MenuItem) (Outcome, error)
 	UpsertBooking(ctx context.Context, b Booking) (Outcome, error)
 	UpsertBookingTable(ctx context.Context, bt BookingTable) (Outcome, error)
+
+	// WorkingHoursCandidates returns venues whose legacy free-text opening hours
+	// differ from the text of their last import attempt (or that were never
+	// attempted) — the only venues the working-hours pass has any reason to look
+	// at. Ordered by id, capped at limit.
+	WorkingHoursCandidates(ctx context.Context, limit int) ([]WorkingHoursCandidate, error)
+
+	// LoadWorkingHours reads the venue's current weekly rows plus its import
+	// record. Called INSIDE the fill transaction: the ownership decision and the
+	// write must see the same snapshot.
+	LoadWorkingHours(ctx context.Context, restaurantID uuid.UUID) (WorkingHoursState, error)
+
+	// ReplaceSyncedWorkingHours replaces the venue's weekly rows with rows and
+	// records the import as HoursImportFilled with fingerprint. Callers must have
+	// decided the sync owns those hours (see decideWorkingHours).
+	ReplaceSyncedWorkingHours(ctx context.Context, restaurantID uuid.UUID, rows []domain.WorkingHours, sourceText, fingerprint string) error
+
+	// RecordWorkingHoursImport stores an attempt that wrote NO hours
+	// (HoursImportVenueOwned / HoursImportRefused), so the same unchanged text is
+	// not reconsidered and re-logged every tick.
+	RecordWorkingHoursImport(ctx context.Context, restaurantID uuid.UUID, sourceText, status, reason string) error
 }
 
 // The trivial entities (restaurants, tables, menu) are near 1:1 old->new, so
