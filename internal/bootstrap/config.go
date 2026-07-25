@@ -220,6 +220,12 @@ type PaymentsConfig struct {
 	// refund unless an acquirer genuinely charges for the reversal.
 	RefundAcquiringBps int // env: PAYMENTS_REFUND_ACQUIRING_BPS
 
+	// AcquirerMinFeeMinor is the acquirer's per-operation FLOOR in tiyn, the
+	// "минимум 25 ₸" half of FreedomPay's "3,5% мин 25 ₸" tariff. Without it a
+	// small deposit leaves the venue short: the percentage markup would be less
+	// than the fee the acquirer actually takes. env: PAYMENTS_ACQUIRER_MIN_FEE_MINOR
+	AcquirerMinFeeMinor int64
+
 	// RefundAcquiringBpsByProvider overrides RefundAcquiringBps per acquirer,
 	// because the rate is a property of the acquirer, not of the platform: one
 	// returns its fee on a reversal (0 bps), another keeps it (some non-zero

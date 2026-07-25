@@ -437,6 +437,7 @@ func newPaymentsConfig(cfg Config) payments.Config {
 		ServiceFeeBps:                cfg.Payments.ServiceFeeBps,
 		RefundAcquiringBps:           cfg.Payments.RefundAcquiringBps,
 		RefundAcquiringBpsByProvider: refundAcquiringBpsByProvider(cfg.Payments.RefundAcquiringBpsByProvider),
+		AcquirerMinFeeMinor:          cfg.Payments.AcquirerMinFeeMinor,
 		DepositDefaultMinor:          cfg.Payments.DepositDefaultMinor,
 		DepositRequired:              cfg.Payments.DepositRequired,
 		PreorderPaymentRequired:      cfg.Payments.PreorderPaymentRequired,

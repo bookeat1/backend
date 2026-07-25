@@ -34,10 +34,13 @@ type Config struct {
 	// map uses RefundAcquiringBps. Read through refundAcquiringBpsFor, never
 	// directly — a missing key and a stored 0 mean different things.
 	RefundAcquiringBpsByProvider map[domain.PaymentProvider]int
-	DepositDefaultMinor          int64
-	DepositRequired              bool
-	PreorderPaymentRequired      bool
-	HoldTTL                      time.Duration
+	// AcquirerMinFeeMinor is the acquirer's per-operation floor (see
+	// domain.GrossUpForAcquirerWithMinimum). 0 means the tariff is pure percent.
+	AcquirerMinFeeMinor     int64
+	DepositDefaultMinor     int64
+	DepositRequired         bool
+	PreorderPaymentRequired bool
+	HoldTTL                 time.Duration
 	// FreeCancelWindow is the global default free-cancellation window for the
 	// money path, applied to any restaurant that has not overridden
 	// free_cancel_window_minutes. Owner-confirmed default 120 minutes (see

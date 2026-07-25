@@ -204,13 +204,38 @@ func TotalWithFee(base Money, bps int) (fee Money, total Money, err error) {
 // acquirerBps must be in [0, 10000). 10000 (100%) is rejected: it would mean the
 // acquirer takes everything, leaving no finite total that nets a positive base.
 func GrossUpForAcquirer(base Money, acquirerBps int) (fee Money, total Money, err error) {
+	return GrossUpForAcquirerWithMinimum(base, acquirerBps, 0)
+}
+
+// GrossUpForAcquirerWithMinimum is GrossUpForAcquirer for an acquirer whose
+// tariff has a FLOOR as well as a rate — FreedomPay charges "3.5%, minimum 25 ₸
+// per operation" (merchant questionnaire, 14.07.2026). Without the floor a small
+// deposit nets the venue less than its base: 3.5% of a 500 ₸ deposit is 17.5 ₸,
+// the acquirer still takes 25 ₸, and the missing 7.5 ₸ comes out of the venue.
+//
+// Both readings of the tariff are computed and the LARGER total wins:
+//
+//	percentage: total = ceil(base × 10000 / (10000 − bps))   (the rate binds)
+//	floor:      total = base + minFeeMinor                   (the minimum binds)
+//
+// so the venue nets at least base under either, and the guest is never charged
+// for both. minFeeMinor is in the same minor unit as base; 0 means "no floor".
+func GrossUpForAcquirerWithMinimum(base Money, acquirerBps int, minFeeMinor int64) (fee Money, total Money, err error) {
 	if acquirerBps < 0 || int64(acquirerBps) >= BasisPointsDenominator {
 		return Money{}, Money{}, fmt.Errorf("acquirer basis points %d out of range [0,%d): %w", acquirerBps, BasisPointsDenominator, ErrValidation)
 	}
 	if base.AmountMinor < 0 {
 		return Money{}, Money{}, ErrNegativeAmount
 	}
-	if acquirerBps == 0 || base.AmountMinor == 0 {
+	if minFeeMinor < 0 {
+		return Money{}, Money{}, fmt.Errorf("acquirer minimum fee %d is negative: %w", minFeeMinor, ErrValidation)
+	}
+	// Nothing to charge on: a zero base is not an operation, so no floor either.
+	if base.AmountMinor == 0 {
+		return Money{AmountMinor: 0, Currency: base.Currency},
+			Money{AmountMinor: 0, Currency: base.Currency}, nil
+	}
+	if acquirerBps == 0 && minFeeMinor == 0 {
 		return Money{AmountMinor: 0, Currency: base.Currency},
 			Money{AmountMinor: base.AmountMinor, Currency: base.Currency}, nil
 	}
@@ -218,11 +243,22 @@ func GrossUpForAcquirer(base Money, acquirerBps int) (fee Money, total Money, er
 	if base.AmountMinor > math.MaxInt64/BasisPointsDenominator {
 		return Money{}, Money{}, ErrMoneyOverflow
 	}
-	denom := BasisPointsDenominator - int64(acquirerBps)
-	numerator := base.AmountMinor * BasisPointsDenominator
-	// Ceiling division for non-negative operands: round the total UP so the net
-	// after the acquirer's cut never falls below base.
-	totalMinor := (numerator + denom - 1) / denom
+	totalMinor := base.AmountMinor
+	if acquirerBps > 0 {
+		denom := BasisPointsDenominator - int64(acquirerBps)
+		numerator := base.AmountMinor * BasisPointsDenominator
+		// Ceiling division for non-negative operands: round the total UP so the
+		// net after the acquirer's cut never falls below base.
+		totalMinor = (numerator + denom - 1) / denom
+	}
+	// The floor reading. Whichever of the two totals is larger is the one that
+	// actually leaves the venue whole, so that is the one charged.
+	if floorTotal := base.AmountMinor + minFeeMinor; floorTotal > totalMinor {
+		if minFeeMinor > math.MaxInt64-base.AmountMinor {
+			return Money{}, Money{}, ErrMoneyOverflow
+		}
+		totalMinor = floorTotal
+	}
 	total = Money{AmountMinor: totalMinor, Currency: base.Currency}
 	fee, err = total.Sub(base)
 	if err != nil {
