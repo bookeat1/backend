@@ -288,10 +288,9 @@ func TestRenderConcurrentColdCacheCallsProviderOnce(t *testing.T) {
 	rest.add(id, ptr(51.1), ptr(71.4), true)
 
 	release := make(chan struct{})
-	prov := &fakeProvider{render: func(RenderRequest) (Image, error) {
-		<-release // hold every caller inside the provider until they have all arrived
-		return Image{Bytes: pngBytes, ContentType: "image/png"}, nil
-	}}
+	// hold every caller inside the provider until they have all arrived
+	prov := &fakeProvider{render: blockingRender(make(chan struct{}, 1), release,
+		Image{Bytes: pngBytes, ContentType: "image/png"})}
 	uc := newUC(t, rest, prov)
 	p := defaultParams(t)
 
@@ -318,5 +317,137 @@ func TestRenderConcurrentColdCacheCallsProviderOnce(t *testing.T) {
 	}
 	if got := prov.calls.Load(); got != 1 {
 		t.Errorf("provider calls = %d, want 1 — %d concurrent cold-cache requests must collapse into one paid render", got, n)
+	}
+}
+
+// The guest who happened to start the shared render must not be able to take it
+// down for everybody else by navigating away. On mobile networks a cancelled
+// request is routine, so if the leader's context reached the provider call, a
+// single guest closing a screen would fail every other guest waiting on the
+// same venue.
+func TestRenderLeaderCancellationDoesNotFailTheFollowers(t *testing.T) {
+	id := uuid.New()
+	rest := newFakeRestaurants()
+	rest.add(id, ptr(51.1), ptr(71.4), true)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	prov := &fakeProvider{render: blockingRender(entered, release,
+		Image{Bytes: pngBytes, ContentType: "image/png"})}
+	uc := newUC(t, rest, prov)
+	p := defaultParams(t)
+
+	// The leader: starts the render, then its request context is cancelled.
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := uc.Render(leaderCtx, id, p)
+		leaderErr <- err
+	}()
+	<-entered // the shared render is now in flight, owned by the leader
+
+	// The followers pile onto the same key with their own, healthy contexts.
+	const followers = 5
+	var wg sync.WaitGroup
+	imgs := make([]Image, followers)
+	errs := make([]error, followers)
+	for i := 0; i < followers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			imgs[i], errs[i] = uc.Render(context.Background(), id, p)
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond) // let the followers reach the wait
+
+	cancelLeader() // guest A navigates away
+	<-leaderErr    // A's own call returns promptly, that is its right
+	close(release) // the provider finally answers
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("follower #%d got %v — the leader's cancellation killed a healthy caller's render", i, err)
+		}
+		if string(imgs[i].Bytes) != string(pngBytes) {
+			t.Errorf("follower #%d got no image", i)
+		}
+	}
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("provider calls = %d, want 1", got)
+	}
+}
+
+// A caller that goes away must get a prompt, non-internal answer for itself —
+// and must never be reported as a 500.
+func TestRenderCallerCancellationIsNotAnInternalError(t *testing.T) {
+	id := uuid.New()
+	rest := newFakeRestaurants()
+	rest.add(id, ptr(51.1), ptr(71.4), true)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prov := &fakeProvider{render: blockingRender(entered, release,
+		Image{Bytes: pngBytes, ContentType: "image/png"})}
+	uc := newUC(t, rest, prov)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := uc.Render(ctx, id, defaultParams(t))
+		done <- err
+	}()
+	<-entered
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, domain.ErrUnavailable) {
+			t.Fatalf("error = %v, want domain.ErrUnavailable (503), never an internal error", err)
+		}
+		if code, _ := domain.CodeOf(err); code != domain.CodeMapProviderUnavailable {
+			t.Errorf("code = %q, want %q", code, domain.CodeMapProviderUnavailable)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Render did not return after its caller's context was cancelled")
+	}
+}
+
+// The render was already paid for; if every original caller walked away, the
+// picture must still end up in the cache instead of being thrown out and
+// re-bought on the next request.
+func TestRenderAbandonedWorkStillPopulatesTheCache(t *testing.T) {
+	id := uuid.New()
+	rest := newFakeRestaurants()
+	rest.add(id, ptr(51.1), ptr(71.4), true)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	prov := &fakeProvider{render: blockingRender(entered, release,
+		Image{Bytes: pngBytes, ContentType: "image/png"})}
+	uc := newUC(t, rest, prov)
+	p := defaultParams(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _, _ = uc.Render(ctx, id, p) }()
+	<-entered
+	cancel()
+	close(release)
+
+	// Wait for the detached render to finish and write through to the cache.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := uc.cache.Get(uc.cacheKey(id, p)); ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := uc.Render(context.Background(), id, p); err != nil {
+		t.Fatalf("Render after the abandoned one: %v", err)
+	}
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("provider calls = %d, want 1 — the abandoned render was paid for and must not be re-bought", got)
 	}
 }

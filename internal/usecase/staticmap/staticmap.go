@@ -92,14 +92,38 @@ func (u *UseCase) Render(ctx context.Context, restaurantID uuid.UUID, p Params) 
 	// guests at once, exactly ONE of them pays for the provider request and the
 	// rest wait for its result. Without this the "cache the result" saving
 	// disappears precisely in the burst it matters for.
-	img, err := u.flights.do(key, func() (Image, error) {
-		return u.fetch(ctx, restaurantID, p)
+	//
+	// The shared render runs on a context detached from every caller (see
+	// flightGroup) — one guest navigating away must not fail the render for
+	// everyone else waiting on it. The cache write lives INSIDE the shared work
+	// for the same reason: if every original caller walks away, the render that
+	// was already paid for is still kept.
+	img, err := u.flights.do(ctx, key, func(work context.Context) (Image, error) {
+		img, err := u.fetch(work, restaurantID, p)
+		if err != nil {
+			return Image{}, err
+		}
+		u.cache.Set(key, img)
+		return img, nil
 	})
 	if err != nil {
-		return Image{}, err
+		return Image{}, u.classifyWait(err)
 	}
-	u.cache.Set(key, img)
 	return img, nil
+}
+
+// classifyWait maps the outcome of waiting for a shared render. A raw
+// context.Canceled / DeadlineExceeded means THIS caller gave up (its connection
+// died or its deadline passed) while the render was still running — the client
+// is gone, so the only thing that matters is that it does not get logged and
+// reported as an internal error. Everything else is already a domain error from
+// fetch and passes through untouched.
+func (u *UseCase) classifyWait(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return domain.WithCode(domain.CodeMapProviderUnavailable,
+			fmt.Errorf("static map: caller went away while waiting for the render: %w", domain.ErrUnavailable))
+	}
+	return err
 }
 
 // fetch resolves the coordinates and asks the provider. Runs once per cache

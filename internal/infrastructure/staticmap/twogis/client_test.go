@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,6 +221,93 @@ func TestRenderUnreachableProviderDoesNotLeakTheKey(t *testing.T) {
 		t.Fatalf("error = %v, want ErrProviderUnavailable", err)
 	}
 	assertNoKeyLeak(t, err)
+}
+
+// The success path's own key-leak hazard: the key travels in the query string,
+// so following a redirect would re-send it to whatever the 3xx points at AND
+// attach a Referer header carrying the full previous URL — key included — to a
+// third party we never chose. One misconfigured proxy in front of the provider
+// is enough. So: refuse to follow, and prove that the redirect target never
+// hears from us at all.
+func TestRenderDoesNotFollowRedirectsAndNeverForwardsTheKey(t *testing.T) {
+	for _, status := range []int{
+		http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			// The third party. It must never be contacted. Guarded by a mutex
+			// because the handler runs on the server's goroutine, not the test's.
+			var mu sync.Mutex
+			var attackerHits []string
+			attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				attackerHits = append(attackerHits,
+					r.Method+" "+r.URL.RequestURI()+" Referer="+r.Header.Get("Referer"))
+				mu.Unlock()
+				pngHandler(w, r)
+			}))
+			t.Cleanup(attacker.Close)
+
+			provider, seen := fakeProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", attacker.URL+"/relay")
+				w.WriteHeader(status)
+			})
+
+			_, err := newTestClient(t, provider).Render(context.Background(), sampleRequest)
+			if !errors.Is(err, staticmap.ErrProviderUnavailable) {
+				t.Fatalf("error = %v, want ErrProviderUnavailable (a redirect is not a usable image)", err)
+			}
+			assertNoKeyLeak(t, err)
+
+			mu.Lock()
+			hits := append([]string(nil), attackerHits...)
+			mu.Unlock()
+			if len(hits) != 0 {
+				t.Fatalf("the redirect target was contacted (%s) — the key was handed to a third party", hits[0])
+			}
+			if len(*seen) != 1 {
+				t.Errorf("provider saw %d requests, want exactly 1 (no redirect hops)", len(*seen))
+			}
+		})
+	}
+}
+
+// Belt and braces on the same hazard: whatever the policy above does, no
+// outbound request other than the first may ever carry the key. This asserts it
+// over the raw request records rather than over our own error handling.
+func TestRenderIssuesExactlyOneRequestCarryingTheKey(t *testing.T) {
+	var relayHits atomic.Int64
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayHits.Add(1)
+		if r.URL.Query().Get("key") != "" || r.Header.Get("Referer") != "" {
+			t.Errorf("relay received key=%q Referer=%q — the credential escaped",
+				r.URL.Query().Get("key"), r.Header.Get("Referer"))
+		}
+		pngHandler(w, r)
+	}))
+	t.Cleanup(relay.Close)
+
+	provider, seen := fakeProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, relay.URL+"/hop", http.StatusFound)
+	})
+	if _, err := newTestClient(t, provider).Render(context.Background(), sampleRequest); err == nil {
+		t.Fatal("Render: want an error, a redirect is not an image")
+	}
+	if n := relayHits.Load(); n != 0 {
+		t.Errorf("relay hit %d times, want 0", n)
+	}
+	withKey := 0
+	for _, uri := range *seen {
+		if strings.Contains(uri, "key="+testAPIKey) {
+			withKey++
+		}
+	}
+	if withKey != 1 {
+		t.Errorf("%d outbound requests carried the key, want exactly 1", withKey)
+	}
 }
 
 func TestConfiguredRequiresAKey(t *testing.T) {

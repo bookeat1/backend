@@ -88,7 +88,20 @@ func NewClient(cfg Config) *Client {
 		baseURL:  strings.TrimRight(base, "/"),
 		apiKey:   strings.TrimSpace(cfg.APIKey),
 		maxBytes: maxBytes,
-		http:     &http.Client{Timeout: timeout},
+		http: &http.Client{
+			Timeout: timeout,
+			// Never follow a redirect. The API key travels in the query string,
+			// and Go's default policy would not only re-send the request to
+			// whatever the 3xx points at (up to 10 hops) but also attach a
+			// Referer header carrying the FULL previous URL — key included — to
+			// a third party we never chose. One misconfigured proxy or CDN in
+			// front of the provider is all it takes. ErrUseLastResponse makes Do
+			// hand back the 3xx itself without issuing another request, and
+			// Render then treats it as an unusable answer.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -126,6 +139,15 @@ func (c *Client) Render(ctx context.Context, req staticmap.RenderRequest) (stati
 	defer resp.Body.Close()
 
 	switch {
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		// A redirect we deliberately did not follow (see NewClient's
+		// CheckRedirect). Whatever it points at, this response is not an image,
+		// so it is the same clean transient failure as any other non-image
+		// answer — and the key stayed with us. The Location header is NOT read
+		// or reported: it is attacker-influenceable in the scenario this guards
+		// against, and we have no use for it.
+		return staticmap.Image{}, fmt.Errorf("2gis static map: unexpected redirect (status %d), not followed: %w",
+			resp.StatusCode, staticmap.ErrProviderUnavailable)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return staticmap.Image{}, fmt.Errorf("2gis static map: status 429: %w", staticmap.ErrProviderRateLimited)
 	case resp.StatusCode >= 500:
