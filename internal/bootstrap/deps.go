@@ -46,6 +46,7 @@ import (
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	"backend-core/internal/infrastructure/sqltx"
+	"backend-core/internal/infrastructure/staticmap/twogis"
 	"backend-core/internal/infrastructure/telegramnotify"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/webpush"
@@ -68,6 +69,7 @@ import (
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
+	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 )
@@ -103,6 +105,7 @@ type Deps struct {
 	Dashboard          *dashboard.UseCase
 	BookingExternal    bookings.ExternalReservationUseCase
 	Preorder           *preorder.UseCase
+	StaticMap          *staticmap.UseCase
 	Issuer             *token.RSAIssuer
 
 	// Payments repositories, exposed for anything that still wants direct
@@ -355,7 +358,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// = the "already paid → frozen" guard.
 		Preorder: preorder.NewUseCase(bookingRepo, menuItems, bookingItems, restRepo,
 			restaurantManagers, paymentsRepo, txm),
-		Issuer: issuer,
+		// Server-side map preview. Always constructed, even without a provider
+		// key: the endpoint then answers a clean map_not_configured instead of
+		// disappearing from the routing table, so the app gets one stable
+		// contract and the day the key arrives it is one env var and a restart.
+		StaticMap: newStaticMap(cfg, restRepo, log),
+		Issuer:    issuer,
 
 		PaymentsRepo:         paymentsRepo,
 		PaymentRefundsRepo:   paymentRefundsRepo,
@@ -932,6 +940,43 @@ func otpDeliveryDeadlines(channelTimeout, budget time.Duration, log *slog.Logger
 		channelTimeout = max
 	}
 	return channelTimeout, budget
+}
+
+// newStaticMap wires the restaurant map-preview proxy.
+//
+// Same rule as every other optional provider in this file: the feature exists
+// if and only if its credential does, and its absence is a warning at startup,
+// not a boot failure. An unknown STATIC_MAP_PROVIDER is an operator typo — it
+// is reported loudly and treated as "no provider", never as a reason to crash.
+//
+// restaurants is the ordinary Postgres restaurant repository: resolving an id
+// to its coordinates needs no new query, and the cache keeps the lookup off the
+// hot path anyway.
+func newStaticMap(cfg Config, restaurants staticmap.RestaurantCoords, log *slog.Logger) *staticmap.UseCase {
+	cache := staticmap.NewMemoryCache(cfg.StaticMap.CacheTTL, cfg.StaticMap.CacheMaxBytes)
+
+	var provider staticmap.Provider
+	switch name := strings.ToLower(strings.TrimSpace(cfg.StaticMap.Provider)); name {
+	case "":
+		log.Warn("static map proxy not configured (no STATIC_MAP_PROVIDER) — /restaurants/:id/map will answer map_not_configured")
+	case "2gis":
+		twoGIS := twogis.Config{
+			APIKey:  cfg.StaticMap.TwoGISAPIKey,
+			BaseURL: cfg.StaticMap.TwoGISBaseURL,
+			Timeout: cfg.StaticMap.Timeout,
+		}
+		if !twoGIS.Configured() {
+			// Never log the key — only the fact that it is missing.
+			log.Error("STATIC_MAP_PROVIDER=2gis but STATIC_MAP_2GIS_API_KEY is empty — the map proxy stays disabled")
+			break
+		}
+		provider = twogis.NewClient(twoGIS)
+	default:
+		log.Error("unknown STATIC_MAP_PROVIDER — the map proxy stays disabled",
+			slog.String("provider", cfg.StaticMap.Provider))
+	}
+
+	return staticmap.New(restaurants, provider, cache, log)
 }
 
 func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {

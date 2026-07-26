@@ -34,6 +34,7 @@ import (
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
+	staticmaprest "backend-core/internal/transport/rest/staticmap"
 	"backend-core/internal/transport/rest/swaggerui"
 	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
@@ -112,6 +113,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic := api.Group("")
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
+
+	// Server-side static map preview. Fully public and NOT on the OptionalAuth
+	// group: the picture is identical for every caller, so parsing a token
+	// would only add a user lookup to a route meant to be cheap. Registered
+	// unconditionally — without a provider key it answers a clean
+	// 503/map_not_configured, which the app already handles like "no map".
+	staticmaprest.NewHandler(deps.StaticMap).RegisterPublic(api)
 
 	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
 	// SAME OptionalAuth group and for the same reason as the catalog: it is a

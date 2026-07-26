@@ -217,8 +217,12 @@ var routeTiers = map[string]RateLimitTier{
 	"POST /api/v1/bookings/:id/payment/settle": TierStrict,
 
 	// Public reading: browsing traffic.
-	"GET /api/v1/restaurants":                  TierSoft,
-	"GET /api/v1/restaurants/:id":              TierSoft,
+	"GET /api/v1/restaurants":     TierSoft,
+	"GET /api/v1/restaurants/:id": TierSoft,
+	// The map proxy costs a paid provider request on a cache miss, so it sits
+	// in the browsing tier rather than being unlimited — the cache absorbs the
+	// repeats, the tier bounds a caller trying to walk the catalog.
+	"GET /api/v1/restaurants/:id/map":          TierSoft,
 	"GET /api/v1/restaurant-categories":        TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
