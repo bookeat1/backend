@@ -19,9 +19,9 @@ import (
 // to the guest ("hours unknown" vs "closed" / "cannot book").
 type venueStateReader interface {
 	WorkingHoursFor(ctx context.Context, restaurantIDs []uuid.UUID) (map[uuid.UUID][]domain.WorkingHours, error)
-	// BookableTableCountsFor counts the tables that could actually seat someone
-	// (is_active AND capacity > 0) — the same filter the availability engine
-	// applies in usecase/bookings.loadSchedule.
+	// BookableTableCountsFor counts the tables that could actually seat a
+	// party (is_active AND capacity > 0) — the same filter the availability
+	// engine applies in usecase/bookings.loadSchedule.
 	BookableTableCountsFor(ctx context.Context, restaurantIDs []uuid.UUID) (map[uuid.UUID]int, error)
 }
 
@@ -32,6 +32,43 @@ type venueStateReader interface {
 // "bookable slots" can never be computed against two different clocks.
 type VenueTimezoneResolver interface {
 	VenueTimezone(r domain.Restaurant) string
+}
+
+// VenueState computes the guest-facing venue state — structured weekly
+// schedule, "open now", and "can this venue take an online booking at all" —
+// and attaches it to catalog rows.
+//
+// It is a standalone unit rather than a method set on the catalog facade
+// because MORE THAN ONE endpoint serves domain.RestaurantListItem rows: the
+// catalog listing, the search, and the user's favorites all render the same
+// public shape through transport/rest/restaurants.PublicListItem. Every one of
+// them must attach the state, or the same venue reads differently on two
+// screens — the guest would see "hours unknown" in favorites and a full
+// schedule in the catalog, with no data reason for the difference.
+type VenueState struct {
+	reader venueStateReader
+	tz     VenueTimezoneResolver
+	clock  func() time.Time
+}
+
+// VenueStateOption configures optional VenueState dependencies.
+type VenueStateOption func(*VenueState)
+
+// WithVenueStateClock overrides the clock "open now" is evaluated against.
+// Tests only.
+func WithVenueStateClock(now func() time.Time) VenueStateOption {
+	return func(v *VenueState) { v.clock = now }
+}
+
+// NewVenueState constructs the enricher. Both dependencies are required; a nil
+// one makes every Attach* a no-op, so the fields are simply absent from the
+// payload rather than guessed.
+func NewVenueState(reader venueStateReader, tz VenueTimezoneResolver, opts ...VenueStateOption) *VenueState {
+	v := &VenueState{reader: reader, tz: tz}
+	for _, opt := range opts {
+		opt(v)
+	}
+	return v
 }
 
 // buildVenueState computes the public schedule + open-now + bookability for one
@@ -67,54 +104,58 @@ func buildVenueState(hours []domain.WorkingHours, tz string, bookableTables int,
 	return st
 }
 
-// attachVenueState fills VenueState on every listing row. It is best-effort by
-// design: the catalog is the app's home screen, so a failure to read hours
-// degrades to "unknown" (nil VenueState, fields omitted) instead of failing the
-// whole response.
-func (f *facade) attachVenueState(ctx context.Context, items []domain.RestaurantListItem) {
-	if f.venueState == nil || f.venueTZ == nil || len(items) == 0 {
+// AttachList fills VenueState on every listing row, in place. It is
+// best-effort by design: the catalog is the app's home screen, so a failure to
+// read hours degrades to "unknown" (nil VenueState, fields omitted) instead of
+// failing the whole response.
+func (v *VenueState) AttachList(ctx context.Context, items []domain.RestaurantListItem) {
+	if !v.usable() || len(items) == 0 {
 		return
 	}
 	ids := make([]uuid.UUID, 0, len(items))
 	for _, it := range items {
 		ids = append(ids, it.Restaurant.ID)
 	}
-	hours, tables, ok := f.readVenueState(ctx, ids)
+	hours, tables, ok := v.read(ctx, ids)
 	if !ok {
 		return
 	}
-	now := f.now()
+	now := v.now()
 	for i := range items {
 		id := items[i].Restaurant.ID
-		st := buildVenueState(hours[id], f.venueTZ.VenueTimezone(items[i].Restaurant), tables[id], now)
+		st := buildVenueState(hours[id], v.tz.VenueTimezone(items[i].Restaurant), tables[id], now)
 		items[i].VenueState = &st
 	}
 }
 
-// attachVenueStateOne is attachVenueState for the detail endpoint.
-func (f *facade) attachVenueStateOne(ctx context.Context, agg *domain.RestaurantAggregate) {
-	if f.venueState == nil || f.venueTZ == nil || agg == nil {
+// AttachOne is AttachList for the detail endpoint.
+func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggregate) {
+	if !v.usable() || agg == nil {
 		return
 	}
-	ids := []uuid.UUID{agg.Restaurant.ID}
-	hours, tables, ok := f.readVenueState(ctx, ids)
+	id := agg.Restaurant.ID
+	hours, tables, ok := v.read(ctx, []uuid.UUID{id})
 	if !ok {
 		return
 	}
-	st := buildVenueState(hours[agg.Restaurant.ID], f.venueTZ.VenueTimezone(agg.Restaurant),
-		tables[agg.Restaurant.ID], f.now())
+	st := buildVenueState(hours[id], v.tz.VenueTimezone(agg.Restaurant), tables[id], v.now())
 	agg.VenueState = &st
 }
 
-func (f *facade) readVenueState(ctx context.Context, ids []uuid.UUID) (
+// usable reports whether this enricher can do anything at all. A nil receiver
+// is valid and means "not wired", so a caller can hold a plain *VenueState
+// without nil-checking at every use site.
+func (v *VenueState) usable() bool { return v != nil && v.reader != nil && v.tz != nil }
+
+func (v *VenueState) read(ctx context.Context, ids []uuid.UUID) (
 	map[uuid.UUID][]domain.WorkingHours, map[uuid.UUID]int, bool,
 ) {
-	hours, err := f.venueState.WorkingHoursFor(ctx, ids)
+	hours, err := v.reader.WorkingHoursFor(ctx, ids)
 	if err != nil {
 		slog.Warn("venue working hours lookup failed, serving catalog without schedule", "error", err)
 		return nil, nil, false
 	}
-	tables, err := f.venueState.BookableTableCountsFor(ctx, ids)
+	tables, err := v.reader.BookableTableCountsFor(ctx, ids)
 	if err != nil {
 		slog.Warn("venue table lookup failed, serving catalog without schedule", "error", err)
 		return nil, nil, false
@@ -122,10 +163,11 @@ func (f *facade) readVenueState(ctx context.Context, ids []uuid.UUID) (
 	return hours, tables, true
 }
 
-// now is the facade's clock, injectable so schedule tests can freeze an instant.
-func (f *facade) now() time.Time {
-	if f.clock != nil {
-		return f.clock()
+// now is the enricher's clock, injectable so schedule tests can freeze an
+// instant.
+func (v *VenueState) now() time.Time {
+	if v.clock != nil {
+		return v.clock()
 	}
 	return time.Now()
 }

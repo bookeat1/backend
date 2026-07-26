@@ -189,7 +189,6 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// authorization.
 	deviceTokens := notifications.NewDeviceTokenUseCase(notificationrepo.NewDeviceTokens(db))
 	favoritesRepo := favoriterepo.New(db)
-	favoritesFacade := favorites.NewFacade(favoritesRepo)
 	consentFacade := consent.NewFacade(
 		consentrepo.NewConsentRepository(db),
 		consentrepo.NewPreferenceRepository(db),
@@ -289,8 +288,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// can take an online booking at all — so the guest app stops inferring all
 	// three from the free-text opening_hours string. bookingCfg is passed as
 	// the timezone resolver on purpose: same zone as the availability engine.
+	//
+	// ONE instance, shared by every endpoint that serves a catalog row (list,
+	// search, detail, favorites). Wiring a second one — or forgetting one
+	// endpoint — makes the same venue read differently on two screens.
+	venueState := restaurants.NewVenueState(restRelated, bookingCfg)
+	favoritesFacade := favorites.NewFacade(favoritesRepo, favorites.WithVenueState(venueState))
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
-		restaurants.WithVenueState(restRelated, bookingCfg))
+		restaurants.WithVenueState(venueState))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,

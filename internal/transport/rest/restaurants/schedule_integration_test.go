@@ -136,33 +136,44 @@ func TestPublicScheduleEndToEnd(t *testing.T) {
 	rel := restrepo.NewRelated(pool)
 	facade := uc.NewFacade(repo, rel, restrepo.NewCategories(pool), restrepo.NewPartnership(pool),
 		sqltx.NewManager(pool),
-		uc.WithVenueState(rel, bookinguc.Config{TimezoneFallback: "Asia/Almaty"}),
-		uc.WithClock(func() time.Time { return now }))
+		uc.WithVenueState(uc.NewVenueState(rel, bookinguc.Config{TimezoneFallback: "Asia/Almaty"},
+			uc.WithVenueStateClock(func() time.Time { return now }))))
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	NewHandler(facade, nil, nil).RegisterPublic(r.Group("/api/v1"))
 
-	// ---- listing ----------------------------------------------------------
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/restaurants?per_page=50", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("list = %d, body %s", w.Code, w.Body.String())
+	// ---- the LIST-shaped routes -------------------------------------------
+	// Every route that serves catalog rows is exercised. A third list added
+	// later must be added here too, or it will silently ship without the
+	// fields — which is exactly how favorites first shipped without them.
+	fetchList := func(path string) map[string]publicPayload {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, body %s", path, w.Code, w.Body.String())
+		}
+		var env struct {
+			Data struct {
+				Items []publicPayload `json:"items"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		out := make(map[string]publicPayload, len(env.Data.Items))
+		for _, it := range env.Data.Items {
+			out[it.ID] = it
+		}
+		if len(out) != len(venues) {
+			t.Fatalf("%s returned %d venues, want %d", path, len(out), len(venues))
+		}
+		return out
 	}
-	var listEnv struct {
-		Data struct {
-			Items []publicPayload `json:"items"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &listEnv); err != nil {
-		t.Fatalf("decode list: %v", err)
-	}
-	byID := make(map[string]publicPayload, len(listEnv.Data.Items))
-	for _, it := range listEnv.Data.Items {
-		byID[it.ID] = it
-	}
-	if len(byID) != len(venues) {
-		t.Fatalf("listing returned %d venues, want %d", len(byID), len(venues))
+	listRoutes := map[string]map[string]publicPayload{
+		"list":   fetchList("/api/v1/restaurants?per_page=50"),
+		"search": fetchList("/api/v1/restaurants/search?per_page=50"),
 	}
 
 	tests := []struct {
@@ -179,10 +190,12 @@ func TestPublicScheduleEndToEnd(t *testing.T) {
 		{"no tables: schedule known, bookings refused", noTables, true, false, "Asia/Almaty", false},
 		{"venue timezone wins over the platform fallback", otherZone, true, true, "Europe/Istanbul", true},
 	}
-	for _, tc := range tests {
-		t.Run("list/"+tc.name, func(t *testing.T) {
-			assertVenuePayload(t, byID[tc.venue.id.String()], tc.wantSched, tc.wantOpenNow, tc.wantTZ, tc.wantBooking)
-		})
+	for route, byID := range listRoutes {
+		for _, tc := range tests {
+			t.Run(route+"/"+tc.name, func(t *testing.T) {
+				assertVenuePayload(t, byID[tc.venue.id.String()], tc.wantSched, tc.wantOpenNow, tc.wantTZ, tc.wantBooking)
+			})
+		}
 	}
 
 	// ---- detail: the same facts must come back on GET /restaurants/:id ----
@@ -207,8 +220,8 @@ func TestPublicScheduleEndToEnd(t *testing.T) {
 	// 01:00 is the exclusive end of Friday's window and Saturday opens at 11:00.
 	afterClose := uc.NewFacade(repo, rel, restrepo.NewCategories(pool), restrepo.NewPartnership(pool),
 		sqltx.NewManager(pool),
-		uc.WithVenueState(rel, bookinguc.Config{TimezoneFallback: "Asia/Almaty"}),
-		uc.WithClock(func() time.Time { return time.Date(2026, 7, 25, 2, 0, 0, 0, almaty) }))
+		uc.WithVenueState(uc.NewVenueState(rel, bookinguc.Config{TimezoneFallback: "Asia/Almaty"},
+			uc.WithVenueStateClock(func() time.Time { return time.Date(2026, 7, 25, 2, 0, 0, 0, almaty) }))))
 	agg, err := afterClose.Get(context.Background(), overnight.id)
 	if err != nil {
 		t.Fatalf("get after close: %v", err)

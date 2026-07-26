@@ -209,8 +209,8 @@ func TestListComputesOpenNowPerVenueTimezone(t *testing.T) {
 	instant := time.Date(2026, 7, 24, 6, 30, 0, 0, time.UTC)
 
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
-		WithVenueState(state, perVenueTZ{fallback: "Asia/Almaty"}),
-		WithClock(func() time.Time { return instant }))
+		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
+			WithVenueStateClock(func() time.Time { return instant }))))
 
 	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
 	if err != nil {
@@ -249,7 +249,7 @@ func TestListAndGetAttachVenueState(t *testing.T) {
 		tables: map[uuid.UUID]int{}, // no bookable tables at all
 	}
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
-		WithVenueState(state, fixedTZ{tz: "Asia/Almaty"}))
+		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"})))
 
 	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
 	if err != nil {
@@ -286,7 +286,7 @@ func TestVenueStateLookupFailureDegradesToUnknown(t *testing.T) {
 	repo := &fakeRestaurantRepo{list: []domain.RestaurantListItem{{Restaurant: domain.Restaurant{ID: id}}}}
 	state := &fakeVenueState{hoursErr: errors.New("db down")}
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
-		WithVenueState(state, fixedTZ{tz: "Asia/Almaty"}))
+		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"})))
 
 	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
 	if err != nil {

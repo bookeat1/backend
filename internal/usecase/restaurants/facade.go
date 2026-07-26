@@ -3,7 +3,6 @@ package restaurants
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -31,11 +30,10 @@ type facade struct {
 	partners   domain.PartnershipRequestRepository
 	tx         domain.TxManager
 
-	// Optional public-venue-state enrichment (see WithVenueState). All three
-	// are nil unless wired; the catalog then simply omits the new fields.
-	venueState venueStateReader
-	venueTZ    VenueTimezoneResolver
-	clock      func() time.Time
+	// venue is the optional public-venue-state enrichment (see
+	// WithVenueState). Nil unless wired; the catalog then simply omits the
+	// schedule / bookability fields rather than guessing them.
+	venue *VenueState
 }
 
 // FacadeOption configures optional facade dependencies without breaking the
@@ -46,13 +44,12 @@ type FacadeOption func(*facade)
 // structured weekly schedule, the server-computed "open now" flag, and the
 // "can this venue take an online booking at all" flag. Left unwired, those JSON
 // fields are absent — never guessed.
-func WithVenueState(reader venueStateReader, tz VenueTimezoneResolver) FacadeOption {
-	return func(f *facade) { f.venueState, f.venueTZ = reader, tz }
-}
-
-// WithClock overrides the clock "open now" is evaluated against. Tests only.
-func WithClock(now func() time.Time) FacadeOption {
-	return func(f *facade) { f.clock = now }
+//
+// The same *VenueState must be given to every other endpoint that serves
+// domain.RestaurantListItem rows (today: usecase/favorites), or the same venue
+// reads differently on two screens.
+func WithVenueState(v *VenueState) FacadeOption {
+	return func(f *facade) { f.venue = v }
 }
 
 // NewFacade constructs the restaurants Facade.
@@ -122,7 +119,7 @@ func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter) ([]domai
 	if err != nil {
 		return nil, 0, err
 	}
-	f.attachVenueState(ctx, items)
+	f.venue.AttachList(ctx, items)
 	return items, total, nil
 }
 
@@ -131,7 +128,7 @@ func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter) 
 	if err != nil {
 		return nil, 0, err
 	}
-	f.attachVenueState(ctx, items)
+	f.venue.AttachList(ctx, items)
 	return items, total, nil
 }
 
@@ -140,7 +137,7 @@ func (f *facade) Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggre
 	if err != nil {
 		return nil, err
 	}
-	f.attachVenueStateOne(ctx, agg)
+	f.venue.AttachOne(ctx, agg)
 	return agg, nil
 }
 
