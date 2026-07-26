@@ -37,6 +37,64 @@ type restaurantResponse struct {
 	// pointer so "not favorited" and "we don't know because you're not
 	// logged in" are never confused with each other.
 	IsFavorite *bool `json:"is_favorite,omitempty"`
+	// Schedule is the STRUCTURED weekly schedule plus a server-computed
+	// "open now", replacing the client's habit of parsing the free-text
+	// `opening_hours` string (which stays, untouched, for older clients).
+	// Absent when the venue has no usable working-hours rows: the client must
+	// then show "hours unknown", never "closed".
+	Schedule *scheduleResponse `json:"schedule,omitempty"`
+	// AcceptsOnlineBookings tells the guest, BEFORE they pick a date, whether
+	// this venue can be booked through the app at all. Absent only when the
+	// server did not compute the venue state (never guessed).
+	AcceptsOnlineBookings *bool `json:"accepts_online_bookings,omitempty"`
+}
+
+// scheduleResponse is the venue's regular weekly hours in a shape a client
+// renders directly. Days holds ONLY the weekdays the venue has a usable row
+// for — a missing weekday is unknown, not closed.
+type scheduleResponse struct {
+	// Timezone is the IANA zone `open_now` was computed in — the venue's own.
+	Timezone string `json:"timezone"`
+	// OpenNow is absent when the timezone could not be resolved on the server.
+	OpenNow *bool                 `json:"open_now,omitempty"`
+	Days    []scheduleDayResponse `json:"days"`
+}
+
+type scheduleDayResponse struct {
+	// DayOfWeek is 0 = Sunday .. 6 = Saturday.
+	DayOfWeek int  `json:"day_of_week"`
+	IsOpen    bool `json:"is_open"`
+	// OpensAt/ClosesAt are "HH:MM" venue-local wall clock, empty when closed.
+	OpensAt  string `json:"opens_at"`
+	ClosesAt string `json:"closes_at"`
+	// ClosesNextDay marks a window that runs past midnight (11:00 → 01:00):
+	// ClosesAt belongs to the FOLLOWING calendar day.
+	ClosesNextDay bool `json:"closes_next_day"`
+}
+
+// applyVenueState maps the server-computed venue state onto the public payload.
+// A nil state leaves both fields absent.
+func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
+	if st == nil {
+		return
+	}
+	accepts := st.AcceptsOnlineBookings
+	resp.AcceptsOnlineBookings = &accepts
+	if st.Schedule == nil {
+		return
+	}
+	days := make([]scheduleDayResponse, 0, len(st.Schedule.Days))
+	for _, d := range st.Schedule.Days {
+		days = append(days, scheduleDayResponse{
+			DayOfWeek: d.DayOfWeek, IsOpen: d.IsOpen,
+			OpensAt: d.OpenTime, ClosesAt: d.CloseTime, ClosesNextDay: d.ClosesNextDay,
+		})
+	}
+	resp.Schedule = &scheduleResponse{
+		Timezone: st.Schedule.Timezone,
+		OpenNow:  st.Schedule.OpenNow,
+		Days:     days,
+	}
 }
 
 type imageResponse struct {
@@ -104,6 +162,7 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantResponse {
 	resp := baseFromDomain(it.Restaurant, lang)
 	resp.PrimaryImage = it.PrimaryImage
+	applyVenueState(&resp, it.VenueState)
 	return resp
 }
 
@@ -136,6 +195,7 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 	for _, s := range a.SocialLinks {
 		resp.SocialLinks = append(resp.SocialLinks, socialResponse{ID: s.ID.String(), Type: s.Type, URL: s.URL})
 	}
+	applyVenueState(&resp, a.VenueState)
 	return resp
 }
 

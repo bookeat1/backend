@@ -221,10 +221,26 @@ func TestCreateIdempotency(t *testing.T) {
 		t.Errorf("create called %d times, want 1 — a retry must not book twice", d.create.calls)
 	}
 
-	// Same key, different body → 409, and still no second booking.
+	// Same key, different body → 409, and still no second booking. The status
+	// alone is not the contract: 409 is also what a lost slot race returns, so
+	// the body must carry the code that tells them apart (see
+	// conflict_integration_test.go).
 	conflict := do(r, http.MethodPost, "/api/v1/bookings", createBody(rid, 5), headers)
 	if conflict.Code != http.StatusConflict {
 		t.Errorf("key reuse with another body: status = %d, want 409 (body %s)", conflict.Code, conflict.Body)
+	}
+	var body struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(conflict.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode conflict body %s: %v", conflict.Body, err)
+	}
+	if body.Code != string(domain.CodeIdempotencyKeyReused) {
+		t.Errorf("key reuse: code = %q, want %q", body.Code, domain.CodeIdempotencyKeyReused)
+	}
+	if body.Error != "already exists" {
+		t.Errorf("key reuse: error = %q, want the unchanged %q", body.Error, "already exists")
 	}
 	if d.create.calls != 1 {
 		t.Errorf("create called %d times after the conflicting retry, want 1", d.create.calls)

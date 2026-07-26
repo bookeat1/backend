@@ -3,6 +3,7 @@ package bookings
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -470,4 +471,42 @@ func TestCreateStaffWindowIsRelaxed(t *testing.T) {
 	if _, err := h2.uc.Create(context.Background(), h2.manager, in2); err != nil {
 		t.Fatalf("staff off-grid = %v, want success", err)
 	}
+}
+
+// TestCreateConflictCodes pins the machine-readable identity of the two 409s
+// this usecase can produce. Both wrap ErrAlreadyExists, so the status and the
+// message cannot tell them apart — only the code can, and a client that
+// mistakes "the slot went to somebody else" for "you already booked this" sends
+// the guest to a reservation that does not exist.
+func TestCreateConflictCodes(t *testing.T) {
+	t.Run("lost exclusion race", func(t *testing.T) {
+		h := newCreateHarness(t, domain.BookingPolicyOverride{})
+		// What Postgres returns when the GiST exclusion constraint on
+		// booking_tables rejects the insert.
+		h.links.createErr = fmt.Errorf("%w: booking tables", domain.ErrAlreadyExists)
+
+		_, err := h.uc.Create(context.Background(), h.guest, h.input())
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			t.Fatalf("Create = %v, want ErrAlreadyExists", err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok || code != domain.CodeSlotTaken {
+			t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeSlotTaken)
+		}
+	})
+
+	t.Run("no table fits the party", func(t *testing.T) {
+		h := newCreateHarness(t, domain.BookingPolicyOverride{})
+		in := h.input()
+		in.Guests = 7 // the venue seats 4 + 2 — seven never fits
+
+		_, err := h.uc.Create(context.Background(), h.guest, in)
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			t.Fatalf("Create = %v, want ErrAlreadyExists", err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok || code != domain.CodeNoTableAvailable {
+			t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeNoTableAvailable)
+		}
+	})
 }

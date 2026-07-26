@@ -84,12 +84,19 @@ func (h *Handler) login(c *gin.Context) {
 // @Description Generates a one-time code and delivers it to the phone. Rate-limited
 // @Description (per-minute and per-hour); over the limit returns 422. The response
 // @Description "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
+// @Description
+// @Description When no delivery channel accepts the code the answer is a plain 500
+// @Description with the generic body — identical for a number nobody can reach and
+// @Description for a provider outage. That is deliberate: a response that varied by
+// @Description channel would let anyone enumerate which numbers have Telegram or
+// @Description WhatsApp. The per-channel reasons live in our logs, phone masked.
 // @Tags        auth
 // @Accept      json
 // @Produce     json
 // @Param       body body otpRequestRequest true "Phone number"
 // @Success     200 {object} response.Envelope{data=otpRequestedResponse}
 // @Failure     422 {object} response.Envelope "validation failed / rate limited"
+// @Failure     500 {object} response.Envelope "the code could not be delivered on any channel"
 // @Router      /api/v1/auth/otp/request [post]
 func (h *Handler) otpRequest(c *gin.Context) {
 	var req otpRequestRequest

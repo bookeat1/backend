@@ -287,3 +287,93 @@ func TestListMembershipsByUser(t *testing.T) {
 		t.Fatalf("briefs = %+v, want [Alpha, Bravo]", briefs)
 	}
 }
+
+// The batch reads back the public catalog's schedule/bookability fields. Two
+// contracts are pinned here, because the guest-facing answer depends on both:
+// a venue with no rows must be ABSENT from the map ("unknown", not "closed" /
+// "zero"), and the table count must apply the same is_active + capacity > 0
+// filter the availability engine does.
+func TestWorkingHoursAndBookableTablesBatch(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants")
+	ctx := context.Background()
+	repo := New(pool)
+	rel := NewRelated(pool)
+	txm := sqltx.NewManager(pool)
+
+	seed := func(name string) uuid.UUID {
+		id := uuid.New()
+		if err := repo.Create(ctx, &domain.Restaurant{
+			ID: id, Name: name, City: domain.CityAlmaty, PriceCategory: domain.PriceLow, IsActive: true,
+		}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return id
+	}
+	withHours := seed("Пятница")   // hours + a usable table
+	noTables := seed("Adept")      // hours, but nothing to seat anyone at
+	bare := seed("Без расписания") // no rows in either table at all
+
+	open, close_ := "11:00", "01:00"
+	week := func() []domain.WorkingHours {
+		out := make([]domain.WorkingHours, 0, 7)
+		for dow := 0; dow < 7; dow++ {
+			o, c := open, close_
+			out = append(out, domain.WorkingHours{DayOfWeek: dow, IsOpen: true, OpenTime: &o, CloseTime: &c})
+		}
+		return out
+	}
+	err := txm.WithinTx(ctx, func(ctx context.Context) error {
+		if err := rel.ReplaceWorkingHours(ctx, withHours, week()); err != nil {
+			return err
+		}
+		if err := rel.ReplaceWorkingHours(ctx, noTables, week()); err != nil {
+			return err
+		}
+		return rel.ReplaceTables(ctx, withHours, []domain.RestaurantTable{
+			{Name: "T1", Capacity: 4, IsActive: true},
+			{Name: "T2", Capacity: 2, IsActive: false}, // inactive: not bookable
+			{Name: "T3", Capacity: 0, IsActive: true},  // seats nobody: not bookable
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ids := []uuid.UUID{withHours, noTables, bare}
+	hours, err := rel.WorkingHoursFor(ctx, ids)
+	if err != nil {
+		t.Fatalf("working hours batch: %v", err)
+	}
+	if len(hours[withHours]) != 7 || len(hours[noTables]) != 7 {
+		t.Errorf("expected 7 rows per seeded venue, got %d/%d", len(hours[withHours]), len(hours[noTables]))
+	}
+	if _, ok := hours[bare]; ok {
+		t.Error("a venue with no working-hours rows must be ABSENT from the map, not an empty slice")
+	}
+	if h := hours[withHours][0]; h.OpenTime == nil || *h.OpenTime != "11:00" || h.CloseTime == nil || *h.CloseTime != "01:00" {
+		t.Errorf("row = %+v, want 11:00-01:00 verbatim", h)
+	}
+
+	tables, err := rel.BookableTableCountsFor(ctx, ids)
+	if err != nil {
+		t.Fatalf("table count batch: %v", err)
+	}
+	if tables[withHours] != 1 {
+		t.Errorf("bookable tables = %d, want 1 (inactive and zero-capacity rows excluded)", tables[withHours])
+	}
+	if n, ok := tables[noTables]; ok {
+		t.Errorf("a venue with no tables must be absent from the map, got %d", n)
+	}
+	if n, ok := tables[bare]; ok {
+		t.Errorf("a venue with no tables must be absent from the map, got %d", n)
+	}
+
+	// Empty input must not build a query at all.
+	if m, err := rel.WorkingHoursFor(ctx, nil); err != nil || len(m) != 0 {
+		t.Errorf("empty batch = %v, %v; want empty map, nil", m, err)
+	}
+	if m, err := rel.BookableTableCountsFor(ctx, nil); err != nil || len(m) != 0 {
+		t.Errorf("empty batch = %v, %v; want empty map, nil", m, err)
+	}
+}

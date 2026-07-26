@@ -117,7 +117,11 @@ func (u *idempotentCreate) replay(ctx context.Context, userID uuid.UUID, key Ide
 		return nil, err
 	}
 	if rec.RequestHash != key.RequestHash {
-		return nil, fmt.Errorf("%w: this Idempotency-Key was used with a different request body", domain.ErrAlreadyExists)
+		// This one DOES mean the earlier submit went through — the stored
+		// response belongs to the first body. Distinct code so the app never
+		// confuses it with a lost slot race.
+		return nil, domain.WithCode(domain.CodeIdempotencyKeyReused,
+			fmt.Errorf("%w: this Idempotency-Key was used with a different request body", domain.ErrAlreadyExists))
 	}
 	var out BookingDetails
 	if err := json.Unmarshal(rec.Response, &out); err != nil {

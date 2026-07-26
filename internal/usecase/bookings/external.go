@@ -117,7 +117,10 @@ func (u *externalReservationUseCase) Create(ctx context.Context, actor Actor, re
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrAlreadyExists) {
-			return nil, fmt.Errorf("%w: the slot is already occupied", domain.ErrAlreadyExists)
+			// The exclusion constraint fired: an active booking or another
+			// hold already owns the slot. No hold was created.
+			return nil, domain.WithCode(domain.CodeSlotTaken,
+				fmt.Errorf("%w: the slot is already occupied", domain.ErrAlreadyExists))
 		}
 		return nil, err
 	}

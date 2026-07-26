@@ -519,3 +519,59 @@ func (p *Partnership) Create(ctx context.Context, req *domain.PartnershipRequest
 	}
 	return nil
 }
+
+// WorkingHoursFor reads the weekly working hours of MANY venues in one query,
+// so a catalog page costs one round-trip instead of one per restaurant. A venue
+// with no rows is absent from the map — the caller must keep telling "hours
+// unknown" apart from "closed" (see usecase/restaurants.buildVenueState).
+func (r *Related) WorkingHoursFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]domain.WorkingHours, error) {
+	out := make(map[uuid.UUID][]domain.WorkingHours, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, restaurant_id, day_of_week, open_time, close_time, is_open, created_at, updated_at
+		 FROM restaurant_working_hours WHERE restaurant_id = ANY($1)
+		 ORDER BY restaurant_id, day_of_week`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list working hours for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var w domain.WorkingHours
+		if err := rows.Scan(&w.ID, &w.RestaurantID, &w.DayOfWeek, &w.OpenTime, &w.CloseTime, &w.IsOpen, &w.CreatedAt, &w.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan working hours: %w", err)
+		}
+		out[w.RestaurantID] = append(out[w.RestaurantID], w)
+	}
+	return out, rows.Err()
+}
+
+// BookableTableCountsFor counts, per venue, the tables that could actually seat
+// a party: is_active AND capacity > 0 — exactly the filter the availability
+// engine applies (usecase/bookings.loadSchedule). A venue with no such table is
+// absent from the map (count 0), which is how "Adept" is recognised as unable
+// to accept online bookings at all.
+func (r *Related) BookableTableCountsFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]int, error) {
+	out := make(map[uuid.UUID]int, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT restaurant_id, count(*) FROM restaurant_tables
+		 WHERE restaurant_id = ANY($1) AND is_active AND capacity > 0
+		 GROUP BY restaurant_id`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("count bookable tables: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("scan bookable table count: %w", err)
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}

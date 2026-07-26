@@ -61,9 +61,7 @@ func (r *Repository) Remove(ctx context.Context, userID, restaurantID uuid.UUID)
 // Deactivated restaurants are excluded, same visibility rule as the catalog.
 func (r *Repository) ListByUser(ctx context.Context, userID uuid.UUID) ([]domain.RestaurantListItem, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT `+prefixed(restaurant.Columns, "r")+`,
-			(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
-			 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image
+		`SELECT `+prefixed(restaurant.Columns, "r")+`, `+restaurant.ListExtraColumns+`
 		 FROM restaurant_favorites f
 		 JOIN restaurants r ON r.id = f.restaurant_id
 		 WHERE f.user_id = $1 AND r.is_active = true

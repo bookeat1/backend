@@ -34,9 +34,22 @@ import (
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
+	staticmaprest "backend-core/internal/transport/rest/staticmap"
 	"backend-core/internal/transport/rest/swaggerui"
 	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
+)
+
+// HTTP server timeouts. httpWriteTimeout is a named constant rather than a
+// literal because other subsystems have to fit inside it: anything a handler
+// does synchronously (notably the OTP delivery waterfall, see newOTPSender)
+// must finish before the server stops being able to write the response, or we
+// keep working — and paying providers — for a guest whose connection is gone.
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 15 * time.Second
+	httpWriteTimeout      = 15 * time.Second
+	httpIdleTimeout       = 60 * time.Second
 )
 
 // NewApp builds the Gin engine with all routes wired. db is used by the
@@ -100,6 +113,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic := api.Group("")
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
+
+	// Server-side static map preview. Fully public and NOT on the OptionalAuth
+	// group: the picture is identical for every caller, so parsing a token
+	// would only add a user lookup to a route meant to be cheap. Registered
+	// unconditionally — without a provider key it answers a clean
+	// 503/map_not_configured, which the app already handles like "no map".
+	staticmaprest.NewHandler(deps.StaticMap).RegisterPublic(api)
 
 	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
 	// SAME OptionalAuth group and for the same reason as the catalog: it is a
@@ -297,10 +317,10 @@ func Run(cfg Config, log *slog.Logger) error {
 	srv := &http.Server{
 		Addr:              cfg.App.URL,
 		Handler:           app,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

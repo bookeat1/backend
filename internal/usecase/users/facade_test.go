@@ -95,6 +95,9 @@ func (f *memOTP) IncrementAttempts(context.Context, uuid.UUID) error { return ni
 func (f *memOTP) CountSince(context.Context, string, time.Time) (int, error) {
 	return 0, nil
 }
+func (f *memOTP) LastUsedChannelByPhone(context.Context, string) (string, error) {
+	return "", nil
+}
 func (f *memOTP) InvalidateActiveByPhone(_ context.Context, phone string) error {
 	f.invalidatedFor[phone]++
 	return nil

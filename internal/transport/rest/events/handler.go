@@ -35,6 +35,7 @@ func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 
 // RegisterPublic mounts the unauthenticated read routes.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
+	rg.GET("/events", h.listUpcoming)
 	rg.GET("/restaurants/:id/events", h.listPublic)
 	rg.GET("/restaurants/:id/events/:eventId", h.getPublic)
 }
@@ -67,6 +68,28 @@ func (h *Handler) listPublic(c *gin.Context) {
 		out = append(out, publicResponse(e, lang))
 	}
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// listUpcoming serves the cross-venue guest listing (Explore screen):
+// GET /events?city=&restaurant_id=&from=&to=&page=&per_page=&lang=.
+// Unlike /restaurants/:id/events it is not tied to one venue; what a guest may
+// see is decided in usecase/repository, never by a query parameter.
+func (h *Handler) listUpcoming(c *gin.Context) {
+	flt, ok := publicListFilter(c)
+	if !ok {
+		return
+	}
+	items, total, err := h.facade.ListPublicUpcoming(c.Request.Context(), flt)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	lang := reqlocale.Resolve(c)
+	out := make([]eventListItemResponse, 0, len(items))
+	for _, it := range items {
+		out = append(out, publicListItemResponse(it, lang))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, flt.Page, flt.PerPage))
 }
 
 func (h *Handler) getPublic(c *gin.Context) {
@@ -293,6 +316,54 @@ func pagination(c *gin.Context) (page, perPage int) {
 	return page, perPage
 }
 
+// publicListFilter parses the cross-venue listing's query parameters. A
+// malformed restaurant_id or date is answered with 422 rather than ignored:
+// silently dropping restaurant_id would hand the caller the WHOLE platform's
+// events under the name of one venue, and silently dropping a date bound would
+// answer a different question than the one asked. An unknown `city` is left as
+// it is (it simply matches nothing), same as the catalog listing.
+func publicListFilter(c *gin.Context) (domain.PublicEventFilter, bool) {
+	var f domain.PublicEventFilter
+	if v := strings.TrimSpace(c.Query("city")); v != "" {
+		city := domain.City(v)
+		f.City = &city
+	}
+	if v := strings.TrimSpace(c.Query("restaurant_id")); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, "restaurant_id must be a uuid")
+			return f, false
+		}
+		f.RestaurantID = &id
+	}
+	from, ok := queryTime(c, "from")
+	if !ok {
+		return f, false
+	}
+	to, ok := queryTime(c, "to")
+	if !ok {
+		return f, false
+	}
+	f.From, f.To = from, to
+	f.Page, f.PerPage = pagination(c)
+	return f, true
+}
+
+// queryTime parses an optional RFC3339 query parameter, writing 422 on a
+// malformed value. Same format the admin create/update payload uses.
+func queryTime(c *gin.Context, name string) (*time.Time, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return nil, true
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, name+" must be an RFC3339 timestamp")
+		return nil, false
+	}
+	return &t, true
+}
+
 func parseEventStatuses(raw string) []domain.EventStatus {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -432,6 +503,32 @@ func adminResponse(e domain.Event) eventResponse {
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
 		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+// eventListItemResponse is the cross-venue listing's item: the same guest-facing
+// event shape as the per-restaurant listing (embedded, so its fields stay inline
+// and identical) plus the venue that hosts it, which the Explore card needs.
+type eventListItemResponse struct {
+	eventResponse
+	Restaurant eventRestaurantResponse `json:"restaurant"`
+}
+
+// eventRestaurantResponse is the minimal venue identity on an Explore card.
+type eventRestaurantResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	City string `json:"city"`
+}
+
+func publicListItemResponse(it domain.EventListItem, lang string) eventListItemResponse {
+	return eventListItemResponse{
+		eventResponse: publicResponse(it.Event, lang),
+		Restaurant: eventRestaurantResponse{
+			ID:   it.Restaurant.ID.String(),
+			Name: it.Restaurant.NameI18n.Resolve(lang, it.Restaurant.Name),
+			City: string(it.Restaurant.City),
+		},
 	}
 }
 

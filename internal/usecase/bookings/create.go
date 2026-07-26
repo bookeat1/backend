@@ -262,6 +262,19 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	}
 
 	slotFrom, slotTo := occupancyWindow(startsAt, policy)
+	// Set only by the statements that actually enforce occupancy — the
+	// booking_tables insert in table mode and the capacity-hold insert in seats
+	// mode — so the slot_taken label describes the statement that raised the
+	// conflict rather than "some ErrAlreadyExists escaped the transaction".
+	// WithinTx runs the closure exactly once (no retry), so a plain flag is
+	// enough.
+	//
+	// Both modes must set it: seats mode is the ONLY mode the table-less venues
+	// have, so leaving it to the links insert alone would mean every full slot
+	// at those venues answers with the generic already_exists — which the app
+	// reads as "you have already booked this", telling the guest to check
+	// reservations instead of picking another time.
+	var slotConflict bool
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.bookings.Create(ctx, b); err != nil {
 			return err
@@ -275,6 +288,9 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 				})
 			}
 			if err := u.links.Create(ctx, links); err != nil {
+				// The GiST exclusion constraint on booking_tables: somebody
+				// else committed this table/slot first.
+				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
 				return err
 			}
 		}
@@ -303,6 +319,7 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			// that neither guarantee can see. The honest answer is the same
 			// conflict a lost table race produces; the client retries and gets a
 			// real placement under the new mode.
+			slotConflict = true
 			return fmt.Errorf("%w: the restaurant changed how it takes bookings, please retry", domain.ErrAlreadyExists)
 		}
 		if policy.CapacityMode == domain.CapacityModeSeats {
@@ -326,10 +343,13 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 					return err
 				}
 			}
-			// The DB decides here. An overbooking arrives as ErrAlreadyExists
-			// from the bucket CHECK and is translated below into the same
-			// "the slot was just taken" answer a lost table race produces.
+			// The DB decides here: the bucket CHECK (seats_taken <= seats_limit)
+			// is the seats-mode equivalent of the GiST exclusion, and a party
+			// that no longer fits arrives as ErrAlreadyExists from it. Same
+			// answer as a lost table race — nothing was booked, pick another
+			// time — so it carries the same code.
 			if err := u.capacity.Create(ctx, holds); err != nil {
+				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
 				return err
 			}
 		}
@@ -357,8 +377,14 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			domain.ActorSystem, nil, strPtr("auto-confirm"), now)
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrAlreadyExists) {
-			return nil, fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists)
+		if slotConflict {
+			// A lost capacity race, NOT a duplicate submit: nothing was
+			// booked. The code is what lets the app say "pick another time"
+			// instead of "check your reservations". Any OTHER duplicate inside
+			// the transaction keeps the generic already_exists code — it is a
+			// bug on our side, not a slot the guest can pick around.
+			return nil, domain.WithCode(domain.CodeSlotTaken,
+				fmt.Errorf("%w: the selected time slot was just taken", domain.ErrAlreadyExists))
 		}
 		return nil, err
 	}
@@ -553,8 +579,9 @@ func (u *createUseCase) selectTables(
 	}
 	picked := pickTables(freeTables(sched.tables, busy, from, to), in.Guests)
 	if len(picked) == 0 {
-		return nil, fmt.Errorf("%w: no table available for %d guests at this time",
-			domain.ErrAlreadyExists, in.Guests)
+		return nil, domain.WithCode(domain.CodeNoTableAvailable,
+			fmt.Errorf("%w: no table available for %d guests at this time",
+				domain.ErrAlreadyExists, in.Guests))
 	}
 	return picked, nil
 }

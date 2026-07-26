@@ -375,7 +375,7 @@
         },
         "/api/v1/auth/otp/request": {
             "post": {
-                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.",
+                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.\n\nWhen no delivery channel accepts the code the answer is a plain 500\nwith the generic body — identical for a number nobody can reach and\nfor a provider outage. That is deliberate: a response that varied by\nchannel would let anyone enumerate which numbers have Telegram or\nWhatsApp. The per-channel reasons live in our logs, phone masked.",
                 "consumes": [
                     "application/json"
                 ],
@@ -418,6 +418,12 @@
                     },
                     "422": {
                         "description": "validation failed / rate limited",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "500": {
+                        "description": "the code could not be delivered on any channel",
                         "schema": {
                             "$ref": "#/definitions/response.Envelope"
                         }
@@ -1018,6 +1024,104 @@
                     },
                     "422": {
                         "description": "validation failed",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/devices/push-tokens": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Register my device for push notifications",
+                "parameters": [
+                    {
+                        "description": "Provider push token + platform",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/devicetokens.registerRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Unregister my device from push notifications",
+                "parameters": [
+                    {
+                        "description": "The token to silence",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/devicetokens.unregisterRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
                         "schema": {
                             "$ref": "#/definitions/response.Envelope"
                         }
@@ -2087,6 +2191,32 @@
                 }
             }
         },
+        "devicetokens.registerRequest": {
+            "type": "object",
+            "required": [
+                "platform",
+                "token"
+            ],
+            "properties": {
+                "platform": {
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "devicetokens.unregisterRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
         "payments.createPaymentRequest": {
             "type": "object",
             "properties": {
@@ -2235,6 +2365,9 @@
         "response.Envelope": {
             "type": "object",
             "properties": {
+                "code": {
+                    "type": "string"
+                },
                 "data": {},
                 "error": {
                     "type": "string"

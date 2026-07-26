@@ -110,3 +110,64 @@ func TestFavoriteSet(t *testing.T) {
 		t.Fatalf("expected %s to be favorited", rid)
 	}
 }
+
+// fakeAttacher stands in for the shared usecase/restaurants.VenueState.
+type fakeAttacher struct {
+	calls int
+	state domain.PublicVenueState
+}
+
+func (f *fakeAttacher) AttachList(_ context.Context, items []domain.RestaurantListItem) {
+	f.calls++
+	for i := range items {
+		st := f.state
+		items[i].VenueState = &st
+	}
+}
+
+// Favorites renders the same public shape as the catalog listing, so it must go
+// through the same enrichment. Without this the same venue shows a full
+// schedule on the home screen and none in favorites — a difference with no
+// cause in the data. See transport/rest/favorites' cross-screen integration
+// test for the end-to-end version of this contract.
+func TestList_AttachesVenueState(t *testing.T) {
+	rid := uuid.New()
+	repo := &fakeFavoriteRepo{listItems: []domain.RestaurantListItem{
+		{Restaurant: domain.Restaurant{ID: rid}},
+	}}
+	att := &fakeAttacher{state: domain.PublicVenueState{
+		AcceptsOnlineBookings: true,
+		Schedule:              &domain.WeeklySchedule{Timezone: "Asia/Almaty"},
+	}}
+	f := NewFacade(repo, WithVenueState(att))
+
+	items, err := f.List(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if att.calls != 1 {
+		t.Errorf("enricher called %d times, want exactly 1 (one batch for the page)", att.calls)
+	}
+	if len(items) != 1 || items[0].VenueState == nil {
+		t.Fatalf("favorited venue must carry the venue state, got %+v", items)
+	}
+	if !items[0].VenueState.AcceptsOnlineBookings || items[0].VenueState.Schedule == nil {
+		t.Errorf("venue state = %+v, want the enricher's value verbatim", items[0].VenueState)
+	}
+}
+
+// Unwired, favorites behaves exactly as before: fields absent, never guessed.
+func TestList_WithoutEnricherLeavesVenueStateAbsent(t *testing.T) {
+	repo := &fakeFavoriteRepo{listItems: []domain.RestaurantListItem{
+		{Restaurant: domain.Restaurant{ID: uuid.New()}},
+	}}
+	f := NewFacade(repo)
+
+	items, err := f.List(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if items[0].VenueState != nil {
+		t.Error("venue state must stay absent when the enrichment is not wired")
+	}
+}
