@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -29,11 +30,13 @@ import (
 // real database, because only the database can answer it — is what the cancelled
 // booking ends up holding.
 //
-// The safety net is meant to be migrations 0057 / 0058: a BEFORE INSERT trigger
+// The safety net is migrations 0057 / 0058 plus 0059: a BEFORE INSERT trigger
 // derives `active` from the booking's CURRENT committed status, so a hold or a
 // link written for an already-cancelled booking lands INACTIVE and takes
-// nothing. Both directions of the switch are checked here, and the assertion is
-// the invariant itself: a cancelled booking must occupy nothing.
+// nothing; and a DEFERRED constraint trigger derives it AGAIN at the writer's
+// commit, which is the only place from which a cancel committed after that
+// INSERT is visible. Both directions of the switch are checked here, and the
+// assertion is the invariant itself: a cancelled booking must occupy nothing.
 //
 // THE INVARIANT, stated so it cannot be "fixed" by relaxing an expectation:
 // after a mode switch, a booking whose cancel is committed at ANY point before
@@ -41,12 +44,13 @@ import (
 // link. An active row for a cancelled guest is phantom occupancy — a seat or a
 // table the venue can never sell and never serve.
 
-// skipOpenHole marks the two tests that REPRODUCE a hole which is still open.
-// They are skipped, not deleted and not weakened: their assertions are the
-// invariant the product must hold, and they were verified to FAIL against this
-// commit — that failure is the bug report, not a wrong expectation.
+// CLOSED BY MIGRATION 0059 (`…_active_at_commit`). The two `…AfterItsWrite`
+// tests below were committed SKIPPED, as a reproduction of the open hole; they
+// now run, with their assertions untouched. What they used to observe is kept
+// here because it is the measurement the fix has to keep answering.
 //
-// OBSERVED, 25.07.2026, against the migrated test database at version 58:
+// OBSERVED BEFORE THE FIX, 25.07.2026, against the migrated test database at
+// version 58:
 //
 //	tables → seats, cancel committed after the switch INSERTed the holds:
 //	  10 rows in booking_capacity_holds for the cancelled booking, ALL active,
@@ -58,16 +62,23 @@ import (
 //	  another party of 4 at that table in that slot is refused by the GiST
 //	  exclusion constraint ("already exists"). The table is lost for the slot.
 //
-// Why the trigger does not save this half: migrations 0057 / 0058 derive
-// `active` at INSERT time from the status committed AT THAT MOMENT, which was
-// still live; and the status trigger that would flip the row afterwards
+// Why the INSERT-time derivation did not save this half: migrations 0057 / 0058
+// derive `active` at INSERT time from the status committed AT THAT MOMENT, which
+// was still live; and the status trigger that would flip the row afterwards
 // (0004 / 0054, `UPDATE … WHERE booking_id = NEW.id`) cannot see a row the
 // switch's transaction has not committed yet. Neither side is wrong on its own —
-// they simply do not compose under READ COMMITTED with no lock shared between a
+// they simply did not compose under READ COMMITTED with no lock shared between a
 // status change and a mode switch.
 //
-// REMOVE THIS SKIP as part of the fix. Do not adjust the assertions.
-const skipOpenHole = "reproduces an OPEN hole (mid-loop cancel leaves phantom occupancy) — see the comment on skipOpenHole; unskip as part of the fix, do not relax the assertions"
+// 0059 adds the third derivation, at the writer's COMMIT: a deferred constraint
+// trigger re-reads the booking's status with a fresh snapshot (so it sees every
+// cancel committed since the INSERT) and deactivates the row it wrote. It reads
+// the booking FOR NO KEY UPDATE NOWAIT, which closes the remainder of the window
+// — a cancel arriving after that read waits for our commit and is then flipped by
+// 0054 / 0004, and a status change already IN FLIGHT makes the writer fail
+// (serialization_failure → domain.ErrAlreadyExists, see
+// TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged) rather than commit a
+// phantom.
 
 // hookedCapacity decorates the real capacity repository so a test can commit
 // something out of band immediately before or immediately after one chosen
@@ -77,6 +88,16 @@ const skipOpenHole = "reproduces an OPEN hole (mid-loop cancel leaves phantom oc
 type hookedCapacity struct {
 	domain.BookingCapacityRepository
 	before, after func(bookingID uuid.UUID)
+
+	// splitFor / onSplit reach the THIRD point of the same window, the one
+	// inside ReplaceForBooking: its DELETE and its INSERT are two statements
+	// (the repository says so itself), so a cancel can commit between them. The
+	// split is built out of two ORDINARY calls to the real repository — first
+	// with no holds, which performs only the DELETE, then with the holds, whose
+	// DELETE is now a no-op — so production code is not made testable here
+	// either.
+	splitFor uuid.UUID
+	onSplit  func(bookingID uuid.UUID)
 }
 
 func (c *hookedCapacity) ReplaceForBooking(
@@ -84,6 +105,12 @@ func (c *hookedCapacity) ReplaceForBooking(
 ) error {
 	if c.before != nil {
 		c.before(bookingID)
+	}
+	if c.onSplit != nil && bookingID == c.splitFor && len(holds) > 0 {
+		if err := c.BookingCapacityRepository.ReplaceForBooking(ctx, bookingID, nil); err != nil {
+			return err
+		}
+		c.onSplit(bookingID)
 	}
 	err := c.BookingCapacityRepository.ReplaceForBooking(ctx, bookingID, holds)
 	if c.after != nil {
@@ -275,7 +302,6 @@ func TestTablesToSeatsSwitchGivesNoActiveHoldToABookingCancelledBeforeItsWrite(t
 //
 // The invariant is the same either way: a cancelled guest occupies nothing.
 func TestTablesToSeatsSwitchGivesNoActiveHoldToABookingCancelledAfterItsWrite(t *testing.T) {
-	t.Skip(skipOpenHole)
 	h := newMidLoopHarness(t, "tables", 0)
 	ctx := context.Background()
 	first, victim, last := h.midLoopSeed(t)
@@ -390,7 +416,6 @@ func TestSeatsToTablesSwitchGivesNoActiveLinkToABookingCancelledBeforeItsWrite(t
 // the harder half: the placement is already INSERTed (uncommitted) when the
 // cancel commits, so the status trigger of 0004 has no visible row to flip.
 func TestSeatsToTablesSwitchGivesNoActiveLinkToABookingCancelledAfterItsWrite(t *testing.T) {
-	t.Skip(skipOpenHole)
 	h := newMidLoopHarness(t, "seats", 100)
 	ctx := context.Background()
 	first, victim, last, _ := h.midLoopSeedSeats(t)
@@ -457,4 +482,179 @@ func (h *guaranteeHarness) status(t *testing.T, bookingID uuid.UUID) domain.Book
 		t.Fatalf("read status: %v", err)
 	}
 	return domain.BookingStatus(s)
+}
+
+// TestCapacityChangeAndACancelBetweenTheDeleteAndTheInsertLeaveNoOccupancy is
+// the third interleaving of the same window, and the one nobody had measured:
+// ReplaceForBooking is a DELETE followed by an INSERT, two statements under READ
+// COMMITTED, so a cancel can commit between them.
+//
+// MEASURED, and it is not what the other two cases do: the cancel does not get
+// to commit there at all. Its own status trigger (0054) runs
+// `UPDATE booking_capacity_holds ... WHERE booking_id = ...` over the rows the
+// switch has just DELETEd but not committed, so it WAITS for the switch — while
+// holding the booking row. That is why the cancel has to run on its own
+// goroutine here (a synchronous hook would hold the switch inside ReplaceForBooking
+// and the two would wait for each other for ever).
+//
+// The outcome is therefore allowed to be either of two things, and the test
+// accepts both because both are correct — what it does not accept is phantom
+// occupancy:
+//
+//   - the switch is REFUSED as a conflict: it cannot know what the transaction
+//     sitting on that booking row will commit, so 0059's NOWAIT read makes it
+//     roll back whole (see TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged);
+//   - or the switch commits, and the cancel — which by then can finally run its
+//     flip — sees the new rows committed and deactivates them.
+//
+// Either way the cancelled booking ends up occupying NOTHING, and the live
+// bookings still occupy exactly their own seats.
+func TestCapacityChangeAndACancelBetweenTheDeleteAndTheInsertLeaveNoOccupancy(t *testing.T) {
+	h := newMidLoopHarness(t, "tables", 0)
+	ctx := context.Background()
+	first, victim, last := h.midLoopSeed(t)
+
+	// Round one, undisturbed: every booking now owns real, active capacity, so
+	// the replacement in round two has committed rows to DELETE. A DELETE that
+	// finds nothing would prove nothing.
+	if _, err := h.midPolicy.Update(ctx, h.manager, h.restaurantID, seatsOverride(100)); err != nil {
+		t.Fatalf("switch to seats: %v", err)
+	}
+	if act := h.activeHolds(t, victim.ID); len(act) == 0 {
+		t.Fatalf("the victim holds nothing after the first switch; this test's premise is gone")
+	}
+
+	cancelled := make(chan error, 1)
+	h.capHook.splitFor = victim.ID
+	h.capHook.onSplit = func(id uuid.UUID) {
+		go func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := h.pool.Exec(cctx,
+				`UPDATE bookings SET status='cancelled', cancelled_at=now(), updated_at=now() WHERE id=$1`, id)
+			cancelled <- err
+		}()
+		// Give that statement time to reach the database and take the booking
+		// row, so the interleaving under test really is "the cancel is inside
+		// this window" and not "the cancel starts after the switch committed".
+		h.waitForBlockedCancel(t)
+	}
+
+	_, switchErr := h.midPolicy.Update(ctx, h.manager, h.restaurantID, seatsOverride(120))
+	// Logged, not asserted: which of the two correct outcomes happens depends on
+	// how far the cancel got before the switch reached its commit, and both are
+	// covered by the invariant below.
+	t.Logf("capacity change raced by a cancel between the DELETE and the INSERT returned: %v", switchErr)
+	if switchErr != nil && !errors.Is(switchErr, domain.ErrAlreadyExists) {
+		t.Fatalf("capacity change failed with %v; a cancel racing it is a conflict at worst, never a server error", switchErr)
+	}
+	select {
+	case err := <-cancelled:
+		if err != nil {
+			t.Fatalf("the out-of-band cancel failed: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the out-of-band cancel never finished: it is still waiting for a lock the capacity change left behind")
+	}
+
+	if got := h.status(t, victim.ID); got != domain.BookingCancelled {
+		t.Fatalf("victim status = %q, want cancelled: the out-of-band cancel did not take effect", got)
+	}
+	// THE INVARIANT, whichever of the two outcomes happened.
+	if act := h.activeHolds(t, victim.ID); len(act) != 0 {
+		t.Errorf("INVARIANT BROKEN: a booking cancelled between the DELETE and the INSERT of its own hold replacement came out holding %d ACTIVE capacity holds (%+v) — phantom occupancy for a guest who is not coming (switch returned %v).",
+			len(act), act, switchErr)
+	}
+	if taken := h.takenIn(t, victim.StartsAt); taken != 0 {
+		t.Errorf("INVARIANT BROKEN: the buckets of the cancelled booking's window report %d seats taken, want 0 (phantom occupancy)", taken)
+	}
+	for _, b := range []*domain.Booking{first, last} {
+		if act := h.activeHolds(t, b.ID); len(act) == 0 {
+			t.Errorf("live booking %s came out of the capacity change with no active holds: its seats will be sold twice", b.ID)
+		}
+		if taken := h.takenIn(t, b.StartsAt); taken != 4 {
+			t.Errorf("live booking %s: seats_taken in its window = %d, want 4", b.ID, taken)
+		}
+	}
+}
+
+// waitForBlockedCancel waits until the out-of-band cancel is visibly waiting for
+// a lock — that is the state this interleaving is about, and seeing it removes
+// the guesswork a bare sleep would leave. It gives up quietly after a second:
+// the test is still meaningful if the cancel is merely in flight.
+func (h *midLoopHarness) waitForBlockedCancel(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := h.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_stat_activity
+			 WHERE query LIKE 'UPDATE bookings SET status=%'
+			   AND wait_event_type = 'Lock'`).Scan(&n); err == nil && n > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged pins the one failure
+// mode migration 0059 deliberately introduces, because the alternative is worse.
+//
+// The commit-time derivation reads the booking FOR NO KEY UPDATE NOWAIT. When
+// another transaction is holding that row — a status change or an amendment still
+// in flight — the writer cannot know what will be committed, and its own rows are
+// invisible to that transaction's triggers. Guessing "still live" is exactly the
+// phantom this whole file is about, so the switch refuses instead: the deferred
+// trigger raises serialization_failure, sqltx.Manager maps it to
+// domain.ErrAlreadyExists (409, "retry"), and NOTHING is written — no half-done
+// switch, and no occupancy for a booking whose fate is undecided.
+//
+// NOWAIT rather than a plain wait is the deadlock argument: a writer that waits
+// for the booking row while holding locks on that booking's occupancy rows closes
+// a cycle against the cancel path, which takes the booking row FIRST and its
+// occupancy rows SECOND. A lock nobody waits for cannot deadlock.
+func TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged(t *testing.T) {
+	h := newMidLoopHarness(t, "tables", 0)
+	ctx := context.Background()
+	_, victim, _ := h.midLoopSeed(t)
+
+	// A second transaction takes the victim's row and keeps it — the guest's
+	// cancel (or an amendment) that has not committed yet.
+	blocker, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocking tx: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+
+	h.capHook.after = func(id uuid.UUID) {
+		if id != victim.ID {
+			return
+		}
+		bctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := blocker.Exec(bctx,
+			`UPDATE bookings SET updated_at=now() WHERE id=$1`, victim.ID); err != nil {
+			t.Fatalf("lock the victim's row: %v", err)
+		}
+	}
+
+	_, err = h.midPolicy.Update(ctx, h.manager, h.restaurantID, seatsOverride(100))
+	if err == nil {
+		t.Fatalf("the switch committed while another transaction was changing one of its bookings; a status change committing next would leave that booking's holds active — phantom occupancy")
+	}
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("switch refused with %v, want a conflict (domain.ErrAlreadyExists → 409): a lost race is not a server error", err)
+	}
+	// Released, so the assertions below read the committed world.
+	_ = blocker.Rollback(context.Background())
+
+	// Nothing survived the refusal: the switch rolled back whole.
+	for _, id := range []uuid.UUID{victim.ID} {
+		if hs := h.holds(t, id); len(hs) != 0 {
+			t.Errorf("booking %s kept %d hold rows from a switch that was refused: the rollback was not clean", id, len(hs))
+		}
+	}
+	if taken := h.takenIn(t, victim.StartsAt); taken != 0 {
+		t.Errorf("the buckets report %d seats taken after a refused switch, want 0", taken)
+	}
 }
