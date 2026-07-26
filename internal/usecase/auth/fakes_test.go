@@ -121,7 +121,12 @@ func (f *fakeRefresh) RevokeAllByUser(_ context.Context, userID uuid.UUID) error
 }
 
 // fakeOTP is defined here; exercised in Task 12.
-type fakeOTP struct{ codes []*domain.OTPCode }
+type fakeOTP struct {
+	codes []*domain.OTPCode
+	// lastUsedErr makes the delivery memory misbehave, so a test can prove the
+	// usecase treats it as best effort and never lets it break a login.
+	lastUsedErr error
+}
 
 func newFakeOTP() *fakeOTP { return &fakeOTP{} }
 func (f *fakeOTP) Create(_ context.Context, c *domain.OTPCode) error {
@@ -164,6 +169,22 @@ func (f *fakeOTP) CountSince(_ context.Context, phone string, ts time.Time) (int
 	}
 	return n, nil
 }
+
+// LastUsedChannelByPhone mirrors the SQL: the newest USED code for the phone
+// whose channel is one a guest can be routed back to.
+func (f *fakeOTP) LastUsedChannelByPhone(_ context.Context, phone string) (string, error) {
+	if f.lastUsedErr != nil {
+		return "", f.lastUsedErr
+	}
+	for i := len(f.codes) - 1; i >= 0; i-- {
+		c := f.codes[i]
+		if c.Phone == phone && c.UsedAt != nil && domain.OTPRememberableChannel(c.Channel) {
+			return c.Channel, nil
+		}
+	}
+	return "", nil
+}
+
 func (f *fakeOTP) InvalidateActiveByPhone(_ context.Context, phone string) error {
 	now := time.Now()
 	for _, c := range f.codes {
@@ -181,11 +202,27 @@ func (noTx) WithinTx(ctx context.Context, fn func(context.Context) error) error 
 
 func (noTx) Detach(ctx context.Context) context.Context { return ctx }
 
-// stubSender records nothing and returns channel "test".
-type stubSender struct{ lastCode string }
+// stubSender records the code and the ordering hint it was handed. It answers
+// with channel "test" unless a test sets a real channel name, and fails every
+// send once err is set (the "no channel took the code" path).
+type stubSender struct {
+	lastCode string
+	lastHint domain.OTPSendHint
+	channel  string
+	err      error
+	calls    int
+}
 
-func (s *stubSender) Send(_ context.Context, _, code string) (string, error) {
+func (s *stubSender) Send(_ context.Context, _, code string, hint domain.OTPSendHint) (string, error) {
+	s.calls++
+	s.lastHint = hint
 	s.lastCode = code
+	if s.err != nil {
+		return "", s.err
+	}
+	if s.channel != "" {
+		return s.channel, nil
+	}
 	return "test", nil
 }
 

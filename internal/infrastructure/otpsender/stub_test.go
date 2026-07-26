@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"backend-core/internal/domain"
 )
 
 // The OTP is a bearer credential. These tests are the guard rail: outside a
@@ -17,11 +19,11 @@ func TestStubWithholdsCodeOutsideDevelopment(t *testing.T) {
 			var buf bytes.Buffer
 			log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-			channel, err := NewStub(log, env).Send(context.Background(), "+77075552233", "482913")
+			channel, err := NewStub(log, env).Send(context.Background(), "+77075552233", "482913", domain.OTPSendHint{})
 			if err != nil {
 				t.Fatalf("Send: %v", err)
 			}
-			if channel != "stub" {
+			if channel != domain.OTPChannelStub {
 				t.Fatalf("channel = %q, want stub", channel)
 			}
 
@@ -48,7 +50,7 @@ func TestStubLogsCodeInDevelopment(t *testing.T) {
 			var buf bytes.Buffer
 			log := slog.New(slog.NewJSONHandler(&buf, nil))
 
-			if _, err := NewStub(log, env).Send(context.Background(), "+77075552233", "482913"); err != nil {
+			if _, err := NewStub(log, env).Send(context.Background(), "+77075552233", "482913", domain.OTPSendHint{}); err != nil {
 				t.Fatalf("Send: %v", err)
 			}
 

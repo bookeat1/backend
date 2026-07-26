@@ -39,6 +39,18 @@ import (
 	usersrest "backend-core/internal/transport/rest/users"
 )
 
+// HTTP server timeouts. httpWriteTimeout is a named constant rather than a
+// literal because other subsystems have to fit inside it: anything a handler
+// does synchronously (notably the OTP delivery waterfall, see newOTPSender)
+// must finish before the server stops being able to write the response, or we
+// keep working — and paying providers — for a guest whose connection is gone.
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 15 * time.Second
+	httpWriteTimeout      = 15 * time.Second
+	httpIdleTimeout       = 60 * time.Second
+)
+
 // NewApp builds the Gin engine with all routes wired. db is used by the
 // readiness probe to verify database connectivity.
 func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Engine {
@@ -296,10 +308,10 @@ func Run(cfg Config, log *slog.Logger) error {
 	srv := &http.Server{
 		Addr:              cfg.App.URL,
 		Handler:           app,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

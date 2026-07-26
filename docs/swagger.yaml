@@ -585,6 +585,12 @@ paths:
         Generates a one-time code and delivers it to the phone. Rate-limited
         (per-minute and per-hour); over the limit returns 422. The response
         "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
+
+        When no delivery channel accepts the code the answer is a plain 500
+        with the generic body — identical for a number nobody can reach and
+        for a provider outage. That is deliberate: a response that varied by
+        channel would let anyone enumerate which numbers have Telegram or
+        WhatsApp. The per-channel reasons live in our logs, phone masked.
       parameters:
       - description: Phone number
         in: body
@@ -606,6 +612,10 @@ paths:
               type: object
         "422":
           description: validation failed / rate limited
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "500":
+          description: the code could not be delivered on any channel
           schema:
             $ref: '#/definitions/response.Envelope'
       summary: Request an OTP code

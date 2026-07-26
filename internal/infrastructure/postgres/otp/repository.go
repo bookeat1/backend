@@ -73,6 +73,30 @@ func (r *Repository) CountSince(ctx context.Context, phone string, ts time.Time)
 	return n, nil
 }
 
+// LastUsedChannelByPhone is the per-phone delivery memory built from rows that
+// already exist. The lookup rides idx_otp_codes_phone_created (phone,
+// created_at DESC), so it stays a cheap index scan even for a number that has
+// logged in for years; the `channel = ANY($2)` filter keeps the bookkeeping
+// channels ("stub", "undelivered") out of the answer.
+//
+// Absence is NOT an error: a first-time number simply has no memory, and the
+// caller must fall back to the configured order rather than fail a login.
+func (r *Repository) LastUsedChannelByPhone(ctx context.Context, phone string) (string, error) {
+	q := `SELECT channel
+		FROM otp_codes
+		WHERE phone = $1 AND used_at IS NOT NULL AND channel = ANY($2)
+		ORDER BY created_at DESC LIMIT 1`
+	var channel string
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx, q, phone, domain.OTPRememberableChannels()).Scan(&channel)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("last used otp channel: %w", err)
+	}
+	return channel, nil
+}
+
 func (r *Repository) InvalidateActiveByPhone(ctx context.Context, phone string) error {
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE otp_codes SET used_at = now() WHERE phone = $1 AND used_at IS NULL AND expires_at > now()`, phone)
