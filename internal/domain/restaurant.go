@@ -121,6 +121,11 @@ type RestaurantAggregate struct {
 	Features    []Feature
 	Tags        []Tag
 	SocialLinks []SocialLink
+	// VenueState carries the server-computed schedule / open-now / bookability
+	// facts for the public payload. Nil means "not computed" (the enrichment is
+	// optional, see usecase/restaurants.WithVenueState) — the transport layer
+	// then omits those JSON fields entirely rather than defaulting them.
+	VenueState *PublicVenueState
 }
 
 // RestaurantFilter narrows a listing query. Zero-value fields are ignored.
@@ -176,6 +181,8 @@ type RestaurantRepository interface {
 type RestaurantListItem struct {
 	Restaurant
 	PrimaryImage *string
+	// VenueState — see RestaurantAggregate.VenueState. Nil = not computed.
+	VenueState *PublicVenueState
 }
 
 // RestaurantBrief is a minimal (id, localizable name) row. It backs the
