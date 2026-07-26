@@ -331,3 +331,77 @@ func TestCapacityRejectsAbsurdDeclaredCapacity(t *testing.T) {
 		t.Error("unknown capacity mode was accepted by the database")
 	}
 }
+
+// TestCapacityLoweredLimitIsEnforcedOnTheNextBooking closes the half of the
+// "lowering a venue's capacity must not create an oversell" guarantee that
+// TestCapacityLoweredLimitStillReleases does not cover: that one proves a
+// release still works under a lowered limit, this one proves the lowered limit
+// is actually ENFORCED afterwards.
+//
+// Why it can plausibly break: seats_limit is DENORMALISED onto every bucket row,
+// and a decrement deliberately never refreshes it (see the table comment in
+// 0054 — refreshing it on release would leave seats_taken above the new limit
+// and the CHECK would refuse the venue's own cancellations). So right after a
+// venue shrinks, the bucket rows that already hold seats still carry the OLD,
+// HIGHER limit. If the next booking were judged against the value sitting in the
+// row, the venue would be sold seats it no longer has — silently, because
+// nothing in the row looks wrong.
+//
+// What makes it correct is that the INCREMENT path re-stamps seats_limit from
+// the incoming hold (`seats_limit = p_limit`), so the CHECK is evaluated against
+// the limit the NEW booking was built with. This test pins that: 12 of 20 seats
+// are sold, the venue shrinks to 14, and the next party of 4 must be refused
+// (12 + 4 > 14) even though the bucket row still says 20.
+func TestCapacityLoweredLimitIsEnforcedOnTheNextBooking(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedCapacityVenue(t, pool, 20)
+	capacity := NewCapacity(pool)
+	start := time.Date(2026, 8, 9, 19, 0, 0, 0, time.UTC)
+
+	sold := seedCapacityBooking(t, pool, rid, start, 12)
+	if err := capacity.Create(ctx, holdsFor(sold.ID, rid, start, 8, 12, 20)); err != nil {
+		t.Fatalf("sell 12 of 20: %v", err)
+	}
+
+	// The venue shrinks to 14. Only the declared capacity changes; the buckets
+	// that already hold seats keep the stale limit, which is the trap.
+	if _, err := pool.Exec(ctx,
+		`UPDATE restaurants SET booking_capacity_seats=14 WHERE id=$1`, rid); err != nil {
+		t.Fatalf("shrink venue: %v", err)
+	}
+	var stale int
+	if err := pool.QueryRow(ctx,
+		`SELECT seats_limit FROM restaurant_capacity_buckets
+		 WHERE restaurant_id=$1 AND bucket_start=$2`, rid, start).Scan(&stale); err != nil {
+		t.Fatalf("read bucket: %v", err)
+	}
+	if stale != 20 {
+		t.Fatalf("bucket seats_limit = %d, want the stale 20 — this test's premise is gone, re-read 0054", stale)
+	}
+
+	// A party of 4 built under the NEW capacity: 12 + 4 = 16 > 14.
+	next := seedCapacityBooking(t, pool, rid, start, 4)
+	err := capacity.Create(ctx, holdsFor(next.ID, rid, start, 8, 4, 14))
+	if err == nil {
+		var taken, limit int
+		_ = pool.QueryRow(ctx,
+			`SELECT seats_taken, seats_limit FROM restaurant_capacity_buckets
+			 WHERE restaurant_id=$1 AND bucket_start=$2`, rid, start).Scan(&taken, &limit)
+		t.Fatalf("OVERSELL: a party of 4 was accepted into a venue that had just shrunk to 14 with 12 already sold (bucket now reports seats_taken=%d, seats_limit=%d) — the stale limit on the bucket row was used to sell seats the venue does not have", taken, limit)
+	}
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("refusal = %v, want domain.ErrAlreadyExists (the bucket CHECK, mapped as a conflict)", err)
+	}
+
+	// And the refusal left nothing behind: the venue still holds exactly the 12
+	// it legitimately sold.
+	var taken int
+	if err := pool.QueryRow(ctx,
+		`SELECT seats_taken FROM restaurant_capacity_buckets
+		 WHERE restaurant_id=$1 AND bucket_start=$2`, rid, start).Scan(&taken); err != nil {
+		t.Fatalf("read bucket: %v", err)
+	}
+	if taken != 12 {
+		t.Errorf("seats_taken after the refused booking = %d, want 12", taken)
+	}
+}
