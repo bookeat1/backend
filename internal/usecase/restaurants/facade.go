@@ -3,6 +3,7 @@ package restaurants
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -29,6 +30,29 @@ type facade struct {
 	categories domain.RestaurantCategoryRepository
 	partners   domain.PartnershipRequestRepository
 	tx         domain.TxManager
+
+	// Optional public-venue-state enrichment (see WithVenueState). All three
+	// are nil unless wired; the catalog then simply omits the new fields.
+	venueState venueStateReader
+	venueTZ    VenueTimezoneResolver
+	clock      func() time.Time
+}
+
+// FacadeOption configures optional facade dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type FacadeOption func(*facade)
+
+// WithVenueState enables the guest-facing venue state on the catalog reads: the
+// structured weekly schedule, the server-computed "open now" flag, and the
+// "can this venue take an online booking at all" flag. Left unwired, those JSON
+// fields are absent — never guessed.
+func WithVenueState(reader venueStateReader, tz VenueTimezoneResolver) FacadeOption {
+	return func(f *facade) { f.venueState, f.venueTZ = reader, tz }
+}
+
+// WithClock overrides the clock "open now" is evaluated against. Tests only.
+func WithClock(now func() time.Time) FacadeOption {
+	return func(f *facade) { f.clock = now }
 }
 
 // NewFacade constructs the restaurants Facade.
@@ -38,8 +62,13 @@ func NewFacade(
 	categories domain.RestaurantCategoryRepository,
 	partners domain.PartnershipRequestRepository,
 	tx domain.TxManager,
+	opts ...FacadeOption,
 ) Facade {
-	return &facade{repo: repo, related: related, categories: categories, partners: partners, tx: tx}
+	f := &facade{repo: repo, related: related, categories: categories, partners: partners, tx: tx}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 // SaveInput carries mutable restaurant fields plus inline collections for
@@ -89,15 +118,30 @@ type PartnershipInput struct {
 }
 
 func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
-	return f.repo.ListActive(ctx, flt)
+	items, total, err := f.repo.ListActive(ctx, flt)
+	if err != nil {
+		return nil, 0, err
+	}
+	f.attachVenueState(ctx, items)
+	return items, total, nil
 }
 
 func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
-	return f.repo.Search(ctx, flt)
+	items, total, err := f.repo.Search(ctx, flt)
+	if err != nil {
+		return nil, 0, err
+	}
+	f.attachVenueState(ctx, items)
+	return items, total, nil
 }
 
 func (f *facade) Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
-	return f.repo.GetByID(ctx, id)
+	agg, err := f.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	f.attachVenueStateOne(ctx, agg)
+	return agg, nil
 }
 
 func (f *facade) Categories(ctx context.Context) ([]domain.RestaurantCategory, error) {

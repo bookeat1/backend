@@ -22,6 +22,17 @@ func CancelDeadlineFor(restaurant domain.Restaurant, cfg Config, startsAt time.T
 	return startsAt.Add(-policy.CancelDeadline)
 }
 
+// VenueTimezone returns the IANA timezone this venue's calendar maths runs in:
+// its own restaurants.timezone override when it is set AND loadable on this
+// host, otherwise the platform fallback (BOOKING_TIMEZONE_FALLBACK, default
+// Asia/Almaty). It is exported so the public catalog can compute "open now" in
+// the venue's own zone through the SAME resolution the availability engine
+// uses, instead of growing a second source of truth (bound to
+// usecase/restaurants.VenueTimezoneResolver in bootstrap/deps.go).
+func (c Config) VenueTimezone(r domain.Restaurant) string {
+	return resolvePolicy(r, c).Timezone
+}
+
 // resolvePolicy merges the two policy levels of spec §4.2: the global env
 // defaults (Config) and the restaurant's optional per-field overrides. A NULL
 // (nil) override falls back to the global value; an override that is present

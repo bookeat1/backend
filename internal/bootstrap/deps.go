@@ -284,7 +284,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	// Named facade/usecase variables so both the Deps struct and the admin
 	// panel below share the SAME instances (rather than re-constructing them).
-	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm)
+	// The public catalog reports each venue's structured weekly schedule, an
+	// "open now" flag computed in the VENUE's timezone, and whether the venue
+	// can take an online booking at all — so the guest app stops inferring all
+	// three from the free-text opening_hours string. bookingCfg is passed as
+	// the timezone resolver on purpose: same zone as the availability engine.
+	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
+		restaurants.WithVenueState(restRelated, bookingCfg))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,

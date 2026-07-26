@@ -43,6 +43,19 @@ const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 	booking_lead_minutes, booking_horizon_days, cancel_deadline_minutes,
 	confirm_sla_minutes, max_guests_per_booking, auto_confirm`
 
+// listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
+// order scanListItem reads them.
+//
+// r.timezone is here — rather than the whole policyCols block — because the
+// public payload reports an "open now" flag that MUST be computed in the
+// venue's own zone. GetByID has always read the column; without it here, a
+// venue outside the platform default zone would silently be judged against the
+// fallback and reported open when it is shut. The rest of the booking policy is
+// still resolved per booking and stays out of the listing.
+const listExtraCols = `(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
+		 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image,
+	r.timezone`
+
 func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	now := time.Now()
 	if m.CreatedAt.IsZero() {
@@ -243,9 +256,7 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 		perPage = 100
 	}
 	args = append(args, perPage, (page-1)*perPage)
-	q := `SELECT ` + prefixed(cols, "r") + `,
-		(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
-		 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image
+	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		ORDER BY r.display_order ASC NULLS LAST, r.name ASC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -350,9 +361,7 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 	}
 
 	args = append(args, perPage, (page-1)*perPage)
-	q2 := `SELECT ` + prefixed(cols, "r") + `,
-		(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
-		 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image
+	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -450,9 +459,16 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 // internal/infrastructure/postgres/favorite.Repository.ListByUser.
 const Columns = cols
 
-// ScanListItem scans one row shaped like ListActive's SELECT (Columns plus a
-// trailing primary_image column) into a Restaurant plus its primary image
-// URL. Exported for the same reason as Columns.
+// ListExtraColumns are the trailing listing-only columns (primary_image, then
+// the venue timezone) that must follow Columns in any SELECT fed to
+// ScanListItem. Exported together with Columns so a sibling package cannot
+// spell one and forget the other — that mismatch is a runtime scan error, not
+// a compile error.
+const ListExtraColumns = listExtraCols
+
+// ScanListItem scans one row shaped like ListActive's SELECT (Columns followed
+// by ListExtraColumns) into a Restaurant plus its primary image URL. Exported
+// for the same reason as Columns.
 func ScanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	return scanListItem(row)
 }
@@ -468,6 +484,7 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt, &primary,
+		&m.BookingPolicy.Timezone,
 	); err != nil {
 		return nil, nil, err
 	}

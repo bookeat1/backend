@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -309,56 +307,19 @@ func candidateStarts(s schedule, day time.Time, policy domain.BookingPolicy, ste
 // openingWindow returns [open, close) for the weekday in the venue's timezone.
 // A close time that is not after the open time is treated as past midnight
 // (e.g. 18:00–02:00) and rolls into the next day.
+//
+// It delegates to domain.OpeningWindow: the public catalog payload now reports
+// the same schedule to guests, and the two must never drift apart.
 func openingWindow(hours []domain.WorkingHours, dow int, day time.Time, loc *time.Location) (time.Time, time.Time, bool) {
-	for _, h := range hours {
-		if h.DayOfWeek != dow {
-			continue
-		}
-		if !h.IsOpen || h.OpenTime == nil || h.CloseTime == nil {
-			return time.Time{}, time.Time{}, false
-		}
-		openMin, err := parseClock(*h.OpenTime)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-		closeMin, err := parseClock(*h.CloseTime)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-		base := startOfDay(day, loc)
-		open := base.Add(time.Duration(openMin) * time.Minute)
-		close_ := base.Add(time.Duration(closeMin) * time.Minute)
-		if !close_.After(open) {
-			close_ = close_.AddDate(0, 0, 1)
-		}
-		return open, close_, true
-	}
-	return time.Time{}, time.Time{}, false
+	return domain.OpeningWindow(hours, dow, day, loc)
 }
 
-// startOfDay returns midnight of t's calendar day in loc. Built from the date
-// parts (not by truncation) so DST transitions are handled by the location.
+// startOfDay returns midnight of t's calendar day in loc.
 func startOfDay(t time.Time, loc *time.Location) time.Time {
-	y, m, d := t.In(loc).Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, loc)
+	return domain.StartOfDay(t, loc)
 }
 
 // parseClock parses "HH:MM" or "HH:MM:SS" into minutes since midnight.
 func parseClock(v string) (int, error) {
-	parts := strings.Split(strings.TrimSpace(v), ":")
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	h, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	m, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	if h < 0 || h > 47 || m < 0 || m > 59 {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	return h*60 + m, nil
+	return domain.ParseClockMinutes(v)
 }
