@@ -13,6 +13,15 @@ var (
 	ErrInvalidStatus = errors.New("invalid status transition")
 	ErrValidation    = errors.New("validation failed")
 
+	// ErrUnavailable marks a request the service understood and accepted but
+	// cannot serve right now because an OPTIONAL dependency is missing or
+	// unhealthy — a provider key that has not been provisioned yet, a provider
+	// that timed out, a provider that rate-limited us. It is deliberately not
+	// ErrInternal: nothing is broken in our code and the caller did nothing
+	// wrong, so it maps to 503 (retry later) instead of a 500 with a stack.
+	// Clients branch on the attached ErrorCode to tell the cases apart.
+	ErrUnavailable = errors.New("temporarily unavailable")
+
 	// ErrProviderOutcomeUnknown marks an acquirer call whose result could not
 	// be observed: a timeout, a 5xx that survived every retry, or a response
 	// that could not be parsed. The money-moving action (capture, void,
@@ -49,6 +58,7 @@ const (
 	CodeValidation    ErrorCode = "validation_failed"
 	CodeInvalidStatus ErrorCode = "invalid_status"
 	CodeInternal      ErrorCode = "internal_error"
+	CodeUnavailable   ErrorCode = "unavailable"
 )
 
 // Specific codes. Each one narrows a sentinel that would otherwise be
@@ -70,6 +80,31 @@ const (
 	// went through": the stored response belongs to the first body, and the
 	// client must either reuse that response or retry with a fresh key.
 	CodeIdempotencyKeyReused ErrorCode = "idempotency_key_reused"
+
+	// Static map proxy (GET /api/v1/restaurants/:id/map). All four mean "there
+	// is no picture for you right now" and the app renders its existing no-map
+	// placeholder for each; they differ in whose problem it is and whether a
+	// retry can help, which the status alone cannot express.
+
+	// CodeMapNoCoordinates — the restaurant exists but has no (or an
+	// out-of-range) latitude/longitude on file. 404 and permanent until
+	// somebody fills the venue's coordinates in: retrying will not help.
+	CodeMapNoCoordinates ErrorCode = "map_no_coordinates"
+
+	// CodeMapNotConfigured — no map provider key is provisioned on this
+	// deployment. Our own missing configuration, not an outage: EVERY caller
+	// gets it until the key is set, so a client should stop asking for the rest
+	// of the session instead of retrying on every screen open.
+	CodeMapNotConfigured ErrorCode = "map_not_configured"
+
+	// CodeMapProviderRateLimited — the provider answered 429. Transient, and
+	// specifically a signal for ops that the plan's quota is being hit.
+	CodeMapProviderRateLimited ErrorCode = "map_provider_rate_limited"
+
+	// CodeMapProviderUnavailable — the provider timed out, was unreachable,
+	// refused our key, or answered with something that is not an image.
+	// Transient: a later retry may succeed.
+	CodeMapProviderUnavailable ErrorCode = "map_provider_unavailable"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

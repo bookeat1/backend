@@ -108,6 +108,11 @@ func classifySentinel(err error) (int, domain.ErrorCode, string) {
 		return http.StatusUnprocessableEntity, domain.CodeValidation, "validation failed"
 	case errors.Is(err, domain.ErrInvalidStatus):
 		return http.StatusUnprocessableEntity, domain.CodeInvalidStatus, "invalid status transition"
+	case errors.Is(err, domain.ErrUnavailable):
+		// 503, not 500: an optional dependency is missing or unhealthy, our own
+		// code is fine and the caller did nothing wrong. Logged at Warn (below,
+		// since it is < 500) so a provider outage does not read as a bug.
+		return http.StatusServiceUnavailable, domain.CodeUnavailable, "temporarily unavailable"
 	default:
 		return http.StatusInternalServerError, domain.CodeInternal, "internal server error"
 	}

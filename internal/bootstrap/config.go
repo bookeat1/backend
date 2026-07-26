@@ -68,6 +68,13 @@ type Config struct {
 	// key (same discipline as web push without VAPID keys).
 	Analytics AnalyticsConfig
 
+	// StaticMap configures the server-side restaurant map-preview proxy
+	// (GET /api/v1/restaurants/:id/map). Absent provider key → the endpoint
+	// still exists and answers a clean 503/map_not_configured, same discipline
+	// as web push without VAPID keys: the service boots and works, one feature
+	// says "not available yet" until the credential arrives.
+	StaticMap StaticMapConfig
+
 	// OTPDelivery configures the login-code delivery waterfall (Telegram
 	// Gateway → WhatsApp → SMS). Each channel is enabled ONLY by the presence
 	// of its credentials; absent credentials are not an error, they just mean
@@ -455,6 +462,43 @@ type PushConfig struct {
 	ExpoEndpoint string // env: EXPO_PUSH_ENDPOINT
 }
 
+// StaticMapConfig configures the restaurant map-preview proxy.
+//
+// Provider is an explicit switch, not a flag derived from "is some key set", so
+// adding Google Static Maps later is a config change at the call site, not a
+// guess about which credential wins — same shape as PushConfig.GuestPushProvider.
+type StaticMapConfig struct {
+	// Provider selects the map vendor. Empty (the default) means no provider:
+	// the endpoint answers map_not_configured. The only value implemented today
+	// is "2gis".
+	Provider string // env: STATIC_MAP_PROVIDER ("" | "2gis")
+	// TwoGISAPIKey is the 2GIS Platform Manager access key. A credential: env
+	// only, NEVER logged and never echoed in a response. Empty while Provider
+	// is "2gis" is a misconfiguration, reported once at startup — the endpoint
+	// then behaves as unconfigured rather than failing every request loudly.
+	TwoGISAPIKey string // env: STATIC_MAP_2GIS_API_KEY
+	// TwoGISBaseURL overrides 2GIS's Static API entry point (tests, staging).
+	TwoGISBaseURL string // env: STATIC_MAP_2GIS_BASE_URL
+	// Timeout caps one provider render call. Kept well inside the HTTP server's
+	// write timeout: a map preview must never be the reason a response is cut off.
+	Timeout time.Duration // env: STATIC_MAP_TIMEOUT
+	// CacheTTL is how long a rendered image is reused (and the HTTP max-age the
+	// client is told). Restaurant coordinates change roughly never.
+	CacheTTL time.Duration // env: STATIC_MAP_CACHE_TTL
+	// CacheMaxBytes bounds the in-process image cache.
+	CacheMaxBytes int64 // env: STATIC_MAP_CACHE_MAX_BYTES
+}
+
+// Configured reports whether a map provider is selected AND has its credential.
+func (s StaticMapConfig) Configured() bool {
+	switch strings.ToLower(strings.TrimSpace(s.Provider)) {
+	case "2gis":
+		return strings.TrimSpace(s.TwoGISAPIKey) != ""
+	default:
+		return false
+	}
+}
+
 // GuestPushConfigured reports whether a guest mobile-push provider is selected.
 // When false the guest channel is built disabled and no-ops cleanly.
 func (p PushConfig) GuestPushConfigured() bool {
@@ -599,6 +643,14 @@ func NewConfig() (Config, error) {
 			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
 			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),
 			ExpoEndpoint:      getEnv("EXPO_PUSH_ENDPOINT", ""),
+		},
+		StaticMap: StaticMapConfig{
+			Provider:      getEnv("STATIC_MAP_PROVIDER", ""),
+			TwoGISAPIKey:  getEnv("STATIC_MAP_2GIS_API_KEY", ""),
+			TwoGISBaseURL: getEnv("STATIC_MAP_2GIS_BASE_URL", ""),
+			Timeout:       getEnvDuration("STATIC_MAP_TIMEOUT", 5*time.Second),
+			CacheTTL:      getEnvDuration("STATIC_MAP_CACHE_TTL", 24*time.Hour),
+			CacheMaxBytes: getEnvInt64("STATIC_MAP_CACHE_MAX_BYTES", 64<<20),
 		},
 		RateLimit: RateLimiterConfig{
 			RateLimitConfig: middleware.RateLimitConfig{
