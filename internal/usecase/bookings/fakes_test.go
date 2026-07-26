@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -26,6 +27,9 @@ type fakeBookings struct {
 	createTx error
 	claims   []claimCall
 	claimErr error
+
+	reconcileCalls []reconcileCall
+	reconcileErr   error
 }
 
 type statusWrite struct {
@@ -76,6 +80,59 @@ func (f *fakeBookings) GetByID(_ context.Context, id uuid.UUID) (*domain.Booking
 func (f *fakeBookings) List(_ context.Context, flt domain.BookingFilter) ([]domain.Booking, int, error) {
 	f.lastFlt = flt
 	return f.list, f.total, nil
+}
+
+// reconcileCall records one ListLiveForReconcile invocation. It is a slice, not
+// a "last call" field, because the point of that method is that the caller reads
+// the whole set in ONE statement — a test has to be able to prove there was
+// exactly one call.
+type reconcileCall struct {
+	restaurantID uuid.UUID
+	from         time.Time
+	statuses     []domain.BookingStatus
+	limit        int
+}
+
+// ListLiveForReconcile mirrors the real query rather than returning f.list
+// wholesale: same predicates (venue, status, starts_at >= from), same total
+// ascending order, same cap. A fake that ignored the filter would let a usecase
+// bug through precisely where the real query is strict.
+func (f *fakeBookings) ListLiveForReconcile(
+	_ context.Context,
+	restaurantID uuid.UUID,
+	from time.Time,
+	statuses []domain.BookingStatus,
+	limit int,
+) ([]domain.Booking, error) {
+	f.reconcileCalls = append(f.reconcileCalls, reconcileCall{
+		restaurantID: restaurantID, from: from, statuses: statuses, limit: limit})
+	if f.reconcileErr != nil {
+		return nil, f.reconcileErr
+	}
+	if limit <= 0 || limit > domain.MaxReconcileBookings {
+		limit = domain.MaxReconcileBookings
+	}
+	wanted := map[domain.BookingStatus]bool{}
+	for _, s := range statuses {
+		wanted[s] = true
+	}
+	out := make([]domain.Booking, 0, len(f.list))
+	for _, b := range f.list {
+		if b.RestaurantID != restaurantID || !wanted[b.Status] || b.StartsAt.Before(from) {
+			continue
+		}
+		out = append(out, b)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].StartsAt.Equal(out[j].StartsAt) {
+			return out[i].StartsAt.Before(out[j].StartsAt)
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.BookingStatus, at time.Time) error {
@@ -367,3 +424,150 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 }
 
 func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
+
+// fakeCapacity is an in-memory domain.BookingCapacityRepository. It reproduces
+// the ONE behaviour the usecases depend on — the venue's declared capacity is
+// enforced per bucket and an overflow comes back as ErrAlreadyExists — so that
+// a unit test can cover the branch without a database. The real guarantee is
+// the DB CHECK; see capacity_integration_test.go for the test that proves it.
+type fakeCapacity struct {
+	holds map[uuid.UUID][]domain.BookingCapacityHold // by booking
+	// limits mirrors restaurant_capacity_buckets.seats_limit: re-stamped by
+	// every accepted claim and never lowered by a release, exactly as
+	// apply_capacity_delta does. Without it the fake cannot show the one thing
+	// the override mechanism turns on — that a raised limit is NOT inherited by
+	// the next booking.
+	limits    map[time.Time]int
+	overrides []domain.BookingCapacityOverride
+	err       error
+	locked    []uuid.UUID // venues whose capacity lock was taken, in order
+}
+
+// LockVenue records that the lock was taken. The fake cannot reproduce the real
+// serialisation, but a usecase that forgets to lock is still caught: the
+// counter is asserted where the ordering matters.
+func (f *fakeCapacity) LockVenue(_ context.Context, restaurantID uuid.UUID) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.locked = append(f.locked, restaurantID)
+	return nil
+}
+
+func newFakeCapacity() *fakeCapacity {
+	return &fakeCapacity{
+		holds:  map[uuid.UUID][]domain.BookingCapacityHold{},
+		limits: map[time.Time]int{},
+	}
+}
+
+func (f *fakeCapacity) taken(exclude uuid.UUID) map[time.Time]int {
+	out := map[time.Time]int{}
+	for bookingID, hs := range f.holds {
+		if bookingID == exclude {
+			continue
+		}
+		for _, h := range hs {
+			if h.Active {
+				out[h.BucketStart.UTC()] += h.Seats
+			}
+		}
+	}
+	return out
+}
+
+func (f *fakeCapacity) Create(_ context.Context, holds []domain.BookingCapacityHold) error {
+	if f.err != nil {
+		return f.err
+	}
+	if len(holds) == 0 {
+		return nil
+	}
+	taken := f.taken(holds[0].BookingID)
+	for _, h := range holds {
+		if taken[h.BucketStart.UTC()]+h.Seats > h.SeatsLimit {
+			return fmt.Errorf("%w: capacity", domain.ErrAlreadyExists)
+		}
+	}
+	for _, h := range holds {
+		h.Active = true
+		f.holds[h.BookingID] = append(f.holds[h.BookingID], h)
+		f.limits[h.BucketStart.UTC()] = h.SeatsLimit
+	}
+	return nil
+}
+
+// RecordOverride is append-only and unique per booking, like the table.
+func (f *fakeCapacity) RecordOverride(_ context.Context, o domain.BookingCapacityOverride) error {
+	if f.err != nil {
+		return f.err
+	}
+	for _, existing := range f.overrides {
+		if existing.BookingID == o.BookingID {
+			return fmt.Errorf("%w: capacity override", domain.ErrAlreadyExists)
+		}
+	}
+	f.overrides = append(f.overrides, o)
+	return nil
+}
+
+func (f *fakeCapacity) ListOverrides(_ context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.BookingCapacityOverride, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []domain.BookingCapacityOverride
+	for _, o := range f.overrides {
+		if o.RestaurantID == restaurantID &&
+			!o.PeakBucketStart.Before(from) && o.PeakBucketStart.Before(to) {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCapacity) ReplaceForBooking(ctx context.Context, bookingID uuid.UUID, holds []domain.BookingCapacityHold) error {
+	prev := f.holds[bookingID]
+	delete(f.holds, bookingID)
+	for i := range holds {
+		holds[i].BookingID = bookingID
+	}
+	if err := f.Create(ctx, holds); err != nil {
+		f.holds[bookingID] = prev
+		return err
+	}
+	return nil
+}
+
+func (f *fakeCapacity) ListByBooking(_ context.Context, bookingID uuid.UUID) ([]domain.BookingCapacityHold, error) {
+	return f.holds[bookingID], f.err
+}
+
+func (f *fakeCapacity) ListUsage(_ context.Context, _ uuid.UUID, from, to time.Time) ([]domain.CapacityUsage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []domain.CapacityUsage
+	for bucket, seats := range f.taken(uuid.Nil) {
+		if bucket.Before(from) || !bucket.Before(to) {
+			continue
+		}
+		out = append(out, domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats, SeatsLimit: f.limits[bucket]})
+	}
+	return out, nil
+}
+
+func (f *fakeCapacity) PeakTaken(_ context.Context, _ uuid.UUID, from time.Time) (*domain.CapacityUsage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var peak *domain.CapacityUsage
+	for bucket, seats := range f.taken(uuid.Nil) {
+		if bucket.Before(from) {
+			continue
+		}
+		if peak == nil || seats > peak.SeatsTaken {
+			peak = &domain.CapacityUsage{BucketStart: bucket, SeatsTaken: seats}
+		}
+	}
+	return peak, nil
+}

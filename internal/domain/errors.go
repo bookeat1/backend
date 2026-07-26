@@ -81,6 +81,30 @@ const (
 	// client must either reuse that response or retry with a fresh key.
 	CodeIdempotencyKeyReused ErrorCode = "idempotency_key_reused"
 
+	// Capacity-mode switch (PATCH the venue's booking policy). Both of these are
+	// STAFF-facing, in the venue cabinet, and both mean "nothing was changed" —
+	// they are separated from the generic codes for the same reason CodeSlotTaken
+	// is: on the wire a 409 reads as "that already exists", which is not what
+	// either of them means, and staff cannot act on it.
+
+	// CodeCapacitySwitchConflict — the switch lost a race and was rolled back
+	// whole: another transaction was changing the status of one of the venue's
+	// bookings while the switch tried to commit, so the deferred trigger of
+	// migration 0059 refused rather than commit occupancy for a booking whose
+	// fate was undecided. NOTHING was changed and nothing is wrong with the
+	// venue's data — the honest message is "try again", and a retry a moment
+	// later almost always succeeds.
+	CodeCapacitySwitchConflict ErrorCode = "capacity_switch_conflict"
+
+	// CodeCapacitySwitchTooManyBookings — the venue has more live bookings in the
+	// affected period than one switch may reconcile (MaxReconcileBookings), so
+	// the whole set could not be read as a whole and the switch was refused
+	// before touching anything. Unlike CodeCapacitySwitchConflict this does NOT
+	// resolve by retrying immediately: it needs fewer live bookings in the
+	// window, or support. The cabinet should say so instead of showing a
+	// conflict.
+	CodeCapacitySwitchTooManyBookings ErrorCode = "capacity_switch_too_many_bookings"
+
 	// Static map proxy (GET /api/v1/restaurants/:id/map). All four mean "there
 	// is no picture for you right now" and the app renders its existing no-map
 	// placeholder for each; they differ in whose problem it is and whether a

@@ -31,6 +31,10 @@ type createBookingRequest struct {
 	Items        []bookingItemRequest `json:"items"`
 	TableIDs     []string             `json:"table_ids"`
 	Force        bool                 `json:"force"`
+	// Overbook: seat this party even though a table-less venue's declared
+	// capacity does not fit it. Staff-only and blanked on the guest route, like
+	// Force — see createMine.
+	Overbook bool `json:"overbook"`
 }
 
 type bookingItemRequest struct {
@@ -45,7 +49,7 @@ type bookingItemRequest struct {
 func (r createBookingRequest) toInput() (uc.CreateInput, error) {
 	in := uc.CreateInput{
 		Name: r.Name, Phone: r.Phone, Email: r.Email, Guests: r.Guests,
-		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force,
+		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force, Overbook: r.Overbook,
 		Source: domain.SourceApp,
 	}
 	var err error
@@ -250,6 +254,11 @@ type bookingPolicyRequest struct {
 	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
 	AutoConfirm            *bool   `json:"auto_confirm"`
+	// BookingCapacityMode / BookingCapacitySeats switch the venue between
+	// seating a guest at a specific table and booking against a declared total
+	// capacity (migration 0054). Same PATCH semantics as the fields above.
+	BookingCapacityMode  *string `json:"booking_capacity_mode"`
+	BookingCapacitySeats *int    `json:"booking_capacity_seats"`
 }
 
 // Validate rejects a body that would patch nothing. Range checks live in the
@@ -257,13 +266,21 @@ type bookingPolicyRequest struct {
 func (r bookingPolicyRequest) Validate() error {
 	if r.Timezone == nil && r.BookingDurationMinutes == nil && r.BookingBufferMinutes == nil &&
 		r.BookingLeadMinutes == nil && r.BookingHorizonDays == nil && r.CancelDeadlineMinutes == nil &&
-		r.ConfirmSLAMinutes == nil && r.MaxGuestsPerBooking == nil && r.AutoConfirm == nil {
+		r.ConfirmSLAMinutes == nil && r.MaxGuestsPerBooking == nil && r.AutoConfirm == nil &&
+		r.BookingCapacityMode == nil && r.BookingCapacitySeats == nil {
 		return fmt.Errorf("%w: no policy fields provided", domain.ErrValidation)
 	}
 	return nil
 }
 
 func (r bookingPolicyRequest) toDomain() domain.BookingPolicyOverride {
+	var mode *domain.CapacityMode
+	if r.BookingCapacityMode != nil {
+		// Kept as a raw string on the wire and converted here; validation of
+		// the value itself lives in the usecase, with every other bound.
+		m := domain.CapacityMode(strings.TrimSpace(*r.BookingCapacityMode))
+		mode = &m
+	}
 	return domain.BookingPolicyOverride{
 		Timezone:               r.Timezone,
 		BookingDurationMinutes: r.BookingDurationMinutes,
@@ -274,5 +291,7 @@ func (r bookingPolicyRequest) toDomain() domain.BookingPolicyOverride {
 		ConfirmSLAMinutes:      r.ConfirmSLAMinutes,
 		MaxGuestsPerBooking:    r.MaxGuestsPerBooking,
 		AutoConfirm:            r.AutoConfirm,
+		BookingCapacityMode:    mode,
+		BookingCapacitySeats:   r.BookingCapacitySeats,
 	}
 }

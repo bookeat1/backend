@@ -41,6 +41,19 @@ type scheduleReader interface {
 	ListTables(ctx context.Context, restaurantID uuid.UUID) ([]domain.RestaurantTable, error)
 }
 
+// bookingLister is the read slice of the booking repository needed to walk a
+// venue's future bookings when its capacity mode changes. Declared separately
+// from domain.BookingRepository so the policy usecase cannot write bookings.
+//
+// Only the single-statement read is exposed, deliberately: the paginated List is
+// unusable for this job (see the port doc on domain.BookingRepository — a
+// cancellation committing between two pages hides a booking from the
+// reconciliation entirely), and a port that does not offer it cannot be misused
+// for it again.
+type bookingLister interface {
+	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []domain.BookingStatus, limit int) ([]domain.Booking, error)
+}
+
 // managerChecker answers whether a user manages a restaurant. Bound to
 // restaurants.ManagerUseCase in deps.
 type managerChecker interface {

@@ -46,6 +46,17 @@ type CreateInput struct {
 	// Force skips availability-based table selection (spec §4.2). It does NOT
 	// skip the blacklist, the anti-fraud limit, or input/window validation.
 	Force bool
+	// Overbook is the table-less counterpart of Force: seat this party even
+	// though the venue's declared capacity does not fit it ("we'll bring a
+	// chair", owner decision 25.07.2026). Staff-only, exactly like Force, and
+	// like Force it skips NOTHING else — blacklist, anti-fraud, opening hours
+	// and the horizon all still apply.
+	//
+	// A SEPARATE flag rather than reusing Force in seats mode, deliberately: a
+	// staff client that sends force=true by habit (it is the normal way to pin
+	// tables in table mode) would then start overbooking silently the day its
+	// venue switches modes. Overbooking has to be asked for by name.
+	Overbook bool
 }
 
 // ItemInput is one pre-ordered menu position. Price is captured at booking time
@@ -62,6 +73,7 @@ type ItemInput struct {
 type createUseCase struct {
 	bookings    domain.BookingRepository
 	links       domain.BookingTableRepository
+	capacity    domain.BookingCapacityRepository
 	items       domain.BookingItemRepository
 	history     domain.BookingStatusHistoryRepository
 	outbox      domain.BookingOutboxRepository
@@ -78,6 +90,7 @@ type createUseCase struct {
 func NewCreateUseCase(
 	bookings domain.BookingRepository,
 	links domain.BookingTableRepository,
+	capacity domain.BookingCapacityRepository,
 	items domain.BookingItemRepository,
 	history domain.BookingStatusHistoryRepository,
 	outbox domain.BookingOutboxRepository,
@@ -90,7 +103,7 @@ func NewCreateUseCase(
 	cfg Config,
 ) CreateUseCase {
 	return &createUseCase{
-		bookings: bookings, links: links, items: items, history: history,
+		bookings: bookings, links: links, capacity: capacity, items: items, history: history,
 		outbox: outbox, blacklist: blacklist, rateLog: rateLog,
 		restaurants: restaurants, schedule: schedule, managers: managers,
 		tx: tx, cfg: cfg.withDefaults(),
@@ -111,9 +124,12 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	if err != nil {
 		return nil, err
 	}
-	// Manual placement and forced placement are staff powers, checked before
-	// anything reads data (spec §4.2: "the guest has no such option").
-	if !acc.staff() && (in.Force || len(in.TableIDs) > 0) {
+	// Manual placement, forced placement and deliberate overbooking are staff
+	// powers, checked before anything reads data (spec §4.2: "the guest has no
+	// such option"). The transport layer also blanks these fields on the
+	// guest-facing route; this is the check that actually enforces it, and it
+	// covers every other caller of the usecase too.
+	if !acc.staff() && (in.Force || in.Overbook || len(in.TableIDs) > 0) {
 		return nil, fmt.Errorf("%w: manual placement is restricted to venue staff", domain.ErrForbidden)
 	}
 	// force=true is "seat them anyway, on THESE tables" — never "seat them
@@ -136,6 +152,37 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	policy := resolvePolicy(rest.Restaurant, u.cfg)
 	if in.Guests > policy.MaxGuestsPerBooking {
 		return nil, fmt.Errorf("%w: at most %d guests per booking", domain.ErrValidation, policy.MaxGuestsPerBooking)
+	}
+	if policy.CapacityMode == domain.CapacityModeSeats {
+		// A table-less venue has no tables to name and nothing to force a
+		// guest onto. Both staff powers are refused rather than quietly
+		// ignored: silently dropping TableIDs would tell a manager the guest
+		// was seated where they asked, and a "forced" booking with no
+		// capacity hold would be invisible to the bucket CHECK — the same hole
+		// that force-without-tables opens in table mode. Seating a party the
+		// room does not fit is what Overbook is for, and it keeps its holds.
+		if len(in.TableIDs) > 0 {
+			return nil, fmt.Errorf("%w: this restaurant books by total capacity and has no tables to assign",
+				domain.ErrValidation)
+		}
+		if in.Force {
+			return nil, fmt.Errorf("%w: forced placement is not available for a restaurant booking by total capacity; use overbook to seat a party beyond the declared capacity",
+				domain.ErrValidation)
+		}
+		// Skipped when overbooking: "the party is bigger than the whole room"
+		// is precisely the case staff are overriding. Everything else about the
+		// request still has to be valid.
+		if !in.Overbook {
+			if err := checkCapacityGuests(in.Guests, policy); err != nil {
+				return nil, err
+			}
+		}
+	} else if in.Overbook {
+		// In table mode the equivalent power already exists and has a different
+		// shape (force + the tables to seat the party at). Two ways to say the
+		// same thing in one mode is how one of them ends up unaudited.
+		return nil, fmt.Errorf("%w: overbook applies only to a restaurant booking by total capacity; use force with table_ids",
+			domain.ErrValidation)
 	}
 
 	normalizedPhone := phone.Normalize(in.Phone)
@@ -186,9 +233,16 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		return nil, err
 	}
 
-	tables, err := u.selectTables(ctx, in, policy, sched, startsAt)
-	if err != nil {
-		return nil, err
+	// In capacity mode nothing is selected up front on purpose: there is no
+	// scarce resource to pick, and the only meaningful check ("do the seats
+	// still fit?") is the one the database performs when the holds are
+	// inserted. Reading the buckets here first would just be the losing half of
+	// a race.
+	var tables []domain.RestaurantTable
+	if policy.CapacityMode == domain.CapacityModeTables {
+		if tables, err = u.selectTables(ctx, in, policy, sched, startsAt); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()
@@ -199,15 +253,27 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		StartsAt: startsAt, EndsAt: startsAt.Add(policy.Duration),
 		Status: domain.BookingPending, Source: in.Source, Notes: in.Notes,
 		PromotionID: in.PromotionID, EventID: in.EventID,
-		CreatedByAdmin: acc.staff(), ForcedPlacement: in.Force,
+		// An overbooked party was placed against the venue's own rules just as a
+		// forced one was, so it carries the same flag — every listing and export
+		// that already surfaces forced_placement surfaces this too, instead of
+		// waiting for a client to learn about a new field.
+		CreatedByAdmin: acc.staff(), ForcedPlacement: in.Force || in.Overbook,
 		CreatedAt: now, UpdatedAt: now,
 	}
 
 	slotFrom, slotTo := occupancyWindow(startsAt, policy)
-	// Set only by the booking_tables insert below, so the slot_taken label
-	// describes the statement that actually raised the conflict rather than
-	// "some ErrAlreadyExists escaped the transaction". WithinTx runs the
-	// closure exactly once (no retry), so a plain flag is enough.
+	// Set only by the statements that actually enforce occupancy — the
+	// booking_tables insert in table mode and the capacity-hold insert in seats
+	// mode — so the slot_taken label describes the statement that raised the
+	// conflict rather than "some ErrAlreadyExists escaped the transaction".
+	// WithinTx runs the closure exactly once (no retry), so a plain flag is
+	// enough.
+	//
+	// Both modes must set it: seats mode is the ONLY mode the table-less venues
+	// have, so leaving it to the links insert alone would mean every full slot
+	// at those venues answers with the generic already_exists — which the app
+	// reads as "you have already booked this", telling the guest to check
+	// reservations instead of picking another time.
 	var slotConflict bool
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.bookings.Create(ctx, b); err != nil {
@@ -224,6 +290,65 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			if err := u.links.Create(ctx, links); err != nil {
 				// The GiST exclusion constraint on booking_tables: somebody
 				// else committed this table/slot first.
+				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
+				return err
+			}
+		}
+		// The policy read above happened OUTSIDE this transaction, so by now the
+		// venue may have changed its capacity — or its whole mode. Re-read it
+		// under the venue lock and act on that value: otherwise a create that
+		// read "capacity 100" re-stamps buckets a concurrent change just
+		// rewrote to 80, and a create that read "tables mode" commits a booking
+		// with no holds into a venue that is now seats-mode — invisible to the
+		// ledger, sold twice. The lock is taken before the re-read, so the
+		// policy cannot move between reading and writing.
+		if u.capacity != nil {
+			if err := u.capacity.LockVenue(ctx, in.RestaurantID); err != nil {
+				return err
+			}
+			fresh, err := u.restaurants.GetByID(ctx, in.RestaurantID)
+			if err != nil {
+				return err
+			}
+			policy = resolvePolicy(fresh.Restaurant, u.cfg)
+		}
+		if policy.CapacityMode == domain.CapacityModeTables && len(tables) == 0 {
+			// The venue was in seats mode when the placement was resolved and is
+			// in table mode now. Committing here would write a booking with no
+			// booking_tables rows and no capacity holds — a guest holding a seat
+			// that neither guarantee can see. The honest answer is the same
+			// conflict a lost table race produces; the client retries and gets a
+			// real placement under the new mode.
+			slotConflict = true
+			return fmt.Errorf("%w: the restaurant changed how it takes bookings, please retry", domain.ErrAlreadyExists)
+		}
+		if policy.CapacityMode == domain.CapacityModeSeats {
+			if u.capacity == nil {
+				// Refuse rather than write a booking that holds nothing: an
+				// unheld booking is invisible to the capacity CHECK and the
+				// venue would be sold the same seats twice.
+				return fmt.Errorf("%w: capacity bookings are not configured", domain.ErrValidation)
+			}
+			if b.Guests > policy.CapacitySeats && !in.Overbook {
+				return fmt.Errorf("%w: the venue seats %d guests at a time", domain.ErrValidation, policy.CapacitySeats)
+			}
+			holds := buildCapacityHolds(b, policy, now)
+			if in.Overbook {
+				// Deliberate overbooking. The holds are re-stamped so the
+				// buckets this party overflows end up with exactly enough room
+				// for it and none to spare, and the audit row is written in this
+				// same transaction — an override nobody can be named for must
+				// not survive. See planCapacityOverride for the mechanism.
+				if err := u.applyOverride(ctx, b, holds, policy, acc, actor, now); err != nil {
+					return err
+				}
+			}
+			// The DB decides here: the bucket CHECK (seats_taken <= seats_limit)
+			// is the seats-mode equivalent of the GiST exclusion, and a party
+			// that no longer fits arrives as ErrAlreadyExists from it. Same
+			// answer as a lost table race — nothing was booked, pick another
+			// time — so it carries the same code.
+			if err := u.capacity.Create(ctx, holds); err != nil {
 				slotConflict = errors.Is(err, domain.ErrAlreadyExists)
 				return err
 			}
@@ -272,6 +397,52 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		return nil, err
 	}
 	return details, nil
+}
+
+// applyOverride raises the limits of the buckets this booking overflows and
+// records who did it. Call INSIDE the create transaction and AFTER LockVenue:
+// the raise is computed from the seats currently taken, so it is only correct
+// while no other writer of this venue's buckets can interleave.
+//
+// A booking that turns out to fit writes no audit row and gets no raise — see
+// planCapacityOverride. That is also why the audit is written here rather than
+// from a flag on the request: what is recorded is what actually happened to the
+// room, not what the client asked for.
+func (u *createUseCase) applyOverride(
+	ctx context.Context,
+	b *domain.Booking,
+	holds []domain.BookingCapacityHold,
+	policy domain.BookingPolicy,
+	acc access,
+	actor Actor,
+	now time.Time,
+) error {
+	if len(holds) == 0 {
+		return nil
+	}
+	// buildCapacityHolds emits the buckets in ascending order, so the ends of
+	// the slice are the ends of the window; ListUsage is half-open, hence the
+	// extra bucket on the right.
+	from := holds[0].BucketStart
+	to := holds[len(holds)-1].BucketStart.Add(domain.CapacityBucket)
+	rows, err := u.capacity.ListUsage(ctx, b.RestaurantID, from, to)
+	if err != nil {
+		return err
+	}
+	override := planCapacityOverride(b, holds, usageIndex(rows), policy, acc, actor, now)
+	if override == nil {
+		return nil
+	}
+	logging.FromContext(ctx).Warn(logging.EventBookingOverbooked,
+		slog.String("booking_id", b.ID.String()),
+		slog.String("restaurant_id", b.RestaurantID.String()),
+		slog.String("actor_id", actor.UserID.String()),
+		slog.Int("guests", b.Guests),
+		slog.Int("declared_seats", override.DeclaredSeats),
+		slog.Int("seats_over", override.SeatsOver),
+		slog.String("bucket", override.PeakBucketStart.Format(time.RFC3339)),
+	)
+	return u.capacity.RecordOverride(ctx, *override)
 }
 
 func (u *createUseCase) checkRate(ctx context.Context, normalizedPhone string) error {

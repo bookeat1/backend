@@ -33,6 +33,13 @@ func (s BookingStatus) HoldsTable() bool {
 	return s == BookingPending || s == BookingConfirmed || s == BookingArrived
 }
 
+// StatusesHoldingTable lists the statuses HoldsTable reports true for, for
+// callers that need them as a filter value rather than as a predicate (e.g.
+// "every booking of this venue that still occupies a seat").
+func StatusesHoldingTable() []BookingStatus {
+	return []BookingStatus{BookingPending, BookingConfirmed, BookingArrived}
+}
+
 // Terminal reports whether no further transition is allowed from s.
 func (s BookingStatus) Terminal() bool { return len(bookingTransitions[s]) == 0 }
 
@@ -142,6 +149,12 @@ type BookingPolicy struct {
 	ConfirmSLA          time.Duration // pending → auto-confirm / escalation after this
 	MaxGuestsPerBooking int
 	AutoConfirm         bool
+	// CapacityMode selects the availability engine for this venue; see
+	// CapacityMode. Always a valid value after resolution (never empty).
+	CapacityMode CapacityMode
+	// CapacitySeats is the guests the venue can seat at once. Meaningful only
+	// when CapacityMode is CapacityModeSeats; zero otherwise.
+	CapacitySeats int
 }
 
 // BookingPolicyOverride is a restaurant's optional per-field override of the
@@ -156,6 +169,13 @@ type BookingPolicyOverride struct {
 	ConfirmSLAMinutes      *int
 	MaxGuestsPerBooking    *int
 	AutoConfirm            *bool
+	// BookingCapacityMode / BookingCapacitySeats are the table-less switch
+	// (migration 0054). They follow the same PATCH semantics as the fields
+	// above — nil means "leave this column alone" — but a NULL
+	// booking_capacity_mode is not an env-backed default: it simply means
+	// CapacityModeTables, the behaviour every venue had before 0054.
+	BookingCapacityMode  *CapacityMode
+	BookingCapacitySeats *int
 }
 
 // Booking is a table reservation. ID equals the original Supabase id for
@@ -223,7 +243,52 @@ type BookingRepository interface {
 	// first, so a batch smaller than the candidate set never starves the rows
 	// that have been waiting longest.
 	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
+	// ListLiveForReconcile returns, in ONE statement, every booking of the venue
+	// in the given statuses whose starts_at >= from, ordered by starts_at then
+	// id, capped at limit (and at ReconcileProbeLimit whatever the caller asks
+	// for — one row past MaxReconcileBookings, so the caller can tell "exactly
+	// at the cap" from "truncated"; see ReconcileProbeLimit).
+	//
+	// It exists because List's OFFSET pagination cannot be used to read a set
+	// that must be reconciled as a whole: the enclosing transaction is READ
+	// COMMITTED, so every page is a fresh snapshot, and a status change that
+	// commits between two pages (a guest cancelling — status.go takes no venue
+	// lock) shifts the window and one row is never returned at all. A single
+	// statement sees a single snapshot, which is the property the caller needs.
+	//
+	// The order is ascending and total (starts_at, then id) because the caller
+	// makes decisions whose outcome depends on the order it walks the set in,
+	// and a retry of the same operation must reach the same answer.
+	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []BookingStatus, limit int) ([]Booking, error)
 }
+
+// MaxReconcileBookings is the hard cap on how many bookings one whole-set
+// reconciliation (a capacity-mode switch) may load and rewrite.
+//
+// It is a real product limit, not a paging size: the switch runs 4-5 statements
+// per booking under the venue's advisory lock, inside an HTTP request whose
+// write timeout is 15s (bootstrap/app.go). Past some size the switch cannot
+// finish in time — and the failure mode without a cap is the worst one
+// available: the request dies on timeout, the transaction rolls back, and the
+// venue lock is held meanwhile so ordinary booking creates block behind a
+// switch that will never succeed. With the cap the switch is refused
+// immediately, loudly, and with something staff can act on.
+const MaxReconcileBookings = 300
+
+// ReconcileProbeLimit is what a caller actually asks ListLiveForReconcile for:
+// one row MORE than it is allowed to process.
+//
+// Without the extra row "I got exactly MaxReconcileBookings" is ambiguous — it
+// means either "the venue has exactly that many" (safe to reconcile) or "it has
+// more and the set is truncated" (unsafe, nothing about it can be trusted). The
+// caller has to assume the unsafe reading, so a venue sitting on exactly 300
+// live bookings is locked out of switching modes until one of them goes
+// inactive, for no real reason.
+//
+// Reading one row past the cap removes the ambiguity at the cost of a single
+// row: at most MaxReconcileBookings rows means the set is COMPLETE, and more
+// than that is a genuine, honest truncation signal.
+const ReconcileProbeLimit = MaxReconcileBookings + 1
 
 // BookingReminderRepository backs the pre-visit guest reminder pass. It is a
 // port of its own, separate from BookingRepository, because the reminder marker

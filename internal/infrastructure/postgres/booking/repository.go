@@ -140,6 +140,54 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 	return out, total, nil
 }
 
+// ListLiveForReconcile reads the venue's live bookings in ONE statement — no
+// LIMIT/OFFSET walk. See the port doc on domain.BookingRepository for why that
+// matters: List pages under READ COMMITTED, every page is a fresh snapshot, and
+// a cancellation committing between two pages shifts the offset window so that
+// one booking is never seen. A reconciliation that misses a booking leaves it
+// with no capacity hold and no booking_tables row, i.e. invisible to both
+// engines that are supposed to keep its seats sold exactly once.
+//
+// The ceiling is domain.ReconcileProbeLimit (one row past
+// domain.MaxReconcileBookings), and it is applied here as well as by the caller:
+// this query has no offset, so an unbounded venue would otherwise stream its
+// whole horizon into memory. The ceiling is the PROBE limit rather than the
+// processing cap so the caller can distinguish a venue sitting exactly at the
+// cap from a truncated set — clamping to the cap here would silently destroy
+// that signal.
+func (r *Repository) ListLiveForReconcile(
+	ctx context.Context,
+	restaurantID uuid.UUID,
+	from time.Time,
+	statuses []domain.BookingStatus,
+	limit int,
+) ([]domain.Booking, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > domain.ReconcileProbeLimit {
+		limit = domain.ReconcileProbeLimit
+	}
+	// Ascending, ties broken by id: a total order, so the caller's placement
+	// decisions are reproducible across retries.
+	q := `SELECT ` + cols + ` FROM bookings
+		WHERE restaurant_id = $1
+		  AND status = ANY($2)
+		  AND starts_at >= $3
+		ORDER BY starts_at, id
+		LIMIT $4`
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, restaurantID, statusStrings(statuses), from, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list live bookings for reconcile: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanBookings(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list live bookings for reconcile: %w", err)
+	}
+	return out, nil
+}
+
 // UpdateStatus writes the new status together with the timestamp column that
 // belongs to it. booking_tables.active is NOT touched here — the DB trigger on
 // bookings.status owns that column.
@@ -156,7 +204,11 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	q := `UPDATE bookings SET ` + strings.Join(set, ", ") + ` WHERE id=$1`
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id, string(status), at)
 	if err != nil {
-		return fmt.Errorf("update booking status: %w", err)
+		// A status write is not an innocent UPDATE: the triggers of 0004/0054
+		// re-claim the booking's tables or its capacity holds. Moving a
+		// waitlisted booking back into an active status can therefore lose the
+		// race for a seat the venue has meanwhile sold — a conflict, not a 500.
+		return mapCapacityWrite(err, "update booking status")
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound

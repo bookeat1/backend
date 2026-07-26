@@ -17,6 +17,14 @@ const (
 	// lost race for a table, i.e. a conflict — mapping it anywhere else would
 	// turn a legitimate 409 into a 500.
 	exclusionViolation = "23P01"
+	// checkViolation is raised by chk_capacity_bucket_within_limit when a
+	// table-less venue's declared capacity is already sold for the requested
+	// window. Like the exclusion violation above it is a lost race, not a bug —
+	// but ONLY for that one constraint: every other CHECK in this schema means
+	// the application wrote something invalid, which must stay a 500.
+	checkViolation = "23514"
+	// capacityBucketConstraint is the constraint name from migration 0054.
+	capacityBucketConstraint = "chk_capacity_bucket_within_limit"
 )
 
 // mapWrite maps a unique_violation or an exclusion_violation to
@@ -32,6 +40,19 @@ func mapWrite(err error, resource string) error {
 		}
 	}
 	return fmt.Errorf("%s: %w", resource, err)
+}
+
+// mapCapacityWrite is mapWrite plus the capacity-bucket CHECK: a write that
+// would push a venue past its declared table-less capacity is a conflict (409),
+// not a server error. The constraint is matched BY NAME so an unrelated CHECK
+// failure keeps surfacing as the bug it is.
+func mapCapacityWrite(err error, resource string) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) &&
+		pgErr.Code == checkViolation && pgErr.ConstraintName == capacityBucketConstraint {
+		return fmt.Errorf("%w: %s", domain.ErrAlreadyExists, resource)
+	}
+	return mapWrite(err, resource)
 }
 
 // page normalizes 1-based pagination into a LIMIT/OFFSET pair.

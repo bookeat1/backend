@@ -109,7 +109,12 @@ func newConflictHarness(t *testing.T) *conflictHarness {
 
 	txm := sqltx.NewManager(pool)
 	create := uc.NewCreateUseCase(
-		bookingrepo.New(pool), bookingrepo.NewTables(pool), bookingrepo.NewItems(pool),
+		bookingrepo.New(pool), bookingrepo.NewTables(pool),
+		// The real capacity repository, even though this venue is in table mode:
+		// the create path re-reads the venue's policy under the capacity lock, so
+		// a nil here would change the code path under test.
+		bookingrepo.NewCapacity(pool),
+		bookingrepo.NewItems(pool),
 		bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool),
@@ -120,7 +125,8 @@ func newConflictHarness(t *testing.T) *conflictHarness {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	h := NewHandler(&fakeFacade{}, create, idempotent, &fakeStatus{}, &fakeUpdate{},
-		&fakeAvail{}, &fakeBlacklist{}, &fakePolicy{}, &fakeExternal{})
+		&fakeAvail{}, &fakeBlacklist{}, &fakePolicy{}, &fakeExternal{},
+		&fakeCapacityOverrides{})
 	api := r.Group("/api/v1")
 	h.RegisterPublic(api)
 	authed := api.Group("")

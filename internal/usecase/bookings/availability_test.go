@@ -255,6 +255,7 @@ func TestAvailabilityDay(t *testing.T) {
 			From:    time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, loc),
 			To:      time.Date(day.Year(), day.Month(), day.Day(), 14, 0, 0, 0, loc),
 		}}},
+		newFakeCapacity(),
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
 		&fakeSchedule{hours: openAllWeek("12:00", "18:00"), tables: []domain.RestaurantTable{t4}},
 		testConfig(),
@@ -288,7 +289,7 @@ func TestAvailabilityDay(t *testing.T) {
 
 func TestAvailabilityDayValidation(t *testing.T) {
 	rid := uuid.New()
-	u := NewAvailabilityUseCase(&fakeLinks{},
+	u := NewAvailabilityUseCase(&fakeLinks{}, newFakeCapacity(),
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
 		&fakeSchedule{}, testConfig())
 

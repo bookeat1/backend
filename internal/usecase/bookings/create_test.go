@@ -18,6 +18,7 @@ type createHarness struct {
 	uc        CreateUseCase
 	bookings  *fakeBookings
 	links     *fakeLinks
+	capacity  *fakeCapacity
 	items     *fakeItems
 	history   *fakeHistory
 	outbox    *fakeOutbox
@@ -43,6 +44,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 	h := &createHarness{
 		bookings:  newFakeBookings(),
 		links:     &fakeLinks{},
+		capacity:  newFakeCapacity(),
 		items:     &fakeItems{},
 		history:   &fakeHistory{},
 		outbox:    &fakeOutbox{},
@@ -63,7 +65,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 	h.startsAt = time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
 
 	h.uc = NewCreateUseCase(
-		h.bookings, h.links, h.items, h.history, h.outbox, h.blacklist, h.rateLog,
+		h.bookings, h.links, h.capacity, h.items, h.history, h.outbox, h.blacklist, h.rateLog,
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
 			ID: rid, IsActive: true, BookingPolicy: override,
 		}}},
@@ -434,7 +436,7 @@ func TestCreateLosesRace(t *testing.T) {
 func TestCreateInactiveRestaurant(t *testing.T) {
 	rid := uuid.New()
 	uc := NewCreateUseCase(
-		newFakeBookings(), &fakeLinks{}, &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
+		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
 		&fakeBlacklist{}, &fakeRateLog{},
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid}}},
 		&fakeSchedule{}, newFakeManagers(), &fakeTx{}, testConfig(),

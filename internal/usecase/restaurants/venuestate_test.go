@@ -42,6 +42,13 @@ type fixedTZ struct{ tz string }
 
 func (f fixedTZ) VenueTimezone(domain.Restaurant) string { return f.tz }
 
+// VenueCapacity stands in for the real resolver: it reports whatever the venue
+// row itself declares, so a test can put a venue in seats mode by setting its
+// override fields and nothing else.
+func (f fixedTZ) VenueCapacity(r domain.Restaurant) (domain.CapacityMode, int) {
+	return venueCapacityOf(r)
+}
+
 // perVenueTZ resolves each venue to its own stored override, exactly like the
 // real resolver does, so a test can prove the flags follow the VENUE's clock.
 type perVenueTZ struct{ fallback string }
@@ -51,6 +58,21 @@ func (p perVenueTZ) VenueTimezone(r domain.Restaurant) string {
 		return *tz
 	}
 	return p.fallback
+}
+
+func (p perVenueTZ) VenueCapacity(r domain.Restaurant) (domain.CapacityMode, int) {
+	return venueCapacityOf(r)
+}
+
+// venueCapacityOf mirrors usecase/bookings.resolvePolicy's reading of the two
+// capacity columns: seats mode counts only when the venue declares a positive
+// seat count, otherwise the venue is in table mode.
+func venueCapacityOf(r domain.Restaurant) (domain.CapacityMode, int) {
+	m, s := r.BookingPolicy.BookingCapacityMode, r.BookingPolicy.BookingCapacitySeats
+	if m != nil && *m == domain.CapacityModeSeats && s != nil && *s > 0 {
+		return domain.CapacityModeSeats, *s
+	}
+	return domain.CapacityModeTables, 0
 }
 
 func wh(dow int, isOpen bool, open, close_ string) domain.WorkingHours {
@@ -84,9 +106,14 @@ func TestBuildVenueState(t *testing.T) {
 	middayFriday := time.Date(2026, 7, 24, 13, 0, 0, 0, loc)
 
 	tests := []struct {
-		name        string
-		hours       []domain.WorkingHours
-		tz          string
+		name  string
+		hours []domain.WorkingHours
+		tz    string
+		// mode is the venue's resolved capacity mode. The zero value ("") is
+		// neither constant, so it behaves like table mode — which is what a
+		// venue that never opted in resolves to.
+		mode        domain.CapacityMode
+		seats       int
 		tables      int
 		now         time.Time
 		wantSched   bool
@@ -152,11 +179,62 @@ func TestBuildVenueState(t *testing.T) {
 			wantOpenNow: nil,
 			wantBooking: true,
 		},
+		// SEATS MODE (migration 0054). These are the venues the table-less
+		// branch exists to unblock: they have NO tables on purpose, and judging
+		// them by their table list is what made the flag lie.
+		{
+			name:        "seats mode with declared seats and no tables at all: BOOKABLE",
+			hours:       openEveryDay("11:00", "22:00"),
+			tz:          almaty,
+			mode:        domain.CapacityModeSeats,
+			seats:       60,
+			tables:      0,
+			now:         middayFriday,
+			wantSched:   true,
+			wantOpenNow: boolp(true),
+			wantBooking: true,
+		},
+		{
+			name:        "seats mode declaring zero seats: not bookable, tables cannot rescue it",
+			hours:       openEveryDay("11:00", "22:00"),
+			tz:          almaty,
+			mode:        domain.CapacityModeSeats,
+			seats:       0,
+			tables:      9,
+			now:         middayFriday,
+			wantSched:   true,
+			wantOpenNow: boolp(true),
+			wantBooking: false,
+		},
+		{
+			name:        "seats mode but every day closed: still nothing to book",
+			hours:       []domain.WorkingHours{wh(5, false, "", ""), wh(6, false, "", "")},
+			tz:          almaty,
+			mode:        domain.CapacityModeSeats,
+			seats:       60,
+			tables:      0,
+			now:         middayFriday,
+			wantSched:   true,
+			wantOpenNow: boolp(false),
+			wantBooking: false,
+		},
+		{
+			name:        "table mode ignores a stale seat count",
+			hours:       openEveryDay("11:00", "22:00"),
+			tz:          almaty,
+			mode:        domain.CapacityModeTables,
+			seats:       60, // left behind by a venue that switched back
+			tables:      0,
+			now:         middayFriday,
+			wantSched:   true,
+			wantOpenNow: boolp(true),
+			wantBooking: false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			st := buildVenueState(tc.hours, tc.tz, tc.tables, tc.now)
+			st := buildVenueState(tc.hours, tc.tz, tc.mode, tc.seats, tc.tables, tc.now)
 			if st.AcceptsOnlineBookings != tc.wantBooking {
 				t.Errorf("AcceptsOnlineBookings = %v, want %v", st.AcceptsOnlineBookings, tc.wantBooking)
 			}
@@ -319,5 +397,74 @@ func TestVenueStateAbsentWhenNotWired(t *testing.T) {
 	}
 	if agg.VenueState != nil {
 		t.Error("venue state must be absent on detail when not wired")
+	}
+}
+
+// TestListPublishesATableLessVenueAsBookable is the regression test for the
+// interaction between the venue-state enricher and the table-less capacity mode
+// (migration 0054, ADR-009).
+//
+// accepts_online_bookings was derived from "has at least one active table with
+// capacity > 0". That was the whole truth while a table list was the only way to
+// be bookable. It stopped being the truth the moment a venue could declare a
+// seat count instead — and it fails in the WORST direction: the 17 live venues
+// that keep no tables on purpose are exactly the ones seats mode exists to
+// unblock, and they would still be published as unbookable. The app hides the
+// booking button on this flag, so the feature would ship switched off for its
+// only audience.
+//
+// The venue here has ZERO bookable tables, which is not an accident of the
+// fixture — it is the point.
+func TestListPublishesATableLessVenueAsBookable(t *testing.T) {
+	if _, err := time.LoadLocation("Asia/Almaty"); err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	seatsVenue := uuid.New()
+	tablesVenue := uuid.New()
+	seatsMode := domain.CapacityModeSeats
+	seats := 60
+
+	repo := &fakeRestaurantRepo{list: []domain.RestaurantListItem{
+		{Restaurant: domain.Restaurant{
+			ID: seatsVenue,
+			BookingPolicy: domain.BookingPolicyOverride{
+				BookingCapacityMode:  &seatsMode,
+				BookingCapacitySeats: &seats,
+			},
+		}},
+		// The control: same hours, same absence of tables, but no seats
+		// declared. It must stay unbookable, so a passing test cannot be
+		// explained by "the flag is now always true".
+		{Restaurant: domain.Restaurant{ID: tablesVenue}},
+	}}
+	state := &fakeVenueState{
+		hours: map[uuid.UUID][]domain.WorkingHours{
+			seatsVenue:  openEveryDay("11:00", "22:00"),
+			tablesVenue: openEveryDay("11:00", "22:00"),
+		},
+		tables: map[uuid.UUID]int{}, // neither venue has a single table
+	}
+	instant := time.Date(2026, 7, 24, 6, 30, 0, 0, time.UTC)
+
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
+		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
+			WithVenueStateClock(func() time.Time { return instant }))))
+
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	got := map[uuid.UUID]bool{}
+	for _, it := range items {
+		if it.VenueState == nil {
+			t.Fatalf("venue %s: no venue state attached", it.Restaurant.ID)
+		}
+		got[it.Restaurant.ID] = it.VenueState.AcceptsOnlineBookings
+	}
+	if !got[seatsVenue] {
+		t.Errorf("a seats-mode venue seating 60 guests with no tables is published as accepts_online_bookings=false — the flag still answers from the table list, so the venues table-less booking exists to unblock stay unbookable in the app")
+	}
+	if got[tablesVenue] {
+		t.Errorf("a table-mode venue with no tables is published as bookable; the flag is not answering from capacity at all")
 	}
 }

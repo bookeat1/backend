@@ -11,6 +11,8 @@ func iptr(v int) *int       { return &v }
 func bptr(v bool) *bool     { return &v }
 func sptr(v string) *string { return &v }
 
+func capModePtr(m domain.CapacityMode) *domain.CapacityMode { return &m }
+
 func testConfig() Config {
 	return Config{
 		DefaultDuration:       120 * time.Minute,
@@ -44,6 +46,7 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
 				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
 				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 		{
@@ -57,6 +60,7 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "UTC", Duration: 90 * time.Minute, Buffer: 0,
 				Lead: 15 * time.Minute, HorizonDays: 7, CancelDeadline: 30 * time.Minute,
 				ConfirmSLA: 45 * time.Minute, MaxGuestsPerBooking: 8, AutoConfirm: false,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 		{
@@ -66,6 +70,7 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
 				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
 				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: false,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 		{
@@ -75,6 +80,7 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 0,
 				Lead: 0, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
 				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 		{
@@ -89,6 +95,7 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
 				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
 				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 		{
@@ -98,6 +105,61 @@ func TestResolvePolicy(t *testing.T) {
 				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
 				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
 				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
+			},
+		},
+		{
+			// The table-less switch (0054): honoured only as a complete,
+			// sane pair. A venue that has one without the other must keep
+			// behaving exactly like a table venue, because the alternative is
+			// a venue that silently accepts no bookings at all.
+			name: "capacity mode with seats is honoured",
+			override: domain.BookingPolicyOverride{
+				BookingCapacityMode:  capModePtr(domain.CapacityModeSeats),
+				BookingCapacitySeats: iptr(40),
+			},
+			want: domain.BookingPolicy{
+				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
+				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
+				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeSeats, CapacitySeats: 40,
+			},
+		},
+		{
+			name: "capacity mode without seats falls back to tables",
+			override: domain.BookingPolicyOverride{
+				BookingCapacityMode: capModePtr(domain.CapacityModeSeats),
+			},
+			want: domain.BookingPolicy{
+				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
+				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
+				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
+			},
+		},
+		{
+			name: "absurd capacity is ignored",
+			override: domain.BookingPolicyOverride{
+				BookingCapacityMode:  capModePtr(domain.CapacityModeSeats),
+				BookingCapacitySeats: iptr(maxCapacitySeats + 1),
+			},
+			want: domain.BookingPolicy{
+				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
+				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
+				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
+			},
+		},
+		{
+			name: "seats declared without the mode stays table mode",
+			override: domain.BookingPolicyOverride{
+				BookingCapacitySeats: iptr(40),
+			},
+			want: domain.BookingPolicy{
+				Timezone: "Asia/Almaty", Duration: 120 * time.Minute, Buffer: 15 * time.Minute,
+				Lead: 60 * time.Minute, HorizonDays: 60, CancelDeadline: 180 * time.Minute,
+				ConfirmSLA: 120 * time.Minute, MaxGuestsPerBooking: 20, AutoConfirm: true,
+				CapacityMode: domain.CapacityModeTables,
 			},
 		},
 	}

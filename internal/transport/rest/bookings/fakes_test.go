@@ -305,3 +305,20 @@ func (f *fakeExternal) Delete(_ context.Context, _ uc.Actor, _, _ uuid.UUID) err
 func (f *fakeExternal) List(_ context.Context, _ uc.Actor, _ uuid.UUID, _, _ time.Time) ([]domain.ExternalReservation, error) {
 	return f.list, f.err
 }
+
+// fakeCapacityOverrides is the read-only overbooking audit usecase. It records
+// the window it was asked for, so a test can prove the handler passes the query
+// through instead of inventing one.
+type fakeCapacityOverrides struct {
+	err      error
+	list     []domain.BookingCapacityOverride
+	from, to time.Time
+}
+
+func (f *fakeCapacityOverrides) List(_ context.Context, _ uc.Actor, _ uuid.UUID, from, to time.Time) ([]domain.BookingCapacityOverride, error) {
+	f.from, f.to = from, to
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.list, nil
+}

@@ -21,7 +21,10 @@ import (
 var bookingTables = []string{
 	"booking_outbox", "booking_status_history", "restaurant_surveys",
 	"booking_rate_log", "booking_blacklist", "booking_messages", "booking_items",
-	"booking_tables", "bookings",
+	"booking_tables", "booking_capacity_holds", "bookings",
+	// TRUNCATE fires no row trigger, so the aggregated counters would survive a
+	// truncation of the holds and leak into the next test.
+	"restaurant_capacity_buckets",
 }
 
 func setup(t *testing.T) (*pgxpool.Pool, context.Context) {

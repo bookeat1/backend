@@ -41,7 +41,8 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 // stays untouched.
 const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 	booking_lead_minutes, booking_horizon_days, cancel_deadline_minutes,
-	confirm_sla_minutes, max_guests_per_booking, auto_confirm`
+	confirm_sla_minutes, max_guests_per_booking, auto_confirm,
+	booking_capacity_mode, booking_capacity_seats`
 
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
@@ -50,11 +51,21 @@ const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 // public payload reports an "open now" flag that MUST be computed in the
 // venue's own zone. GetByID has always read the column; without it here, a
 // venue outside the platform default zone would silently be judged against the
-// fallback and reported open when it is shut. The rest of the booking policy is
-// still resolved per booking and stays out of the listing.
+// fallback and reported open when it is shut.
+//
+// r.booking_capacity_mode / r.booking_capacity_seats are here for the same
+// reason, one field further on: the payload also reports whether the venue can
+// take an online booking at all, and for a seats-mode venue (0054) that answer
+// comes from the declared seat count, not from the table list it deliberately
+// does not keep. Without these two columns every table-less venue scans as
+// table mode with zero tables and is published as unbookable — the exact
+// venues seats mode exists to unblock.
+//
+// The rest of the booking policy is still resolved per booking and stays out of
+// the listing.
 const listExtraCols = `(SELECT image_url FROM restaurant_images i WHERE i.restaurant_id = r.id
 		 ORDER BY i.is_primary DESC, i.created_at ASC LIMIT 1) AS primary_image,
-	r.timezone`
+	r.timezone, r.booking_capacity_mode, r.booking_capacity_seats`
 
 func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	now := time.Now()
@@ -151,6 +162,12 @@ func (r *Repository) UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o do
 	}
 	if v := o.AutoConfirm; v != nil {
 		set("auto_confirm", *v)
+	}
+	if v := o.BookingCapacityMode; v != nil {
+		set("booking_capacity_mode", string(*v))
+	}
+	if v := o.BookingCapacitySeats; v != nil {
+		set("booking_capacity_seats", *v)
 	}
 
 	if len(sets) == 0 {
@@ -429,6 +446,10 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 	var m domain.Restaurant
 	var city, price string
 	var name, desc, cuisine, addr, opening []byte
+	// Scanned as *string, not as *domain.CapacityMode: pgx has no reason to
+	// know about a domain type, and a legacy/unknown label must reach
+	// resolvePolicy (which ignores it) rather than fail the scan.
+	var capacityMode *string
 	p := &m.BookingPolicy
 	if err := row.Scan(
 		&m.ID, &m.CategoryID, &m.Name, &name, &m.Description, &desc,
@@ -439,8 +460,13 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm,
+		&capacityMode, &p.BookingCapacitySeats,
 	); err != nil {
 		return nil, err
+	}
+	if capacityMode != nil {
+		mode := domain.CapacityMode(*capacityMode)
+		p.BookingCapacityMode = &mode
 	}
 	m.City = domain.City(city)
 	m.PriceCategory = domain.PriceCategory(price)
@@ -478,6 +504,11 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	var city, price string
 	var name, desc, cuisine, addr, opening []byte
 	var primary *string
+	// Scanned as a plain *string for the same reason GetByID does it: pgx knows
+	// nothing about domain.CapacityMode, and an unknown/legacy label must reach
+	// resolvePolicy (which ignores it, leaving the venue in table mode) rather
+	// than fail the whole catalog page.
+	var capacityMode *string
 	if err := row.Scan(
 		&m.ID, &m.CategoryID, &m.Name, &name, &m.Description, &desc,
 		&m.CuisineType, &cuisine, &m.Address, &addr, &m.OpeningHours, &opening,
@@ -485,8 +516,13 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt, &primary,
 		&m.BookingPolicy.Timezone,
+		&capacityMode, &m.BookingPolicy.BookingCapacitySeats,
 	); err != nil {
 		return nil, nil, err
+	}
+	if capacityMode != nil {
+		mode := domain.CapacityMode(*capacityMode)
+		m.BookingPolicy.BookingCapacityMode = &mode
 	}
 	m.City = domain.City(city)
 	m.PriceCategory = domain.PriceCategory(price)

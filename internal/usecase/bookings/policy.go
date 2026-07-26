@@ -33,6 +33,21 @@ func (c Config) VenueTimezone(r domain.Restaurant) string {
 	return resolvePolicy(r, c).Timezone
 }
 
+// VenueCapacity returns the venue's resolved availability mode and, in seats
+// mode, the number of guests it can seat at once (zero in table mode).
+//
+// Exported for the same reason as VenueTimezone: the public catalog has to
+// answer "can a guest book here at all", and in seats mode the answer has
+// nothing to do with the table list — a table-less venue is bookable with zero
+// tables. Routing that question through resolvePolicy keeps the catalog's
+// answer and the availability engine's behaviour derived from ONE rule,
+// including its validation (a seats mode with a missing or out-of-range seat
+// count degrades to table mode here exactly as it does for a booking).
+func (c Config) VenueCapacity(r domain.Restaurant) (domain.CapacityMode, int) {
+	p := resolvePolicy(r, c)
+	return p.CapacityMode, p.CapacitySeats
+}
+
 // resolvePolicy merges the two policy levels of spec §4.2: the global env
 // defaults (Config) and the restaurant's optional per-field overrides. A NULL
 // (nil) override falls back to the global value; an override that is present
@@ -53,6 +68,17 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 		ConfirmSLA:          cfg.DefaultConfirmSLA,
 		MaxGuestsPerBooking: cfg.DefaultMaxGuests,
 		AutoConfirm:         cfg.DefaultAutoConfirm,
+		// DEFAULT DECISION (owner, 25.07.2026): table mode. A NULL
+		// booking_capacity_mode — which is every venue that existed before
+		// migration 0054 — resolves to exactly the behaviour it had yesterday.
+		// Nobody is switched silently: a venue with tables keeps its tables,
+		// and a venue without tables stays as unbookable as it was until
+		// someone deliberately declares a capacity through the admin API. The
+		// alternative (defaulting the tableless venues to capacity mode) would
+		// have required the platform to INVENT a seat count for a venue it has
+		// never measured, and a made-up capacity is exactly the kind of number
+		// that turns into a double-booked Saturday.
+		CapacityMode: domain.CapacityModeTables,
 	}
 
 	if o.Timezone != nil && *o.Timezone != "" {
@@ -83,6 +109,17 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 	}
 	if o.AutoConfirm != nil {
 		p.AutoConfirm = *o.AutoConfirm
+	}
+	// Capacity mode is only honoured together with a usable seat count: a row
+	// claiming 'seats' with a NULL/absurd capacity would make the venue silently
+	// unbookable, which is the very failure this feature exists to remove. The
+	// DB CHECKs of 0054 make that pair impossible going forward; this guard
+	// covers rows written before them (or by hand).
+	if v := o.BookingCapacityMode; v != nil && *v == domain.CapacityModeSeats {
+		if s := o.BookingCapacitySeats; s != nil && *s > 0 && *s <= maxCapacitySeats {
+			p.CapacityMode = domain.CapacityModeSeats
+			p.CapacitySeats = *s
+		}
 	}
 	return p
 }

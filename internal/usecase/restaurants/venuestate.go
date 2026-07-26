@@ -32,6 +32,11 @@ type venueStateReader interface {
 // "bookable slots" can never be computed against two different clocks.
 type VenueTimezoneResolver interface {
 	VenueTimezone(r domain.Restaurant) string
+	// VenueCapacity reports which availability engine this venue runs on and,
+	// in seats mode, how many guests it seats at once. Bound to the same
+	// resolution the booking engine uses, so the catalog cannot disagree with
+	// it about whether a venue is bookable.
+	VenueCapacity(r domain.Restaurant) (domain.CapacityMode, int)
 }
 
 // VenueState computes the guest-facing venue state — structured weekly
@@ -77,7 +82,11 @@ func NewVenueState(reader venueStateReader, tz VenueTimezoneResolver, opts ...Ve
 //     free-text opening_hours column is deliberately NOT parsed here;
 //   - unknown timezone on this host → OpenNow stays nil ("unknown"), the day
 //     list is still served (it is plain venue-local text, always true).
-func buildVenueState(hours []domain.WorkingHours, tz string, bookableTables int, now time.Time) domain.PublicVenueState {
+func buildVenueState(
+	hours []domain.WorkingHours, tz string,
+	mode domain.CapacityMode, capacitySeats, bookableTables int,
+	now time.Time,
+) domain.PublicVenueState {
 	days := domain.BuildWeeklySchedule(hours)
 
 	var st domain.PublicVenueState
@@ -87,10 +96,21 @@ func buildVenueState(hours []domain.WorkingHours, tz string, bookableTables int,
 			openDays++
 		}
 	}
+	// "Has capacity" is MODE-DEPENDENT, and getting this wrong lies in the
+	// direction that hurts most. A seats-mode venue (migration 0054) declares a
+	// total number of guests instead of a table list, and its availability comes
+	// from restaurant_capacity_buckets — the table list is not consulted at all.
+	// Judging it by its tables would report accepts_online_bookings=false for
+	// exactly the table-less venues seats mode exists to make bookable, and the
+	// app hides the booking button on that flag.
+	hasCapacity := bookableTables > 0
+	if mode == domain.CapacityModeSeats {
+		hasCapacity = capacitySeats > 0
+	}
 	// Without a readable open day the availability engine generates no start
-	// times on ANY date, so the venue cannot be booked online however many
-	// tables it has — see PublicVenueState.AcceptsOnlineBookings.
-	st.AcceptsOnlineBookings = bookableTables > 0 && openDays > 0
+	// times on ANY date, so the venue cannot be booked online however much
+	// capacity it has — see PublicVenueState.AcceptsOnlineBookings.
+	st.AcceptsOnlineBookings = hasCapacity && openDays > 0
 
 	if len(days) == 0 {
 		return st
@@ -123,7 +143,9 @@ func (v *VenueState) AttachList(ctx context.Context, items []domain.RestaurantLi
 	now := v.now()
 	for i := range items {
 		id := items[i].Restaurant.ID
-		st := buildVenueState(hours[id], v.tz.VenueTimezone(items[i].Restaurant), tables[id], now)
+		mode, seats := v.tz.VenueCapacity(items[i].Restaurant)
+		st := buildVenueState(hours[id], v.tz.VenueTimezone(items[i].Restaurant),
+			mode, seats, tables[id], now)
 		items[i].VenueState = &st
 	}
 }
@@ -138,7 +160,9 @@ func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggreg
 	if !ok {
 		return
 	}
-	st := buildVenueState(hours[id], v.tz.VenueTimezone(agg.Restaurant), tables[id], v.now())
+	mode, seats := v.tz.VenueCapacity(agg.Restaurant)
+	st := buildVenueState(hours[id], v.tz.VenueTimezone(agg.Restaurant),
+		mode, seats, tables[id], v.now())
 	agg.VenueState = &st
 }
 
