@@ -245,8 +245,9 @@ type BookingRepository interface {
 	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
 	// ListLiveForReconcile returns, in ONE statement, every booking of the venue
 	// in the given statuses whose starts_at >= from, ordered by starts_at then
-	// id, capped at limit (and at MaxReconcileBookings whatever the caller asks
-	// for).
+	// id, capped at limit (and at ReconcileProbeLimit whatever the caller asks
+	// for — one row past MaxReconcileBookings, so the caller can tell "exactly
+	// at the cap" from "truncated"; see ReconcileProbeLimit).
 	//
 	// It exists because List's OFFSET pagination cannot be used to read a set
 	// that must be reconciled as a whole: the enclosing transaction is READ
@@ -273,6 +274,21 @@ type BookingRepository interface {
 // switch that will never succeed. With the cap the switch is refused
 // immediately, loudly, and with something staff can act on.
 const MaxReconcileBookings = 300
+
+// ReconcileProbeLimit is what a caller actually asks ListLiveForReconcile for:
+// one row MORE than it is allowed to process.
+//
+// Without the extra row "I got exactly MaxReconcileBookings" is ambiguous — it
+// means either "the venue has exactly that many" (safe to reconcile) or "it has
+// more and the set is truncated" (unsafe, nothing about it can be trusted). The
+// caller has to assume the unsafe reading, so a venue sitting on exactly 300
+// live bookings is locked out of switching modes until one of them goes
+// inactive, for no real reason.
+//
+// Reading one row past the cap removes the ambiguity at the cost of a single
+// row: at most MaxReconcileBookings rows means the set is COMPLETE, and more
+// than that is a genuine, honest truncation signal.
+const ReconcileProbeLimit = MaxReconcileBookings + 1
 
 // BookingReminderRepository backs the pre-visit guest reminder pass. It is a
 // port of its own, separate from BookingRepository, because the reminder marker

@@ -170,10 +170,32 @@ func (u *policyUseCase) applyCapacityChange(ctx context.Context, actor Actor, re
 	}
 	log := logging.FromContext(ctx)
 	if err != nil {
+		// A lost race is NOT "that already exists". Every ErrAlreadyExists that
+		// escapes capacityChange means the same thing — a concurrent writer got
+		// there first and the switch was rolled back WHOLE, so nothing changed and
+		// a retry will almost certainly work. The two "does not fit" refusals are
+		// ErrValidation with their own message and are untouched by this.
+		//
+		// The 0059 deferred trigger is what makes this reachable: it refuses to
+		// commit occupancy for a booking whose status another transaction is
+		// changing. Left as a bare 409 it reaches the venue cabinet as "already
+		// exists", i.e. exactly the ambiguity that told a guest about a booking
+		// which never existed — one floor up, in the staff UI. The reason was
+		// already in the log; this puts it on the wire, as a code rather than as
+		// text nobody may branch on.
+		if _, coded := domain.CodeOf(err); !coded && errors.Is(err, domain.ErrAlreadyExists) {
+			err = domain.WithCode(domain.CodeCapacitySwitchConflict, err)
+		}
 		// Warn, not Error: most refusals are the venue being told its own data
 		// does not allow the change. The reason is the message staff saw, so the
-		// log answers "why did the toggle not work" without a reproduction.
-		log.Warn(logging.EventVenueCapacityModeRefused, append(fields, slog.String("reason", err.Error()))...)
+		// log answers "why did the toggle not work" without a reproduction; the
+		// code is logged beside it so a support question can be matched to what
+		// the client actually received.
+		refused := append(fields, slog.String("reason", err.Error()))
+		if code, coded := domain.CodeOf(err); coded {
+			refused = append(refused, slog.String("code", string(code)))
+		}
+		log.Warn(logging.EventVenueCapacityModeRefused, refused...)
 		return err
 	}
 	log.Warn(logging.EventVenueCapacityModeChanged,
@@ -496,16 +518,27 @@ func (u *policyUseCase) liveBookings(
 ) ([]domain.Booking, error) {
 	lookback := policy.Duration + 2*policy.Buffer + domain.CapacityBucket
 	from := time.Now().Add(-lookback)
+	// Asks for ONE ROW MORE than may be processed: with a plain cap, "exactly
+	// MaxReconcileBookings rows" cannot be told apart from "the set is
+	// truncated", the caller must assume the unsafe reading, and a venue sitting
+	// on exactly 300 live bookings is locked out of switching modes for no real
+	// reason. See domain.ReconcileProbeLimit.
 	out, err := u.bookings.ListLiveForReconcile(
-		ctx, restaurantID, from, statusesNeedingHolds(), domain.MaxReconcileBookings)
+		ctx, restaurantID, from, statusesNeedingHolds(), domain.ReconcileProbeLimit)
 	if err != nil {
 		return nil, err
 	}
-	if len(out) >= domain.MaxReconcileBookings {
-		// Reaching the limit means the set may be truncated, so nothing about it
-		// can be trusted — refuse before touching a single hold or link.
-		return nil, fmt.Errorf("%w: this restaurant has %d or more live bookings in the affected period, and a capacity-mode change can only be reconciled for up to %d at once; nothing was changed — please contact support to have the change applied for a venue this size",
-			domain.ErrValidation, len(out), domain.MaxReconcileBookings)
+	if len(out) > domain.MaxReconcileBookings {
+		// The probe row came back, so the set really is truncated and nothing
+		// about it can be trusted — refuse before touching a single hold or link.
+		//
+		// Coded, because a venue cabinet must not show this as a generic conflict:
+		// unlike a lost race it does NOT resolve by retrying, it needs fewer live
+		// bookings in the window (or support), and staff can only be told that if
+		// the client can recognise the case.
+		return nil, domain.WithCode(domain.CodeCapacitySwitchTooManyBookings,
+			fmt.Errorf("%w: this restaurant has more than %d live bookings in the affected period, and a capacity-mode change can only be reconciled for up to %d at once; nothing was changed — please contact support to have the change applied for a venue this size",
+				domain.ErrValidation, domain.MaxReconcileBookings, domain.MaxReconcileBookings))
 	}
 	return out, nil
 }

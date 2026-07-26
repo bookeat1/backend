@@ -211,15 +211,25 @@ func TestModeSwitchRefusalNamesTheOffendingBooking(t *testing.T) {
 // loud refusal rather than a switch that runs past the 15s write timeout with
 // the venue's advisory lock in hand (which would block every booking create
 // meanwhile, and roll back anyway).
+//
+// The venue is seeded ONE PAST the cap, because the cap itself is now a legal
+// size — see TestModeSwitchAcceptsAVenueExactlyAtTheReconcileLimit.
 func TestModeSwitchRefusesAVenueBeyondTheReconcileLimit(t *testing.T) {
 	h := newReconcileHarness(t)
 	ctx := context.Background()
 
-	h.seedLive(t, domain.MaxReconcileBookings)
+	h.seedLive(t, domain.MaxReconcileBookings+1)
 
 	_, err := h.policy.Update(ctx, h.manager, h.restaurantID, seatsOverride(1000))
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("switch on an oversized venue = %v, want ErrValidation", err)
+	}
+	// Staff must not be shown a generic conflict for this: unlike a lost race it
+	// does not resolve by retrying, so the cabinet needs to recognise the case to
+	// say "too many active bookings" instead.
+	code, coded := domain.CodeOf(err)
+	if !coded || code != domain.CodeCapacitySwitchTooManyBookings {
+		t.Errorf("refusal code = %q (coded=%v), want %q", code, coded, domain.CodeCapacitySwitchTooManyBookings)
 	}
 	// The message is what staff read, so it is part of the contract: how many
 	// bookings, what the limit is, and what to do next.
@@ -244,5 +254,50 @@ func TestModeSwitchRefusesAVenueBeyondTheReconcileLimit(t *testing.T) {
 	}
 	if holds != 0 {
 		t.Errorf("a refused switch wrote %d capacity holds, want 0", holds)
+	}
+}
+
+// TestModeSwitchAcceptsAVenueExactlyAtTheReconcileLimit closes a dead end that
+// the plain cap created: a venue with EXACTLY MaxReconcileBookings live bookings
+// could never switch modes.
+//
+// The read used to ask for exactly the cap, so "I got the cap back" was
+// ambiguous — either the venue has exactly that many (safe) or it has more and
+// the set is truncated (unsafe, nothing about it can be trusted). The caller has
+// to take the unsafe reading, so the venue stayed locked out until one of its
+// bookings went inactive, for no real reason. The read now asks for ONE ROW MORE
+// than it may process (domain.ReconcileProbeLimit), which makes the two cases
+// distinguishable at the cost of a single row.
+//
+// This is the boundary in the direction that must WORK; the sibling test above
+// pins the direction that must be refused. Both are needed: a cap is only
+// correct if it is off by neither one.
+func TestModeSwitchAcceptsAVenueExactlyAtTheReconcileLimit(t *testing.T) {
+	h := newReconcileHarness(t)
+	ctx := context.Background()
+
+	h.seedLive(t, domain.MaxReconcileBookings)
+
+	if _, err := h.policy.Update(ctx, h.manager, h.restaurantID, seatsOverride(1000)); err != nil {
+		t.Fatalf("switch for a venue sitting exactly at the reconcile limit = %v, want it to succeed: %d live bookings is the largest set the switch is allowed to process, not one too many", err, domain.MaxReconcileBookings)
+	}
+
+	view, err := h.policy.Get(ctx, h.manager, h.restaurantID)
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if view.Effective.CapacityMode != domain.CapacityModeSeats {
+		t.Fatalf("capacity mode = %q, want %q", view.Effective.CapacityMode, domain.CapacityModeSeats)
+	}
+	// Every one of them was reconciled: the switch is only safe if the whole set
+	// got holds, so a partial success here would be the original bug.
+	var withHolds int
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT booking_id) FROM booking_capacity_holds WHERE active`).Scan(&withHolds); err != nil {
+		t.Fatalf("count bookings with holds: %v", err)
+	}
+	if withHolds != domain.MaxReconcileBookings {
+		t.Errorf("%d of %d live bookings came out of the switch with active holds; the rest are invisible to the ledger and their seats will be sold twice",
+			withHolds, domain.MaxReconcileBookings)
 	}
 }

@@ -148,9 +148,13 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 // with no capacity hold and no booking_tables row, i.e. invisible to both
 // engines that are supposed to keep its seats sold exactly once.
 //
-// The cap is domain.MaxReconcileBookings, and it is applied here as well as by
-// the caller: this query has no offset, so an unbounded venue would otherwise
-// stream its whole horizon into memory.
+// The ceiling is domain.ReconcileProbeLimit (one row past
+// domain.MaxReconcileBookings), and it is applied here as well as by the caller:
+// this query has no offset, so an unbounded venue would otherwise stream its
+// whole horizon into memory. The ceiling is the PROBE limit rather than the
+// processing cap so the caller can distinguish a venue sitting exactly at the
+// cap from a truncated set — clamping to the cap here would silently destroy
+// that signal.
 func (r *Repository) ListLiveForReconcile(
 	ctx context.Context,
 	restaurantID uuid.UUID,
@@ -161,8 +165,8 @@ func (r *Repository) ListLiveForReconcile(
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-	if limit <= 0 || limit > domain.MaxReconcileBookings {
-		limit = domain.MaxReconcileBookings
+	if limit <= 0 || limit > domain.ReconcileProbeLimit {
+		limit = domain.ReconcileProbeLimit
 	}
 	// Ascending, ties broken by id: a total order, so the caller's placement
 	// decisions are reproducible across retries.

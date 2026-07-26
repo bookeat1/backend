@@ -148,6 +148,10 @@ type midLoopHarness struct {
 	capHook   *hookedCapacity
 	linkHook  *hookedTables
 	midPolicy PolicyUseCase
+	// midUpdate is the amendment path wired through the SAME hooked ports, so a
+	// test can reach the moment between an amendment's occupancy write and its
+	// commit — the window migration 0059's trigger closes.
+	midUpdate UpdateUseCase
 }
 
 func newMidLoopHarness(t *testing.T, mode string, seats int) *midLoopHarness {
@@ -162,6 +166,10 @@ func newMidLoopHarness(t *testing.T, mode string, seats int) *midLoopHarness {
 		midPolicy: NewPolicyUseCase(h.restRepo, h.restRepo,
 			newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}),
 			h.related, capHook, linkHook, h.bookings, h.txm, testConfig()),
+		midUpdate: NewUpdateUseCase(h.bookings, linkHook, capHook,
+			bookingrepo.NewOutbox(h.pool), h.restRepo, h.related,
+			newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}),
+			h.txm, testConfig()),
 	}
 }
 
@@ -645,6 +653,16 @@ func TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged(t *testing.T) {
 	if !errors.Is(err, domain.ErrAlreadyExists) {
 		t.Fatalf("switch refused with %v, want a conflict (domain.ErrAlreadyExists → 409): a lost race is not a server error", err)
 	}
+	// And it must be DISTINGUISHABLE from every other 409. A bare already_exists
+	// reads in the venue cabinet as "that already exists", which is not what
+	// happened: nothing exists, nothing changed, and a retry will almost certainly
+	// work. This is the same ambiguity that once told a guest about a booking
+	// which never existed — this assertion keeps it from reappearing one floor up,
+	// in the staff UI.
+	code, coded := domain.CodeOf(err)
+	if !coded || code != domain.CodeCapacitySwitchConflict {
+		t.Fatalf("refusal code = %q (coded=%v), want %q: staff cannot be told \"try again\" if the client cannot recognise the case", code, coded, domain.CodeCapacitySwitchConflict)
+	}
 	// Released, so the assertions below read the committed world.
 	_ = blocker.Rollback(context.Background())
 
@@ -656,5 +674,108 @@ func TestModeSwitchRefusesToCommitWhileABookingIsBeingChanged(t *testing.T) {
 	}
 	if taken := h.takenIn(t, victim.StartsAt); taken != 0 {
 		t.Errorf("the buckets report %d seats taken after a refused switch, want 0", taken)
+	}
+}
+
+// TestAmendmentHoldsItsOwnBookingRowBeforeWritingOccupancy pins the invariant
+// that makes migration 0059 safe for the amendment path, and which is currently
+// held only by the ORDER of two statements in update.go.
+//
+// THE INVARIANT: inside its transaction, an amendment updates the BOOKING row
+// (u.bookings.Update) BEFORE it writes that booking's occupancy rows
+// (capacity.ReplaceForBooking / links.ReplaceForBooking). Because
+// `UPDATE bookings` takes FOR NO KEY UPDATE on that row, the amendment already
+// OWNS the lock by the time 0059's deferred trigger re-reads the status at
+// commit with FOR NO KEY UPDATE NOWAIT. It therefore can neither wait nor fail
+// there, and a concurrent cancel cannot slip in between the occupancy write and
+// the commit: it queues behind the amendment and its own status trigger
+// (0054 / 0004) then flips the committed rows.
+//
+// WHY THIS NEEDS A TEST RATHER THAN A COMMENT: reverse those two statements and
+// nothing fails to compile and no existing test breaks. The order is load-bearing
+// for LOCK ORDERING, not just for correctness of the data — which is exactly the
+// kind of invariant a comment does not defend.
+//
+// MEASURED with the two statements deliberately swapped (26.07.2026): the cancel
+// dies with `deadlock detected (SQLSTATE 40P01)`. The cycle is real and it is the
+// one 0059's NOWAIT was chosen to avoid: with occupancy written first, the
+// amendment holds locks on the booking's occupancy rows and then wants the
+// booking row, while the cancel holds the booking row and — through its own
+// status trigger (0054 / 0004) — wants those same occupancy rows. Writing the
+// booking row FIRST makes the amendment take the two in the same order the cancel
+// does, so the two serialise instead of deadlocking.
+//
+// So a reordering shows up as one of two things, and this test fails on either:
+// the amendment refused as a conflict (0059's NOWAIT declining to guess), or a
+// deadlock on one of the two parties. Data stays intact either way — 0059 still
+// protects it — which is precisely why this would otherwise go unnoticed until
+// staff started seeing random failures.
+//
+// The assertion is deliberately "the amendment SUCCEEDS and the cancel that
+// waited for it also succeeds": that is only possible if the amendment holds the
+// booking row before writing occupancy.
+func TestAmendmentHoldsItsOwnBookingRowBeforeWritingOccupancy(t *testing.T) {
+	h := newMidLoopHarness(t, "seats", 100)
+	ctx := context.Background()
+	policy := domain.BookingPolicy{Duration: 2 * time.Hour, CapacitySeats: 100}
+
+	start := h.slotAt(t, 12)
+	mover := h.seedBooking(t, start, 4, domain.BookingConfirmed)
+	if err := h.capacity.Create(ctx, buildCapacityHolds(mover, policy, time.Now())); err != nil {
+		t.Fatalf("seed the booking's occupancy: %v", err)
+	}
+
+	// A cancel of the SAME booking, fired from another connection the moment the
+	// amendment has written its new holds but has not yet committed. It runs on
+	// its own goroutine because it is expected to BLOCK: the amendment holds the
+	// booking row, so this statement must wait for the amendment's commit. A
+	// synchronous hook would therefore deadlock the test.
+	cancelled := make(chan error, 1)
+	fired := false
+	h.capHook.after = func(id uuid.UUID) {
+		if id != mover.ID || fired {
+			return
+		}
+		fired = true
+		go func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := h.pool.Exec(cctx,
+				`UPDATE bookings SET status='cancelled', cancelled_at=now(), updated_at=now() WHERE id=$1`, id)
+			cancelled <- err
+		}()
+		// Let that statement reach the database and block on the row, so the
+		// interleaving under test really is "the cancel is inside this window".
+		h.waitForBlockedCancel(t)
+	}
+
+	moved := start.Add(30 * time.Minute)
+	_, err := h.midUpdate.Update(ctx, h.manager, mover.ID, UpdateInput{StartsAt: &moved})
+	if err != nil {
+		t.Fatalf("the amendment was refused (%v) while a cancel of its own booking was in flight.\nThis is the signature of update.go writing occupancy BEFORE updating the booking row: the cancel then takes the booking row first, and 0059's NOWAIT read refuses the amendment instead of finding a lock the amendment already holds. Restore the order — u.bookings.Update must come before capacity/links ReplaceForBooking.\nAn amendment must never lose this race: it is the only writer that already owns its booking row.", err)
+	}
+
+	// The cancel was queued behind the amendment, not lost.
+	select {
+	case cerr := <-cancelled:
+		if cerr != nil {
+			t.Fatalf("the out-of-band cancel of the amended booking failed: %v.\nA deadlock (40P01) here is the signature of update.go writing occupancy BEFORE updating the booking row: the amendment then holds the occupancy rows and wants the booking row, while the cancel holds the booking row and wants those occupancy rows through its own status trigger. Restore the order — u.bookings.Update must come before capacity/links ReplaceForBooking.", cerr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the out-of-band cancel never finished: the amendment left a lock behind")
+	}
+	if got := h.status(t, mover.ID); got != domain.BookingCancelled {
+		t.Fatalf("booking status = %q, want cancelled", got)
+	}
+
+	// And the data is still right: the cancel, having waited, saw the amendment's
+	// committed rows and released every one of them.
+	if act := h.activeHolds(t, mover.ID); len(act) != 0 {
+		t.Errorf("INVARIANT BROKEN: the cancelled booking still holds %d ACTIVE capacity holds (%+v) — phantom occupancy", len(act), act)
+	}
+	for _, at := range []time.Time{start, moved} {
+		if taken := h.takenIn(t, at); taken != 0 {
+			t.Errorf("INVARIANT BROKEN: buckets at %s report %d seats taken after the cancel, want 0", at.UTC().Format(time.RFC3339), taken)
+		}
 	}
 }

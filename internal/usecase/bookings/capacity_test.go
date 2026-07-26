@@ -338,11 +338,16 @@ func TestPolicySwitchToSeatsBackfillsExistingBookings(t *testing.T) {
 	if call.restaurantID != h.rid {
 		t.Errorf("backfill read venue %s, want %s", call.restaurantID, h.rid)
 	}
-	// The set must be bounded, and bounded by the shared limit: the usecase
-	// refuses when the answer reaches it, which only means "possibly truncated"
-	// if both sides speak about the same number.
-	if call.limit != domain.MaxReconcileBookings {
-		t.Errorf("backfill limit = %d, want %d", call.limit, domain.MaxReconcileBookings)
+	// The set must be bounded, and bounded by the PROBE limit: one row more than
+	// the usecase is allowed to process. Asking for exactly the processing cap
+	// makes "I got the cap back" ambiguous between "the venue has exactly that
+	// many" and "the set is truncated", and the caller then has to assume the
+	// unsafe reading — which locked a venue with exactly MaxReconcileBookings live
+	// bookings out of switching modes altogether. See domain.ReconcileProbeLimit
+	// and TestModeSwitchAcceptsAVenueExactlyAtTheReconcileLimit.
+	if call.limit != domain.ReconcileProbeLimit {
+		t.Errorf("backfill limit = %d, want %d (the processing cap %d plus one probe row)",
+			call.limit, domain.ReconcileProbeLimit, domain.MaxReconcileBookings)
 	}
 	// The filter must pick every booking that will ever need a hold and nothing
 	// else: the three statuses that hold a seat now, PLUS waitlist (confirming a
