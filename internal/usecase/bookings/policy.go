@@ -33,6 +33,21 @@ func (c Config) VenueTimezone(r domain.Restaurant) string {
 	return resolvePolicy(r, c).Timezone
 }
 
+// VenueCapacity returns the venue's resolved availability mode and, in seats
+// mode, the number of guests it can seat at once (zero in table mode).
+//
+// Exported for the same reason as VenueTimezone: the public catalog has to
+// answer "can a guest book here at all", and in seats mode the answer has
+// nothing to do with the table list — a table-less venue is bookable with zero
+// tables. Routing that question through resolvePolicy keeps the catalog's
+// answer and the availability engine's behaviour derived from ONE rule,
+// including its validation (a seats mode with a missing or out-of-range seat
+// count degrades to table mode here exactly as it does for a booking).
+func (c Config) VenueCapacity(r domain.Restaurant) (domain.CapacityMode, int) {
+	p := resolvePolicy(r, c)
+	return p.CapacityMode, p.CapacitySeats
+}
+
 // resolvePolicy merges the two policy levels of spec §4.2: the global env
 // defaults (Config) and the restaurant's optional per-field overrides. A NULL
 // (nil) override falls back to the global value; an override that is present
