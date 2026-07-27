@@ -121,6 +121,14 @@ func (u *UseCase) createOnePayout(ctx context.Context, restaurantID uuid.UUID, d
 	if bal.AmountMinor <= 0 || len(bal.Entries) == 0 {
 		return nil, fmt.Errorf("%w: non-positive or empty owed balance", domain.ErrValidation)
 	}
+	// Ownership gate #1: the card handle about to be frozen on this payout must
+	// be the card registered to THIS restaurant, and it must identify a card the
+	// provider can address. Checked here rather than at each caller because
+	// this is the ONLY place a destination becomes the address of real money —
+	// the manual generation and the scheduled daily pass both come through it.
+	if err := dest.VerifyOwnedBy(restaurantID); err != nil {
+		return nil, err
+	}
 	gross := domain.Money{AmountMinor: bal.AmountMinor, Currency: bal.Currency}
 	fee, err := domain.PayoutFee(gross, u.cfg.FeeBps, u.cfg.FeeMinimumMinor)
 	if err != nil {

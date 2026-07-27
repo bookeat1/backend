@@ -309,6 +309,7 @@ func TestDaily_UnknownMoneyAgeNeverForcesAPayout(t *testing.T) {
 	if err := h.dest.Upsert(context.Background(), &domain.PayoutDestination{
 		RestaurantID: rid, Provider: domain.ProviderFreedomPay,
 		Method: domain.PayoutMethodFreedomPayCardToken, Token: uuid.NewString(),
+		ProviderCustomerRef: "fp-user-" + rid.String(),
 	}); err != nil {
 		t.Fatalf("seed destination: %v", err)
 	}

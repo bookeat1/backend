@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -173,6 +174,81 @@ func (d PayoutDestination) Validate() error {
 	}
 	if looksLikeRawPAN(d.Token) || looksLikeRawPAN(d.MaskedIdentifier) {
 		return ErrValidation
+	}
+	return nil
+}
+
+// VerifyOwnedBy proves this destination is the card registered TO restaurantID
+// and that the card is identified completely enough for the provider to address
+// it. It is the ownership gate of the money-out path: nothing may put a card
+// handle on a payout, and nothing may dispatch one, without passing it.
+//
+// A nil receiver is a legitimate input — it is what "this venue has no card on
+// file" looks like after a repository ErrNotFound — and it answers the missing
+// code rather than panicking, so every caller has exactly one branch to write.
+//
+// The three outcomes are deliberately distinct codes because the operator's
+// next action differs: ask the venue for a card (missing), stop and investigate
+// (mismatch — money was about to go to somebody else's card), finish the
+// tokenization step (incomplete).
+func (d *PayoutDestination) VerifyOwnedBy(restaurantID uuid.UUID) error {
+	if d == nil {
+		return WithCode(CodePayoutDestinationMissing,
+			fmt.Errorf("%w: restaurant %s has no payout destination", ErrNotFound, restaurantID))
+	}
+	if restaurantID == uuid.Nil || d.RestaurantID != restaurantID {
+		return WithCode(CodePayoutDestinationMismatch,
+			fmt.Errorf("%w: payout destination belongs to restaurant %s, not %s",
+				ErrValidation, d.RestaurantID, restaurantID))
+	}
+	if err := d.Validate(); err != nil {
+		return WithCode(CodePayoutDestinationIncomplete,
+			fmt.Errorf("%w: payout destination of restaurant %s is not a usable card handle",
+				ErrValidation, restaurantID))
+	}
+	// A tokenized payout is addressed by the PAIR (provider user id, card
+	// token): the token alone does not say whose card it is. A destination
+	// missing the user id is therefore not merely incomplete paperwork — it is
+	// a card we cannot prove is addressable at all, and money must not be
+	// dispatched against it. Refused HERE, before the acquirer is called, so it
+	// can never become a payout stranded in `sent`.
+	if d.Method == PayoutMethodFreedomPayCardToken && strings.TrimSpace(d.ProviderCustomerRef) == "" {
+		return WithCode(CodePayoutDestinationIncomplete,
+			fmt.Errorf("%w: payout destination of restaurant %s has no provider user id, a tokenized card cannot be addressed without it",
+				ErrValidation, restaurantID))
+	}
+	return nil
+}
+
+// VerifyPayoutDestination proves the card FROZEN on a payout is still the card
+// registered to that payout's restaurant.
+//
+// The snapshot on the payout row (DestinationToken / DestinationCustomerRef /
+// Method) exists so a later change of the venue's destination does not rewrite
+// history — but "do not rewrite history" must never turn into "keep paying an
+// address the venue has since replaced". Between generation and dispatch the
+// venue can change its card (a manager's card swapped back to the owner's, a
+// compromised destination corrected), and the money must follow the card the
+// venue owns NOW, not the one that happened to be on file when the payout row
+// was written. A payout whose snapshot no longer matches is refused, never
+// silently re-addressed: re-pointing money at a different card automatically is
+// exactly the behaviour an attacker would want.
+//
+// current is the destination read for p.RestaurantID, or nil when there is
+// none.
+func VerifyPayoutDestination(p Payout, current *PayoutDestination) error {
+	if err := current.VerifyOwnedBy(p.RestaurantID); err != nil {
+		return err
+	}
+	sameCard := strings.TrimSpace(p.DestinationToken) == strings.TrimSpace(current.Token) &&
+		strings.TrimSpace(p.DestinationCustomerRef) == strings.TrimSpace(current.ProviderCustomerRef) &&
+		p.Method == current.Method
+	if !sameCard {
+		// The token is never named in the message: it is the address of the
+		// money and this text reaches logs and the failure_reason column.
+		return WithCode(CodePayoutDestinationMismatch,
+			fmt.Errorf("%w: payout %s addresses a card that is not the current payout destination of restaurant %s",
+				ErrValidation, p.ID, p.RestaurantID))
 	}
 	return nil
 }
