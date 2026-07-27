@@ -49,6 +49,30 @@ func (u *UseCase) sendPayout(ctx context.Context, payoutID uuid.UUID) (*domain.P
 		return p, nil
 	}
 
+	// Ownership gate #2, and the reason it is here and not only at generation:
+	// a payout carries a FROZEN card snapshot, and the venue can change its
+	// destination between generation and dispatch. Money may only leave to the
+	// card the venue owns at THIS moment, so the snapshot is re-proven against
+	// the live destination before anything is claimed or dispatched.
+	//
+	// A failure is terminal on purpose: the payout is failed and its ledger
+	// entries released in one transaction, so the money becomes owed again and
+	// the next generation builds a payout against the card that is actually
+	// registered. Re-pointing this payout at the new card automatically is
+	// exactly what must NOT happen.
+	if err := u.verifyDestinationOwnership(ctx, p); err != nil {
+		if failErr := u.markFailedAndRelease(ctx, payoutID, domain.PayoutPending, "destination_unverified", err.Error()); failErr != nil {
+			if !errors.Is(failErr, domain.ErrAlreadyExists) {
+				return nil, fmt.Errorf("payout %s destination refused (%v) and could not be failed: %w", payoutID, err, failErr)
+			}
+			// Somebody else moved the payout out of `pending` first; the
+			// refusal still stands and the acquirer is still not called.
+		}
+		u.log.Warn("payout refused: destination does not belong to the venue being paid",
+			"payout_id", payoutID, "restaurant_id", p.RestaurantID, "err", err.Error())
+		return nil, err
+	}
+
 	now := u.now()
 	// Claim the send BEFORE calling the acquirer.
 	if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, domain.PayoutPending, domain.PayoutSent, domain.PayoutStatusPatch{}, now); err != nil {
@@ -122,7 +146,7 @@ func (u *UseCase) resolveSendSuccess(ctx context.Context, payoutID uuid.UUID, re
 // recorded as failure; everything else is left `sent` for the reconciler.
 func (u *UseCase) resolveSendError(ctx context.Context, payoutID uuid.UUID, gwErr error) (*domain.Payout, error) {
 	if errors.Is(gwErr, domain.ErrProviderDeclined) {
-		if err := u.markFailedAndRelease(ctx, payoutID, "declined", gwErr.Error()); err != nil {
+		if err := u.markFailedAndRelease(ctx, payoutID, domain.PayoutSent, "declined", gwErr.Error()); err != nil {
 			return nil, err
 		}
 		return u.payouts.GetByID(ctx, payoutID)
@@ -164,15 +188,36 @@ func bookPaid(ctx context.Context, repo domain.PayoutRepository, ledger domain.P
 	})
 }
 
-// markFailedAndRelease moves a payout sent→failed and releases its claimed
+// verifyDestinationOwnership reads the restaurant's CURRENT payout destination
+// and proves the card frozen on p is still that card. A missing destination is
+// not a repository error here: it is the ownership answer "this venue has no
+// card on file any more", which the domain turns into its own code.
+func (u *UseCase) verifyDestinationOwnership(ctx context.Context, p *domain.Payout) error {
+	current, err := u.destinations.Get(ctx, p.RestaurantID)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return err
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		current = nil
+	}
+	return domain.VerifyPayoutDestination(*p, current)
+}
+
+// markFailedAndRelease moves a payout from→failed and releases its claimed
 // ledger entries in ONE transaction, so the money becomes owed again atomically
 // with the failure. CAS-guarded: if a reconciler already resolved this payout,
 // the CAS loses and the release is skipped.
-func (u *UseCase) markFailedAndRelease(ctx context.Context, payoutID uuid.UUID, code, reason string) error {
+//
+// `from` is `sent` for an acquirer decline (the payout was dispatched and
+// refused) and `pending` for a refusal that happens BEFORE dispatch (the
+// destination ownership check). Both end in the same place — failed, entries
+// released — because in both cases no money moved and the balance must be
+// payable again.
+func (u *UseCase) markFailedAndRelease(ctx context.Context, payoutID uuid.UUID, from domain.PayoutStatus, code, reason string) error {
 	now := u.now()
 	patch := domain.PayoutStatusPatch{FailureCode: &code, FailureReason: &reason}
 	return u.tx.WithinTx(ctx, func(ctx context.Context) error {
-		if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, domain.PayoutSent, domain.PayoutFailed, patch, now); err != nil {
+		if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, from, domain.PayoutFailed, patch, now); err != nil {
 			return err
 		}
 		return u.items.DeleteByPayout(ctx, payoutID)
