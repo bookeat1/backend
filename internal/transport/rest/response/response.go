@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 
 	"backend-core/internal/domain"
 )
@@ -70,6 +72,17 @@ func Error(w http.ResponseWriter, status int, msg string) {
 // after calling this from a handler.
 func HandleError(w http.ResponseWriter, err error) {
 	status, code, msg := classify(err)
+	// A usecase that knows how long the caller must wait says so through the
+	// standard header, in whole seconds rounded up — the same shape
+	// middleware.RateLimit already uses for its 429, so a client needs one
+	// convention and not two. Set before WriteHeader or it never ships.
+	if after, ok := domain.RetryAfterOf(err); ok {
+		seconds := int(math.Ceil(after.Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	}
 	if status >= http.StatusInternalServerError {
 		slog.Error("request failed", "status", status, "code", string(code), "error", err)
 	} else {

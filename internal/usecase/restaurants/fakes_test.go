@@ -19,6 +19,17 @@ type fakeRestaurantRepo struct {
 	active   bool
 	policyID uuid.UUID
 	policy   domain.BookingPolicyOverride
+
+	// lastList / lastSearch record the filter the facade actually handed the
+	// repository. The venue-state filter is evaluated above the repository, so
+	// the only thing that proves the facade asked for the WHOLE matching set
+	// (and not one page it would then filter page-locally) is Unpaginated on
+	// the recorded filter.
+	lastList   domain.RestaurantFilter
+	lastSearch domain.RestaurantSearchFilter
+	// matchedOverride, when > 0, is returned as the SQL-matched count instead
+	// of total, so a test can simulate a scan truncated by CatalogScanLimit.
+	matchedOverride int
 }
 
 func (f *fakeRestaurantRepo) Create(_ context.Context, r *domain.Restaurant) error {
@@ -42,11 +53,20 @@ func (f *fakeRestaurantRepo) UpdateBookingPolicy(_ context.Context, id uuid.UUID
 	f.policyID, f.policy = id, o
 	return nil
 }
-func (f *fakeRestaurantRepo) ListActive(_ context.Context, _ domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
-	return f.list, f.total, nil
+func (f *fakeRestaurantRepo) ListActive(_ context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
+	f.lastList = flt
+	return f.list, f.matched(), nil
 }
-func (f *fakeRestaurantRepo) Search(_ context.Context, _ domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
-	return f.list, f.total, nil
+func (f *fakeRestaurantRepo) Search(_ context.Context, flt domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
+	f.lastSearch = flt
+	return f.list, f.matched(), nil
+}
+
+func (f *fakeRestaurantRepo) matched() int {
+	if f.matchedOverride > 0 {
+		return f.matchedOverride
+	}
+	return f.total
 }
 func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) error {
 	f.activeID, f.active = id, a

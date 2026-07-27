@@ -134,11 +134,16 @@ func (f *fakeOTP) Create(_ context.Context, c *domain.OTPCode) error {
 	f.codes = append(f.codes, &cp)
 	return nil
 }
+
+// LatestActiveByPhone returns a COPY, like the Postgres repository does: a
+// caller must not see its snapshot change under it when a later call writes to
+// the row (that aliasing hid an off-by-one in the attempt counter once).
 func (f *fakeOTP) LatestActiveByPhone(_ context.Context, phone string) (*domain.OTPCode, error) {
 	for i := len(f.codes) - 1; i >= 0; i-- {
 		c := f.codes[i]
 		if c.Phone == phone && c.UsedAt == nil && c.ExpiresAt.After(time.Now()) {
-			return c, nil
+			cp := *c
+			return &cp, nil
 		}
 	}
 	return nil, domain.ErrNotFound

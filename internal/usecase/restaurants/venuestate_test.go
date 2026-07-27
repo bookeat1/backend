@@ -301,7 +301,7 @@ func TestListComputesOpenNowPerVenueTimezone(t *testing.T) {
 		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
 			WithVenueStateClock(func() time.Time { return instant }))))
 
-	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestListAndGetAttachVenueState(t *testing.T) {
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
 		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"})))
 
-	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestVenueStateLookupFailureDegradesToUnknown(t *testing.T) {
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
 		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"})))
 
-	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
 	if err != nil {
 		t.Fatalf("list must still succeed: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestVenueStateAbsentWhenNotWired(t *testing.T) {
 	}
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
-	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestListPublishesATableLessVenueAsBookable(t *testing.T) {
 		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
 			WithVenueStateClock(func() time.Time { return instant }))))
 
-	items, _, err := f.List(context.Background(), domain.RestaurantFilter{})
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

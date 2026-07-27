@@ -83,6 +83,87 @@ type PublicVenueState struct {
 	AcceptsOnlineBookings bool
 }
 
+// OpenNowKnown reports the venue's server-computed "open right now" answer and
+// whether it is known at all. Unknown means either "no usable working-hours
+// rows" (Schedule nil) or "the venue's timezone could not be loaded on this
+// host" (OpenNow nil) — see WeeklySchedule.OpenNow. It is deliberately a second
+// return value and not a false: a client that flattens the two states says
+// "закрыто" about a venue nobody has entered hours for.
+func (s *PublicVenueState) OpenNowKnown() (open bool, known bool) {
+	if s == nil || s.Schedule == nil || s.Schedule.OpenNow == nil {
+		return false, false
+	}
+	return *s.Schedule.OpenNow, true
+}
+
+// OpenNowUncomputed separates the two reasons OpenNowKnown says "unknown",
+// which look identical in the payload but are not the same thing at all:
+//
+//   - Schedule is nil — nobody entered this venue's hours. A FACT about the
+//     venue. It is not open, and it belongs under open_now=false.
+//   - Schedule is present but OpenNow is nil — we know the hours and still
+//     could not answer: the venue's timezone would not load on this host, or
+//     its special days could not be read. That is OUR failure, and bucketing
+//     such a venue as "not open" would quietly drop a venue that may well be
+//     open — or, if the whole page fails that way, answer open_now=true with an
+//     empty list. Callers that FILTER on open-now must refuse instead; see
+//     usecase/restaurants.
+func (s *PublicVenueState) OpenNowUncomputed() bool {
+	return s != nil && s.Schedule != nil && s.Schedule.OpenNow == nil
+}
+
+// VenueStateFilter narrows a catalog query by the two facts the server COMPUTES
+// per venue (PublicVenueState) instead of storing them in a column: "is it open
+// right now, in its own timezone" and "can it take an online booking at all".
+//
+// It is deliberately NOT a field on RestaurantFilter / RestaurantSearchFilter.
+// Everything on those is answered in SQL by the repository; these two cannot be
+// and must not be. Open-now has to come from the very same IsOpenAt call that
+// produces the public open_now field, and bookability from the same rule that
+// produces accepts_online_bookings — a second implementation in SQL is how a
+// catalog ends up filtering by one rule and displaying another (see
+// bugs/bookeat-backend-bookability-flag-ignores-seats-mode). usecase/restaurants
+// applies this filter in Go, after enrichment and before paging.
+type VenueStateFilter struct {
+	// OpenNow, when set, keeps only venues whose computed open_now equals it.
+	// A venue with no usable hours is NOT open: it can never satisfy
+	// OpenNow=true, and it does satisfy OpenNow=false. So the two values
+	// partition the catalog exactly — their totals add up to the unfiltered
+	// total — and "we don't know" is never published as "открыто".
+	OpenNow *bool
+	// AcceptsOnlineBookings, when set, keeps only venues whose computed
+	// accepts_online_bookings equals it. That flag is already a definite
+	// boolean (a venue with no readable schedule is not bookable), so here too
+	// true and false partition the catalog.
+	AcceptsOnlineBookings *bool
+}
+
+// Active reports whether the filter constrains anything at all.
+func (f VenueStateFilter) Active() bool {
+	return f.OpenNow != nil || f.AcceptsOnlineBookings != nil
+}
+
+// Matches reports whether a venue with the given computed state survives the
+// filter. A nil state ("not computed") matches nothing: an unknown venue must
+// never be silently published as if it satisfied a filter. Callers that cannot
+// compute the state must refuse the request rather than rely on this — see
+// usecase/restaurants.
+func (f VenueStateFilter) Matches(st *PublicVenueState) bool {
+	if st == nil {
+		return false
+	}
+	if f.OpenNow != nil {
+		open, _ := st.OpenNowKnown() // unknown → not open, never "open"
+		if open != *f.OpenNow {
+			return false
+		}
+	}
+	if f.AcceptsOnlineBookings != nil && st.AcceptsOnlineBookings != *f.AcceptsOnlineBookings {
+		return false
+	}
+	return true
+}
+
 // StartOfDay returns midnight of t's calendar day in loc. Built from the date
 // parts (not by truncation) so DST transitions are handled by the location.
 func StartOfDay(t time.Time, loc *time.Location) time.Time {

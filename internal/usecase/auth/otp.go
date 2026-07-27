@@ -15,6 +15,15 @@ import (
 
 const maxOTPAttempts = 5
 
+// The two rate-limit windows. They are constants rather than two literals at
+// the call site because each is used TWICE: once to count the codes inside it,
+// and once as the Retry-After the caller is told to wait. A drift between those
+// two would send the guest back exactly one moment too early, every time.
+const (
+	otpPerMinWindow  = time.Minute
+	otpPerHourWindow = time.Hour
+)
+
 // OTPUseCase is the phone-OTP authentication usecase: request a one-time code
 // and verify it (find-or-create the user, then issue a token pair). It is a
 // distinct usecase from the core credential Facade (facade.go).
@@ -78,22 +87,34 @@ func NewOTPUseCase(
 func (o *otpUseCase) RequestOTP(ctx context.Context, rawPhone string) (string, error) {
 	p := phone.Normalize(rawPhone)
 	if p == "" {
-		return "", fmt.Errorf("%w: phone required", domain.ErrValidation)
+		return "", domain.WithCode(domain.CodeOTPInvalidPhone,
+			fmt.Errorf("%w: phone required", domain.ErrValidation))
 	}
 
-	perMin, err := o.otp.CountSince(ctx, p, time.Now().Add(-time.Minute))
+	// Both limits keep their 422 and their message; only the code and the
+	// Retry-After are new. The wait is the FULL window, not the exact time
+	// remaining: computing the latter needs the timestamp of somebody else's
+	// request, and answering with it would tell an outsider the second at which
+	// this number last asked for a code — the one piece of timing an OTP
+	// phishing call actually wants. An upper bound costs a legitimate guest a
+	// few seconds and gives a prober nothing.
+	perMin, err := o.otp.CountSince(ctx, p, time.Now().Add(-otpPerMinWindow))
 	if err != nil {
 		return "", err
 	}
 	if perMin >= o.cfg.OTPPerMin {
-		return "", fmt.Errorf("%w: too many requests, wait a minute", domain.ErrValidation)
+		return "", domain.WithCode(domain.CodeOTPRateLimitedMinute,
+			domain.WithRetryAfter(otpPerMinWindow,
+				fmt.Errorf("%w: too many requests, wait a minute", domain.ErrValidation)))
 	}
-	perHour, err := o.otp.CountSince(ctx, p, time.Now().Add(-time.Hour))
+	perHour, err := o.otp.CountSince(ctx, p, time.Now().Add(-otpPerHourWindow))
 	if err != nil {
 		return "", err
 	}
 	if perHour >= o.cfg.OTPPerHour {
-		return "", fmt.Errorf("%w: hourly OTP limit reached", domain.ErrValidation)
+		return "", domain.WithCode(domain.CodeOTPRateLimitedHour,
+			domain.WithRetryAfter(otpPerHourWindow,
+				fmt.Errorf("%w: hourly OTP limit reached", domain.ErrValidation)))
 	}
 
 	code, err := otpcode.Generate()
@@ -176,12 +197,40 @@ func (o *otpUseCase) recordUndeliveredAttempt(ctx context.Context, p, code strin
 	})
 }
 
+// errOTPInvalid is the ONE answer to "the code you sent is not accepted".
+//
+// It is deliberately shared by three different situations — the code is wrong,
+// the code expired, and there is no active code for this number at all — and
+// they must stay indistinguishable on the wire. See domain.CodeOTPInvalid: the
+// difference between them is exactly "does a live code exist for this number
+// right now", and publishing that bit turns this endpoint into a presence
+// oracle for anyone who knows a phone number.
+//
+// Built fresh on every call rather than kept as a package-level var so nobody
+// can wrap or annotate the shared value by accident.
+func errOTPInvalid() error {
+	return domain.WithCode(domain.CodeOTPInvalid, domain.ErrUnauthorized)
+}
+
+// errOTPTooManyAttempts marks a code that is dead from wrong guesses. Separate
+// from errOTPInvalid because retyping cannot help any more — the guest has to
+// request a new code, and the app can only say that if it can tell the two
+// apart.
+func errOTPTooManyAttempts() error {
+	return domain.WithCode(domain.CodeOTPTooManyAttempts, domain.ErrUnauthorized)
+}
+
 // VerifyOTP checks the latest active code for the phone; on success it marks the
 // code used, finds-or-creates the user, and returns a token pair.
 func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error) {
 	p := phone.Normalize(rawPhone)
-	if p == "" || code == "" {
-		return nil, fmt.Errorf("%w: phone and code required", domain.ErrValidation)
+	if p == "" {
+		return nil, domain.WithCode(domain.CodeOTPInvalidPhone,
+			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
+	}
+	if code == "" {
+		return nil, domain.WithCode(domain.CodeOTPCodeRequired,
+			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
 	}
 
 	// Read + attempt accounting happen OUTSIDE the transaction: a failed guess
@@ -189,17 +238,31 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 	// auth error, the rollback would discard it and the lockout would never fire).
 	rec, err := o.otp.LatestActiveByPhone(ctx, p)
 	if errors.Is(err, domain.ErrNotFound) {
-		return nil, domain.ErrUnauthorized
+		// No unused, unexpired code for this number — never requested, already
+		// used, or expired. Same answer as a wrong code, on purpose.
+		return nil, errOTPInvalid()
 	}
 	if err != nil {
 		return nil, err
 	}
 	if rec.Attempts >= maxOTPAttempts {
-		return nil, domain.ErrUnauthorized
+		return nil, errOTPTooManyAttempts()
 	}
 	if otpcode.Hash(code) != rec.CodeHash {
-		_ = o.otp.IncrementAttempts(ctx, rec.ID) // committed immediately (no active tx)
-		return nil, domain.ErrUnauthorized
+		// Committed immediately (no active tx). When this guess is the one that
+		// exhausts the budget, say so straight away instead of inviting the
+		// guest to retype into a code that is already dead — but only if the
+		// attempt was actually recorded, or the lockout would be a claim about
+		// state we failed to write.
+		// Counted BEFORE the write: rec is this caller's snapshot, and reading
+		// it back after the repository has touched the row makes the answer
+		// depend on whether that repository happens to hand out live rows.
+		attempts := rec.Attempts + 1
+		if err := o.otp.IncrementAttempts(ctx, rec.ID); err == nil &&
+			attempts >= maxOTPAttempts {
+			return nil, errOTPTooManyAttempts()
+		}
+		return nil, errOTPInvalid()
 	}
 
 	// Correct code: mark used + find-or-create the user + issue tokens atomically.

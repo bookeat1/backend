@@ -112,7 +112,7 @@ func (h *Handler) list(c *gin.Context) {
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
 
-	items, total, err := h.facade.List(c.Request.Context(), f)
+	items, total, err := h.facade.List(c.Request.Context(), f, venueStateFilter(c))
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -125,15 +125,38 @@ func (h *Handler) list(c *gin.Context) {
 		ids = append(ids, it.Restaurant.ID)
 	}
 	h.attachFavorites(c.Request.Context(), out, ids)
-	page := f.Page
-	if page <= 0 {
-		page = 1
-	}
-	perPage := f.PerPage
-	if perPage <= 0 {
-		perPage = 20
-	}
+	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// venueStateFilter reads the two server-computed catalog filters off the query
+// string. Both are optional and both accept the full strconv.ParseBool
+// vocabulary, exactly like the existing is_popular / is_new filters — including
+// their behaviour on garbage, which is to ignore the parameter rather than fail
+// the request.
+//
+//   - open_now=true|false — evaluated in the VENUE's timezone by the same
+//     domain.IsOpenAt call that fills the response's schedule.open_now. A venue
+//     with no usable working hours is not open, so it appears only under
+//     open_now=false;
+//   - accepts_online_bookings=true|false — the same flag the payload carries.
+//
+// The response's `total` counts everything matching these too, so a client can
+// show the guest an honest "забронировать онлайн можно в N из M" without
+// counting one page by hand.
+func venueStateFilter(c *gin.Context) domain.VenueStateFilter {
+	var vs domain.VenueStateFilter
+	if v := c.Query("open_now"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			vs.OpenNow = &b
+		}
+	}
+	if v := c.Query("accepts_online_bookings"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			vs.AcceptsOnlineBookings = &b
+		}
+	}
+	return vs
 }
 
 // search runs the public full-text + fuzzy catalog search. It is a distinct
@@ -162,7 +185,7 @@ func (h *Handler) search(c *gin.Context) {
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
 
-	items, total, err := h.facade.Search(c.Request.Context(), f)
+	items, total, err := h.facade.Search(c.Request.Context(), f, venueStateFilter(c))
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -175,14 +198,7 @@ func (h *Handler) search(c *gin.Context) {
 		ids = append(ids, it.Restaurant.ID)
 	}
 	h.attachFavorites(c.Request.Context(), out, ids)
-	page := f.Page
-	if page <= 0 {
-		page = 1
-	}
-	perPage := f.PerPage
-	if perPage <= 0 {
-		perPage = 20
-	}
+	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
 }
 

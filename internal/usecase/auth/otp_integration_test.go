@@ -122,3 +122,105 @@ func TestVerifyOTPWrongCodePersistsAttemptAcrossRealTx(t *testing.T) {
 		t.Fatalf("attempts = %d, want unchanged %d once locked out", attempts, maxOTPAttempts)
 	}
 }
+
+// TestOTPVerifyCodesAgainstRealPostgres pins the machine-readable codes over
+// the REAL repository. The in-memory fake decides "expired" by comparing Go
+// timestamps; here it is the SQL predicate on otp_codes that decides, which is
+// the thing that actually runs in production — and it is the one situation
+// where a merged answer could silently become a distinguishable one.
+func TestOTPVerifyCodesAgainstRealPostgres(t *testing.T) {
+	uc, otpRepo, _ := newRealTestOTP(t)
+	ctx := context.Background()
+
+	seed := func(t *testing.T, phone, code string, expiresIn time.Duration) {
+		t.Helper()
+		if err := otpRepo.Create(ctx, &domain.OTPCode{
+			ID: uuid.New(), Phone: phone, CodeHash: otpcode.Hash(code),
+			Channel: "test", ExpiresAt: time.Now().Add(expiresIn),
+		}); err != nil {
+			t.Fatalf("seed OTP: %v", err)
+		}
+	}
+
+	const (
+		live    = "+77010000010" // a live code, guessed wrong
+		expired = "+77010000011" // the right code, submitted too late
+		unknown = "+77010000012" // never requested anything
+	)
+	seed(t, live, "111111", 5*time.Minute)
+	seed(t, expired, "222222", -time.Second)
+
+	answers := map[string]error{}
+	for name, call := range map[string]func() error{
+		"wrong code": func() error {
+			_, err := uc.VerifyOTP(ctx, live, "000000")
+			return err
+		},
+		"expired code": func() error {
+			_, err := uc.VerifyOTP(ctx, expired, "222222")
+			return err
+		},
+		"no active code": func() error {
+			_, err := uc.VerifyOTP(ctx, unknown, "000000")
+			return err
+		},
+	} {
+		err := call()
+		if !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("%s: err = %v, want ErrUnauthorized", name, err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok || code != domain.CodeOTPInvalid {
+			t.Errorf("%s: code = %q (present %v), want %q — the three must stay merged, "+
+				"or the endpoint tells an outsider whether a live code exists",
+				name, code, ok, domain.CodeOTPInvalid)
+		}
+		answers[name] = err
+	}
+	if len(answers) != 3 {
+		t.Fatalf("expected all three situations to be exercised, got %d", len(answers))
+	}
+
+	// The lockout keeps its own code: retyping cannot help any more.
+	const locked = "+77010000013"
+	seed(t, locked, "333333", 5*time.Minute)
+	var lastErr error
+	for i := 0; i < maxOTPAttempts; i++ {
+		_, lastErr = uc.VerifyOTP(ctx, locked, "000000")
+	}
+	code, ok := domain.CodeOf(lastErr)
+	if !ok || code != domain.CodeOTPTooManyAttempts {
+		t.Errorf("after %d wrong guesses: code = %q (present %v), want %q",
+			maxOTPAttempts, code, ok, domain.CodeOTPTooManyAttempts)
+	}
+	// Even the correct code is refused now, with the same code.
+	_, err := uc.VerifyOTP(ctx, locked, "333333")
+	code, ok = domain.CodeOf(err)
+	if !ok || code != domain.CodeOTPTooManyAttempts {
+		t.Errorf("correct code after lockout: code = %q (present %v), want %q", code, ok, domain.CodeOTPTooManyAttempts)
+	}
+}
+
+// The per-phone rate limits must be distinguishable AND must say how long to
+// wait, over the real counter (which counts otp_codes rows, not memory).
+func TestOTPRequestRateLimitCodesAgainstRealPostgres(t *testing.T) {
+	uc, _, _ := newRealTestOTP(t) // OTPPerMin = 1, OTPPerHour = 5
+	ctx := context.Background()
+
+	const phone = "+77010000020"
+	if _, err := uc.RequestOTP(ctx, phone); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	_, err := uc.RequestOTP(ctx, phone)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("second request: err = %v, want ErrValidation (422 unchanged)", err)
+	}
+	code, ok := domain.CodeOf(err)
+	if !ok || code != domain.CodeOTPRateLimitedMinute {
+		t.Errorf("code = %q (present %v), want %q", code, ok, domain.CodeOTPRateLimitedMinute)
+	}
+	after, ok := domain.RetryAfterOf(err)
+	if !ok || after != time.Minute {
+		t.Errorf("retry-after = %v (present %v), want 1m", after, ok)
+	}
+}
