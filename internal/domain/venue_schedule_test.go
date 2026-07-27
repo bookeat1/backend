@@ -546,3 +546,159 @@ func TestExceptionsAgreeWithTheOpeningWindow(t *testing.T) {
 		t.Error("the published exception for that date must say closed")
 	}
 }
+
+// A special day that lands exactly on a daylight-saving transition.
+//
+// Europe/Lisbon springs forward on 2026-03-29 (01:00 WET → 02:00 WEST, a
+// 23-hour day) and falls back on 2026-10-25 (02:00 WEST → 01:00 WET, a 25-hour
+// day). An override says "on this date we work 10:00–22:00". Those are WALL
+// CLOCK times on the venue's own clock — the door opens when the clock in the
+// window says 10:00, whatever the UTC offset did at 01:00 that morning.
+//
+// The bug this pins: the window was built by ADDING an absolute duration to
+// local midnight, and an absolute 10 hours from midnight is not 10:00 on a day
+// that is 23 or 25 hours long. The venue opened at 11:00 on the spring-forward
+// date and at 09:00 on the fall-back one — an hour stolen from the guest on one
+// date, an hour sold before the staff arrived on the other.
+func TestOpeningWindowOnDaylightSavingBoundary(t *testing.T) {
+	lisbon := mustLoad(t, "Europe/Lisbon")
+
+	// 2026-03-29 is a Sunday, 2026-10-25 also a Sunday. The weekly row is
+	// deliberately DIFFERENT from the override so a fallback to it is visible.
+	week := []WorkingHours{day(int(time.Sunday), true, "08:00", "16:00")}
+
+	tests := []struct {
+		name      string
+		date      string
+		override  ScheduleOverride
+		wantOpen  string // "HH:MM" on the venue's wall clock
+		wantClose string
+	}{
+		{
+			name:     "spring forward: the 23-hour day",
+			date:     "2026-03-29",
+			override: hoursOn("2026-03-29", "10:00", "22:00"),
+			wantOpen: "10:00", wantClose: "22:00",
+		},
+		{
+			name:     "fall back: the 25-hour day",
+			date:     "2026-10-25",
+			override: hoursOn("2026-10-25", "10:00", "22:00"),
+			wantOpen: "10:00", wantClose: "22:00",
+		},
+		{
+			// The transition happens at 01:00/02:00, INSIDE this window, so a
+			// window that starts before it and ends after it is the sharpest
+			// case: both ends must still read as the venue wrote them.
+			name:     "spring forward: a window straddling the skipped hour",
+			date:     "2026-03-29",
+			override: hoursOn("2026-03-29", "00:30", "04:00"),
+			wantOpen: "00:30", wantClose: "04:00",
+		},
+		{
+			name:     "fall back: a window straddling the repeated hour",
+			date:     "2026-10-25",
+			override: hoursOn("2026-10-25", "00:30", "04:00"),
+			wantOpen: "00:30", wantClose: "04:00",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			date := mustDate(tc.date)
+			dayStart := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, lisbon)
+
+			open, close_, ok := OpeningWindow(week, []ScheduleOverride{tc.override}, dayStart, lisbon)
+			if !ok {
+				t.Fatalf("venue reported shut on %s, but the override opens it", tc.date)
+			}
+			if got := open.In(lisbon).Format("15:04"); got != tc.wantOpen {
+				t.Errorf("opens at %s (%s), want %s on the venue's clock",
+					got, open.In(lisbon).Format(time.RFC3339), tc.wantOpen)
+			}
+			if got := close_.In(lisbon).Format("15:04"); got != tc.wantClose {
+				t.Errorf("closes at %s (%s), want %s on the venue's clock",
+					got, close_.In(lisbon).Format(time.RFC3339), tc.wantClose)
+			}
+			// The window must belong to the date the override names, not slide
+			// into its neighbour.
+			if d := dateKey(open.In(lisbon)); d != tc.date {
+				t.Errorf("the window opens on %s, want %s", d, tc.date)
+			}
+		})
+	}
+}
+
+// open_now on a DST date, asked at instants that are unambiguous on both sides
+// of the transition. The venue's override says 10:00–22:00; a guest looking at
+// their phone at 09:30 must see "closed" and at 10:30 "open", on both the
+// 23-hour and the 25-hour day.
+func TestIsOpenAtOnDaylightSavingBoundary(t *testing.T) {
+	lisbon := mustLoad(t, "Europe/Lisbon")
+	week := []WorkingHours{day(int(time.Sunday), true, "08:00", "16:00")}
+
+	tests := []struct {
+		name      string
+		date      string
+		hour, min int
+		want      bool
+	}{
+		{"spring forward, before opening", "2026-03-29", 9, 30, false},
+		{"spring forward, just open", "2026-03-29", 10, 0, true},
+		{"spring forward, mid-service", "2026-03-29", 15, 0, true},
+		{"spring forward, closing is exclusive", "2026-03-29", 22, 0, false},
+		{"fall back, before opening", "2026-10-25", 9, 30, false},
+		{"fall back, just open", "2026-10-25", 10, 0, true},
+		{"fall back, mid-service", "2026-10-25", 15, 0, true},
+		{"fall back, closing is exclusive", "2026-10-25", 22, 0, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := []ScheduleOverride{hoursOn(tc.date, "10:00", "22:00")}
+			d := mustDate(tc.date)
+			at := time.Date(d.Year(), d.Month(), d.Day(), tc.hour, tc.min, 0, 0, lisbon)
+			if got := IsOpenAt(week, overrides, at, lisbon); got != tc.want {
+				t.Errorf("IsOpenAt(%s) = %v, want %v", at.Format(time.RFC3339), got, tc.want)
+			}
+		})
+	}
+}
+
+// The exceptions list a guest is shown must say the same thing as the window
+// the engine sells from — on a DST date too. This is the same agreement
+// TestExceptionsAgreeWithTheOpeningWindow pins for ordinary dates; a transition
+// day is exactly where the two would drift apart unnoticed.
+func TestScheduleExceptionsAgreeOnDaylightSavingDates(t *testing.T) {
+	lisbon := mustLoad(t, "Europe/Lisbon")
+	week := []WorkingHours{day(int(time.Sunday), true, "08:00", "16:00")}
+
+	for _, date := range []string{"2026-03-29", "2026-10-25"} {
+		t.Run(date, func(t *testing.T) {
+			overrides := []ScheduleOverride{hoursOn(date, "10:00", "22:00")}
+			d := mustDate(date)
+			dayStart := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, lisbon)
+
+			ex := BuildScheduleExceptions(overrides, dayStart, 1, lisbon)
+			if len(ex) != 1 {
+				t.Fatalf("got %d exceptions, want the one for %s", len(ex), date)
+			}
+			open, close_, ok := OpeningWindow(week, overrides, dayStart, lisbon)
+			if !ok {
+				t.Fatal("the engine reports the venue shut on a date the guest is told it opens")
+			}
+			if ex[0].OpenTime != open.In(lisbon).Format("15:04") {
+				t.Errorf("guest is promised %s, the engine opens at %s",
+					ex[0].OpenTime, open.In(lisbon).Format("15:04"))
+			}
+			if ex[0].CloseTime != close_.In(lisbon).Format("15:04") {
+				t.Errorf("guest is promised a close at %s, the engine closes at %s",
+					ex[0].CloseTime, close_.In(lisbon).Format("15:04"))
+			}
+			if ex[0].OpenTime != "10:00" || ex[0].CloseTime != "22:00" {
+				t.Errorf("exception says %s–%s, want the 10:00–22:00 the venue wrote",
+					ex[0].OpenTime, ex[0].CloseTime)
+			}
+		})
+	}
+}

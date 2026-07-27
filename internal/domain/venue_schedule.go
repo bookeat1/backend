@@ -255,14 +255,45 @@ func overrideWindow(o ScheduleOverride, day time.Time, loc *time.Location) (time
 // minutes-since-midnight values, rolling the close into the next day when it is
 // not after the open (11:00–01:00). Shared by the weekly and the override path
 // so a special day crosses midnight by exactly the same rule as a normal one.
+//
+// The bounds are built as WALL-CLOCK fields, not by adding a duration to local
+// midnight, and the difference is not academic. On a daylight-saving transition
+// the local day is 23 or 25 hours long, so an absolute "midnight + 10h" lands
+// on 11:00 in spring and 09:00 in autumn. A venue that wrote "10:00–22:00"
+// means the time on its own wall clock: the door opens when the clock says
+// 10:00, whatever the offset did overnight. Adding the offset shift to the
+// venue's hours stole an hour of trading on one date and sold an hour before
+// the staff arrived on the other — and it did so consistently in BOTH the
+// engine and the guest-facing exceptions, so the two agreed with each other and
+// the defect was invisible from the outside.
+//
+// time.Date normalizes out-of-range fields against the calendar first and
+// resolves the zone offset afterwards, which is exactly what is wanted here: it
+// makes "25:00" the next day at 01:00, and it makes the +24h roll below land on
+// the same wall-clock time on the following date even when that date has a
+// different UTC offset.
 func clockWindow(day time.Time, loc *time.Location, openMin, closeMin int) (time.Time, time.Time) {
-	base := StartOfDay(day, loc)
-	open := base.Add(time.Duration(openMin) * time.Minute)
-	close_ := base.Add(time.Duration(closeMin) * time.Minute)
+	open := wallClock(day, loc, openMin)
+	close_ := wallClock(day, loc, closeMin)
 	if !close_.After(open) {
-		close_ = close_.AddDate(0, 0, 1)
+		close_ = wallClock(day, loc, closeMin+24*60)
 	}
 	return open, close_
+}
+
+// wallClock returns the instant at which the clock in loc reads `mins` minutes
+// past midnight on the calendar day of `day`. Values past 24h roll into the
+// following days by the calendar, not by 1440 absolute minutes.
+//
+// A wall-clock time that a DST transition SKIPS (01:30 on a spring-forward
+// date) or REPEATS (01:30 on a fall-back one) has no single instant; time.Date
+// resolves it to a definite one either way, which keeps the window well-formed.
+// The engine never needs to distinguish the two occurrences — it asks "is the
+// venue open at this instant", and both readings answer that identically for
+// every instant outside the ambiguous hour itself.
+func wallClock(day time.Time, loc *time.Location, mins int) time.Time {
+	y, m, d := day.In(loc).Date()
+	return time.Date(y, m, d, 0, mins, 0, 0, loc)
 }
 
 // dateKey renders a calendar date as "YYYY-MM-DD" from the parts t has in its
