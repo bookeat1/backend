@@ -179,12 +179,15 @@ func bookingFilter(c *gin.Context) (domain.BookingFilter, error) {
 	// A bare ?date=YYYY-MM-DD is the venue calendar's default view: one day,
 	// half-open, so the (restaurant_id, starts_at) index is usable.
 	if d := c.Query("date"); d != "" && f.From == nil && f.To == nil {
-		day, err := time.Parse(uc.DateLayout, d)
+		day, err := domain.ParseCalendarDate(d)
 		if err != nil {
-			return f, fmt.Errorf("%w: date must be YYYY-MM-DD", domain.ErrValidation)
+			return f, err
 		}
-		next := day.AddDate(0, 0, 1)
-		f.From, f.To = &day, &next
+		// Passed on UNRESOLVED. Turning it into instants here would mean
+		// choosing a zone, and this layer does not know the venue — it used to
+		// produce a UTC day, so a venue in Almaty saw its calendar start at
+		// 05:00 local.
+		f.CalendarDate = &day
 	}
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
