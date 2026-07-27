@@ -375,7 +375,7 @@
         },
         "/api/v1/auth/otp/request": {
             "post": {
-                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.\n\nWhen no delivery channel accepts the code the answer is a plain 500\nwith the generic body — identical for a number nobody can reach and\nfor a provider outage. That is deliberate: a response that varied by\nchannel would let anyone enumerate which numbers have Telegram or\nWhatsApp. The per-channel reasons live in our logs, phone masked.",
+                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.\n\nEvery 422 carries a machine-readable \"code\" in the error envelope —\nbranch on it, never on the message: otp_invalid_phone (the number is\nunusable, point at the field), otp_rate_limited_minute and\notp_rate_limited_hour (both carry a Retry-After header in seconds;\nit is the full window, an upper bound, not the exact time left).\n\nWhen no delivery channel accepts the code the answer is a plain 500\nwith the generic body — identical for a number nobody can reach and\nfor a provider outage. That is deliberate: a response that varied by\nchannel would let anyone enumerate which numbers have Telegram or\nWhatsApp. The per-channel reasons live in our logs, phone masked.",
                 "consumes": [
                     "application/json"
                 ],
@@ -433,7 +433,7 @@
         },
         "/api/v1/auth/otp/verify": {
             "post": {
-                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.",
+                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.\n\nThe 401 carries one of two codes. \"otp_invalid\" means the code was\nnot accepted and covers three cases on purpose — wrong, expired, and\nno active code at all: telling them apart would let anyone with a\nphone number detect when its owner is mid-login. \"otp_too_many_attempts\"\nmeans the code is dead from wrong guesses and only a new code helps.\nThe 422 codes are otp_invalid_phone and otp_code_required.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1475,6 +1475,78 @@
                     },
                     "422": {
                         "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/restaurants/{id}/map": {
+            "get": {
+                "description": "Returns a PNG map preview of the restaurant, rendered server-side so the map provider key never reaches the client. Size and zoom are whitelisted. Failures return a JSON envelope whose \"code\" tells them apart: map_no_coordinates (404), map_not_configured (503), map_provider_rate_limited (503), map_provider_unavailable (503).",
+                "produces": [
+                    "image/png"
+                ],
+                "tags": [
+                    "restaurants"
+                ],
+                "summary": "Restaurant map preview (server-side proxy)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path"
+                    },
+                    {
+                        "enum": [
+                            "card",
+                            "detail",
+                            "wide"
+                        ],
+                        "type": "string",
+                        "default": "detail",
+                        "description": "Image preset",
+                        "name": "size",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "default": 1,
+                        "description": "1 or 2 (HiDPI)",
+                        "name": "scale",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "default": 16,
+                        "description": "14..18",
+                        "name": "zoom",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "PNG image",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "404": {
+                        "description": "unknown restaurant or no coordinates",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "size/scale/zoom outside the whitelist",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "503": {
+                        "description": "provider not configured or unavailable",
                         "schema": {
                             "$ref": "#/definitions/response.Envelope"
                         }

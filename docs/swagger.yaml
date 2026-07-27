@@ -586,6 +586,12 @@ paths:
         (per-minute and per-hour); over the limit returns 422. The response
         "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
 
+        Every 422 carries a machine-readable "code" in the error envelope —
+        branch on it, never on the message: otp_invalid_phone (the number is
+        unusable, point at the field), otp_rate_limited_minute and
+        otp_rate_limited_hour (both carry a Retry-After header in seconds;
+        it is the full window, an upper bound, not the exact time left).
+
         When no delivery channel accepts the code the answer is a plain 500
         with the generic body — identical for a number nobody can reach and
         for a provider outage. That is deliberate: a response that varied by
@@ -629,6 +635,13 @@ paths:
         Verifies the latest active code for the phone. On success, finds or
         creates the user and returns a token pair. Wrong/expired codes and
         too many attempts return 401.
+
+        The 401 carries one of two codes. "otp_invalid" means the code was
+        not accepted and covers three cases on purpose — wrong, expired, and
+        no active code at all: telling them apart would let anyone with a
+        phone number detect when its owner is mid-login. "otp_too_many_attempts"
+        means the code is dead from wrong guesses and only a new code helps.
+        The 422 codes are otp_invalid_phone and otp_code_required.
       parameters:
       - description: Phone and code
         in: body
@@ -1283,6 +1296,59 @@ paths:
       summary: Register my browser push subscription
       tags:
       - push
+  /api/v1/restaurants/{id}/map:
+    get:
+      description: 'Returns a PNG map preview of the restaurant, rendered server-side
+        so the map provider key never reaches the client. Size and zoom are whitelisted.
+        Failures return a JSON envelope whose "code" tells them apart: map_no_coordinates
+        (404), map_not_configured (503), map_provider_rate_limited (503), map_provider_unavailable
+        (503).'
+      parameters:
+      - description: Restaurant id
+        in: path
+        name: id
+        type: string
+      - default: detail
+        description: Image preset
+        enum:
+        - card
+        - detail
+        - wide
+        in: query
+        name: size
+        type: string
+      - default: 1
+        description: 1 or 2 (HiDPI)
+        in: query
+        name: scale
+        type: integer
+      - default: 16
+        description: 14..18
+        in: query
+        name: zoom
+        type: integer
+      produces:
+      - image/png
+      responses:
+        "200":
+          description: PNG image
+          schema:
+            type: file
+        "404":
+          description: unknown restaurant or no coordinates
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "422":
+          description: size/scale/zoom outside the whitelist
+          schema:
+            $ref: '#/definitions/response.Envelope'
+        "503":
+          description: provider not configured or unavailable
+          schema:
+            $ref: '#/definitions/response.Envelope'
+      summary: Restaurant map preview (server-side proxy)
+      tags:
+      - restaurants
   /api/v1/restaurants/{id}/reviews:
     get:
       parameters:
