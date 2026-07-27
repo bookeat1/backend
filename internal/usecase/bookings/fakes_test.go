@@ -384,13 +384,17 @@ func (f *fakeRestaurants) GetByID(_ context.Context, id uuid.UUID) (*domain.Rest
 }
 
 type fakeSchedule struct {
-	hours  []domain.WorkingHours
-	slots  []domain.TimeSlot
-	tables []domain.RestaurantTable
+	hours     []domain.WorkingHours
+	overrides []domain.ScheduleOverride
+	slots     []domain.TimeSlot
+	tables    []domain.RestaurantTable
 }
 
 func (f *fakeSchedule) ListWorkingHours(context.Context, uuid.UUID) ([]domain.WorkingHours, error) {
 	return f.hours, nil
+}
+func (f *fakeSchedule) ListScheduleOverrides(context.Context, uuid.UUID) ([]domain.ScheduleOverride, error) {
+	return f.overrides, nil
 }
 func (f *fakeSchedule) ListTimeSlots(context.Context, uuid.UUID) ([]domain.TimeSlot, error) {
 	return f.slots, nil
