@@ -23,7 +23,27 @@ type venueStateReader interface {
 	// party (is_active AND capacity > 0) — the same filter the availability
 	// engine applies in usecase/bookings.loadSchedule.
 	BookableTableCountsFor(ctx context.Context, restaurantIDs []uuid.UUID) (map[uuid.UUID]int, error)
+	// ScheduleOverridesFor reads the venues' special-day exceptions in the
+	// window [from, to] (inclusive calendar dates). The window is widened by a
+	// day on each side by the caller so it covers every venue's local dates
+	// whatever timezone it sits in; the exact per-venue resolution happens in
+	// the domain, through the SAME helper the availability engine uses.
+	ScheduleOverridesFor(ctx context.Context, restaurantIDs []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.ScheduleOverride, error)
 }
+
+// scheduleExceptionDays is how far ahead the public payload reports a venue's
+// special days. Long enough for a guest planning the next few weeks (New Year,
+// a holiday closure) and short enough that the list stays a handful of rows on
+// a catalog page of twenty venues. The covered window is stated in the payload
+// itself (WeeklySchedule.ExceptionsFrom/Until) so a client never has to guess
+// whether an empty list means "no special days" or "we didn't look".
+const scheduleExceptionDays = 30
+
+// dateLayout is the calendar-date format the public payload speaks, identical
+// to usecase/bookings.DateLayout (the availability endpoint's ?date=). Spelled
+// out here rather than imported so this package keeps its one-way dependency
+// on the booking layer limited to the small resolver interfaces above.
+const dateLayout = "2006-01-02"
 
 // VenueTimezoneResolver answers which IANA timezone a venue's own clock runs
 // in. It is bound in bootstrap/deps.go to the SAME resolution the booking and
@@ -82,8 +102,12 @@ func NewVenueState(reader venueStateReader, tz VenueTimezoneResolver, opts ...Ve
 //     free-text opening_hours column is deliberately NOT parsed here;
 //   - unknown timezone on this host → OpenNow stays nil ("unknown"), the day
 //     list is still served (it is plain venue-local text, always true).
+//   - overrides could not be read → OpenNow stays nil and the exceptions
+//     window is absent: with unknown special days "open now" would be a guess,
+//     and a guess is exactly what a holiday closure turns into a lie.
 func buildVenueState(
-	hours []domain.WorkingHours, tz string,
+	hours []domain.WorkingHours, overrides []domain.ScheduleOverride, overridesKnown bool,
+	tz string,
 	mode domain.CapacityMode, capacitySeats, bookableTables int,
 	now time.Time,
 ) domain.PublicVenueState {
@@ -116,9 +140,18 @@ func buildVenueState(
 		return st
 	}
 	sch := &domain.WeeklySchedule{Timezone: tz, Days: days}
-	if loc, err := time.LoadLocation(tz); err == nil {
-		open := domain.IsOpenAt(hours, now, loc)
+	if loc, err := time.LoadLocation(tz); err == nil && overridesKnown {
+		open := domain.IsOpenAt(hours, overrides, now, loc)
 		sch.OpenNow = &open
+
+		// The exceptions window is stated in the VENUE's local dates, from its
+		// today: a date already past says nothing about the venue's next
+		// month, and a client applying a stale closure would shut a venue that
+		// is open.
+		from := domain.StartOfDay(now, loc)
+		sch.Exceptions = domain.BuildScheduleExceptions(overrides, from, scheduleExceptionDays, loc)
+		sch.ExceptionsFrom = from.Format(dateLayout)
+		sch.ExceptionsUntil = from.AddDate(0, 0, scheduleExceptionDays-1).Format(dateLayout)
 	}
 	st.Schedule = sch
 	return st
@@ -136,16 +169,17 @@ func (v *VenueState) AttachList(ctx context.Context, items []domain.RestaurantLi
 	for _, it := range items {
 		ids = append(ids, it.Restaurant.ID)
 	}
-	hours, tables, ok := v.read(ctx, ids)
+	now := v.now()
+	data, ok := v.read(ctx, ids, now)
 	if !ok {
 		return
 	}
-	now := v.now()
 	for i := range items {
 		id := items[i].Restaurant.ID
 		mode, seats := v.tz.VenueCapacity(items[i].Restaurant)
-		st := buildVenueState(hours[id], v.tz.VenueTimezone(items[i].Restaurant),
-			mode, seats, tables[id], now)
+		st := buildVenueState(data.hours[id], data.overrides[id], data.overridesKnown,
+			v.tz.VenueTimezone(items[i].Restaurant),
+			mode, seats, data.tables[id], now)
 		items[i].VenueState = &st
 	}
 }
@@ -156,13 +190,15 @@ func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggreg
 		return
 	}
 	id := agg.Restaurant.ID
-	hours, tables, ok := v.read(ctx, []uuid.UUID{id})
+	now := v.now()
+	data, ok := v.read(ctx, []uuid.UUID{id}, now)
 	if !ok {
 		return
 	}
 	mode, seats := v.tz.VenueCapacity(agg.Restaurant)
-	st := buildVenueState(hours[id], v.tz.VenueTimezone(agg.Restaurant),
-		mode, seats, tables[id], v.now())
+	st := buildVenueState(data.hours[id], data.overrides[id], data.overridesKnown,
+		v.tz.VenueTimezone(agg.Restaurant),
+		mode, seats, data.tables[id], now)
 	agg.VenueState = &st
 }
 
@@ -171,20 +207,46 @@ func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggreg
 // without nil-checking at every use site.
 func (v *VenueState) usable() bool { return v != nil && v.reader != nil && v.tz != nil }
 
-func (v *VenueState) read(ctx context.Context, ids []uuid.UUID) (
-	map[uuid.UUID][]domain.WorkingHours, map[uuid.UUID]int, bool,
-) {
+// venueStateData is one batch read of everything the enrichment needs.
+// overridesKnown is false when the special-day read failed — the catalog is
+// still served, but without "open now" and without an exceptions window, so
+// nothing in the payload silently ignores a closure it could not see.
+type venueStateData struct {
+	hours          map[uuid.UUID][]domain.WorkingHours
+	tables         map[uuid.UUID]int
+	overrides      map[uuid.UUID][]domain.ScheduleOverride
+	overridesKnown bool
+}
+
+func (v *VenueState) read(ctx context.Context, ids []uuid.UUID, now time.Time) (venueStateData, bool) {
 	hours, err := v.reader.WorkingHoursFor(ctx, ids)
 	if err != nil {
 		slog.Warn("venue working hours lookup failed, serving catalog without schedule", "error", err)
-		return nil, nil, false
+		return venueStateData{}, false
 	}
 	tables, err := v.reader.BookableTableCountsFor(ctx, ids)
 	if err != nil {
 		slog.Warn("venue table lookup failed, serving catalog without schedule", "error", err)
-		return nil, nil, false
+		return venueStateData{}, false
 	}
-	return hours, tables, true
+	data := venueStateData{hours: hours, tables: tables}
+
+	// The window is widened by a day on each side of the venue-local range: the
+	// page may hold venues in different zones, and "today" in Almaty can still
+	// be yesterday in Istanbul. The exact per-venue dates are then resolved in
+	// the venue's own zone by domain.BuildScheduleExceptions, so the slack here
+	// costs at most two extra rows per venue and can never cut a date short.
+	// Yesterday is included for a second reason: "open now" at 00:30 has to see
+	// the shift that started the previous evening.
+	from := now.AddDate(0, 0, -1)
+	to := now.AddDate(0, 0, scheduleExceptionDays)
+	overrides, err := v.reader.ScheduleOverridesFor(ctx, ids, from, to)
+	if err != nil {
+		slog.Warn("venue schedule overrides lookup failed, serving catalog without open_now/exceptions", "error", err)
+		return data, true
+	}
+	data.overrides, data.overridesKnown = overrides, true
+	return data, true
 }
 
 // now is the enricher's clock, injectable so schedule tests can freeze an

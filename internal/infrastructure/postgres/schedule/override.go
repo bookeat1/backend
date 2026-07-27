@@ -73,6 +73,56 @@ func (r *Repository) ListByRestaurant(ctx context.Context, restaurantID uuid.UUI
 	return out, nil
 }
 
+// dateParam renders a Go time as the bare calendar date it carries in its OWN
+// location, for binding to a `date` column as text.
+//
+// It is deliberately not a timestamptz parameter: `$1::timestamptz::date` is
+// resolved with the SESSION's TimeZone setting, so the same instant would land
+// on different days on a UTC connection and an Asia/Almaty one. A "YYYY-MM-DD"
+// string cast to date has exactly one meaning everywhere.
+func dateParam(t time.Time) string { return t.Format("2006-01-02") }
+
+// ListForVenues returns the overrides of MANY venues whose override_date falls
+// inside [from, to] (inclusive, calendar dates), grouped by restaurant. It is
+// the batch read behind the public catalog: one page of venues costs one
+// round-trip, and the date bound keeps the payload from growing with every
+// holiday a venue has ever had.
+//
+// A venue with no override in the window is simply absent from the map. The
+// caller decides which venue-local dates it needs; because venues sit in
+// different timezones, `from`/`to` are expected to be widened by a day on each
+// side and the exact per-venue date filtering happens in the domain
+// (domain.BuildScheduleExceptions).
+func (r *Repository) ListForVenues(ctx context.Context, restaurantIDs []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.ScheduleOverride, error) {
+	out := make(map[uuid.UUID][]domain.ScheduleOverride, len(restaurantIDs))
+	if len(restaurantIDs) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, restaurant_id, override_date, is_closed, open_time, close_time, note,
+		        booking_payment_required, deposit_amount_minor, created_at, updated_at
+		 FROM restaurant_schedule_overrides
+		 WHERE restaurant_id = ANY($1)
+		   AND override_date BETWEEN $2::date AND $3::date
+		 ORDER BY restaurant_id, override_date ASC`,
+		restaurantIDs, dateParam(from), dateParam(to))
+	if err != nil {
+		return nil, fmt.Errorf("list schedule overrides for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		o, err := scanOverride(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[o.RestaurantID] = append(out[o.RestaurantID], o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list schedule overrides for venues: %w", err)
+	}
+	return out, nil
+}
+
 // Upsert inserts or replaces the override for (restaurant_id, override_date).
 // The ON CONFLICT on the unique (restaurant_id, override_date) index makes
 // "set the override for this day" idempotent — a repeat call for the same day

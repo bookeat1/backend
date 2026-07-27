@@ -501,7 +501,7 @@ func withinOpeningHours(sched schedule, startsAt time.Time, policy domain.Bookin
 	local := startsAt.In(loc)
 	day := startOfDay(local, loc)
 	for _, d := range []time.Time{day, day.AddDate(0, 0, -1)} {
-		open, close_, ok := openingWindow(sched.hours, int(d.Weekday()), d, loc)
+		open, close_, ok := openingWindow(sched, d, loc)
 		if !ok {
 			continue
 		}

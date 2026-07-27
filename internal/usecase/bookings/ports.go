@@ -34,9 +34,20 @@ type policyWriter interface {
 }
 
 // scheduleReader is the minimal slice of the restaurant "related" repository
-// used by the availability engine (opening hours, bookable slots, tables).
+// used by the availability engine (opening hours, special-day overrides,
+// bookable slots, tables).
+//
+// ListScheduleOverrides is part of THIS port rather than a separate optional
+// dependency on purpose: a venue's exceptions are not an enhancement of its
+// hours, they are part of them, and an engine that can be wired without them
+// is an engine that will one day sell a table on a holiday again.
 type scheduleReader interface {
 	ListWorkingHours(ctx context.Context, restaurantID uuid.UUID) ([]domain.WorkingHours, error)
+	// ListScheduleOverrides returns the venue's special-day exceptions
+	// (restaurant_schedule_overrides). Dates are matched exactly, so a past
+	// override is inert rather than harmful; the list is per venue and small
+	// (one row per special day an admin has ever entered).
+	ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID) ([]domain.ScheduleOverride, error)
 	ListTimeSlots(ctx context.Context, restaurantID uuid.UUID) ([]domain.TimeSlot, error)
 	ListTables(ctx context.Context, restaurantID uuid.UUID) ([]domain.RestaurantTable, error)
 }

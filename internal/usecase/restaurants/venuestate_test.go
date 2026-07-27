@@ -14,11 +14,14 @@ import (
 // fakeVenueState is a hand-written venueStateReader over two plain maps, close
 // enough to the batch SQL: a restaurant with no rows is simply absent.
 type fakeVenueState struct {
-	hours     map[uuid.UUID][]domain.WorkingHours
-	tables    map[uuid.UUID]int
-	hoursErr  error
-	tablesErr error
-	hoursIDs  [][]uuid.UUID // every batch of ids the facade asked for
+	hours        map[uuid.UUID][]domain.WorkingHours
+	tables       map[uuid.UUID]int
+	overrides    map[uuid.UUID][]domain.ScheduleOverride
+	hoursErr     error
+	tablesErr    error
+	overridesErr error
+	hoursIDs     [][]uuid.UUID  // every batch of ids the facade asked for
+	overrideWins [][2]time.Time // the [from, to] window each overrides read asked for
 }
 
 func (f *fakeVenueState) WorkingHoursFor(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]domain.WorkingHours, error) {
@@ -34,6 +37,14 @@ func (f *fakeVenueState) BookableTableCountsFor(_ context.Context, _ []uuid.UUID
 		return nil, f.tablesErr
 	}
 	return f.tables, nil
+}
+
+func (f *fakeVenueState) ScheduleOverridesFor(_ context.Context, _ []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.ScheduleOverride, error) {
+	f.overrideWins = append(f.overrideWins, [2]time.Time{from, to})
+	if f.overridesErr != nil {
+		return nil, f.overridesErr
+	}
+	return f.overrides, nil
 }
 
 // fixedTZ resolves every venue to one zone, standing in for the booking
@@ -234,7 +245,7 @@ func TestBuildVenueState(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			st := buildVenueState(tc.hours, tc.tz, tc.mode, tc.seats, tc.tables, tc.now)
+			st := buildVenueState(tc.hours, nil, true, tc.tz, tc.mode, tc.seats, tc.tables, tc.now)
 			if st.AcceptsOnlineBookings != tc.wantBooking {
 				t.Errorf("AcceptsOnlineBookings = %v, want %v", st.AcceptsOnlineBookings, tc.wantBooking)
 			}
@@ -466,5 +477,213 @@ func TestListPublishesATableLessVenueAsBookable(t *testing.T) {
 	}
 	if got[tablesVenue] {
 		t.Errorf("a table-mode venue with no tables is published as bookable; the flag is not answering from capacity at all")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Special days in the PUBLIC payload.
+//
+// The catalog must tell the guest the truth for the dates it covers: a venue
+// closed on an upcoming date has to be VISIBLE as closed, not merely missing
+// from a weekly grid that keeps saying "open 11:00–22:00 every day".
+// ---------------------------------------------------------------------------
+
+func vsClosed(date string) domain.ScheduleOverride {
+	return domain.ScheduleOverride{Date: vsDate(date), IsClosed: true}
+}
+
+func vsHours(date, open, close_ string) domain.ScheduleOverride {
+	o, c := open, close_
+	return domain.ScheduleOverride{Date: vsDate(date), OpenTime: &o, CloseTime: &c}
+}
+
+// vsDate mimics pgx's reading of a `date` column: midnight UTC.
+func vsDate(date string) time.Time {
+	t, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func TestBuildVenueStateExceptions(t *testing.T) {
+	tz := "Asia/Almaty"
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// Friday 2026-07-24, 13:00 — the venue is inside its 11:00–22:00 window.
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, loc)
+	hours := openEveryDay("11:00", "22:00")
+
+	tests := []struct {
+		name           string
+		overrides      []domain.ScheduleOverride
+		overridesKnown bool
+		wantOpenNow    *bool
+		wantWindow     bool // exceptions_from/until published at all
+		wantExceptions []domain.ScheduleException
+	}{
+		{
+			name:           "no special days: the window is still stated, the list is empty",
+			overridesKnown: true, wantOpenNow: boolp(true), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{},
+		},
+		{
+			name:           "a closure TODAY flips open_now and is published as closed",
+			overrides:      []domain.ScheduleOverride{vsClosed("2026-07-24")},
+			overridesKnown: true, wantOpenNow: boolp(false), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{{Date: "2026-07-24"}},
+		},
+		{
+			name:           "an upcoming closure is visible, and today stays open",
+			overrides:      []domain.ScheduleOverride{vsClosed("2026-08-01")},
+			overridesKnown: true, wantOpenNow: boolp(true), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{{Date: "2026-08-01"}},
+		},
+		{
+			name:           "changed hours today are honoured by open_now and published",
+			overrides:      []domain.ScheduleOverride{vsHours("2026-07-24", "18:00", "23:00")},
+			overridesKnown: true, wantOpenNow: boolp(false), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{
+				{Date: "2026-07-24", IsOpen: true, OpenTime: "18:00", CloseTime: "23:00"},
+			},
+		},
+		{
+			name:           "a past closure is neither applied nor published",
+			overrides:      []domain.ScheduleOverride{vsClosed("2026-07-23")},
+			overridesKnown: true, wantOpenNow: boolp(true), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{},
+		},
+		{
+			name:           "a closure beyond the published horizon is not shown",
+			overrides:      []domain.ScheduleOverride{vsClosed("2026-09-30")},
+			overridesKnown: true, wantOpenNow: boolp(true), wantWindow: true,
+			wantExceptions: []domain.ScheduleException{},
+		},
+		{
+			name:      "overrides unreadable: no open_now and NO window — unknown, not 'none'",
+			overrides: nil, overridesKnown: false,
+			wantOpenNow: nil, wantWindow: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := buildVenueState(hours, tc.overrides, tc.overridesKnown, tz,
+				domain.CapacityModeTables, 0, 4, now)
+			if st.Schedule == nil {
+				t.Fatal("schedule must be present: the venue has usable weekly hours")
+			}
+			switch {
+			case tc.wantOpenNow == nil && st.Schedule.OpenNow != nil:
+				t.Errorf("open_now = %v, want absent (unknown)", *st.Schedule.OpenNow)
+			case tc.wantOpenNow != nil && st.Schedule.OpenNow == nil:
+				t.Errorf("open_now absent, want %v", *tc.wantOpenNow)
+			case tc.wantOpenNow != nil && *st.Schedule.OpenNow != *tc.wantOpenNow:
+				t.Errorf("open_now = %v, want %v", *st.Schedule.OpenNow, *tc.wantOpenNow)
+			}
+			if !tc.wantWindow {
+				if st.Schedule.ExceptionsFrom != "" || st.Schedule.ExceptionsUntil != "" {
+					t.Errorf("window = %s..%s, want none: the server did not read the overrides",
+						st.Schedule.ExceptionsFrom, st.Schedule.ExceptionsUntil)
+				}
+				if len(st.Schedule.Exceptions) != 0 {
+					t.Errorf("exceptions = %+v, want none", st.Schedule.Exceptions)
+				}
+				return
+			}
+			if st.Schedule.ExceptionsFrom != "2026-07-24" || st.Schedule.ExceptionsUntil != "2026-08-22" {
+				t.Errorf("window = %s..%s, want 2026-07-24..2026-08-22",
+					st.Schedule.ExceptionsFrom, st.Schedule.ExceptionsUntil)
+			}
+			if len(st.Schedule.Exceptions) != len(tc.wantExceptions) {
+				t.Fatalf("exceptions = %+v, want %+v", st.Schedule.Exceptions, tc.wantExceptions)
+			}
+			for i := range tc.wantExceptions {
+				if st.Schedule.Exceptions[i] != tc.wantExceptions[i] {
+					t.Errorf("exception[%d] = %+v, want %+v",
+						i, st.Schedule.Exceptions[i], tc.wantExceptions[i])
+				}
+			}
+		})
+	}
+}
+
+// A venue shut for one holiday is not a venue that cannot be booked online:
+// accepts_online_bookings is a static capability, and flipping it on a single
+// date would hide the booking button for the other twenty-nine days.
+func TestOverrideDoesNotChangeTheBookabilityFlag(t *testing.T) {
+	tz := "Asia/Almaty"
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, loc)
+	st := buildVenueState(openEveryDay("11:00", "22:00"),
+		[]domain.ScheduleOverride{vsClosed("2026-07-24")}, true, tz,
+		domain.CapacityModeTables, 0, 4, now)
+	if !st.AcceptsOnlineBookings {
+		t.Error("a one-day closure must not make the venue unbookable in general")
+	}
+}
+
+// The batch read must cover yesterday (a shift that began the previous evening
+// is still running at 00:30) and the whole published horizon.
+func TestVenueStateAsksForTheWholeExceptionWindow(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, loc)
+	id := uuid.New()
+	reader := &fakeVenueState{
+		hours:  map[uuid.UUID][]domain.WorkingHours{id: openEveryDay("11:00", "22:00")},
+		tables: map[uuid.UUID]int{id: 4},
+	}
+	v := NewVenueState(reader, fixedTZ{tz: "Asia/Almaty"},
+		WithVenueStateClock(func() time.Time { return now }))
+	agg := &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: id}}
+	v.AttachOne(context.Background(), agg)
+
+	if len(reader.overrideWins) != 1 {
+		t.Fatalf("overrides read %d times, want exactly one batch", len(reader.overrideWins))
+	}
+	from, to := reader.overrideWins[0][0], reader.overrideWins[0][1]
+	if !from.Before(now.AddDate(0, 0, -1).Add(time.Second)) {
+		t.Errorf("window starts at %v, must reach back to yesterday for the past-midnight shift", from)
+	}
+	if to.Before(now.AddDate(0, 0, scheduleExceptionDays-1)) {
+		t.Errorf("window ends at %v, must cover the whole published horizon", to)
+	}
+}
+
+// A failed override read must not silently degrade into "the venue is open":
+// the catalog is still served, but open_now and the window are absent.
+func TestVenueStateDegradesWhenOverridesCannotBeRead(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, loc)
+	id := uuid.New()
+	reader := &fakeVenueState{
+		hours:        map[uuid.UUID][]domain.WorkingHours{id: openEveryDay("11:00", "22:00")},
+		tables:       map[uuid.UUID]int{id: 4},
+		overridesErr: errors.New("boom"),
+	}
+	v := NewVenueState(reader, fixedTZ{tz: "Asia/Almaty"},
+		WithVenueStateClock(func() time.Time { return now }))
+	agg := &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: id}}
+	v.AttachOne(context.Background(), agg)
+
+	if agg.VenueState == nil || agg.VenueState.Schedule == nil {
+		t.Fatal("the weekly schedule must still be served")
+	}
+	if agg.VenueState.Schedule.OpenNow != nil {
+		t.Errorf("open_now = %v, want absent: the special days were not readable",
+			*agg.VenueState.Schedule.OpenNow)
+	}
+	if agg.VenueState.Schedule.ExceptionsFrom != "" {
+		t.Error("an exceptions window must not be published when the read failed")
 	}
 }
