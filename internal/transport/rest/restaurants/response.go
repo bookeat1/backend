@@ -55,9 +55,43 @@ type restaurantResponse struct {
 type scheduleResponse struct {
 	// Timezone is the IANA zone `open_now` was computed in — the venue's own.
 	Timezone string `json:"timezone"`
-	// OpenNow is absent when the timezone could not be resolved on the server.
+	// OpenNow is absent when the timezone could not be resolved on the server,
+	// or when the venue's special days could not be read — "open now" computed
+	// without the exceptions is exactly the lie a holiday closure produces.
 	OpenNow *bool                 `json:"open_now,omitempty"`
 	Days    []scheduleDayResponse `json:"days"`
+	// Exceptions are the venue's SPECIAL DAYS for the covered window: dates
+	// that override the weekday row in Days — a holiday closure, one-off hours,
+	// or an opening on a weekday the venue is normally shut. A date listed here
+	// wins over Days for that date, and the booking engine resolves it through
+	// the same rule, so a date shown as closed sells no slots.
+	//
+	// THE WINDOW IS THE PRESENCE SIGNAL, not the array: exceptions_from /
+	// exceptions_until are set whenever the server looked, and the list is then
+	// simply omitted when there is nothing in it (an empty JSON array carries
+	// no information the window does not already give). No window at all means
+	// the server does NOT know the venue's special days — never "there are
+	// none", the same rule `days` already follows (absent ≠ closed).
+	Exceptions      []scheduleExceptionResponse `json:"exceptions,omitempty"`
+	ExceptionsFrom  string                      `json:"exceptions_from,omitempty"`
+	ExceptionsUntil string                      `json:"exceptions_until,omitempty"`
+}
+
+// scheduleExceptionResponse is one dated departure from the weekly schedule. It
+// mirrors scheduleDayResponse field for field (minus day_of_week, plus the
+// date and the admin's note) so a client renders it with the same code.
+type scheduleExceptionResponse struct {
+	// Date is "YYYY-MM-DD" in the venue's own timezone.
+	Date   string `json:"date"`
+	IsOpen bool   `json:"is_open"`
+	// OpensAt/ClosesAt are "HH:MM" venue-local wall clock, empty when closed.
+	OpensAt  string `json:"opens_at"`
+	ClosesAt string `json:"closes_at"`
+	// ClosesNextDay marks a special-day window that runs past midnight.
+	ClosesNextDay bool `json:"closes_next_day"`
+	// Note is what the venue wrote about the day ("Новогодние каникулы"),
+	// empty when it wrote nothing.
+	Note string `json:"note,omitempty"`
 }
 
 type scheduleDayResponse struct {
@@ -90,10 +124,21 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 			OpensAt: d.OpenTime, ClosesAt: d.CloseTime, ClosesNextDay: d.ClosesNextDay,
 		})
 	}
+	exceptions := make([]scheduleExceptionResponse, 0, len(st.Schedule.Exceptions))
+	for _, e := range st.Schedule.Exceptions {
+		exceptions = append(exceptions, scheduleExceptionResponse{
+			Date: e.Date, IsOpen: e.IsOpen,
+			OpensAt: e.OpenTime, ClosesAt: e.CloseTime, ClosesNextDay: e.ClosesNextDay,
+			Note: e.Note,
+		})
+	}
 	resp.Schedule = &scheduleResponse{
-		Timezone: st.Schedule.Timezone,
-		OpenNow:  st.Schedule.OpenNow,
-		Days:     days,
+		Timezone:        st.Schedule.Timezone,
+		OpenNow:         st.Schedule.OpenNow,
+		Days:            days,
+		Exceptions:      exceptions,
+		ExceptionsFrom:  st.Schedule.ExceptionsFrom,
+		ExceptionsUntil: st.Schedule.ExceptionsUntil,
 	}
 }
 

@@ -57,6 +57,16 @@ type publicPayload struct {
 			ClosesAt      string `json:"closes_at"`
 			ClosesNextDay bool   `json:"closes_next_day"`
 		} `json:"days"`
+		Exceptions []struct {
+			Date          string `json:"date"`
+			IsOpen        bool   `json:"is_open"`
+			OpensAt       string `json:"opens_at"`
+			ClosesAt      string `json:"closes_at"`
+			ClosesNextDay bool   `json:"closes_next_day"`
+			Note          string `json:"note"`
+		} `json:"exceptions"`
+		ExceptionsFrom  string `json:"exceptions_from"`
+		ExceptionsUntil string `json:"exceptions_until"`
 	} `json:"schedule"`
 	AcceptsOnlineBookings *bool `json:"accepts_online_bookings"`
 }

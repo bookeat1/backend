@@ -173,9 +173,15 @@ func (u *availabilityUseCase) loadUsage(ctx context.Context, restaurantID uuid.U
 
 // schedule is the venue's day-shape inputs, loaded once per request.
 type schedule struct {
-	hours  []domain.WorkingHours
-	slots  []domain.TimeSlot
-	tables []domain.RestaurantTable
+	hours []domain.WorkingHours
+	// overrides are the venue's special-day exceptions
+	// (restaurant_schedule_overrides). They live HERE, next to the weekly
+	// hours, because every consumer of a venue's day shape — availability,
+	// create, update — reads this struct through loadSchedule: a caller cannot
+	// get the hours without also getting the exceptions to them.
+	overrides []domain.ScheduleOverride
+	slots     []domain.TimeSlot
+	tables    []domain.RestaurantTable
 }
 
 func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uuid.UUID) (schedule, error) {
@@ -186,6 +192,10 @@ func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uui
 // venue. Inactive tables are dropped here so no caller can forget to.
 func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID) (schedule, error) {
 	hours, err := r.ListWorkingHours(ctx, restaurantID)
+	if err != nil {
+		return schedule{}, err
+	}
+	overrides, err := r.ListScheduleOverrides(ctx, restaurantID)
 	if err != nil {
 		return schedule{}, err
 	}
@@ -203,7 +213,7 @@ func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID)
 			active = append(active, t)
 		}
 	}
-	return schedule{hours: hours, slots: slots, tables: active}, nil
+	return schedule{hours: hours, overrides: overrides, slots: slots, tables: active}, nil
 }
 
 // evaluateSlot decides whether one start time can seat the party.
@@ -327,7 +337,10 @@ func totalCapacity(tables []domain.RestaurantTable) int {
 func candidateStarts(s schedule, day time.Time, policy domain.BookingPolicy, step time.Duration) []time.Time {
 	loc := day.Location()
 	dow := int(day.Weekday())
-	open, close_, ok := openingWindow(s.hours, dow, day, loc)
+	// The window already has the venue's special-day override applied: a date
+	// closed by an override has no window, so it produces NO start times at
+	// all, whatever the weekly hours and the explicit time-slot rows say.
+	open, close_, ok := openingWindow(s, day, loc)
 	if !ok {
 		return nil
 	}
@@ -361,14 +374,17 @@ func candidateStarts(s schedule, day time.Time, policy domain.BookingPolicy, ste
 	return out
 }
 
-// openingWindow returns [open, close) for the weekday in the venue's timezone.
-// A close time that is not after the open time is treated as past midnight
-// (e.g. 18:00–02:00) and rolls into the next day.
+// openingWindow returns [open, close) for one calendar day in the venue's
+// timezone, with the venue's special-day overrides applied. A close time that
+// is not after the open time is treated as past midnight (e.g. 18:00–02:00) and
+// rolls into the next day.
 //
-// It delegates to domain.OpeningWindow: the public catalog payload now reports
-// the same schedule to guests, and the two must never drift apart.
-func openingWindow(hours []domain.WorkingHours, dow int, day time.Time, loc *time.Location) (time.Time, time.Time, bool) {
-	return domain.OpeningWindow(hours, dow, day, loc)
+// It delegates to domain.OpeningWindow and takes the whole schedule (hours AND
+// overrides) rather than the hours alone: the public catalog payload reports the
+// same days to guests through the same function, and the two must never drift
+// apart again.
+func openingWindow(s schedule, day time.Time, loc *time.Location) (time.Time, time.Time, bool) {
+	return domain.OpeningWindow(s.hours, s.overrides, day, loc)
 }
 
 // startOfDay returns midnight of t's calendar day in loc.

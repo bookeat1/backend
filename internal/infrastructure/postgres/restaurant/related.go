@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/postgres/schedule"
 	"backend-core/internal/infrastructure/sqltx"
 )
 
@@ -545,6 +546,24 @@ func (r *Related) WorkingHoursFor(ctx context.Context, ids []uuid.UUID) (map[uui
 		out[w.RestaurantID] = append(out[w.RestaurantID], w)
 	}
 	return out, rows.Err()
+}
+
+// ListScheduleOverrides returns one venue's special-day exceptions, for the
+// availability engine (usecase/bookings.loadSchedule) — the same rows the admin
+// panel writes and the money path reads.
+//
+// It delegates to the schedule repository, which OWNS this table: the query,
+// the column order and the scan live in exactly one place, so a column added
+// there (as 0036 added the paid-day pair) cannot reach one reader and miss
+// another.
+func (r *Related) ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID) ([]domain.ScheduleOverride, error) {
+	return schedule.New(r.pool).ListByRestaurant(ctx, restaurantID)
+}
+
+// ScheduleOverridesFor is the batch read behind the public catalog: the
+// special days of MANY venues inside a date window, in one round-trip.
+func (r *Related) ScheduleOverridesFor(ctx context.Context, ids []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.ScheduleOverride, error) {
+	return schedule.New(r.pool).ListForVenues(ctx, ids, from, to)
 }
 
 // BookableTableCountsFor counts, per venue, the tables that could actually seat

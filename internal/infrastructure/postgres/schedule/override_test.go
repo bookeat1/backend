@@ -162,3 +162,112 @@ func TestScheduleOverrideInstantFallbackTZ(t *testing.T) {
 		t.Fatalf("fallback-tz lookup wrong: %+v", got)
 	}
 }
+
+// ListForVenues is the batch read behind the public catalog. It must group by
+// venue, respect the INCLUSIVE date bounds, and — the part that is easy to get
+// wrong — bind the bounds as calendar dates, not as instants reinterpreted in
+// whatever timezone the connection happens to run in.
+func TestScheduleOverrideListForVenues(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+
+	var rids []uuid.UUID
+	for i := 0; i < 2; i++ {
+		rid := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'R','Алматы','₸')`, rid); err != nil {
+			t.Fatalf("seed restaurant: %v", err)
+		}
+		rids = append(rids, rid)
+	}
+	repo := New(pool)
+	d := func(day int) time.Time { return time.Date(2026, 1, day, 0, 0, 0, 0, time.UTC) }
+
+	seed := []*domain.ScheduleOverride{
+		{RestaurantID: rids[0], Date: d(1), IsClosed: true},
+		{RestaurantID: rids[0], Date: d(5), OpenTime: ptr("16:00"), CloseTime: ptr("20:00")},
+		{RestaurantID: rids[0], Date: d(20), IsClosed: true}, // outside the window
+		{RestaurantID: rids[1], Date: d(3), IsClosed: true},
+	}
+	for _, o := range seed {
+		if err := repo.Upsert(ctx, o); err != nil {
+			t.Fatalf("seed override: %v", err)
+		}
+	}
+
+	got, err := repo.ListForVenues(ctx, rids, d(1), d(5))
+	if err != nil {
+		t.Fatalf("list for venues: %v", err)
+	}
+	if len(got[rids[0]]) != 2 {
+		t.Errorf("venue 0: %+v, want the two inside [01-01, 01-05] (bounds inclusive)", got[rids[0]])
+	}
+	if len(got[rids[1]]) != 1 {
+		t.Errorf("venue 1: %+v, want its single override", got[rids[1]])
+	}
+	for _, o := range got[rids[0]] {
+		if o.RestaurantID != rids[0] {
+			t.Errorf("rows leaked across venues: %+v", o)
+		}
+	}
+	// The stored date must survive the round-trip as the same calendar day.
+	if len(got[rids[0]]) > 0 && got[rids[0]][0].Date.Format("2006-01-02") != "2026-01-01" {
+		t.Errorf("date came back as %s, want 2026-01-01", got[rids[0]][0].Date.Format(time.RFC3339))
+	}
+
+	// A window that touches nothing returns an empty map, not every row.
+	empty, err := repo.ListForVenues(ctx, rids, d(10), d(12))
+	if err != nil {
+		t.Fatalf("list empty window: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("window with no overrides returned %+v", empty)
+	}
+	// No ids at all: no query, no rows.
+	if m, err := repo.ListForVenues(ctx, nil, d(1), d(5)); err != nil || len(m) != 0 {
+		t.Errorf("empty id list = %v, %v; want an empty map and no error", m, err)
+	}
+}
+
+// The session timezone must not move a date. The same window is asked for on a
+// connection running in UTC and one running in Asia/Almaty; both must return
+// the boundary row, which a `$1::timestamptz::date` binding would drop.
+func TestScheduleOverrideListForVenuesIgnoresSessionTimezone(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'R','Алматы','₸')`, rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := New(pool).Upsert(ctx, &domain.ScheduleOverride{RestaurantID: rid, Date: day, IsClosed: true}); err != nil {
+		t.Fatalf("seed override: %v", err)
+	}
+
+	for _, tz := range []string{"UTC", "Asia/Almaty", "Pacific/Honolulu"} {
+		t.Run(tz, func(t *testing.T) {
+			conn, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			defer conn.Release()
+			if _, err := conn.Exec(ctx, "SET TIME ZONE '"+tz+"'"); err != nil {
+				t.Fatalf("set tz: %v", err)
+			}
+			out, err := New(conn).ListForVenues(ctx, []uuid.UUID{rid}, day, day)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(out[rid]) != 1 {
+				t.Errorf("session tz %s lost the boundary row: %+v", tz, out)
+			}
+			if _, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'"); err != nil {
+				t.Fatalf("reset tz: %v", err)
+			}
+		})
+	}
+}
