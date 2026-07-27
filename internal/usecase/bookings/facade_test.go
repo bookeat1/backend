@@ -319,3 +319,161 @@ func TestFacadeGet_FreeCancelDeadline_NilForTerminal(t *testing.T) {
 		t.Fatalf("terminal booking should have no free_cancel_deadline, got %v", *got.FreeCancelDeadline)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ?date= is the VENUE's day
+// ---------------------------------------------------------------------------
+
+// fakeVenueZone answers with a fixed venue zone and a fixed platform zone, so a
+// test can prove which of the two a listing was bucketed by.
+type fakeVenueZone struct {
+	venue    *time.Location
+	platform *time.Location
+	err      error
+	calls    int
+}
+
+func (f *fakeVenueZone) VenueLocation(_ context.Context, _ uuid.UUID) (*time.Location, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.venue, nil
+}
+
+func (f *fakeVenueZone) PlatformLocation() (*time.Location, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.platform, nil
+}
+
+func mustZone(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Skipf("timezone database unavailable for %s: %v", name, err)
+	}
+	return loc
+}
+
+// TestListByRestaurantResolvesTheDateInTheVenueZone: the venue calendar's "day"
+// is the venue's own day. Asking for 2026-07-25 at an Almaty venue must select
+// [00:00, 24:00) ALMATY — not the UTC day, which starts at 05:00 local and put
+// the tail of every evening service on the next day's screen.
+func TestListByRestaurantResolvesTheDateInTheVenueZone(t *testing.T) {
+	h := newFacadeHarness(t, domain.BookingConfirmed)
+	almaty := mustZone(t, "Asia/Almaty")
+	zone := &fakeVenueZone{venue: almaty, platform: time.UTC}
+	h.f = NewFacade(h.bookings, h.links, h.items, h.messages, h.surveys,
+		h.history, h.outbox, newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}), h.tx,
+		WithVenueLocationResolver(zone))
+
+	day := domain.CalendarDate{Year: 2026, Month: time.July, Day: 25}
+	if _, _, err := h.f.ListByRestaurant(context.Background(), h.manager, h.restaurantID,
+		domain.BookingFilter{CalendarDate: &day}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	got := h.bookings.lastFlt
+	if got.CalendarDate != nil {
+		t.Fatal("the calendar date reached the repository unresolved")
+	}
+	wantFrom := time.Date(2026, 7, 25, 0, 0, 0, 0, almaty)
+	wantTo := time.Date(2026, 7, 26, 0, 0, 0, 0, almaty)
+	if got.From == nil || !got.From.Equal(wantFrom) {
+		t.Fatalf("from = %v, want the venue's own midnight %v", got.From, wantFrom)
+	}
+	if got.To == nil || !got.To.Equal(wantTo) {
+		t.Fatalf("to = %v, want the venue's next midnight %v", got.To, wantTo)
+	}
+}
+
+// TestListByRestaurantDateSpansTheRealLocalDayAcrossDST: on a spring-forward
+// date the venue's day is 23 hours long, and on a fall-back date 25. The window
+// must be the day, not a fixed 24 hours from local midnight — a booking made in
+// the extra hour of the long day would otherwise fall outside "that day".
+func TestListByRestaurantDateSpansTheRealLocalDayAcrossDST(t *testing.T) {
+	lisbon := mustZone(t, "Europe/Lisbon")
+	cases := []struct {
+		name  string
+		date  domain.CalendarDate
+		hours float64
+	}{
+		{"spring forward, a 23-hour day", domain.CalendarDate{Year: 2026, Month: time.March, Day: 29}, 23},
+		{"fall back, a 25-hour day", domain.CalendarDate{Year: 2026, Month: time.October, Day: 25}, 25},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFacadeHarness(t, domain.BookingConfirmed)
+			h.f = NewFacade(h.bookings, h.links, h.items, h.messages, h.surveys,
+				h.history, h.outbox, newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}), h.tx,
+				WithVenueLocationResolver(&fakeVenueZone{venue: lisbon, platform: time.UTC}))
+
+			date := tc.date
+			if _, _, err := h.f.ListByRestaurant(context.Background(), h.manager, h.restaurantID,
+				domain.BookingFilter{CalendarDate: &date}); err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			got := h.bookings.lastFlt
+			if got.From == nil || got.To == nil {
+				t.Fatal("the date filter was dropped")
+			}
+			if h, want := got.To.Sub(*got.From).Hours(), tc.hours; h != want {
+				t.Fatalf("the venue's day is %.0fh long, the filter covers %.0fh", want, h)
+			}
+			// Both ends are wall-clock midnight, whatever the offset does in between.
+			if got.From.In(lisbon).Hour() != 0 || got.To.In(lisbon).Hour() != 0 {
+				t.Fatalf("window ends are not local midnights: %s .. %s", got.From.In(lisbon), got.To.In(lisbon))
+			}
+		})
+	}
+}
+
+// TestListByRestaurantRefusesADateItCannotPlace: with no zone resolver wired,
+// or with a venue whose stored zone is unusable, the listing FAILS. It must not
+// answer with a UTC day, and it must not answer with the whole history: both
+// look like a normal page to whoever is reading the screen.
+func TestListByRestaurantRefusesADateItCannotPlace(t *testing.T) {
+	t.Run("no resolver wired", func(t *testing.T) {
+		h := newFacadeHarness(t, domain.BookingConfirmed)
+		day := domain.CalendarDate{Year: 2026, Month: time.July, Day: 25}
+		if _, _, err := h.f.ListByRestaurant(context.Background(), h.manager, h.restaurantID,
+			domain.BookingFilter{CalendarDate: &day}); err == nil {
+			t.Fatalf("a date filter was answered without a zone; repository saw %+v", h.bookings.lastFlt)
+		}
+	})
+	t.Run("venue zone unusable", func(t *testing.T) {
+		h := newFacadeHarness(t, domain.BookingConfirmed)
+		_, zoneErr := domain.LoadVenueLocation("KZT")
+		h.f = NewFacade(h.bookings, h.links, h.items, h.messages, h.surveys,
+			h.history, h.outbox, newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}), h.tx,
+			WithVenueLocationResolver(&fakeVenueZone{err: zoneErr}))
+		day := domain.CalendarDate{Year: 2026, Month: time.July, Day: 25}
+		_, _, err := h.f.ListByRestaurant(context.Background(), h.manager, h.restaurantID,
+			domain.BookingFilter{CalendarDate: &day})
+		if code, ok := domain.CodeOf(err); !ok || code != domain.CodeVenueTimezoneInvalid {
+			t.Fatalf("err = %v (code %q), want the venue-timezone refusal", err, code)
+		}
+	})
+}
+
+// TestListMineResolvesTheDateInThePlatformZone pins the guest side: a guest's
+// bookings can sit in several zones, so no venue defines the day and the
+// platform zone is used. UTC would be wrong for every current user.
+func TestListMineResolvesTheDateInThePlatformZone(t *testing.T) {
+	h := newFacadeHarness(t, domain.BookingConfirmed)
+	almaty := mustZone(t, "Asia/Almaty")
+	h.f = NewFacade(h.bookings, h.links, h.items, h.messages, h.surveys,
+		h.history, h.outbox, newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}), h.tx,
+		WithVenueLocationResolver(&fakeVenueZone{venue: time.UTC, platform: almaty}))
+
+	day := domain.CalendarDate{Year: 2026, Month: time.July, Day: 25}
+	if _, _, err := h.f.ListMine(context.Background(), h.guest, domain.BookingFilter{CalendarDate: &day}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	got := h.bookings.lastFlt
+	want := time.Date(2026, 7, 25, 0, 0, 0, 0, almaty)
+	if got.From == nil || !got.From.Equal(want) {
+		t.Fatalf("from = %v, want the platform zone's midnight %v", got.From, want)
+	}
+}

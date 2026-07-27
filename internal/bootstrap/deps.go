@@ -304,7 +304,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
-		bookings.WithFreeCancelDeadlineResolver(cancelDeadline)) // same window as the money path
+		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
+		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
@@ -605,6 +606,38 @@ func (a depositSettlerAdapter) SettleDepositOnCancel(ctx context.Context, bookin
 		Trigger: trigger, CancelledAt: cancelledAt,
 	})
 	return err
+}
+
+// venueLocationAdapter implements usecase/bookings' venueLocationResolver: it
+// answers which zone a venue's calendar day is measured in, for the ?date=
+// filter of the venue calendar.
+//
+// It resolves the venue's OWN stored zone strictly (domain.LoadVenueLocation —
+// an unusable value is an error, never a substituted zone), and falls back to
+// the platform zone only when the venue has none. That is the same split the
+// payout pass makes: "no zone of its own" is a configuration, "a zone we cannot
+// read" is a data fault, and answering a fault with the platform default is how
+// a whole screen of bookings ends up on the wrong day without anybody noticing.
+type venueLocationAdapter struct {
+	restaurants interface {
+		GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error)
+	}
+	cfg bookings.Config
+}
+
+func (a venueLocationAdapter) VenueLocation(ctx context.Context, restaurantID uuid.UUID) (*time.Location, error) {
+	agg, err := a.restaurants.GetByID(ctx, restaurantID)
+	if err != nil {
+		return nil, err
+	}
+	if tz := agg.BookingPolicy.Timezone; tz != nil && strings.TrimSpace(*tz) != "" {
+		return domain.LoadVenueLocation(*tz)
+	}
+	return a.PlatformLocation()
+}
+
+func (a venueLocationAdapter) PlatformLocation() (*time.Location, error) {
+	return domain.LoadVenueLocation(a.cfg.TimezoneFallback)
 }
 
 // specialDayAdapter implements usecase/payments' specialDayResolver over the
