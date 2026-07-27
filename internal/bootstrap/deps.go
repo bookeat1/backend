@@ -29,6 +29,7 @@ import (
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
+	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
@@ -60,6 +61,7 @@ import (
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
+	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
@@ -90,6 +92,7 @@ type Deps struct {
 	ReviewsFacade      reviews.Facade
 	EventsFacade       events.Facade
 	PromosFacade       promos.Facade
+	GastroguideFacade  gastroguide.Facade
 	ContentFacade      content.Facade
 	FeedFacade         feed.Facade
 	MenuFacade         menu.Facade
@@ -216,6 +219,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers, feedRepo)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
+
+	// Gastroguide (migration 0061): editorial collections of venues. Guest reads
+	// only — there is no editor cabinet yet, so the facade takes the repository
+	// and nothing else: no RBAC port, because nothing here writes.
+	gastroguideFacade := gastroguide.NewFacade(gastroguiderepo.New(db))
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
@@ -350,6 +358,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		ReviewsFacade:      reviewsFacade,
 		EventsFacade:       eventsFacade,
 		PromosFacade:       promosFacade,
+		GastroguideFacade:  gastroguideFacade,
 		ContentFacade:      contentFacade,
 		FeedFacade:         feedFacade,
 		MenuFacade:         menuFacade,
