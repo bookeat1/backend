@@ -202,7 +202,7 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 		`SELECT cv.restaurant_id, cv.position, cv.note, cv.note_i18n,
 			rest.name, rest.name_i18n, rest.address, rest.address_i18n,
 			rest.cuisine_type, rest.cuisine_type_i18n, rest.city, rest.price_category,
-			img.image_url
+			img.image_url, rest.is_active
 		 FROM gastroguide_collection_venues cv
 		 JOIN restaurants rest ON rest.id = cv.restaurant_id
 		 LEFT JOIN LATERAL (
@@ -224,7 +224,8 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 		var noteI18n, nameI18n, addrI18n, cuisineI18n []byte
 		if err := rows.Scan(&v.RestaurantID, &v.Position, &v.Note, &noteI18n,
 			&v.Name, &nameI18n, &v.Address, &addrI18n,
-			&v.CuisineType, &cuisineI18n, &v.City, &v.PriceCategory, &v.PrimaryImageURL); err != nil {
+			&v.CuisineType, &cuisineI18n, &v.City, &v.PriceCategory, &v.PrimaryImageURL,
+			&v.IsActive); err != nil {
 			return nil, fmt.Errorf("scan guide collection venue: %w", err)
 		}
 		v.NoteI18n = i18nFromDB(noteI18n)

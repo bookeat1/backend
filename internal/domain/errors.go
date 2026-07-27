@@ -247,6 +247,39 @@ const (
 	// registered under). Fixed by completing the tokenization step for that
 	// venue, not by retrying.
 	CodePayoutDestinationIncomplete ErrorCode = "payout_destination_incomplete"
+
+	// --- gastroguide editor (migration 0061) ---
+	//
+	// The editor cabinet is the only writer of the guide, and every refusal
+	// below is something an editor can fix in the panel without asking an
+	// engineer. A bare 409/422 here would leave them guessing which of three
+	// different problems they hit.
+
+	// CodeGuideSlugTaken — the slug of a collection or a rubric is already used
+	// by another row. Slugs are the client-facing stable name (the app links to
+	// a rubric by slug), so they are unique platform-wide and the editor must
+	// pick a different one. Not retryable.
+	CodeGuideSlugTaken ErrorCode = "guide_slug_taken"
+
+	// CodeGuideCollectionEmpty — publishing was refused because the collection
+	// holds no venue a guest could open. The guest listing hides an empty
+	// collection outright (see the repository's visibleVenues predicate), so
+	// publishing one produces a collection that is "live" and invisible — the
+	// worst state to debug. Fixed by attaching at least one ACTIVE venue.
+	CodeGuideCollectionEmpty ErrorCode = "guide_collection_empty"
+
+	// CodeGuideOrderMismatch — the reorder request did not list exactly the
+	// collection's current venues: it repeated one, skipped one, or named a
+	// venue that is not in the collection. The order is sent as the intended
+	// FINAL sequence, so a payload that disagrees with the membership means the
+	// editor's screen is stale (somebody attached or detached a venue in
+	// another tab). Nothing is written; the client reloads and retries.
+	CodeGuideOrderMismatch ErrorCode = "guide_order_mismatch"
+
+	// CodeGuideVenueAlreadyAttached — this venue is already in this collection.
+	// A venue may sit in any number of DIFFERENT collections; what the primary
+	// key forbids is the same venue twice in one.
+	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps
