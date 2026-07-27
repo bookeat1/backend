@@ -209,6 +209,16 @@ const (
 	// should retry, or fall back to browsing without the filter — never
 	// present the result as filtered.
 	CodeCatalogVenueStateUnavailable ErrorCode = "catalog_venue_state_unavailable"
+
+	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
+	// against) a venue is not a usable IANA zone name. Kept apart from the
+	// generic validation code because it is the one venue field money decisions
+	// are derived from: it names the venue's payout day, the local date of a
+	// paid special day, and the wall clock its opening hours are read on. On a
+	// write it means "nothing was saved, fix the name"; on a read it means "we
+	// refuse to settle this venue on a guessed day until the stored value is
+	// corrected" — never "we quietly used the platform default".
+	CodeVenueTimezoneInvalid ErrorCode = "venue_timezone_invalid"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps
