@@ -219,6 +219,34 @@ const (
 	// refuse to settle this venue on a guessed day until the stored value is
 	// corrected" — never "we quietly used the platform default".
 	CodeVenueTimezoneInvalid ErrorCode = "venue_timezone_invalid"
+
+	// Payout destination ownership (money OUT — generating and dispatching a
+	// venue payout). All three mean "no money was moved"; they are kept apart
+	// because the operator's next action is completely different, and because a
+	// mismatch is the one that must never be retried away.
+
+	// CodePayoutDestinationMissing — the restaurant has no payout destination
+	// on file at all (never configured, or the card was removed after the
+	// payout had already been generated). Nothing to pay to: the money stays
+	// owed and is settled once a card is registered.
+	CodePayoutDestinationMissing ErrorCode = "payout_destination_missing"
+
+	// CodePayoutDestinationMismatch — the card this payout would be paid to is
+	// NOT the card currently registered to that restaurant: it belongs to a
+	// different venue, or the venue's destination was changed after the payout
+	// was generated and the frozen snapshot now addresses a card nobody at this
+	// venue owns any more. This is the ownership failure: it is never retried
+	// and never "fixed" by re-sending — the payout is failed, its ledger
+	// entries are released, and the next generation builds a payout against the
+	// card that is actually registered.
+	CodePayoutDestinationMismatch ErrorCode = "payout_destination_mismatch"
+
+	// CodePayoutDestinationIncomplete — the destination belongs to the right
+	// restaurant but does not identify a card the provider can address (a
+	// tokenized payout needs BOTH the card token and the provider user id it is
+	// registered under). Fixed by completing the tokenization step for that
+	// venue, not by retrying.
+	CodePayoutDestinationIncomplete ErrorCode = "payout_destination_incomplete"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

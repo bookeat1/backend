@@ -87,3 +87,117 @@ func TestPayoutDestinationValidate_RejectsRawPAN(t *testing.T) {
 		t.Error("increment 1 supports only FreedomPay payouts")
 	}
 }
+
+// --- ownership of the card money is sent to -------------------------------
+
+// TestPayoutDestinationVerifyOwnedBy covers the three ways a card can fail to
+// be "the card this venue is entitled to be paid on". Each one carries its own
+// code because the operator's next action differs, so the codes are asserted,
+// not just the fact that an error came back.
+func TestPayoutDestinationVerifyOwnedBy(t *testing.T) {
+	rid := uuid.New()
+	good := &PayoutDestination{
+		RestaurantID:        rid,
+		Provider:            ProviderFreedomPay,
+		Method:              PayoutMethodFreedomPayCardToken,
+		Token:               uuid.NewString(),
+		ProviderCustomerRef: "fp-user-1",
+	}
+	if err := good.VerifyOwnedBy(rid); err != nil {
+		t.Fatalf("the venue's own complete destination must pass, got %v", err)
+	}
+
+	foreign := *good
+	foreign.RestaurantID = uuid.New()
+
+	incomplete := *good
+	incomplete.ProviderCustomerRef = "  "
+
+	malformed := *good
+	malformed.Token = "card-1234"
+
+	cases := map[string]struct {
+		dest *PayoutDestination
+		want ErrorCode
+	}{
+		"no destination at all":                      {nil, CodePayoutDestinationMissing},
+		"a card registered to a different venue":     {&foreign, CodePayoutDestinationMismatch},
+		"a card with no provider user id":            {&incomplete, CodePayoutDestinationIncomplete},
+		"a handle that is not a provider card token": {&malformed, CodePayoutDestinationIncomplete},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := tc.dest.VerifyOwnedBy(rid)
+			if err == nil {
+				t.Fatal("expected the ownership check to refuse")
+			}
+			code, ok := CodeOf(err)
+			if !ok || code != tc.want {
+				t.Fatalf("expected code %q, got %q (ok=%v): %v", tc.want, code, ok, err)
+			}
+		})
+	}
+
+	// A nil restaurant id must never match a real destination: an unset id is
+	// not proof of anything, so it is refused rather than treated as a wildcard.
+	if err := good.VerifyOwnedBy(uuid.Nil); err == nil {
+		t.Fatal("a nil restaurant id must not pass the ownership check")
+	}
+}
+
+// TestVerifyPayoutDestinationSnapshot proves the frozen card on a payout is
+// re-checked against the venue's LIVE destination — the window between
+// generating a payout and dispatching it is where a card can change hands.
+func TestVerifyPayoutDestinationSnapshot(t *testing.T) {
+	rid := uuid.New()
+	token, ref := uuid.NewString(), "fp-user-1"
+	current := &PayoutDestination{
+		RestaurantID:        rid,
+		Provider:            ProviderFreedomPay,
+		Method:              PayoutMethodFreedomPayCardToken,
+		Token:               token,
+		ProviderCustomerRef: ref,
+	}
+	p := Payout{
+		ID:                     uuid.New(),
+		RestaurantID:           rid,
+		Method:                 PayoutMethodFreedomPayCardToken,
+		DestinationToken:       token,
+		DestinationCustomerRef: ref,
+	}
+	if err := VerifyPayoutDestination(p, current); err != nil {
+		t.Fatalf("a payout addressing the venue's current card must pass, got %v", err)
+	}
+
+	// The venue replaced its card after the payout was generated: the old
+	// snapshot must NOT be paid, and must not be silently re-pointed either.
+	swapped := *current
+	swapped.Token = uuid.NewString()
+	err := VerifyPayoutDestination(p, &swapped)
+	if code, _ := CodeOf(err); code != CodePayoutDestinationMismatch {
+		t.Fatalf("a stale card snapshot must be refused as a mismatch, got %v", err)
+	}
+
+	// Same card token, different provider user id — the pair is the address,
+	// so half a match is a mismatch.
+	otherUser := *current
+	otherUser.ProviderCustomerRef = "fp-user-2"
+	err = VerifyPayoutDestination(p, &otherUser)
+	if code, _ := CodeOf(err); code != CodePayoutDestinationMismatch {
+		t.Fatalf("a different provider user id must be refused, got %v", err)
+	}
+
+	// The card is no longer attached to anybody at this venue.
+	err = VerifyPayoutDestination(p, nil)
+	if code, _ := CodeOf(err); code != CodePayoutDestinationMissing {
+		t.Fatalf("a payout with no live destination must be refused as missing, got %v", err)
+	}
+
+	// The destination on file belongs to another restaurant entirely.
+	foreign := *current
+	foreign.RestaurantID = uuid.New()
+	err = VerifyPayoutDestination(p, &foreign)
+	if code, _ := CodeOf(err); code != CodePayoutDestinationMismatch {
+		t.Fatalf("a foreign destination must be refused as a mismatch, got %v", err)
+	}
+}

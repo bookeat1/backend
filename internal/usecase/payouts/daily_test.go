@@ -23,9 +23,14 @@ const (
 func seedVenue(t *testing.T, h *harness, tz string, entries ...domain.OwedEntry) uuid.UUID {
 	t.Helper()
 	rid := uuid.New()
+	// ProviderCustomerRef is part of the fixture, not decoration: a tokenized
+	// card is addressed by the PAIR (provider user id, token), and a
+	// destination without the user id is refused by the ownership check before
+	// any money is generated or dispatched.
 	if err := h.dest.Upsert(context.Background(), &domain.PayoutDestination{
 		RestaurantID: rid, Provider: domain.ProviderFreedomPay,
 		Method: domain.PayoutMethodFreedomPayCardToken, Token: uuid.NewString(),
+		ProviderCustomerRef: "fp-user-" + rid.String(),
 	}); err != nil {
 		t.Fatalf("seed destination: %v", err)
 	}
