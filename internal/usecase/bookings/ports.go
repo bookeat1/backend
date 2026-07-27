@@ -44,10 +44,18 @@ type policyWriter interface {
 type scheduleReader interface {
 	ListWorkingHours(ctx context.Context, restaurantID uuid.UUID) ([]domain.WorkingHours, error)
 	// ListScheduleOverrides returns the venue's special-day exceptions
-	// (restaurant_schedule_overrides). Dates are matched exactly, so a past
-	// override is inert rather than harmful; the list is per venue and small
-	// (one row per special day an admin has ever entered).
-	ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID) ([]domain.ScheduleOverride, error)
+	// (restaurant_schedule_overrides) for the calendar dates in [from, to].
+	//
+	// The window is part of the port rather than an implementation detail: this
+	// call happens on every availability, create and update request, and the
+	// engine resolves overrides by EXACT date, so anything outside a couple of
+	// days around the requested one can never change an answer. Without the
+	// bound the read grows with every holiday a venue has ever entered.
+	//
+	// [from, to] is anchored on the requested date, never on "now" — a past
+	// date must resolve its override exactly like a future one. Callers widen
+	// it by overrideLookaround days; see loadSchedule.
+	ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.ScheduleOverride, error)
 	ListTimeSlots(ctx context.Context, restaurantID uuid.UUID) ([]domain.TimeSlot, error)
 	ListTables(ctx context.Context, restaurantID uuid.UUID) ([]domain.RestaurantTable, error)
 }

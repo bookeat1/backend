@@ -462,3 +462,76 @@ func TestWithinOpeningHoursHonoursOverrides(t *testing.T) {
 		t.Error("17:00 is inside the special hours and must be accepted")
 	}
 }
+
+// The override read is BOUNDED, and the bound is anchored on the date the
+// caller asked about — never on time.Now(). That distinction is the whole
+// contract: availability for a date far in the past must resolve its special
+// day exactly like a future one, which is why the query used to be unbounded.
+//
+// The fake honours the window, so a window computed from "now" would silently
+// drop these overrides and the venue would look open.
+func TestAvailabilityLoadsOverridesAroundTheRequestedDate(t *testing.T) {
+	loc := mustLoad(t, "Asia/Almaty")
+	rid := uuid.New()
+
+	newUC := func(sch *fakeSchedule) AvailabilityUseCase {
+		return NewAvailabilityUseCase(&fakeLinks{}, newFakeCapacity(),
+			&fakeRestaurants{agg: &domain.RestaurantAggregate{
+				Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
+			sch, testConfig())
+	}
+
+	dates := []struct {
+		name string
+		date string
+	}{
+		{"a date years in the past", "2019-03-14"},
+		{"a date years in the future", "2031-11-08"},
+	}
+	for _, tc := range dates {
+		t.Run(tc.name+" still sees its closure", func(t *testing.T) {
+			sch := &fakeSchedule{
+				hours:     openAllWeek("12:00", "18:00"),
+				overrides: []domain.ScheduleOverride{overrideClosed(tc.date)},
+				tables:    []domain.RestaurantTable{table("t4", 4)},
+			}
+			got, err := newUC(sch).Day(context.Background(), rid, tc.date, 4)
+			if err != nil {
+				t.Fatalf("Day: %v", err)
+			}
+			if len(got.Slots) != 0 {
+				t.Fatalf("closed override on %s produced %d slots — the engine did not load it",
+					tc.date, len(got.Slots))
+			}
+			// The window must bracket the requested date, and tightly: it is a
+			// couple of days of slack, not the venue's whole history.
+			want, _ := time.ParseInLocation(DateLayout, tc.date, loc)
+			if !sch.overrideFrom.Before(want) || !sch.overrideTo.After(want) {
+				t.Errorf("override window [%s, %s] does not bracket %s",
+					sch.overrideFrom.Format(DateLayout), sch.overrideTo.Format(DateLayout), tc.date)
+			}
+			if span := sch.overrideTo.Sub(sch.overrideFrom); span > 6*24*time.Hour {
+				t.Errorf("override window spans %v — it is meant to be a few days around the date, not open-ended", span)
+			}
+		})
+	}
+
+	// An override outside the window must not be read at all: it can never
+	// change the answer, and reading it is exactly the unbounded growth the
+	// bound exists to stop.
+	t.Run("an override on an unrelated date is not loaded", func(t *testing.T) {
+		sch := &fakeSchedule{
+			hours:     openAllWeek("12:00", "18:00"),
+			overrides: []domain.ScheduleOverride{overrideClosed("2019-03-14"), overrideClosed("2031-11-08")},
+			tables:    []domain.RestaurantTable{table("t4", 4)},
+		}
+		day := time.Now().In(loc).AddDate(0, 0, 7)
+		got, err := newUC(sch).Day(context.Background(), rid, day.Format(DateLayout), 4)
+		if err != nil {
+			t.Fatalf("Day: %v", err)
+		}
+		if len(got.Slots) == 0 {
+			t.Fatal("an ordinary day sold nothing: a distant override leaked into it")
+		}
+	})
+}

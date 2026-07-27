@@ -271,3 +271,91 @@ func TestScheduleOverrideListForVenuesIgnoresSessionTimezone(t *testing.T) {
 		})
 	}
 }
+
+// ListByRestaurantBetween is the bounded read the booking engine uses. It must
+// return exactly the rows inside the window (bounds inclusive) and NOTHING
+// else, whichever side of "today" the window happens to sit on: a date in the
+// past resolves its override exactly like one in the future, which is the whole
+// reason the window is anchored on the requested date rather than on now.
+//
+// Its unbounded sibling ListByRestaurant stays unbounded on purpose (the admin
+// cabinet manages past special days), so both are asserted here side by side —
+// if someone ever "fixes" the unbounded one, this test says what it cost.
+func TestScheduleOverrideListByRestaurantBetween(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+
+	rid, other := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{rid, other} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'R','Алматы','₸')`, id); err != nil {
+			t.Fatalf("seed restaurant: %v", err)
+		}
+	}
+	repo := New(pool)
+	d := func(y, m, day int) time.Time { return time.Date(y, time.Month(m), day, 0, 0, 0, 0, time.UTC) }
+
+	seed := []*domain.ScheduleOverride{
+		{RestaurantID: rid, Date: d(2019, 1, 1), IsClosed: true}, // long past
+		{RestaurantID: rid, Date: d(2026, 1, 1), IsClosed: true}, // in the past window
+		{RestaurantID: rid, Date: d(2026, 1, 3), OpenTime: ptr("16:00"), CloseTime: ptr("20:00")},
+		{RestaurantID: rid, Date: d(2030, 6, 6), IsClosed: true},   // far future
+		{RestaurantID: other, Date: d(2026, 1, 2), IsClosed: true}, // another venue
+	}
+	for _, o := range seed {
+		if err := repo.Upsert(ctx, o); err != nil {
+			t.Fatalf("seed override: %v", err)
+		}
+	}
+
+	t.Run("window in the past returns its rows and only its rows", func(t *testing.T) {
+		got, err := repo.ListByRestaurantBetween(ctx, rid, d(2026, 1, 1), d(2026, 1, 3))
+		if err != nil {
+			t.Fatalf("list between: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d rows, want the 2 inside [2026-01-01, 2026-01-03]: %+v", len(got), got)
+		}
+		if got[0].Date.Format("2006-01-02") != "2026-01-01" || got[1].Date.Format("2006-01-02") != "2026-01-03" {
+			t.Errorf("rows = %s, %s; want the boundary dates, inclusive, ascending",
+				got[0].Date.Format("2006-01-02"), got[1].Date.Format("2006-01-02"))
+		}
+		for _, o := range got {
+			if o.RestaurantID != rid {
+				t.Errorf("another venue's row leaked in: %+v", o)
+			}
+		}
+	})
+
+	t.Run("a single day is a valid window", func(t *testing.T) {
+		got, err := repo.ListByRestaurantBetween(ctx, rid, d(2026, 1, 3), d(2026, 1, 3))
+		if err != nil {
+			t.Fatalf("list between: %v", err)
+		}
+		if len(got) != 1 || got[0].OpenTime == nil || *got[0].OpenTime != "16:00" {
+			t.Fatalf("single-day window = %+v, want just the 2026-01-03 override", got)
+		}
+	})
+
+	t.Run("a window with nothing in it returns nothing", func(t *testing.T) {
+		got, err := repo.ListByRestaurantBetween(ctx, rid, d(2027, 5, 1), d(2027, 5, 30))
+		if err != nil {
+			t.Fatalf("list between: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("empty window returned %+v; the bound is not being applied", got)
+		}
+	})
+
+	t.Run("the unbounded read still shows the venue everything", func(t *testing.T) {
+		got, err := repo.ListByRestaurant(ctx, rid)
+		if err != nil {
+			t.Fatalf("list by restaurant: %v", err)
+		}
+		if len(got) != 4 {
+			t.Fatalf("got %d rows, want all 4 of this venue's overrides — the admin cabinet edits past special days: %+v",
+				len(got), got)
+		}
+	})
+}
