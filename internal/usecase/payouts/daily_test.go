@@ -683,3 +683,107 @@ func TestDaily_HeldTooLongAndWorthPayingIsStillForced(t *testing.T) {
 		t.Fatalf("expected one payout marked forced_by_age, got %+v", list)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 6. The venue's timezone as a money boundary
+// ---------------------------------------------------------------------------
+
+// TestDaily_UnusableVenueTimezoneIsNotSettledOnAGuessedDay is the money-side of
+// the timezone rule: a venue whose stored zone is not a usable IANA name is NOT
+// paid on the platform's day. It used to be — the zone silently fell back to
+// Asia/Almaty with a warning — and the damage is invisible in the result: a
+// payout row appears, its amount is plausible, and its period_date is the wrong
+// calendar day for that venue. The once-per-venue-day unique index then makes
+// that wrong day permanent, so the mistake cannot even be re-settled later.
+//
+// "KZT" is the realistic bad value: it is what a human types when asked for a
+// timezone, it is not an IANA name, and time.LoadLocation rejects it.
+func TestDaily_UnusableVenueTimezoneIsNotSettledOnAGuessedDay(t *testing.T) {
+	h := newHarness()
+	almaty := mustLoad(t, tzAlmaty)
+	now := time.Date(2026, 7, 25, 9, 0, 0, 0, almaty)
+
+	broken := seedVenue(t, h, "KZT", owedAt(h, 3_000_000, time.Date(2026, 7, 24, 20, 0, 0, 0, almaty)))
+	// A healthy venue in the same pass: one venue's bad data must not stop
+	// everyone else's money.
+	healthy := seedVenue(t, h, tzIstanbul, owedAt(h, 3_000_000, time.Date(2026, 7, 24, 12, 0, 0, 0, almaty)))
+
+	d := h.daily(DailyConfig{}, now)
+	res, err := d.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if list, _ := h.payouts.List(context.Background(), broken, 10); len(list) != 0 {
+		t.Fatalf("a venue with the unusable timezone %q was paid anyway, on a period we invented: %+v", "KZT", list[0])
+	}
+	if list, _ := h.payouts.List(context.Background(), healthy, 10); len(list) != 1 {
+		t.Fatalf("the healthy venue must still be paid in the same pass, got %d payouts", len(list))
+	}
+	if res.Generated != 1 {
+		t.Fatalf("generated=%d, want 1 (only the healthy venue)", res.Generated)
+	}
+}
+
+// TestDaily_AbbreviationTimezoneIsRefusedEvenThoughItLoads guards the case that
+// does NOT announce itself: "EST" exists in tzdata and time.LoadLocation
+// accepts it, but it is a fixed-offset compatibility entry that never leaves
+// standard time. A venue stored that way would be settled an hour off for half
+// the year, and nothing would error.
+func TestDaily_AbbreviationTimezoneIsRefusedEvenThoughItLoads(t *testing.T) {
+	if _, err := time.LoadLocation("EST"); err != nil {
+		t.Skipf("tzdata on this host has no EST entry: %v", err)
+	}
+	h := newHarness()
+	almaty := mustLoad(t, tzAlmaty)
+	now := time.Date(2026, 7, 25, 9, 0, 0, 0, almaty)
+
+	// Dated several days back, so it is inside the settled period whichever of
+	// the two zones is used: the test must fail because the venue was PAID under
+	// a guessed zone, not because the guessed cutoff happened to exclude the
+	// money.
+	rid := seedVenue(t, h, "EST", owedAt(h, 3_000_000, time.Date(2026, 7, 21, 12, 0, 0, 0, almaty)))
+
+	d := h.daily(DailyConfig{}, now)
+	if _, err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if list, _ := h.payouts.List(context.Background(), rid, 10); len(list) != 0 {
+		t.Fatalf("a venue stored as %q was settled anyway: %+v", "EST", list[0])
+	}
+}
+
+// TestDaily_VenueInADSTZoneIsSettledOnItsOwnMidnight runs the whole pass — not
+// just the period arithmetic — for a venue in a zone that actually changes
+// offset, on the transition day itself. Lisbon springs forward at 01:00 on
+// 2026-03-29, so that local day is 23 hours long; the venue's 28.03 must still
+// end at ITS midnight, and money captured after that midnight must wait.
+func TestDaily_VenueInADSTZoneIsSettledOnItsOwnMidnight(t *testing.T) {
+	h := newHarness()
+	lisbon := mustLoad(t, "Europe/Lisbon")
+	// 10:00 on the short day. Lisbon is already on summer time (UTC+1) here,
+	// while the settled day 28.03 was on winter time (UTC+0).
+	now := time.Date(2026, 3, 29, 10, 0, 0, 0, lisbon)
+
+	before := owedAt(h, 4_000_000, time.Date(2026, 3, 28, 23, 30, 0, 0, lisbon))
+	after := owedAt(h, 9_000_000, time.Date(2026, 3, 29, 0, 30, 0, 0, lisbon))
+	rid := seedVenue(t, h, "Europe/Lisbon", before, after)
+
+	d := h.daily(DailyConfig{}, now)
+	if _, err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	list, _ := h.payouts.List(context.Background(), rid, 10)
+	if len(list) != 1 {
+		t.Fatalf("expected one payout, got %d", len(list))
+	}
+	if got := list[0].PeriodDate.Format(time.DateOnly); got != "2026-03-28" {
+		t.Fatalf("period = %s, want 2026-03-28 (the last day that ended in Lisbon)", got)
+	}
+	if !list[0].PeriodEndAt.Equal(time.Date(2026, 3, 29, 0, 0, 0, 0, lisbon)) {
+		t.Fatalf("cutoff = %s, want Lisbon's own midnight of 29.03", list[0].PeriodEndAt)
+	}
+	if list[0].GrossAmountMinor != 4_000_000 {
+		t.Fatalf("gross = %d, want 4 000 000: money captured after the venue's midnight belongs to the next period",
+			list[0].GrossAmountMinor)
+	}
+}

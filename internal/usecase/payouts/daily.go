@@ -236,7 +236,15 @@ func (d *DailyRunner) settingsFor(ctx context.Context, ids []uuid.UUID) (map[uui
 // runVenue settles one venue's last completed local day under the EFFECTIVE
 // policy for that venue (its own overrides on top of the platform default).
 func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz string, policy domain.PayoutPolicy, res *DailyResult) error {
-	loc := d.location(tz, restaurantID)
+	loc, err := d.location(tz)
+	if err != nil {
+		// No payout, no claim, no period consumed: the venue's money simply
+		// stays owed and is paid in full once the zone is corrected. Refusing is
+		// the cheap failure here — settling on a guessed zone would write a
+		// period_date that the once-per-venue-day unique index then makes
+		// permanent, so the wrong day could not be re-settled afterwards.
+		return fmt.Errorf("resolve venue timezone: %w", err)
+	}
 	period := lastCompletedLocalDay(d.now(), loc)
 
 	dest, err := d.dest.Get(ctx, restaurantID)
@@ -352,25 +360,34 @@ func (d *DailyRunner) runVenue(ctx context.Context, restaurantID uuid.UUID, tz s
 	return nil
 }
 
-// location resolves a venue's IANA zone, falling back to the configured
-// platform default. A zone the runtime cannot load is a data problem, not a
-// reason to pay the venue on the wrong day — it is logged and the fallback is
-// used, and if even the fallback fails we use UTC rather than time.Local (the
-// server's zone must never silently decide a venue's day).
-func (d *DailyRunner) location(tz string, restaurantID uuid.UUID) *time.Location {
+// location resolves the zone this venue's payout day is measured in.
+//
+// Two cases, and they are NOT the same:
+//
+//   - the venue has no zone of its own (tz empty — PayoutVenueReader leaves such
+//     a venue out of the map). The platform fallback applies; that is the
+//     documented meaning of BOOKING_TIMEZONE_FALLBACK, not a guess.
+//   - the venue HAS a stored zone and it is not usable ("KZT", "+06", "Local",
+//     a name this host's tzdata does not know). That is a data fault, and the
+//     honest answer is an error. It used to fall back to the platform zone with
+//     a warning, which is the same shape of silent substitution that let the DST
+//     bug hide for weeks: an Istanbul venue would have been settled on Almaty
+//     days — three hours of one day's takings landing in the neighbouring
+//     period, every day, with the venue's statement looking perfectly plausible.
+//
+// A failing fallback is also an error rather than UTC: the server's own
+// preferences must never decide when a venue gets paid, and UTC is nobody's
+// business day.
+func (d *DailyRunner) location(tz string) (*time.Location, error) {
 	if tz != "" {
-		if loc, err := time.LoadLocation(tz); err == nil {
-			return loc
-		}
-		d.log.Warn("venue has an unloadable timezone, using the platform fallback",
-			"restaurant_id", restaurantID, "timezone", tz, "fallback", d.cfg.TimezoneFallback)
+		return domain.LoadVenueLocation(tz)
 	}
-	if loc, err := time.LoadLocation(d.cfg.TimezoneFallback); err == nil {
-		return loc
+	loc, err := time.LoadLocation(d.cfg.TimezoneFallback)
+	if err != nil {
+		return nil, domain.WithCode(domain.CodeVenueTimezoneInvalid,
+			fmt.Errorf("%w: platform payout timezone fallback %q is unloadable", domain.ErrValidation, d.cfg.TimezoneFallback))
 	}
-	d.log.Error("payout timezone fallback is unloadable, settling on UTC days",
-		"fallback", d.cfg.TimezoneFallback)
-	return time.UTC
+	return loc, nil
 }
 
 // lastCompletedLocalDay returns the venue-local day this pass settles: the last
