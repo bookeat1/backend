@@ -225,7 +225,7 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	}
 
 	startsAt := in.StartsAt.UTC()
-	sched, err := loadSchedule(ctx, u.schedule, in.RestaurantID)
+	sched, err := loadSchedule(ctx, u.schedule, in.RestaurantID, startsAt, startsAt)
 	if err != nil {
 		return nil, err
 	}

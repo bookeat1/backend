@@ -388,14 +388,38 @@ type fakeSchedule struct {
 	overrides []domain.ScheduleOverride
 	slots     []domain.TimeSlot
 	tables    []domain.RestaurantTable
+
+	// overrideFrom/overrideTo record the window of the last
+	// ListScheduleOverrides call, so a test can assert the engine asked about
+	// the date it was given and not about "now".
+	overrideFrom, overrideTo time.Time
 }
 
 func (f *fakeSchedule) ListWorkingHours(context.Context, uuid.UUID) ([]domain.WorkingHours, error) {
 	return f.hours, nil
 }
-func (f *fakeSchedule) ListScheduleOverrides(context.Context, uuid.UUID) ([]domain.ScheduleOverride, error) {
-	return f.overrides, nil
+
+// ListScheduleOverrides HONOURS the [from, to] window instead of returning
+// everything it holds. A fake that ignored the bound would make every caller's
+// window look correct and let a real one that asks for the wrong dates ship
+// green — the same trap as bugs/bookeat-backend-fake-ignoring-context.
+func (f *fakeSchedule) ListScheduleOverrides(_ context.Context, _ uuid.UUID, from, to time.Time) ([]domain.ScheduleOverride, error) {
+	f.overrideFrom, f.overrideTo = from, to
+	lo, hi := dateOnly(from), dateOnly(to)
+	out := make([]domain.ScheduleOverride, 0, len(f.overrides))
+	for _, o := range f.overrides {
+		d := dateOnly(o.Date)
+		if d < lo || d > hi {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out, nil
 }
+
+// dateOnly renders the calendar date t carries in its OWN location, matching
+// what the repository binds to a `date` column.
+func dateOnly(t time.Time) string { return t.Format("2006-01-02") }
 func (f *fakeSchedule) ListTimeSlots(context.Context, uuid.UUID) ([]domain.TimeSlot, error) {
 	return f.slots, nil
 }

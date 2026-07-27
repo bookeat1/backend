@@ -95,7 +95,15 @@ func (u *updateUseCase) Update(ctx context.Context, actor Actor, id uuid.UUID, i
 		return nil, err
 	}
 	policy := resolvePolicy(rest.Restaurant, u.cfg)
-	sched, err := loadSchedule(ctx, u.schedule, b.RestaurantID)
+	// An amendment can be asked about TWO dates: where the booking is now and
+	// where it is being moved to. Both are handed to loadSchedule so a closure
+	// on either end is loaded — a move whose target date is a holiday must
+	// still be refused.
+	schedFrom, schedTo := b.StartsAt, b.StartsAt
+	if in.StartsAt != nil {
+		schedTo = in.StartsAt.UTC()
+	}
+	sched, err := loadSchedule(ctx, u.schedule, b.RestaurantID, schedFrom, schedTo)
 	if err != nil {
 		return nil, err
 	}

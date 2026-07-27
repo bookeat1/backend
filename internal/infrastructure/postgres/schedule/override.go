@@ -47,6 +47,19 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 
 var _ domain.ScheduleOverrideRepository = (*Repository)(nil)
 
+// ListByRestaurant returns EVERY override a venue has, unbounded, ordered by
+// date.
+//
+// The lack of a date bound is deliberate and must stay: the only caller is the
+// admin cabinet (usecase/admin.GetSchedule), which shows the venue the special
+// days it has entered so it can edit or delete them — including the ones that
+// have already passed. A window here would make rows disappear from the screen
+// they are managed on.
+//
+// The booking engine deliberately does NOT use this method. It asks about one
+// date at a time and reads through ListByRestaurantBetween, so the growth of
+// this table costs an availability request nothing. If you came here to add a
+// bound because this query looked unbounded, that is the method you want.
 func (r *Repository) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.ScheduleOverride, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT id, restaurant_id, override_date, is_closed, open_time, close_time, note,
@@ -119,6 +132,55 @@ func (r *Repository) ListForVenues(ctx context.Context, restaurantIDs []uuid.UUI
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list schedule overrides for venues: %w", err)
+	}
+	return out, nil
+}
+
+// ListByRestaurantBetween returns ONE venue's overrides whose override_date
+// falls inside [from, to] (inclusive, calendar dates), ordered by date.
+//
+// It is the read behind the booking engine (usecase/bookings.loadSchedule),
+// which is called on every availability, create and update request. The engine
+// resolves a single date at a time (domain.FindScheduleOverride matches by
+// exact calendar date), so it never needs a row outside a couple of days around
+// the date it was asked about — while the unbounded ListByRestaurant grows for
+// as long as the venue keeps entering holidays, forever, on the hottest read
+// path in the service.
+//
+// The window is anchored on the REQUESTED date, not on today, so availability
+// for a date in the past keeps behaving exactly like one in the future: it gets
+// its own override, and a past closure still sells nothing. That is the
+// property the previous author was protecting by leaving the query unbounded,
+// and it survives — bounding relative to now would have broken it.
+//
+// from/to are rendered as bare calendar dates in the location they carry, so
+// the caller is expected to widen them by a day or two (see
+// bookings.overrideLookaround) rather than pass the exact instants: venues sit
+// in zones up to 14 hours off UTC, and the engine also consults the PREVIOUS
+// day for a window that runs past midnight.
+func (r *Repository) ListByRestaurantBetween(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.ScheduleOverride, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, restaurant_id, override_date, is_closed, open_time, close_time, note,
+		        booking_payment_required, deposit_amount_minor, created_at, updated_at
+		 FROM restaurant_schedule_overrides
+		 WHERE restaurant_id=$1
+		   AND override_date BETWEEN $2::date AND $3::date
+		 ORDER BY override_date ASC`, restaurantID, dateParam(from), dateParam(to))
+	if err != nil {
+		return nil, fmt.Errorf("list schedule overrides in window: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.ScheduleOverride
+	for rows.Next() {
+		o, err := scanOverride(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list schedule overrides in window: %w", err)
 	}
 	return out, nil
 }

@@ -548,16 +548,22 @@ func (r *Related) WorkingHoursFor(ctx context.Context, ids []uuid.UUID) (map[uui
 	return out, rows.Err()
 }
 
-// ListScheduleOverrides returns one venue's special-day exceptions, for the
-// availability engine (usecase/bookings.loadSchedule) — the same rows the admin
-// panel writes and the money path reads.
+// ListScheduleOverrides returns one venue's special-day exceptions for the
+// calendar dates in [from, to], for the availability engine
+// (usecase/bookings.loadSchedule) — the same rows the admin panel writes and the
+// money path reads.
+//
+// The window is what keeps this read flat: it runs on every availability,
+// create and update call, and the engine only ever resolves the dates it was
+// asked about. The venue's full history stays available to the admin cabinet
+// through the unbounded ListByRestaurant.
 //
 // It delegates to the schedule repository, which OWNS this table: the query,
 // the column order and the scan live in exactly one place, so a column added
 // there (as 0036 added the paid-day pair) cannot reach one reader and miss
 // another.
-func (r *Related) ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID) ([]domain.ScheduleOverride, error) {
-	return schedule.New(r.pool).ListByRestaurant(ctx, restaurantID)
+func (r *Related) ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.ScheduleOverride, error) {
+	return schedule.New(r.pool).ListByRestaurantBetween(ctx, restaurantID, from, to)
 }
 
 // ScheduleOverridesFor is the batch read behind the public catalog: the

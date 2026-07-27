@@ -110,7 +110,7 @@ func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, d
 		return nil, fmt.Errorf("%w: date must be YYYY-MM-DD", domain.ErrValidation)
 	}
 
-	sched, err := u.loadSchedule(ctx, restaurantID)
+	sched, err := u.loadSchedule(ctx, restaurantID, day)
 	if err != nil {
 		return nil, err
 	}
@@ -184,18 +184,53 @@ type schedule struct {
 	tables    []domain.RestaurantTable
 }
 
-func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uuid.UUID) (schedule, error) {
-	return loadSchedule(ctx, u.schedule, restaurantID)
+func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uuid.UUID, day time.Time) (schedule, error) {
+	return loadSchedule(ctx, u.schedule, restaurantID, day, day)
 }
 
-// loadSchedule reads opening hours, bookable slots and the active tables of a
-// venue. Inactive tables are dropped here so no caller can forget to.
-func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID) (schedule, error) {
+// overrideLookaround is how many calendar days on each side of the dates a
+// request is about the engine loads special-day overrides for.
+//
+// Two, and here is the arithmetic, because the obvious answer is zero and it is
+// wrong:
+//   - the engine also evaluates the PREVIOUS calendar day, so a venue closing
+//     past midnight still answers for a 01:00 start (withinOpeningHours,
+//     isBookableStart, domain.IsOpenAt) — that is one day back;
+//   - an override window that starts on day D can run into D+1 — one day
+//     forward;
+//   - the from/to handed to the repository are instants, turned into bare
+//     calendar dates in whatever location they carry, while override_date is
+//     the VENUE's local date. Venues sit up to 14 hours off UTC, so the date
+//     can be off by one in either direction.
+//
+// One day covers each of those alone; two covers them together, and the extra
+// row or two it may read costs nothing. It is a safety margin, not a semantic
+// boundary — the engine still matches overrides by exact date.
+const overrideLookaround = 2
+
+// loadSchedule reads opening hours, special-day overrides, bookable slots and
+// the active tables of a venue. Inactive tables are dropped here so no caller
+// can forget to.
+//
+// [from, to] are the instants the caller is going to ask the schedule about —
+// one date for availability and create, two for an update that moves a booking.
+// Overrides are loaded only around them: the whole history is never needed, and
+// reading it on every request made the cost of an availability call grow with
+// the number of holidays the venue had ever entered.
+//
+// Anchoring on the REQUESTED instants, not on time.Now(), is what preserves the
+// property the unbounded query used to give for free: availability for a date
+// in the past resolves its override exactly like one in the future.
+func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID, from, to time.Time) (schedule, error) {
+	if to.Before(from) {
+		from, to = to, from
+	}
 	hours, err := r.ListWorkingHours(ctx, restaurantID)
 	if err != nil {
 		return schedule{}, err
 	}
-	overrides, err := r.ListScheduleOverrides(ctx, restaurantID)
+	overrides, err := r.ListScheduleOverrides(ctx, restaurantID,
+		from.AddDate(0, 0, -overrideLookaround), to.AddDate(0, 0, overrideLookaround))
 	if err != nil {
 		return schedule{}, err
 	}

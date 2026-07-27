@@ -208,11 +208,20 @@ func (f *fakeUpdate) Update(context.Context, uc.Actor, uuid.UUID, uc.UpdateInput
 	return &uc.BookingDetails{Booking: domain.Booking{ID: uuid.New()}}, nil
 }
 
-type fakeAvail struct{ err error }
+// fakeAvail stands in for the availability engine. day, when set, is returned
+// verbatim so a transport test can pin the EXACT usecase value the mapper is
+// handed — the only way to catch a field the mapper silently drops.
+type fakeAvail struct {
+	err error
+	day *uc.DayAvailability
+}
 
 func (f *fakeAvail) Day(_ context.Context, id uuid.UUID, date string, guests int) (*uc.DayAvailability, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.day != nil {
+		return f.day, nil
 	}
 	return &uc.DayAvailability{RestaurantID: id, Date: date, Guests: guests, Timezone: "Asia/Almaty"}, nil
 }
