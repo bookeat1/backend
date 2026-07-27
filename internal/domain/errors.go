@@ -1,6 +1,9 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Sentinel errors returned by usecases and repositories. The transport layer
 // maps these to HTTP status codes in response.HandleError. Wrap with
@@ -130,6 +133,74 @@ const (
 	// Transient: a later retry may succeed.
 	CodeMapProviderUnavailable ErrorCode = "map_provider_unavailable"
 
+	// Phone-OTP login (POST /auth/otp/request, POST /auth/otp/verify). All of
+	// these keep the status and the message they have always had; the code is
+	// what lets the app say ONE true sentence instead of listing possibilities.
+	//
+	// # What an outsider may learn from them
+	//
+	// These endpoints are unauthenticated and a phone number is not a secret,
+	// so every code below was chosen against one question: does it tell someone
+	// who does not own the number something they could not already observe?
+	//
+	// Nothing here reveals whether a phone is REGISTERED — OTP login creates the
+	// user on first success, so registered and unknown numbers behave
+	// identically all the way through.
+
+	// CodeOTPInvalidPhone — the phone could not be normalized into a number we
+	// can send to. Pure input validation, no lookup happens, so it is the same
+	// answer for every caller and leaks nothing. It is the one 422 the app can
+	// point at the phone field instead of the timer.
+	CodeOTPInvalidPhone ErrorCode = "otp_invalid_phone"
+
+	// CodeOTPCodeRequired — the verify request carried no code at all.
+	// Client-side bug or an empty submit; again no lookup, nothing leaked.
+	CodeOTPCodeRequired ErrorCode = "otp_code_required"
+
+	// CodeOTPRateLimitedMinute — this NUMBER already requested a code within
+	// the last minute. Carries Retry-After.
+	//
+	// It does tell the caller that somebody asked for a code for this number
+	// in the last minute — but that bit is already on the wire today and always
+	// has been: a rate-limited request answers 422 while an accepted one
+	// answers 200. Splitting the two windows apart adds no new observation, it
+	// only stops the app from saying "подождите" when the truth is "номер
+	// написан неправильно".
+	CodeOTPRateLimitedMinute ErrorCode = "otp_rate_limited_minute"
+
+	// CodeOTPRateLimitedHour — this NUMBER has spent its hourly budget of code
+	// requests. Distinct from the per-minute one because the guest's next
+	// action differs: waiting a minute helps, here it does not. Carries
+	// Retry-After.
+	CodeOTPRateLimitedHour ErrorCode = "otp_rate_limited_hour"
+
+	// CodeOTPInvalid — the submitted code was not accepted. It DELIBERATELY
+	// covers three situations at once: the code is wrong, the code expired, and
+	// there is no active code for this number at all (never requested, already
+	// used, or invalidated).
+	//
+	// They are merged, not merged by accident. Separating them turns
+	// /auth/otp/verify into a presence oracle: one request with a random code
+	// would answer "wrong code" exactly when a live code exists for that number
+	// and "no active code" otherwise, letting anyone watch a number and learn
+	// the moment its owner starts logging in — which is precisely the timing an
+	// OTP phishing call needs. Nobody outside the login flow gets that bit here.
+	//
+	// The guest loses little: the only useful action is the same in all three
+	// cases — check the digits, or request a new code — and the app knows from
+	// its own state when it last requested one.
+	CodeOTPInvalid ErrorCode = "otp_invalid"
+
+	// CodeOTPTooManyAttempts — the code was guessed wrong too many times and is
+	// now dead. Kept separate from CodeOTPInvalid because the action differs and
+	// retyping cannot succeed any more: the guest must request a new code.
+	//
+	// Residual leak, accepted knowingly: reaching this state requires enough
+	// wrong guesses to burn a LIVE code, so a prober learns "a code existed" —
+	// at the price of destroying the very code they would want alive, and of
+	// more requests than the strict per-IP rate limit passes in a minute.
+	CodeOTPTooManyAttempts ErrorCode = "otp_too_many_attempts"
+
 	// CodeCatalogVenueStateUnavailable — the catalog was asked to filter by
 	// open_now / accepts_online_bookings, but the server-computed venue state
 	// behind those fields could not be read for this request. 503, and
@@ -170,4 +241,37 @@ func CodeOf(err error) (code ErrorCode, ok bool) {
 		return c.ErrorCode(), true
 	}
 	return "", false
+}
+
+// retryAfterError attaches "do not retry before" to an error, the same way
+// codedError attaches a code: additively, with Unwrap intact, so status mapping
+// and errors.Is are untouched. The transport layer turns it into the standard
+// Retry-After header — the repo already answers a 429 from the rate-limit
+// middleware that way, and a client should not need a second convention to
+// learn how long to wait.
+type retryAfterError struct {
+	after time.Duration
+	err   error
+}
+
+func (e *retryAfterError) Error() string             { return e.err.Error() }
+func (e *retryAfterError) Unwrap() error             { return e.err }
+func (e *retryAfterError) RetryAfter() time.Duration { return e.after }
+
+// WithRetryAfter tags err with how long the caller should wait. A non-positive
+// duration or a nil err is left alone (a "retry after 0" header is noise).
+func WithRetryAfter(after time.Duration, err error) error {
+	if err == nil || after <= 0 {
+		return err
+	}
+	return &retryAfterError{after: after, err: err}
+}
+
+// RetryAfterOf reports the wait carried by err or anything it wraps.
+func RetryAfterOf(err error) (time.Duration, bool) {
+	var r interface{ RetryAfter() time.Duration }
+	if errors.As(err, &r) {
+		return r.RetryAfter(), true
+	}
+	return 0, false
 }

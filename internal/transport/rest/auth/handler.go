@@ -85,6 +85,12 @@ func (h *Handler) login(c *gin.Context) {
 // @Description (per-minute and per-hour); over the limit returns 422. The response
 // @Description "code" field is populated only when AUTH_OTP_DEV_EXPOSE=true.
 // @Description
+// @Description Every 422 carries a machine-readable "code" in the error envelope —
+// @Description branch on it, never on the message: otp_invalid_phone (the number is
+// @Description unusable, point at the field), otp_rate_limited_minute and
+// @Description otp_rate_limited_hour (both carry a Retry-After header in seconds;
+// @Description it is the full window, an upper bound, not the exact time left).
+// @Description
 // @Description When no delivery channel accepts the code the answer is a plain 500
 // @Description with the generic body — identical for a number nobody can reach and
 // @Description for a provider outage. That is deliberate: a response that varied by
@@ -117,6 +123,13 @@ func (h *Handler) otpRequest(c *gin.Context) {
 // @Description Verifies the latest active code for the phone. On success, finds or
 // @Description creates the user and returns a token pair. Wrong/expired codes and
 // @Description too many attempts return 401.
+// @Description
+// @Description The 401 carries one of two codes. "otp_invalid" means the code was
+// @Description not accepted and covers three cases on purpose — wrong, expired, and
+// @Description no active code at all: telling them apart would let anyone with a
+// @Description phone number detect when its owner is mid-login. "otp_too_many_attempts"
+// @Description means the code is dead from wrong guesses and only a new code helps.
+// @Description The 422 codes are otp_invalid_phone and otp_code_required.
 // @Tags        auth
 // @Accept      json
 // @Produce     json
