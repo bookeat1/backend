@@ -204,10 +204,18 @@ func surveyToResponse(s *domain.RestaurantSurvey) surveyResponse {
 	}
 }
 
+// availabilityToResponse maps the engine's answer to the wire DTO.
+//
+// CapacityMode/CapacitySeats are copied here and not derived from the slots:
+// they are the summary a client reads INSTEAD of scanning the slots, so the two
+// must come from the same source. Leaving them out (as this mapper once did)
+// published `"capacity_mode":"", "capacity_seats":0` next to slots carrying
+// remaining_seats — a payload that contradicted itself.
 func availabilityToResponse(d *uc.DayAvailability) availabilityResponse {
 	out := availabilityResponse{
 		RestaurantID: d.RestaurantID.String(), Date: d.Date, Timezone: d.Timezone,
 		Guests: d.Guests, DurationMinutes: d.DurationMinutes,
+		CapacityMode: string(d.CapacityMode), CapacitySeats: d.CapacitySeats,
 		Slots: make([]slotResponse, 0, len(d.Slots)),
 	}
 	for _, s := range d.Slots {
