@@ -267,3 +267,201 @@ func assertVenuePayload(t *testing.T, p publicPayload, wantSched, wantOpenNow bo
 		t.Error("a known schedule must carry days")
 	}
 }
+
+// TestCatalogFiltersEndToEnd runs the two server-side catalog filters through
+// the real stack — Postgres rows → repository → facade → JSON. The fake-based
+// tests cannot answer the two questions that actually broke in production:
+// whether the filtered read still pages correctly over the whole matching set,
+// and whether `total` counts the filtered set rather than the SQL-matched one.
+func TestCatalogFiltersEndToEnd(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants")
+
+	almaty, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// Friday 2026-07-24, 13:00 Almaty — inside an 11:00–22:00 day, before a
+	// 19:00–23:00 one, and 10:00 in Istanbul (before an 11:00 open).
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, almaty)
+
+	table := func() []domain.RestaurantTable {
+		return []domain.RestaurantTable{{Name: "T1", Capacity: 4, IsActive: true}}
+	}
+	fullWeek := func(open, close_ string) []domain.WorkingHours {
+		out := make([]domain.WorkingHours, 0, 7)
+		for dow := 0; dow < 7; dow++ {
+			out = append(out, openDay(dow, open, close_))
+		}
+		return out
+	}
+
+	openBookable := seededVenue{id: uuid.New(), name: "OpenBookable", hours: fullWeek("11:00", "22:00"), tables: table()}
+	openNoTables := seededVenue{id: uuid.New(), name: "OpenNoTables", hours: fullWeek("11:00", "22:00")}
+	shutBookable := seededVenue{id: uuid.New(), name: "ShutBookable", hours: fullWeek("19:00", "23:00"), tables: table()}
+	// No working-hours rows at all — the live catalog has exactly one such
+	// venue. "Unknown" must never be counted as open.
+	noHours := seededVenue{id: uuid.New(), name: "NoHours", tables: table()}
+	// Same instant, two zones apart: 13:00 in Almaty is 11:00 in Istanbul, an
+	// hour before this venue opens. Judged against the platform's default zone
+	// it would read as OPEN (13:00 is inside 12:00–22:00) — so this venue is
+	// the one that fails if the filter ever stops using the venue's own clock.
+	istanbul := seededVenue{id: uuid.New(), name: "Istanbul", timezone: "Europe/Istanbul",
+		hours: fullWeek("12:00", "22:00"), tables: table()}
+
+	venues := []seededVenue{openBookable, openNoTables, shutBookable, noHours, istanbul}
+	seedVenues(t, pool, venues)
+
+	repo := restrepo.New(pool)
+	rel := restrepo.NewRelated(pool)
+	facade := uc.NewFacade(repo, rel, restrepo.NewCategories(pool), restrepo.NewPartnership(pool),
+		sqltx.NewManager(pool),
+		uc.WithVenueState(uc.NewVenueState(rel, bookinguc.Config{TimezoneFallback: "Asia/Almaty"},
+			uc.WithVenueStateClock(func() time.Time { return now }))))
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	NewHandler(facade, nil, nil).RegisterPublic(r.Group("/api/v1"))
+
+	type pageEnvelope struct {
+		Items   []publicPayload `json:"items"`
+		Total   int             `json:"total"`
+		Page    int             `json:"page"`
+		PerPage int             `json:"per_page"`
+	}
+	fetch := func(t *testing.T, path string) pageEnvelope {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, body %s", path, w.Code, w.Body.String())
+		}
+		var env struct {
+			Data pageEnvelope `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		return env.Data
+	}
+	namesOf := func(p pageEnvelope) []string {
+		byID := map[string]string{}
+		for _, v := range venues {
+			byID[v.id.String()] = v.name
+		}
+		out := make([]string, 0, len(p.Items))
+		for _, it := range p.Items {
+			out = append(out, byID[it.ID])
+		}
+		return out
+	}
+	equal := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	filters := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{
+			name:  "unfiltered: the whole catalog, exactly as before",
+			query: "",
+			want:  []string{"OpenBookable", "OpenNoTables", "ShutBookable", "NoHours", "Istanbul"},
+		},
+		{
+			name:  "open_now=true: the venue with no hours and the one in another zone are out",
+			query: "&open_now=true",
+			want:  []string{"OpenBookable", "OpenNoTables"},
+		},
+		{
+			name:  "open_now=false: the complement, unknown hours included",
+			query: "&open_now=false",
+			want:  []string{"ShutBookable", "NoHours", "Istanbul"},
+		},
+		{
+			name:  "accepts_online_bookings=true: needs capacity AND a readable schedule",
+			query: "&accepts_online_bookings=true",
+			want:  []string{"OpenBookable", "ShutBookable", "Istanbul"},
+		},
+		{
+			name:  "accepts_online_bookings=false",
+			query: "&accepts_online_bookings=false",
+			want:  []string{"OpenNoTables", "NoHours"},
+		},
+		{
+			name:  "both, AND-combined",
+			query: "&open_now=true&accepts_online_bookings=true",
+			want:  []string{"OpenBookable"},
+		},
+	}
+
+	for _, route := range []string{"/api/v1/restaurants", "/api/v1/restaurants/search"} {
+		for _, tc := range filters {
+			t.Run(route+" "+tc.name, func(t *testing.T) {
+				got := fetch(t, route+"?per_page=50"+tc.query)
+				if names := namesOf(got); !equal(names, tc.want) {
+					t.Errorf("items = %v, want %v", names, tc.want)
+				}
+				// The count the guest is shown must describe the filtered set.
+				if got.Total != len(tc.want) {
+					t.Errorf("total = %d, want %d", got.Total, len(tc.want))
+				}
+			})
+		}
+	}
+
+	// Paging over a FILTERED set: the three bookable venues split across two
+	// pages of two, and the total stays 3 on both. Before the filter moved to
+	// the server this is exactly what could not work — the app counted one page.
+	t.Run("pagination with a filter applied", func(t *testing.T) {
+		for _, route := range []string{"/api/v1/restaurants", "/api/v1/restaurants/search"} {
+			first := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=1")
+			if names := namesOf(first); !equal(names, []string{"OpenBookable", "ShutBookable"}) {
+				t.Errorf("%s page 1 = %v", route, names)
+			}
+			if first.Total != 3 {
+				t.Errorf("%s page 1 total = %d, want 3", route, first.Total)
+			}
+			second := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=2")
+			if names := namesOf(second); !equal(names, []string{"Istanbul"}) {
+				t.Errorf("%s page 2 = %v", route, names)
+			}
+			if second.Total != 3 {
+				t.Errorf("%s page 2 total = %d, want 3", route, second.Total)
+			}
+			third := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=3")
+			if len(third.Items) != 0 {
+				t.Errorf("%s page 3 = %v, want an empty page", route, namesOf(third))
+			}
+			if third.Total != 3 {
+				t.Errorf("%s page 3 total = %d, want 3", route, third.Total)
+			}
+		}
+	})
+
+	// The SQL-backed filters and the venue-state ones compose: city narrows in
+	// SQL first, the venue state is then evaluated over what survived.
+	t.Run("combined with an SQL filter", func(t *testing.T) {
+		got := fetch(t, "/api/v1/restaurants?city=Алматы&open_now=true&per_page=50")
+		if names := namesOf(got); !equal(names, []string{"OpenBookable", "OpenNoTables"}) {
+			t.Errorf("items = %v", names)
+		}
+		if got.Total != 2 {
+			t.Errorf("total = %d, want 2", got.Total)
+		}
+		// A city nothing is seeded in must return nothing, filter or no filter.
+		empty := fetch(t, "/api/v1/restaurants?city=Астана&open_now=true&per_page=50")
+		if empty.Total != 0 || len(empty.Items) != 0 {
+			t.Errorf("other city: total = %d, items = %v", empty.Total, namesOf(empty))
+		}
+	})
+}

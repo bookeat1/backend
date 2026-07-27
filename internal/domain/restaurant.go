@@ -128,6 +128,40 @@ type RestaurantAggregate struct {
 	VenueState *PublicVenueState
 }
 
+// Paging defaults shared by every catalog read. They live here, not in the
+// repository, because THREE layers have to agree on them: the repository
+// (which builds LIMIT/OFFSET), the usecase (which pages a venue-state-filtered
+// set in memory) and the transport layer (which echoes page/per_page back to
+// the client). A private copy in each is how the echoed per_page and the
+// number of rows actually returned drift apart.
+const (
+	DefaultPerPage = 20
+	MaxPerPage     = 100
+)
+
+// NormalizePaging applies the catalog's paging defaults: a non-positive page is
+// the first one, a non-positive per-page is DefaultPerPage, and per-page is
+// capped at MaxPerPage.
+func NormalizePaging(page, perPage int) (int, int) {
+	if page <= 0 {
+		page = 1
+	}
+	if perPage <= 0 {
+		perPage = DefaultPerPage
+	}
+	if perPage > MaxPerPage {
+		perPage = MaxPerPage
+	}
+	return page, perPage
+}
+
+// CatalogScanLimit caps an Unpaginated catalog read (see
+// RestaurantFilter.Unpaginated). It is a safety ceiling on a query that has no
+// LIMIT of its own, not a page size: the venue-state filter is evaluated over
+// the whole matching set, and the set has to be bounded by something. The
+// current catalog is two orders of magnitude below it.
+const CatalogScanLimit = 2000
+
 // RestaurantFilter narrows a listing query. Zero-value fields are ignored.
 type RestaurantFilter struct {
 	City      *City
@@ -137,6 +171,12 @@ type RestaurantFilter struct {
 	Search    string // case-insensitive substring match on name
 	Page      int    // 1-based; <=0 means 1
 	PerPage   int    // <=0 means default (20), capped at 100
+	// Unpaginated asks for the WHOLE matching set (up to CatalogScanLimit)
+	// instead of one page, ignoring Page/PerPage. Set only by
+	// usecase/restaurants when a VenueStateFilter is in play: that filter is
+	// evaluated in Go, after the rows are read, so paging before it would page
+	// the wrong set and report a page-local total. No transport layer sets it.
+	Unpaginated bool
 }
 
 // RestaurantSearchFilter narrows a full-text restaurant search. The zero value
@@ -154,6 +194,8 @@ type RestaurantSearchFilter struct {
 	Price    *PriceCategory
 	Page     int // 1-based; <=0 means 1
 	PerPage  int // <=0 means default (20), capped at 100
+	// Unpaginated — see RestaurantFilter.Unpaginated.
+	Unpaginated bool
 }
 
 // RestaurantRepository persists restaurants. Get* return ErrNotFound when absent.

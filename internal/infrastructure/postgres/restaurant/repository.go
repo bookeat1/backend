@@ -262,17 +262,8 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 		return nil, 0, fmt.Errorf("count restaurants: %w", err)
 	}
 
-	page, perPage := f.Page, f.PerPage
-	if page <= 0 {
-		page = 1
-	}
-	if perPage <= 0 {
-		perPage = 20
-	}
-	if perPage > 100 {
-		perPage = 100
-	}
-	args = append(args, perPage, (page-1)*perPage)
+	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
+	args = append(args, limit, offset)
 	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		ORDER BY r.display_order ASC NULLS LAST, r.name ASC
@@ -354,17 +345,6 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 		return nil, 0, fmt.Errorf("count search restaurants: %w", err)
 	}
 
-	page, perPage := f.Page, f.PerPage
-	if page <= 0 {
-		page = 1
-	}
-	if perPage <= 0 {
-		perPage = 20
-	}
-	if perPage > 100 {
-		perPage = 100
-	}
-
 	// Ordering: with a text query, rank by FTS relevance then trigram
 	// word-similarity, tie-broken by id so a page boundary is deterministic
 	// (equal-ranked rows never reshuffle between pages). Without a query the
@@ -377,7 +357,8 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 			searchTextExpr, qN, qN, searchTextExpr)
 	}
 
-	args = append(args, perPage, (page-1)*perPage)
+	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
+	args = append(args, limit, offset)
 	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		` + orderSQL + `
@@ -532,6 +513,25 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	m.AddressI18n = i18nFromDB(addr)
 	m.OpeningHoursI18n = i18nFromDB(opening)
 	return &m, primary, nil
+}
+
+// limitOffset resolves the LIMIT/OFFSET pair for a catalog read.
+//
+// Normal reads take one page, with the shared defaults (domain.NormalizePaging)
+// rather than a copy of "20 / cap 100" that can drift from the one the usecase
+// and transport layers apply.
+//
+// An unpaginated read asks for the WHOLE matching set: the caller has a filter
+// it can only evaluate in Go over every matching row (see
+// domain.VenueStateFilter). It is still bounded — domain.CatalogScanLimit is a
+// safety ceiling, not a page size, and the caller compares the number of rows it
+// got against the count to notice if it ever bites.
+func limitOffset(page, perPage int, unpaginated bool) (int, int) {
+	if unpaginated {
+		return domain.CatalogScanLimit, 0
+	}
+	page, perPage = domain.NormalizePaging(page, perPage)
+	return perPage, (page - 1) * perPage
 }
 
 // escapeLike escapes the LIKE/ILIKE metacharacters (backslash first) so a

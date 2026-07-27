@@ -129,6 +129,15 @@ const (
 	// refused our key, or answered with something that is not an image.
 	// Transient: a later retry may succeed.
 	CodeMapProviderUnavailable ErrorCode = "map_provider_unavailable"
+
+	// CodeCatalogVenueStateUnavailable — the catalog was asked to filter by
+	// open_now / accepts_online_bookings, but the server-computed venue state
+	// behind those fields could not be read for this request. 503, and
+	// deliberately NOT an unfiltered 200: answering a filtered query with the
+	// whole catalog is the silent lie the filter exists to remove. The client
+	// should retry, or fall back to browsing without the filter — never
+	// present the result as filtered.
+	CodeCatalogVenueStateUnavailable ErrorCode = "catalog_venue_state_unavailable"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

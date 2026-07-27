@@ -2,6 +2,8 @@ package restaurants
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -11,10 +13,14 @@ import (
 
 // Facade exposes catalog reads and admin mutations.
 type Facade interface {
-	List(ctx context.Context, f domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error)
+	// List returns one page of the catalog plus the total number of venues
+	// matching BOTH filters. vs (the server-computed venue state: open now /
+	// accepts online bookings) is a separate argument on purpose — see
+	// domain.VenueStateFilter for why it cannot travel inside the SQL filter.
+	List(ctx context.Context, f domain.RestaurantFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error)
 	// Search runs the full-text + fuzzy catalog search (a distinct endpoint
 	// from List, which keeps its existing response shape untouched).
-	Search(ctx context.Context, f domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error)
+	Search(ctx context.Context, f domain.RestaurantSearchFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error)
 	Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error)
 	Categories(ctx context.Context) ([]domain.RestaurantCategory, error)
 	Create(ctx context.Context, in SaveInput) (*domain.RestaurantAggregate, error)
@@ -114,22 +120,96 @@ type PartnershipInput struct {
 	AdditionalInfo *string
 }
 
-func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
-	items, total, err := f.repo.ListActive(ctx, flt)
+func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
+	if !vs.Active() {
+		items, total, err := f.repo.ListActive(ctx, flt)
+		if err != nil {
+			return nil, 0, err
+		}
+		f.venue.AttachList(ctx, items)
+		return items, total, nil
+	}
+	scan := flt
+	scan.Unpaginated = true
+	items, matched, err := f.repo.ListActive(ctx, scan)
 	if err != nil {
 		return nil, 0, err
 	}
 	f.venue.AttachList(ctx, items)
-	return items, total, nil
+	return f.pageByVenueState(items, matched, vs, flt.Page, flt.PerPage)
 }
 
-func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
-	items, total, err := f.repo.Search(ctx, flt)
+func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
+	if !vs.Active() {
+		items, total, err := f.repo.Search(ctx, flt)
+		if err != nil {
+			return nil, 0, err
+		}
+		f.venue.AttachList(ctx, items)
+		return items, total, nil
+	}
+	scan := flt
+	scan.Unpaginated = true
+	items, matched, err := f.repo.Search(ctx, scan)
 	if err != nil {
 		return nil, 0, err
 	}
 	f.venue.AttachList(ctx, items)
-	return items, total, nil
+	return f.pageByVenueState(items, matched, vs, flt.Page, flt.PerPage)
+}
+
+// pageByVenueState applies a domain.VenueStateFilter to an ALREADY ENRICHED,
+// unpaginated candidate set and cuts the requested page out of what survives.
+//
+// The order matters and is the whole point of the two-phase read: SQL narrows
+// (city / cuisine / price / text), Go decides open-now and bookability with the
+// same code that publishes those fields, and only then does paging happen. Any
+// other order gives a page-local answer — the exact defect the app worked around
+// on the client, where "забронировать можно в 7 из 24" was true only while the
+// whole catalog fitted in one page.
+//
+// The returned total is therefore the number of venues matching BOTH filters,
+// which is what the client shows the guest.
+func (f *facade) pageByVenueState(
+	items []domain.RestaurantListItem, matched int,
+	vs domain.VenueStateFilter, page, perPage int,
+) ([]domain.RestaurantListItem, int, error) {
+	if matched > len(items) {
+		// The scan hit domain.CatalogScanLimit. Everything below is then
+		// computed over a truncated set and the total under-reports. Loud in
+		// the log rather than silently wrong-by-a-little; when this ever fires,
+		// the filter has to move into SQL (materialized venue state), which is
+		// a schema change and a separate decision.
+		slog.Warn("catalog venue-state filter truncated by the scan limit",
+			"matched", matched, "scanned", len(items), "limit", domain.CatalogScanLimit)
+	}
+	kept := make([]domain.RestaurantListItem, 0, len(items))
+	for _, it := range items {
+		if it.VenueState == nil {
+			// The enrichment is optional and best-effort (a hours/tables read
+			// that fails degrades the catalog to "hours unknown"). It cannot
+			// degrade a REQUEST TO FILTER by it: serving the unfiltered list
+			// under a filtered query is precisely the silent lie this task
+			// removes. 503 + a code the client can act on instead.
+			return nil, 0, domain.WithCode(domain.CodeCatalogVenueStateUnavailable,
+				fmt.Errorf("%w: venue state could not be computed", domain.ErrUnavailable))
+		}
+		if vs.Matches(it.VenueState) {
+			kept = append(kept, it)
+		}
+	}
+	total := len(kept)
+
+	page, perPage = domain.NormalizePaging(page, perPage)
+	start := (page - 1) * perPage
+	if start >= total {
+		return nil, total, nil
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+	return kept[start:end], total, nil
 }
 
 func (f *facade) Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
