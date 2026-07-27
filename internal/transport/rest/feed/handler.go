@@ -71,7 +71,13 @@ func (h *Handler) RegisterPlatformRoutes(rg *gin.RouterGroup) {
 func (h *Handler) main(c *gin.Context) {
 	city := domain.City(c.Query("city"))
 	if !city.Valid() {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "city is required and must be a known city")
+		// Status and message are exactly what they were; the code is what is
+		// new. A bare 422 here is indistinguishable from every other 422 the
+		// home screen can get, so the app could not tell "pick a city first"
+		// from a real failure — which is how a first launch without a chosen
+		// city ends up showing "что-то пошло не так".
+		response.ErrorWithCode(c.Writer, http.StatusUnprocessableEntity,
+			domain.CodeCityRequired, "city is required and must be a known city")
 		return
 	}
 	// OptionalAuth: an anonymous guest simply carries no user id, and the

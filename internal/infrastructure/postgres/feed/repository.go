@@ -34,14 +34,15 @@ var _ domain.FeedRepository = (*Repository)(nil)
 // NEVER caller input: it comes from tableFor, a closed switch over the two
 // known kinds, so no string here can carry an injection.
 //
-// The two branches differ only in the columns the other entity lacks:
-// promos have no cover image, events have no terms. Both are projected as a
-// typed NULL / empty string so the column list stays identical.
+// The two branches now differ only in `terms`, which events do not have and
+// which is projected as an empty string so the column list stays identical.
+// Both tables carry cover_image_url (promos since migration 0060), so the card
+// picture is read the same way for both kinds.
 func itemSelect(kind domain.FeedItemKind) string {
 	table, alias := tableFor(kind), "i"
-	cover, terms := "NULL::varchar", alias+".terms"
+	cover, terms := alias+".cover_image_url", alias+".terms"
 	if kind == domain.FeedItemEvent {
-		cover, terms = alias+".cover_image_url", "''::text"
+		terms = "''::text"
 	}
 	return `SELECT '` + string(kind) + `'::text AS kind,
 		` + alias + `.id, ` + alias + `.restaurant_id,

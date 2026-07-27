@@ -57,6 +57,7 @@ type CreateInput struct {
 	StartsAt        time.Time
 	EndsAt          time.Time
 	Terms           string
+	CoverImageURL   *string
 	Status          domain.PromoStatus
 }
 
@@ -69,6 +70,7 @@ type UpdateInput struct {
 	StartsAt        time.Time
 	EndsAt          time.Time
 	Terms           string
+	CoverImageURL   *string
 	Status          domain.PromoStatus
 }
 
@@ -101,6 +103,7 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		StartsAt:        in.StartsAt,
 		EndsAt:          in.EndsAt,
 		Terms:           in.Terms,
+		CoverImageURL:   in.CoverImageURL,
 		Status:          status,
 	}
 	if err := validatePromo(p); err != nil {
@@ -134,6 +137,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	p.StartsAt = in.StartsAt
 	p.EndsAt = in.EndsAt
 	p.Terms = in.Terms
+	p.CoverImageURL = in.CoverImageURL
 	p.Status = in.Status
 	if err := validatePromo(p); err != nil {
 		return nil, err
@@ -230,10 +234,20 @@ func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
 	return strings.TrimSpace(in.Title) != cur.Title ||
 		in.Description != cur.Description ||
 		in.Terms != cur.Terms ||
+		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL) ||
 		!in.StartsAt.Equal(cur.StartsAt) ||
 		!in.EndsAt.Equal(cur.EndsAt) ||
 		!i18nEqual(in.TitleI18n, cur.TitleI18n) ||
 		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n)
+}
+
+// strPtrEqual compares two optional strings by value: two nils are equal, and a
+// nil never equals a set value ("the picture was removed" IS an edit).
+func strPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // i18nEqual compares two localized maps by content: a nil map and an empty one

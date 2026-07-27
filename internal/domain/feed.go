@@ -126,7 +126,9 @@ type FeedItem struct {
 	// EventRepository.ListPublishedUpcoming) rather than inventing a third rule.
 	StartsAt time.Time
 	EndsAt   time.Time
-	// CoverImageURL is set for events only (promos carry no image column yet).
+	// CoverImageURL is the card's picture, for both kinds (promos got their own
+	// column in migration 0060). Nil means the item has no picture — never a
+	// placeholder URL.
 	CoverImageURL *string
 	// Terms is set for promos only (the fine print).
 	Terms string

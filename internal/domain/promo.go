@@ -48,10 +48,15 @@ type Promo struct {
 	EndsAt          time.Time
 	// Terms is free-text fine print ("dine-in only, not combinable with other
 	// offers"). Not localized in this increment.
-	Terms     string
-	Status    PromoStatus
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Terms string
+	// CoverImageURL is the promo card's picture — the FULL public URL, exactly
+	// like Event.CoverImageURL and Image.ImageURL. Nil means the promo has no
+	// picture: the API omits the field rather than inventing a placeholder, and
+	// the client draws its own.
+	CoverImageURL *string
+	Status        PromoStatus
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // PromoRepository persists restaurant promos. Get* return ErrNotFound when

@@ -97,3 +97,58 @@ func TestListByRestaurant_StatusFilter(t *testing.T) {
 		t.Fatalf("draft-filtered admin list: total=%d err=%v", total, err)
 	}
 }
+
+// The promo cover round-trips as a full public URL, and "no picture" stays a
+// real NULL — the API must be able to say "there is no image" instead of
+// inventing one.
+func TestCoverImageURL_RoundTripAndNull(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "promos", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	cover := "https://pub-41b6f06fc8e74b6e959cdd6def081e22.r2.dev/promos/happy-hour.jpg"
+	withCover := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	withCover.CoverImageURL = &cover
+	withoutCover := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	for _, p := range []*domain.Promo{withCover, withoutCover} {
+		if err := repo.Create(ctx, p); err != nil {
+			t.Fatalf("create promo: %v", err)
+		}
+	}
+
+	got, err := repo.GetByID(ctx, withCover.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.CoverImageURL == nil || *got.CoverImageURL != cover {
+		t.Fatalf("cover = %v, want %q", got.CoverImageURL, cover)
+	}
+
+	got, err = repo.GetByID(ctx, withoutCover.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.CoverImageURL != nil {
+		t.Fatalf("cover = %v, want nil for a promo with no picture", *got.CoverImageURL)
+	}
+
+	// And an update can both set and clear it.
+	got.CoverImageURL = &cover
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	reread, err := repo.GetByID(ctx, withoutCover.ID)
+	if err != nil || reread.CoverImageURL == nil || *reread.CoverImageURL != cover {
+		t.Fatalf("cover after update = %v (err %v)", reread.CoverImageURL, err)
+	}
+	reread.CoverImageURL = nil
+	if err := repo.Update(ctx, reread); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	cleared, err := repo.GetByID(ctx, withoutCover.ID)
+	if err != nil || cleared.CoverImageURL != nil {
+		t.Fatalf("cover after clearing = %v (err %v)", cleared.CoverImageURL, err)
+	}
+}
