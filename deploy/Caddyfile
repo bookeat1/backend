@@ -20,6 +20,34 @@
 		format json
 	}
 
+	# Static preview of the guest mobile app (Expo web build). Served before
+	# the proxy so that /preview never reaches the backend. It is an SPA: any
+	# path that does not exist on disk falls back to index.html and the client
+	# resolves the route.
+	handle_path /preview* {
+		root * /srv/preview
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Static preview of the venue panel (Next.js static export built with
+	# basePath=/admin-preview). Served before the proxy so that /admin-preview
+	# never reaches the backend. handle_path strips the prefix, so a request for
+	# /admin-preview/_next/... maps onto files at the root of admin-preview.
+	# With trailingSlash every page is a directory holding index.html; unknown
+	# routes fall back to the root index.html.
+	#
+	# /srv/preview/admin-preview is a SYMLINK to the current release directory
+	# under /srv/preview/admin-releases/. The deploy pipeline in bookeat1/frontend
+	# (.github/workflows/deploy-admin-test.yml) uploads a new release next to it
+	# and moves that symlink, so a half-finished upload is never served. Caddy
+	# follows the symlink on every request; swapping it needs no reload.
+	handle_path /admin-preview* {
+		root * /srv/preview/admin-preview
+		try_files {path} {path}/index.html /index.html
+		file_server
+	}
+
 	# Liveness check does not need to go through the app's readiness path;
 	# Caddy just proxies everything, including /health and /health/ready.
 	reverse_proxy app:8080 {
