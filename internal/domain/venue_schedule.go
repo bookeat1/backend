@@ -96,6 +96,22 @@ func (s *PublicVenueState) OpenNowKnown() (open bool, known bool) {
 	return *s.Schedule.OpenNow, true
 }
 
+// OpenNowUncomputed separates the two reasons OpenNowKnown says "unknown",
+// which look identical in the payload but are not the same thing at all:
+//
+//   - Schedule is nil — nobody entered this venue's hours. A FACT about the
+//     venue. It is not open, and it belongs under open_now=false.
+//   - Schedule is present but OpenNow is nil — we know the hours and still
+//     could not answer: the venue's timezone would not load on this host, or
+//     its special days could not be read. That is OUR failure, and bucketing
+//     such a venue as "not open" would quietly drop a venue that may well be
+//     open — or, if the whole page fails that way, answer open_now=true with an
+//     empty list. Callers that FILTER on open-now must refuse instead; see
+//     usecase/restaurants.
+func (s *PublicVenueState) OpenNowUncomputed() bool {
+	return s != nil && s.Schedule != nil && s.Schedule.OpenNow == nil
+}
+
 // VenueStateFilter narrows a catalog query by the two facts the server COMPUTES
 // per venue (PublicVenueState) instead of storing them in a column: "is it open
 // right now, in its own timezone" and "can it take an online booking at all".

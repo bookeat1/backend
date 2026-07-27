@@ -3,6 +3,7 @@ package restaurants
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -33,16 +34,21 @@ type venueFixture struct {
 	hours  []domain.WorkingHours
 	tables int
 	tz     string // venue override; empty = platform fallback
+	// overrides are the venue's special days. They are AUTHORITATIVE over the
+	// weekly rows (ADR-014), so a venue shut for a holiday must fall out of
+	// open_now=true even though every weekday row says it is open.
+	overrides []domain.ScheduleOverride
 }
 
 // newFilterFacade wires the real facade + real VenueState over the fakes, with
-// a frozen clock. Returns the facade and the repo so a test can inspect the
-// filter the repository was handed.
-func newFilterFacade(t *testing.T, now time.Time, venues []venueFixture) (Facade, *fakeRestaurantRepo) {
+// a frozen clock. Returns the facade, the repo (to inspect the filter it was
+// handed) and the state reader (to count how many batches the enrichment cost).
+func newFilterFacade(t *testing.T, now time.Time, venues []venueFixture) (Facade, *fakeRestaurantRepo, *fakeVenueState) {
 	t.Helper()
 	items := make([]domain.RestaurantListItem, 0, len(venues))
 	hours := map[uuid.UUID][]domain.WorkingHours{}
 	tables := map[uuid.UUID]int{}
+	overrides := map[uuid.UUID][]domain.ScheduleOverride{}
 	for _, v := range venues {
 		r := domain.Restaurant{ID: v.id, Name: v.name}
 		if v.tz != "" {
@@ -56,13 +62,16 @@ func newFilterFacade(t *testing.T, now time.Time, venues []venueFixture) (Facade
 		if v.tables > 0 {
 			tables[v.id] = v.tables
 		}
+		if len(v.overrides) > 0 {
+			overrides[v.id] = v.overrides
+		}
 	}
 	repo := &fakeRestaurantRepo{list: items, total: len(items)}
-	state := &fakeVenueState{hours: hours, tables: tables}
+	state := &fakeVenueState{hours: hours, tables: tables, overrides: overrides}
 	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
 		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
 			WithVenueStateClock(func() time.Time { return now }))))
-	return f, repo
+	return f, repo, state
 }
 
 // catalogFixture is the shared four-venue catalog: every combination of
@@ -173,7 +182,7 @@ func TestVenueStateFilterCombinations(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run("list/"+tc.name, func(t *testing.T) {
-			f, _ := newFilterFacade(t, now, venues)
+			f, _, _ := newFilterFacade(t, now, venues)
 			items, total, err := f.List(context.Background(), domain.RestaurantFilter{}, tc.vs)
 			if err != nil {
 				t.Fatalf("list: %v", err)
@@ -186,7 +195,7 @@ func TestVenueStateFilterCombinations(t *testing.T) {
 			}
 		})
 		t.Run("search/"+tc.name, func(t *testing.T) {
-			f, _ := newFilterFacade(t, now, venues)
+			f, _, _ := newFilterFacade(t, now, venues)
 			items, total, err := f.Search(context.Background(), domain.RestaurantSearchFilter{}, tc.vs)
 			if err != nil {
 				t.Fatalf("search: %v", err)
@@ -213,12 +222,12 @@ func TestVenueStateFilterPartitionsTheCatalog(t *testing.T) {
 			} else {
 				yes.AcceptsOnlineBookings, no.AcceptsOnlineBookings = boolPtr(true), boolPtr(false)
 			}
-			f, _ := newFilterFacade(t, now, venues)
+			f, _, _ := newFilterFacade(t, now, venues)
 			_, totalYes, err := f.List(context.Background(), domain.RestaurantFilter{}, yes)
 			if err != nil {
 				t.Fatalf("list true: %v", err)
 			}
-			f, _ = newFilterFacade(t, now, venues)
+			f, _, _ = newFilterFacade(t, now, venues)
 			_, totalNo, err := f.List(context.Background(), domain.RestaurantFilter{}, no)
 			if err != nil {
 				t.Fatalf("list false: %v", err)
@@ -240,7 +249,7 @@ func TestVenueStateFilterUsesTheVenueTimezone(t *testing.T) {
 		{name: "Istanbul", id: uuid.New(), hours: openEveryDay("11:00", "22:00"), tables: 4,
 			tz: "Europe/Istanbul"},
 	}
-	f, _ := newFilterFacade(t, instant, venues)
+	f, _, _ := newFilterFacade(t, instant, venues)
 	items, total, err := f.List(context.Background(), domain.RestaurantFilter{},
 		domain.VenueStateFilter{OpenNow: boolPtr(true)})
 	if err != nil {
@@ -259,7 +268,7 @@ func TestVenueStateFilterUsesTheVenueTimezone(t *testing.T) {
 func TestVenueStateFilterReadsTheWholeMatchingSet(t *testing.T) {
 	now, venues := catalogFixture(t)
 
-	f, repo := newFilterFacade(t, now, venues)
+	f, repo, _ := newFilterFacade(t, now, venues)
 	if _, _, err := f.List(context.Background(),
 		domain.RestaurantFilter{PerPage: 2}, domain.VenueStateFilter{OpenNow: boolPtr(true)}); err != nil {
 		t.Fatalf("list: %v", err)
@@ -268,7 +277,7 @@ func TestVenueStateFilterReadsTheWholeMatchingSet(t *testing.T) {
 		t.Error("a filtered listing must scan the whole matching set, not one page")
 	}
 
-	f, repo = newFilterFacade(t, now, venues)
+	f, repo, _ = newFilterFacade(t, now, venues)
 	if _, _, err := f.Search(context.Background(),
 		domain.RestaurantSearchFilter{PerPage: 2}, domain.VenueStateFilter{OpenNow: boolPtr(true)}); err != nil {
 		t.Fatalf("search: %v", err)
@@ -279,7 +288,7 @@ func TestVenueStateFilterReadsTheWholeMatchingSet(t *testing.T) {
 
 	// Without a venue-state filter nothing changes: the repository still pages
 	// in SQL, which is what every existing client relies on.
-	f, repo = newFilterFacade(t, now, venues)
+	f, repo, _ = newFilterFacade(t, now, venues)
 	if _, _, err := f.List(context.Background(),
 		domain.RestaurantFilter{PerPage: 2}, domain.VenueStateFilter{}); err != nil {
 		t.Fatalf("list: %v", err)
@@ -326,7 +335,7 @@ func TestVenueStateFilterPagination(t *testing.T) {
 		{page: 0, perPage: 0, want: wantOpen},
 	}
 	for _, tc := range tests {
-		f, _ := newFilterFacade(t, now, venues)
+		f, _, _ := newFilterFacade(t, now, venues)
 		items, total, err := f.List(context.Background(),
 			domain.RestaurantFilter{Page: tc.page, PerPage: tc.perPage},
 			domain.VenueStateFilter{OpenNow: boolPtr(true)})
@@ -371,5 +380,188 @@ func TestVenueStateFilterRefusesWhenStateIsUnavailable(t *testing.T) {
 	if _, _, err := f.List(context.Background(), domain.RestaurantFilter{},
 		domain.VenueStateFilter{}); err != nil {
 		t.Errorf("an unfiltered listing must still work without the enrichment: %v", err)
+	}
+}
+
+// Special days are AUTHORITATIVE over the weekly rows (ADR-014), and the filter
+// stands on the same domain.IsOpenAt call the payload does — so a venue shut for
+// a holiday must fall out of open_now=true even though all seven weekday rows
+// say it is open. This is not a side effect of the merge, it is the point of
+// having one implementation.
+func TestVenueStateFilterHonoursSpecialDays(t *testing.T) {
+	almaty, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// Friday 2026-07-24, 13:00 Almaty — inside every venue's 11:00–22:00 week.
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, almaty)
+
+	venues := []venueFixture{
+		{name: "Normal", id: uuid.New(), hours: openEveryDay("11:00", "22:00"), tables: 4},
+		{
+			name: "ClosedForHoliday", id: uuid.New(),
+			hours: openEveryDay("11:00", "22:00"), tables: 4,
+			overrides: []domain.ScheduleOverride{vsClosed("2026-07-24")},
+		},
+		{
+			name: "ShortenedPastUs", id: uuid.New(),
+			hours: openEveryDay("11:00", "22:00"), tables: 4,
+			// Open today, but only in the evening: at 13:00 it is shut.
+			overrides: []domain.ScheduleOverride{vsHours("2026-07-24", "18:00", "23:00")},
+		},
+		{
+			name: "OpenLaterToday", id: uuid.New(),
+			hours: openEveryDay("11:00", "22:00"), tables: 4,
+			// A special day that is NOT today changes nothing about now.
+			overrides: []domain.ScheduleOverride{vsClosed("2026-08-01")},
+		},
+		{
+			name: "OpenedByOverride", id: uuid.New(),
+			// The weekly row says closed on Friday; the special day opens it.
+			// The filter must follow the override in this direction too, or it
+			// hides a venue that is serving guests.
+			hours: []domain.WorkingHours{
+				wh(0, true, "11:00", "22:00"), wh(1, true, "11:00", "22:00"),
+				wh(2, true, "11:00", "22:00"), wh(3, true, "11:00", "22:00"),
+				wh(4, true, "11:00", "22:00"), wh(5, false, "", ""),
+				wh(6, true, "11:00", "22:00"),
+			},
+			tables:    4,
+			overrides: []domain.ScheduleOverride{vsHours("2026-07-24", "11:00", "22:00")},
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		vs   domain.VenueStateFilter
+		want []string
+	}{
+		{
+			name: "open_now=true drops the venue shut for the holiday",
+			vs:   domain.VenueStateFilter{OpenNow: boolPtr(true)},
+			want: []string{"Normal", "OpenLaterToday", "OpenedByOverride"},
+		},
+		{
+			name: "open_now=false picks up exactly those the special days shut",
+			vs:   domain.VenueStateFilter{OpenNow: boolPtr(false)},
+			want: []string{"ClosedForHoliday", "ShortenedPastUs"},
+		},
+		{
+			// A holiday closure is about TODAY, not about the venue's ability to
+			// take bookings at all — that flag must not move.
+			name: "accepts_online_bookings is unaffected by a special day",
+			vs:   domain.VenueStateFilter{AcceptsOnlineBookings: boolPtr(true)},
+			want: []string{"Normal", "ClosedForHoliday", "ShortenedPastUs", "OpenLaterToday", "OpenedByOverride"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _, _ := newFilterFacade(t, now, venues)
+			items, total, err := f.List(context.Background(), domain.RestaurantFilter{}, tc.vs)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if got := namesOf(items); !equalNames(got, tc.want) {
+				t.Errorf("items = %v, want %v", got, tc.want)
+			}
+			if total != len(tc.want) {
+				t.Errorf("total = %d, want %d", total, len(tc.want))
+			}
+		})
+	}
+}
+
+// The enrichment now reads THREE things per page (hours, tables, special days).
+// All three must stay one batch each, whatever the page holds — the filtered
+// read hands the whole matching catalog to AttachList, so a per-venue query
+// here would turn a 24-venue catalog into 72 round trips.
+func TestVenueStateFilterCostsOneBatchPerRead(t *testing.T) {
+	almaty, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, almaty)
+
+	// The size of the live catalog, so the number in the failure message is the
+	// one that matters in production.
+	const catalogSize = 24
+	venues := make([]venueFixture, 0, catalogSize)
+	for i := 0; i < catalogSize; i++ {
+		venues = append(venues, venueFixture{
+			name: "V" + strconv.Itoa(i), id: uuid.New(),
+			hours: openEveryDay("11:00", "22:00"), tables: 4,
+		})
+	}
+
+	f, _, state := newFilterFacade(t, now, venues)
+	items, total, err := f.List(context.Background(),
+		domain.RestaurantFilter{PerPage: 5}, domain.VenueStateFilter{OpenNow: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != catalogSize || len(items) != 5 {
+		t.Fatalf("total = %d (want %d), items = %d (want 5)", total, catalogSize, len(items))
+	}
+
+	// One hours batch, one overrides batch — and each carrying every id, not one.
+	if len(state.hoursIDs) != 1 {
+		t.Errorf("working-hours lookups = %d, want 1 batch for the whole page", len(state.hoursIDs))
+	} else if len(state.hoursIDs[0]) != catalogSize {
+		t.Errorf("first hours batch carried %d ids, want all %d", len(state.hoursIDs[0]), catalogSize)
+	}
+	if len(state.overrideWins) != 1 {
+		t.Errorf("special-day lookups = %d, want 1 batch for the whole page — a per-venue "+
+			"read would cost %d round trips on the live catalog", len(state.overrideWins), catalogSize)
+	}
+}
+
+// If the special days could NOT be read, open-now comes back unanswered even
+// though the hours are known. Such a venue must not be quietly filed under
+// "not open": with the whole page failing that way, open_now=true would answer
+// 200 with an empty catalog, as if the city had shut.
+func TestVenueStateFilterRefusesWhenSpecialDaysAreUnreadable(t *testing.T) {
+	almaty, err := time.LoadLocation("Asia/Almaty")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 7, 24, 13, 0, 0, 0, almaty)
+
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{
+		list:  []domain.RestaurantListItem{{Restaurant: domain.Restaurant{ID: id, Name: "V"}}},
+		total: 1,
+	}
+	state := &fakeVenueState{
+		hours:        map[uuid.UUID][]domain.WorkingHours{id: openEveryDay("11:00", "22:00")},
+		tables:       map[uuid.UUID]int{id: 4},
+		overridesErr: errors.New("overrides table unreachable"),
+	}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
+		WithVenueState(NewVenueState(state, perVenueTZ{fallback: "Asia/Almaty"},
+			WithVenueStateClock(func() time.Time { return now }))))
+
+	_, _, err = f.List(context.Background(), domain.RestaurantFilter{},
+		domain.VenueStateFilter{OpenNow: boolPtr(true)})
+	if !errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable (503)", err)
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeCatalogVenueStateUnavailable {
+		t.Errorf("code = %q (present %v), want %q", code, ok, domain.CodeCatalogVenueStateUnavailable)
+	}
+
+	// The bookability filter does NOT depend on the special days, so it must
+	// keep working — refusing it too would be an outage invented by this guard.
+	items, total, err := f.List(context.Background(), domain.RestaurantFilter{},
+		domain.VenueStateFilter{AcceptsOnlineBookings: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("accepts_online_bookings must still be answerable: %v", err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Errorf("total = %d, items = %d, want 1 and 1", total, len(items))
+	}
+
+	// And an unfiltered catalog is still served, without open_now.
+	if _, _, err := f.List(context.Background(), domain.RestaurantFilter{},
+		domain.VenueStateFilter{}); err != nil {
+		t.Errorf("unfiltered listing must survive an overrides outage: %v", err)
 	}
 }

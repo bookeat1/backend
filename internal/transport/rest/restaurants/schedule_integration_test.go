@@ -14,6 +14,7 @@ import (
 
 	"backend-core/internal/domain"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
+	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	"backend-core/internal/infrastructure/postgres/testdb"
 	"backend-core/internal/infrastructure/sqltx"
 	bookinguc "backend-core/internal/usecase/bookings"
@@ -309,8 +310,27 @@ func TestCatalogFiltersEndToEnd(t *testing.T) {
 	istanbul := seededVenue{id: uuid.New(), name: "Istanbul", timezone: "Europe/Istanbul",
 		hours: fullWeek("12:00", "22:00"), tables: table()}
 
-	venues := []seededVenue{openBookable, openNoTables, shutBookable, noHours, istanbul}
+	// Open all week, with tables — and closed TODAY by a special day. Special
+	// days are authoritative over the weekly rows (ADR-014), and the filter
+	// stands on the same domain.IsOpenAt call the payload does, so this venue
+	// must fall out of open_now=true. Its ability to take bookings at all is a
+	// different question and must not move.
+	holidayClosed := seededVenue{id: uuid.New(), name: "HolidayClosed",
+		hours: fullWeek("11:00", "22:00"), tables: table()}
+
+	venues := []seededVenue{openBookable, openNoTables, shutBookable, noHours, istanbul, holidayClosed}
 	seedVenues(t, pool, venues)
+
+	holidayNote := "Санитарный день"
+	if err := schedulerepo.New(pool).Upsert(context.Background(), &domain.ScheduleOverride{
+		RestaurantID: holidayClosed.id,
+		// The frozen clock's own calendar date, in the venue's zone.
+		Date:     domain.StartOfDay(now, almaty),
+		IsClosed: true,
+		Note:     &holidayNote,
+	}); err != nil {
+		t.Fatalf("upsert holiday override: %v", err)
+	}
 
 	repo := restrepo.New(pool)
 	rel := restrepo.NewRelated(pool)
@@ -375,7 +395,7 @@ func TestCatalogFiltersEndToEnd(t *testing.T) {
 		{
 			name:  "unfiltered: the whole catalog, exactly as before",
 			query: "",
-			want:  []string{"OpenBookable", "OpenNoTables", "ShutBookable", "NoHours", "Istanbul"},
+			want:  []string{"OpenBookable", "OpenNoTables", "ShutBookable", "NoHours", "Istanbul", "HolidayClosed"},
 		},
 		{
 			name:  "open_now=true: the venue with no hours and the one in another zone are out",
@@ -383,14 +403,14 @@ func TestCatalogFiltersEndToEnd(t *testing.T) {
 			want:  []string{"OpenBookable", "OpenNoTables"},
 		},
 		{
-			name:  "open_now=false: the complement, unknown hours included",
+			name:  "open_now=false: the complement — unknown hours AND the special-day closure",
 			query: "&open_now=false",
-			want:  []string{"ShutBookable", "NoHours", "Istanbul"},
+			want:  []string{"ShutBookable", "NoHours", "Istanbul", "HolidayClosed"},
 		},
 		{
-			name:  "accepts_online_bookings=true: needs capacity AND a readable schedule",
+			name:  "accepts_online_bookings=true: a holiday closure does not make a venue unbookable",
 			query: "&accepts_online_bookings=true",
-			want:  []string{"OpenBookable", "ShutBookable", "Istanbul"},
+			want:  []string{"OpenBookable", "ShutBookable", "Istanbul", "HolidayClosed"},
 		},
 		{
 			name:  "accepts_online_bookings=false",
@@ -419,31 +439,62 @@ func TestCatalogFiltersEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Paging over a FILTERED set: the three bookable venues split across two
-	// pages of two, and the total stays 3 on both. Before the filter moved to
-	// the server this is exactly what could not work — the app counted one page.
+	// Paging over a FILTERED set: the four bookable venues split across two
+	// pages of two, and the total stays 4 on every one of them — including the
+	// empty third. Before the filter moved to the server this is exactly what
+	// could not work: the app counted the page it had.
 	t.Run("pagination with a filter applied", func(t *testing.T) {
 		for _, route := range []string{"/api/v1/restaurants", "/api/v1/restaurants/search"} {
 			first := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=1")
 			if names := namesOf(first); !equal(names, []string{"OpenBookable", "ShutBookable"}) {
 				t.Errorf("%s page 1 = %v", route, names)
 			}
-			if first.Total != 3 {
-				t.Errorf("%s page 1 total = %d, want 3", route, first.Total)
+			if first.Total != 4 {
+				t.Errorf("%s page 1 total = %d, want 4", route, first.Total)
 			}
 			second := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=2")
-			if names := namesOf(second); !equal(names, []string{"Istanbul"}) {
+			if names := namesOf(second); !equal(names, []string{"Istanbul", "HolidayClosed"}) {
 				t.Errorf("%s page 2 = %v", route, names)
 			}
-			if second.Total != 3 {
-				t.Errorf("%s page 2 total = %d, want 3", route, second.Total)
+			if second.Total != 4 {
+				t.Errorf("%s page 2 total = %d, want 4", route, second.Total)
 			}
 			third := fetch(t, route+"?accepts_online_bookings=true&per_page=2&page=3")
 			if len(third.Items) != 0 {
 				t.Errorf("%s page 3 = %v, want an empty page", route, namesOf(third))
 			}
-			if third.Total != 3 {
-				t.Errorf("%s page 3 total = %d, want 3", route, third.Total)
+			if third.Total != 4 {
+				t.Errorf("%s page 3 total = %d, want 4", route, third.Total)
+			}
+		}
+	})
+
+	// The special-day closure, stated as its own case so a failure names it.
+	t.Run("a venue closed by a special day drops out of open_now=true", func(t *testing.T) {
+		for _, route := range []string{"/api/v1/restaurants", "/api/v1/restaurants/search"} {
+			openPage := fetch(t, route+"?open_now=true&per_page=50")
+			for _, name := range namesOf(openPage) {
+				if name == "HolidayClosed" {
+					t.Errorf("%s: a venue shut for a holiday was served as open now", route)
+				}
+			}
+			// ...while its weekly rows still say it is open every day, which is
+			// what makes this a test of the override and not of the week.
+			all := fetch(t, route+"?per_page=50")
+			found := false
+			for _, it := range all.Items {
+				if it.ID == holidayClosed.id.String() {
+					found = true
+					if it.Schedule == nil || len(it.Schedule.Days) != 7 {
+						t.Errorf("%s: expected a full weekly schedule, got %+v", route, it.Schedule)
+					}
+					if it.AcceptsOnlineBookings == nil || !*it.AcceptsOnlineBookings {
+						t.Errorf("%s: a holiday closure must not make the venue unbookable", route)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("%s: the holiday venue is missing from the unfiltered catalog", route)
 			}
 		}
 	})

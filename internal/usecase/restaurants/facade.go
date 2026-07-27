@@ -158,6 +158,15 @@ func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter, 
 	return f.pageByVenueState(items, matched, vs, flt.Page, flt.PerPage)
 }
 
+// errVenueStateUnavailable is the one refusal for "you asked me to filter by
+// the venue state and I could not compute it". 503 rather than a 200 with an
+// unfiltered list, and a narrow code so the client can retry or fall back to
+// browsing — but never present what it got as filtered.
+func errVenueStateUnavailable() error {
+	return domain.WithCode(domain.CodeCatalogVenueStateUnavailable,
+		fmt.Errorf("%w: venue state could not be computed", domain.ErrUnavailable))
+}
+
 // pageByVenueState applies a domain.VenueStateFilter to an ALREADY ENRICHED,
 // unpaginated candidate set and cuts the requested page out of what survives.
 //
@@ -191,8 +200,17 @@ func (f *facade) pageByVenueState(
 			// degrade a REQUEST TO FILTER by it: serving the unfiltered list
 			// under a filtered query is precisely the silent lie this task
 			// removes. 503 + a code the client can act on instead.
-			return nil, 0, domain.WithCode(domain.CodeCatalogVenueStateUnavailable,
-				fmt.Errorf("%w: venue state could not be computed", domain.ErrUnavailable))
+			return nil, 0, errVenueStateUnavailable()
+		}
+		if vs.OpenNow != nil && it.VenueState.OpenNowUncomputed() {
+			// Same refusal, one level finer. The venue's hours ARE known and
+			// open-now still came back unanswered — the timezone would not load,
+			// or the special-day read failed (VenueState.read degrades to
+			// "no open_now" so a holiday closure is never ignored silently).
+			// Counting such a venue as "not open" would drop it from
+			// open_now=true, and when the failure hits the whole page the guest
+			// would be shown an empty catalog as if nothing were open.
+			return nil, 0, errVenueStateUnavailable()
 		}
 		if vs.Matches(it.VenueState) {
 			kept = append(kept, it)
