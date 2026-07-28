@@ -93,6 +93,7 @@ type Deps struct {
 	EventsFacade       events.Facade
 	PromosFacade       promos.Facade
 	GastroguideFacade  gastroguide.Facade
+	GastroguideEditor  gastroguide.Editor
 	ContentFacade      content.Facade
 	FeedFacade         feed.Facade
 	MenuFacade         menu.Facade
@@ -220,10 +221,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
 
-	// Gastroguide (migration 0061): editorial collections of venues. Guest reads
-	// only — there is no editor cabinet yet, so the facade takes the repository
-	// and nothing else: no RBAC port, because nothing here writes.
+	// Gastroguide (migration 0061): editorial collections of venues. Two halves
+	// with two postures — the guest facade is read-only and takes no RBAC port
+	// because nothing in it writes; the editor takes the write repository (which
+	// needs the transaction manager, since attach/detach/reorder are only correct
+	// as a unit) and enforces the superadmin gate itself.
 	gastroguideFacade := gastroguide.NewFacade(gastroguiderepo.New(db))
+	gastroguideEditor := gastroguide.NewEditor(gastroguiderepo.NewEditor(db, txm))
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
@@ -360,6 +364,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		EventsFacade:       eventsFacade,
 		PromosFacade:       promosFacade,
 		GastroguideFacade:  gastroguideFacade,
+		GastroguideEditor:  gastroguideEditor,
 		ContentFacade:      contentFacade,
 		FeedFacade:         feedFacade,
 		MenuFacade:         menuFacade,

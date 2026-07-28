@@ -98,6 +98,12 @@ type GuideCollectionVenue struct {
 	PriceCategory   PriceCategory
 	// PrimaryImageURL is the venue's primary catalog image, nil when it has none.
 	PrimaryImageURL *string
+	// IsActive is the venue's catalog state. On a GUEST read it is always true —
+	// the SQL filters deactivated venues out — and it exists for the EDITOR
+	// read, which shows them: an editor has to see that a slot in their
+	// collection is currently dark, otherwise the venue count in the cabinet and
+	// the one a guest sees differ with no visible reason.
+	IsActive bool
 }
 
 // GuideCollectionDetail is a collection together with its ordered, guest-visible
