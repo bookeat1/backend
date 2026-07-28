@@ -359,3 +359,116 @@ func TestScheduleOverrideListByRestaurantBetween(t *testing.T) {
 		}
 	})
 }
+
+// TestScheduleOverrideInstantRefusesAnUnusableVenueTimezone is the money-side
+// guard of this lookup. It answers "must this booking be prepaid, and how
+// much", and the answer depends entirely on which LOCAL day the instant falls
+// on. A venue whose stored zone is not a usable IANA name used to be silently
+// resolved against the platform fallback, so a venue several hours away from
+// Almaty would be charged (or not charged) a deposit according to somebody
+// else's calendar for a few hours of every day — and the response looked
+// completely normal.
+//
+// Both refused values below survive the naive check: "EST" even exists in
+// Postgres's pg_timezone_names, which is exactly why it needs naming here.
+func TestScheduleOverrideInstantRefusesAnUnusableVenueTimezone(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+	repo := New(pool)
+
+	// An empty string is NOT in this list: like NULL, it means "this venue has
+	// no zone of its own", and the platform fallback legitimately applies —
+	// the same reading postgres/payout.TimezonesFor uses. It is unwritable
+	// through the API (domain.NormalizeVenueTimezone refuses it); only a value
+	// that CLAIMS to be a zone and is not gets refused here.
+	for _, tz := range []string{"KZT", "EST", "Local", "Asia/Almatyy", "+06"} {
+		rid := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO restaurants (id, name, city, price_category, timezone) VALUES ($1,'R','Алматы','₸',$2)`,
+			rid, tz); err != nil {
+			t.Fatalf("seed restaurant (%q): %v", tz, err)
+		}
+		day := time.Date(2026, 3, 21, 0, 0, 0, 0, time.UTC)
+		o := &domain.ScheduleOverride{
+			RestaurantID: rid, Date: day, IsClosed: false, OpenTime: ptr("10:00"), CloseTime: ptr("23:00"),
+			BookingPaymentRequired: true, DepositAmountMinor: ptr(int64(300_000)),
+		}
+		if err := repo.Upsert(ctx, o); err != nil {
+			t.Fatalf("upsert (%q): %v", tz, err)
+		}
+		instant := time.Date(2026, 3, 20, 21, 0, 0, 0, time.UTC)
+
+		got, err := repo.GetForBookingInstant(ctx, rid, instant, "Asia/Almaty")
+		if err == nil {
+			t.Fatalf("venue timezone %q was accepted and answered %+v; the deposit decision was made on a guessed calendar day", tz, got)
+		}
+		if code, ok := domain.CodeOf(err); !ok || code != domain.CodeVenueTimezoneInvalid {
+			t.Fatalf("venue timezone %q: code = %q (ok=%v), want %q", tz, code, ok, domain.CodeVenueTimezoneInvalid)
+		}
+	}
+}
+
+// TestScheduleOverrideInstantReportsABadTimezoneEvenWithNoOverride: the refusal
+// must not depend on a row existing. "No special day today" and "we cannot tell
+// which day today is" are different answers, and only the first one may be read
+// as "this booking is free".
+func TestScheduleOverrideInstantReportsABadTimezoneEvenWithNoOverride(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category, timezone) VALUES ($1,'R','Алматы','₸','KZT')`,
+		rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+	_, err := New(pool).GetForBookingInstant(ctx, rid, time.Now(), "Asia/Almaty")
+	if errors.Is(err, domain.ErrNotFound) {
+		t.Fatal("an unusable venue timezone was reported as 'no override for this day', which reads as 'the booking is free'")
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeVenueTimezoneInvalid {
+		t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeVenueTimezoneInvalid)
+	}
+}
+
+// TestScheduleOverrideInstantStillWorksInADSTZone: the strict check must not
+// break a legitimate zone, including one that changes offset. Lisbon springs
+// forward at 01:00 on 2026-03-29; a booking at 00:30 that night is still on the
+// 29th locally, and a booking at 23:30 UTC on the 28th is not.
+func TestScheduleOverrideInstantStillWorksInADSTZone(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_schedule_overrides", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category, timezone) VALUES ($1,'R','Алматы','₸','Europe/Lisbon')`,
+		rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+	repo := New(pool)
+	if err := repo.Upsert(ctx, &domain.ScheduleOverride{
+		RestaurantID: rid, Date: time.Date(2026, 3, 29, 0, 0, 0, 0, time.UTC),
+		IsClosed: false, OpenTime: ptr("10:00"), CloseTime: ptr("23:00"),
+		BookingPaymentRequired: true, DepositAmountMinor: ptr(int64(300_000)),
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// 00:30 on 29.03 in Lisbon — winter time is still in force, so UTC+0.
+	if got, err := repo.GetForBookingInstant(ctx, rid, time.Date(2026, 3, 29, 0, 30, 0, 0, time.UTC), "Asia/Almaty"); err != nil {
+		t.Fatalf("the paid day was not found for an instant inside it: %v", err)
+	} else if !got.BookingPaymentRequired {
+		t.Fatalf("wrong override matched: %+v", got)
+	}
+	// 23:30 UTC on 28.03 is still 28.03 in Lisbon: a free day.
+	if _, err := repo.GetForBookingInstant(ctx, rid, time.Date(2026, 3, 28, 23, 30, 0, 0, time.UTC), "Asia/Almaty"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("28.03 in Lisbon matched the 29.03 override: err = %v", err)
+	}
+	// 14:00 UTC on 29.03 — Lisbon is on summer time (UTC+1) by then; still the 29th.
+	if _, err := repo.GetForBookingInstant(ctx, rid, time.Date(2026, 3, 29, 14, 0, 0, 0, time.UTC), "Asia/Almaty"); err != nil {
+		t.Fatalf("afternoon of the DST day did not match its own override: %v", err)
+	}
+}

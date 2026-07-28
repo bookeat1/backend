@@ -222,8 +222,15 @@ type BookingFilter struct {
 	Statuses     []BookingStatus
 	From         *time.Time // starts_at >= From
 	To           *time.Time // starts_at <  To
-	Page         int        // 1-based; <=0 means 1
-	PerPage      int        // <=0 means default (20), capped at 100
+	// CalendarDate is "the venue's day", still unresolved: a date carries no
+	// zone, so only the usecase — which knows WHOSE calendar is being asked
+	// about — may turn it into From/To. It never reaches a repository; the
+	// usecase replaces it with the resolved window first, and
+	// BookingRepository.List refuses a filter that still carries one rather
+	// than quietly listing a day that is nobody's.
+	CalendarDate *CalendarDate
+	Page         int // 1-based; <=0 means 1
+	PerPage      int // <=0 means default (20), capped at 100
 }
 
 // BookingRepository persists bookings. Get* return ErrNotFound when absent.

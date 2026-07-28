@@ -220,6 +220,16 @@ const (
 	// Astana offers shown to a guest in Almaty is worse than an empty rail.
 	CodeCityRequired ErrorCode = "city_required"
 
+	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
+	// against) a venue is not a usable IANA zone name. Kept apart from the
+	// generic validation code because it is the one venue field money decisions
+	// are derived from: it names the venue's payout day, the local date of a
+	// paid special day, and the wall clock its opening hours are read on. On a
+	// write it means "nothing was saved, fix the name"; on a read it means "we
+	// refuse to settle this venue on a guessed day until the stored value is
+	// corrected" — never "we quietly used the platform default".
+	CodeVenueTimezoneInvalid ErrorCode = "venue_timezone_invalid"
+
 	// Payout destination ownership (money OUT — generating and dispatching a
 	// venue payout). All three mean "no money was moved"; they are kept apart
 	// because the operator's next action is completely different, and because a
