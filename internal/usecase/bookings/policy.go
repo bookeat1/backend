@@ -81,9 +81,20 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 		CapacityMode: domain.CapacityModeTables,
 	}
 
-	if o.Timezone != nil && *o.Timezone != "" {
-		if _, err := time.LoadLocation(*o.Timezone); err == nil {
-			p.Timezone = *o.Timezone
+	// Read under the SAME rule the write path enforces
+	// (domain.NormalizeVenueTimezone), so a value that could not be saved today
+	// cannot be honoured either just because an older row still carries it.
+	//
+	// RESIDUAL, deliberate: a stored value that fails the rule falls back to the
+	// platform zone here instead of failing, because this function has no error
+	// to return and the catalog/availability read must not 500 on one bad row.
+	// Every MONEY reader is strict instead — the payout pass refuses the venue
+	// (usecase/payouts.DailyRunner.location) and the paid-special-day lookup
+	// refuses the booking (postgres/schedule.GetForBookingInstant) rather than
+	// settle on a guessed day.
+	if o.Timezone != nil {
+		if tz, err := domain.NormalizeVenueTimezone(*o.Timezone); err == nil {
+			p.Timezone = tz
 		}
 	}
 	if v := o.BookingDurationMinutes; v != nil && *v > 0 {

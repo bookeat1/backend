@@ -210,6 +210,26 @@ const (
 	// present the result as filtered.
 	CodeCatalogVenueStateUnavailable ErrorCode = "catalog_venue_state_unavailable"
 
+	// CodeCityRequired — a city-scoped guest listing (today: the main-screen
+	// feed) was called without a city, or with one the platform does not serve.
+	// The status and the message are exactly what they have always been; what is
+	// new is that the app can now tell this 422 apart from every other 422 on
+	// the same screen and react by asking the guest to pick a city, instead of
+	// rendering "что-то пошло не так" on a first launch that simply has not
+	// chosen one yet. The city itself stays required on the feed: a rail of
+	// Astana offers shown to a guest in Almaty is worse than an empty rail.
+	CodeCityRequired ErrorCode = "city_required"
+
+	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
+	// against) a venue is not a usable IANA zone name. Kept apart from the
+	// generic validation code because it is the one venue field money decisions
+	// are derived from: it names the venue's payout day, the local date of a
+	// paid special day, and the wall clock its opening hours are read on. On a
+	// write it means "nothing was saved, fix the name"; on a read it means "we
+	// refuse to settle this venue on a guessed day until the stored value is
+	// corrected" — never "we quietly used the platform default".
+	CodeVenueTimezoneInvalid ErrorCode = "venue_timezone_invalid"
+
 	// Payout destination ownership (money OUT — generating and dispatching a
 	// venue payout). All three mean "no money was moved"; they are kept apart
 	// because the operator's next action is completely different, and because a
@@ -237,6 +257,39 @@ const (
 	// registered under). Fixed by completing the tokenization step for that
 	// venue, not by retrying.
 	CodePayoutDestinationIncomplete ErrorCode = "payout_destination_incomplete"
+
+	// --- gastroguide editor (migration 0061) ---
+	//
+	// The editor cabinet is the only writer of the guide, and every refusal
+	// below is something an editor can fix in the panel without asking an
+	// engineer. A bare 409/422 here would leave them guessing which of three
+	// different problems they hit.
+
+	// CodeGuideSlugTaken — the slug of a collection or a rubric is already used
+	// by another row. Slugs are the client-facing stable name (the app links to
+	// a rubric by slug), so they are unique platform-wide and the editor must
+	// pick a different one. Not retryable.
+	CodeGuideSlugTaken ErrorCode = "guide_slug_taken"
+
+	// CodeGuideCollectionEmpty — publishing was refused because the collection
+	// holds no venue a guest could open. The guest listing hides an empty
+	// collection outright (see the repository's visibleVenues predicate), so
+	// publishing one produces a collection that is "live" and invisible — the
+	// worst state to debug. Fixed by attaching at least one ACTIVE venue.
+	CodeGuideCollectionEmpty ErrorCode = "guide_collection_empty"
+
+	// CodeGuideOrderMismatch — the reorder request did not list exactly the
+	// collection's current venues: it repeated one, skipped one, or named a
+	// venue that is not in the collection. The order is sent as the intended
+	// FINAL sequence, so a payload that disagrees with the membership means the
+	// editor's screen is stale (somebody attached or detached a venue in
+	// another tab). Nothing is written; the client reloads and retries.
+	CodeGuideOrderMismatch ErrorCode = "guide_order_mismatch"
+
+	// CodeGuideVenueAlreadyAttached — this venue is already in this collection.
+	// A venue may sit in any number of DIFFERENT collections; what the primary
+	// key forbids is the same venue twice in one.
+	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

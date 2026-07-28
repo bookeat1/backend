@@ -479,3 +479,40 @@ func TestSetPlacementWeight(t *testing.T) {
 		t.Fatalf("an absent id must be ErrNotFound, got %v", err)
 	}
 }
+
+// A promo's own picture must reach the main-screen card. Before migration 0060
+// the union projected NULL for every promo, so the rail's promo block had
+// nothing to draw; the guarantee is asserted here, against the real query.
+func TestListCandidates_CarriesThePromoCover(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	rid := seedVenue(ctx, t, pool, "Bistro", activeVenue())
+
+	cover := "https://pub-41b6f06fc8e74b6e959cdd6def081e22.r2.dev/promos/happy-hour.jpg"
+	withCover := seedPromo(ctx, t, pool, rid, "С картинкой", domain.PromoPublished,
+		feedNow.Add(-time.Hour), feedNow.Add(time.Hour), domain.FeedApproved, 0)
+	if _, err := pool.Exec(ctx, `UPDATE promos SET cover_image_url = $2 WHERE id = $1`,
+		withCover, cover); err != nil {
+		t.Fatalf("set cover: %v", err)
+	}
+	withoutCover := seedPromo(ctx, t, pool, rid, "Без картинки", domain.PromoPublished,
+		feedNow.Add(-time.Hour), feedNow.Add(time.Hour), domain.FeedApproved, 0)
+
+	items, err := New(pool).ListCandidates(ctx, domain.FeedQuery{
+		City: domain.CityAlmaty, Now: feedNow, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("list candidates: %v", err)
+	}
+	seen := map[uuid.UUID]*string{}
+	for _, it := range items {
+		seen[it.ID] = it.CoverImageURL
+	}
+	if got, ok := seen[withCover]; !ok || got == nil || *got != cover {
+		t.Fatalf("promo cover = %v, want %q", got, cover)
+	}
+	if got, ok := seen[withoutCover]; !ok || got != nil {
+		t.Fatalf("a promo with no picture must carry nil, got %v", got)
+	}
+}

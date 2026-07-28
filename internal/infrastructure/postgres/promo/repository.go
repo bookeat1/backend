@@ -27,7 +27,7 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.PromoRepository = (*Repository)(nil)
 
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
-	starts_at, ends_at, terms, status, created_at, updated_at`
+	starts_at, ends_at, terms, cover_image_url, status, created_at, updated_at`
 
 // Create inserts a new promo. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound.
@@ -37,11 +37,11 @@ func (r *Repository) Create(ctx context.Context, p *domain.Promo) error {
 	}
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO promos (id, restaurant_id, title, title_i18n, description, description_i18n,
-			starts_at, ends_at, terms, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			starts_at, ends_at, terms, cover_image_url, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 RETURNING created_at, updated_at`,
 		p.ID, p.RestaurantID, p.Title, i18nToDB(p.TitleI18n), p.Description, i18nToDB(p.DescriptionI18n),
-		p.StartsAt, p.EndsAt, p.Terms, p.Status).
+		p.StartsAt, p.EndsAt, p.Terms, p.CoverImageURL, p.Status).
 		Scan(&p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -65,10 +65,11 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Promo, 
 func (r *Repository) Update(ctx context.Context, p *domain.Promo) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE promos SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
-			starts_at = $6, ends_at = $7, terms = $8, status = $9, updated_at = now()
+			starts_at = $6, ends_at = $7, terms = $8, cover_image_url = $9, status = $10,
+			updated_at = now()
 		 WHERE id = $1`,
 		p.ID, p.Title, i18nToDB(p.TitleI18n), p.Description, i18nToDB(p.DescriptionI18n),
-		p.StartsAt, p.EndsAt, p.Terms, p.Status)
+		p.StartsAt, p.EndsAt, p.Terms, p.CoverImageURL, p.Status)
 	if err != nil {
 		return fmt.Errorf("update promo: %w", err)
 	}
@@ -183,7 +184,7 @@ func scanPromoRow(row pgx.Row) (*domain.Promo, error) {
 	var p domain.Promo
 	var titleI18n, descI18n []byte
 	if err := row.Scan(&p.ID, &p.RestaurantID, &p.Title, &titleI18n, &p.Description, &descI18n,
-		&p.StartsAt, &p.EndsAt, &p.Terms, &p.Status, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.StartsAt, &p.EndsAt, &p.Terms, &p.CoverImageURL, &p.Status, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	p.TitleI18n = i18nFromDB(titleI18n)

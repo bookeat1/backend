@@ -65,6 +65,19 @@ func Error(w http.ResponseWriter, status int, msg string) {
 	write(w, status, Envelope{Error: msg})
 }
 
+// ErrorWithCode writes the given status with BOTH the human-readable message and
+// the machine-readable code. It exists for the refusals a handler decides on its
+// own, before any usecase is called (a missing query parameter, an unparsable
+// path id): those go out through Error and therefore carry no code at all, which
+// leaves a client unable to tell one 422 from another on the same screen.
+// HandleError is not a substitute here — it deliberately replaces the message
+// with a generic one, which is right for an error coming out of a usecase (it
+// may carry SQL or internal context) and wrong for a message the handler itself
+// wrote for the caller.
+func ErrorWithCode(w http.ResponseWriter, status int, code domain.ErrorCode, msg string) {
+	write(w, status, Envelope{Error: msg, Code: string(code)})
+}
+
 // HandleError maps a domain sentinel error to the matching HTTP status and a
 // generic, non-revealing message, then logs the underlying error server-side.
 // The original error text (which may carry wrapped internal context, SQL, etc.)

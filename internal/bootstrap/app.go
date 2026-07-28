@@ -24,6 +24,7 @@ import (
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
+	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
@@ -184,6 +185,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
 
+	// Gastroguide — the home screen's editorial collections. Plain public group,
+	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the
+	// user lookup would only cost a query. Guest reads only; the editor cabinet
+	// that fills these collections is a separate task.
+	gastroguiderest.NewHandler(deps.GastroguideFacade).RegisterPublic(api)
+
 	contentrest.NewHandler(deps.ContentFacade).RegisterStaffRoutes(authed)
 
 	// Venue side of the feed: submit an item for the main screen and see where
@@ -225,6 +232,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// group so a venue owner cannot reach it, and re-checked in usecase/feed as
 	// defense-in-depth. A venue must never be able to price its own placement.
 	feedHandler.RegisterPlatformRoutes(adminGlobal)
+
+	// Gastroguide editor cabinet: create/edit/publish collections, manage the
+	// rubrics, attach/detach and reorder venues. Superadmin ONLY, mounted on the
+	// RequireRole(RoleAdmin) group for the same reason the feed's platform side
+	// is — the guide is the PLATFORM's editorial opinion about which venues are
+	// worth eating at, and a restaurant owner who could reach it could put their
+	// own venue into "лучшие завтраки". The usecase re-checks the role.
+	gastroguiderest.NewEditorHandler(deps.GastroguideEditor).RegisterAdminRoutes(adminGlobal)
 
 	// Restaurant payouts (выплаты заведениям). The money-OUT routes (generate +
 	// send) are mounted on the superadmin group; the venue-scoped routes

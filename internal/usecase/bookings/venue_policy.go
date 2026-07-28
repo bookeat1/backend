@@ -590,13 +590,14 @@ func (u *policyUseCase) view(ctx context.Context, restaurantID uuid.UUID) (*Poli
 // validatePolicyOverride checks the fields the caller actually provided. Omitted
 // (nil) fields are not validated: they are not being written.
 func validatePolicyOverride(o domain.BookingPolicyOverride) error {
+	// The venue's zone is validated in the DOMAIN, by the same rule every
+	// money-path reader resolves it with: an empty string, the server's "Local",
+	// an abbreviation ("KZT", "EST") or a name this host does not know is not
+	// storable. The column behind it is a plain varchar with no CHECK, so this
+	// is the only gate there is.
 	if o.Timezone != nil {
-		tz := strings.TrimSpace(*o.Timezone)
-		if tz == "" {
-			return fmt.Errorf("%w: timezone must not be empty", domain.ErrValidation)
-		}
-		if _, err := time.LoadLocation(tz); err != nil {
-			return fmt.Errorf("%w: unknown timezone %q", domain.ErrValidation, tz)
+		if _, err := domain.NormalizeVenueTimezone(*o.Timezone); err != nil {
+			return err
 		}
 	}
 	if m := o.BookingCapacityMode; m != nil && !m.Valid() {
