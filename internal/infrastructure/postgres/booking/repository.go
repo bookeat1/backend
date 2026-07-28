@@ -91,6 +91,14 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Booking
 }
 
 func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain.Booking, int, error) {
+	// A calendar date is not an instant: turning it into one needs a zone, and
+	// this layer does not know whose. Reaching here with one unresolved means a
+	// usecase forgot to resolve it — and the damage would be a silently
+	// UNFILTERED day (the whole history returned as "today"), so it is an error,
+	// not a fallback.
+	if f.CalendarDate != nil {
+		return nil, 0, fmt.Errorf("list bookings: calendar date %s reached the repository unresolved", f.CalendarDate)
+	}
 	where := []string{"true"}
 	args := []any{}
 	add := func(cond string, val any) {

@@ -224,32 +224,94 @@ func (r *Repository) Upsert(ctx context.Context, o *domain.ScheduleOverride) err
 // path never has to load-and-parse the venue timezone in Go:
 //
 //   - `restaurants.timezone` is the venue's IANA zone (nullable, migration 0004);
-//   - the LEFT JOIN on pg_timezone_names resolves it to a KNOWN zone, yielding
-//     NULL for a NULL or unrecognized value, so COALESCE(z.name, $3) falls back
-//     to the platform default (fallbackTZ) instead of raising on a bad row —
-//     mirroring usecase/bookings.policyLocation's "never panic on a bad DB
-//     value" posture;
+//   - the LEFT JOIN on pg_timezone_names resolves it to a zone Postgres knows,
+//     under the SAME rule domain.NormalizeVenueTimezone applies in Go: an
+//     "Area/Location" name, or the single exception "UTC". An abbreviation
+//     ("EST", "MET") is deliberately NOT accepted even though Postgres has an
+//     entry for it — those are fixed-offset compatibility zones that stay on
+//     standard time all year;
 //   - `$2 AT TIME ZONE <tz>` converts the timestamptz instant to the local
 //     wall-clock timestamp in that zone, and `::date` takes its calendar day —
 //     the exact value the venue stored in override_date.
 //
+// A venue with NO zone of its own (NULL/empty) uses fallbackTZ: that is the
+// documented platform default, not a guess. A venue whose stored zone is
+// unusable returns an error tagged CodeVenueTimezoneInvalid instead — this call
+// decides whether a booking must be PREPAID and how much (usecase/payments'
+// paid-special-day resolver), so the wrong calendar date here means charging a
+// deposit for the wrong day, or letting a paid day go free. It used to fall
+// back silently: a venue 3 hours away from the platform zone would get the
+// wrong answer for every booking in those 3 hours, every day, with nothing in
+// the logs.
+//
 // Returns ErrNotFound when there is no override for that local date.
 func (r *Repository) GetForBookingInstant(ctx context.Context, restaurantID uuid.UUID, at time.Time, fallbackTZ string) (*domain.ScheduleOverride, error) {
+	// One statement, one round trip: the venue row is read as a CTE and the
+	// override is LEFT JOINed to it, so an unusable zone is reported even when
+	// the venue has no override for that date at all — the difference between
+	// "this day is free" and "we cannot tell which day this is" must not depend
+	// on whether a row happens to exist.
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT o.id, o.restaurant_id, o.override_date, o.is_closed, o.open_time, o.close_time, o.note,
+		`WITH v AS (
+		     SELECT r.timezone AS stored, z.name AS known
+		     FROM restaurants r
+		     LEFT JOIN pg_timezone_names z
+		            ON z.name = r.timezone
+		           AND (r.timezone = 'UTC' OR r.timezone LIKE '%/%')
+		     WHERE r.id = $1
+		 )
+		 SELECT (v.stored IS NOT NULL AND v.stored <> '' AND v.known IS NULL) AS tz_unusable,
+		        v.stored,
+		        o.id, o.restaurant_id, o.override_date, o.is_closed, o.open_time, o.close_time, o.note,
 		        o.booking_payment_required, o.deposit_amount_minor, o.created_at, o.updated_at
-		 FROM restaurant_schedule_overrides o
-		 JOIN restaurants r ON r.id = o.restaurant_id
-		 LEFT JOIN pg_timezone_names z ON z.name = r.timezone
-		 WHERE o.restaurant_id = $1
-		   AND o.override_date = ($2::timestamptz AT TIME ZONE COALESCE(z.name, $3::text))::date`,
+		 FROM v
+		 LEFT JOIN restaurant_schedule_overrides o
+		        ON o.restaurant_id = $1
+		       AND o.override_date = ($2::timestamptz AT TIME ZONE COALESCE(v.known, $3::text))::date`,
 		restaurantID, at, fallbackTZ)
-	o, err := scanOverride(row)
+
+	// Every override column is scanned through a pointer: the LEFT JOIN yields a
+	// row for the venue even when it has no override that day, and then all of
+	// them are NULL.
+	var (
+		tzUnusable bool
+		stored     *string
+		id, rid    *uuid.UUID
+		date       *time.Time
+		isClosed   *bool
+		openTime   *string
+		closeTime  *string
+		note       *string
+		paid       *bool
+		deposit    *int64
+		createdAt  *time.Time
+		updatedAt  *time.Time
+	)
+	err := row.Scan(&tzUnusable, &stored, &id, &rid, &date, &isClosed,
+		&openTime, &closeTime, &note, &paid, &deposit, &createdAt, &updatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrNotFound
+			return nil, domain.ErrNotFound // no such venue
 		}
 		return nil, fmt.Errorf("get schedule override for instant: %w", err)
+	}
+	if tzUnusable {
+		name := ""
+		if stored != nil {
+			name = *stored
+		}
+		return nil, domain.WithCode(domain.CodeVenueTimezoneInvalid,
+			fmt.Errorf("%w: venue %s has an unusable timezone %q, so its local date cannot be determined",
+				domain.ErrValidation, restaurantID, name))
+	}
+	if id == nil {
+		return nil, domain.ErrNotFound // venue exists, no override on that local date
+	}
+	o := domain.ScheduleOverride{
+		ID: *id, RestaurantID: *rid, Date: *date, IsClosed: *isClosed,
+		OpenTime: openTime, CloseTime: closeTime, Note: note,
+		BookingPaymentRequired: *paid, DepositAmountMinor: deposit,
+		CreatedAt: *createdAt, UpdatedAt: *updatedAt,
 	}
 	return &o, nil
 }
