@@ -24,6 +24,7 @@ import (
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
+	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
@@ -183,6 +184,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler := promosrest.NewHandler(deps.PromosFacade)
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
+
+	// Gastroguide — the home screen's editorial collections. Plain public group,
+	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the
+	// user lookup would only cost a query. Guest reads only; the editor cabinet
+	// that fills these collections is a separate task.
+	gastroguiderest.NewHandler(deps.GastroguideFacade).RegisterPublic(api)
 
 	contentrest.NewHandler(deps.ContentFacade).RegisterStaffRoutes(authed)
 

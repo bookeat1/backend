@@ -93,6 +93,7 @@ func (h *Handler) create(c *gin.Context) {
 		StartsAt:        startsAt,
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
+		CoverImageURL:   req.CoverImageURL,
 		Status:          domain.PromoStatus(req.Status),
 	})
 	if err != nil {
@@ -128,6 +129,7 @@ func (h *Handler) update(c *gin.Context) {
 		StartsAt:        startsAt,
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
+		CoverImageURL:   req.CoverImageURL,
 		Status:          domain.PromoStatus(req.Status),
 	})
 	if err != nil {
@@ -252,7 +254,10 @@ type promoRequest struct {
 	StartsAt        string            `json:"starts_at"`
 	EndsAt          string            `json:"ends_at"`
 	Terms           string            `json:"terms"`
-	Status          string            `json:"status"`
+	// CoverImageURL is the full public image URL. Omitted or null means the
+	// promo has no picture — that is a valid, honest state, not a missing field.
+	CoverImageURL *string `json:"cover_image_url"`
+	Status        string  `json:"status"`
 }
 
 func (r promoRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, ok bool) {
@@ -279,9 +284,12 @@ type promoResponse struct {
 	StartsAt        string            `json:"starts_at"`
 	EndsAt          string            `json:"ends_at"`
 	Terms           string            `json:"terms,omitempty"`
-	Status          string            `json:"status"`
-	CreatedAt       string            `json:"created_at"`
-	UpdatedAt       string            `json:"updated_at"`
+	// CoverImageURL is omitted entirely when the promo has no picture: the
+	// client must render its own placeholder, never a made-up URL.
+	CoverImageURL *string `json:"cover_image_url,omitempty"`
+	Status        string  `json:"status"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
 }
 
 func adminResponse(p domain.Promo) promoResponse {
@@ -295,6 +303,7 @@ func adminResponse(p domain.Promo) promoResponse {
 		StartsAt:        p.StartsAt.Format(time.RFC3339),
 		EndsAt:          p.EndsAt.Format(time.RFC3339),
 		Terms:           p.Terms,
+		CoverImageURL:   p.CoverImageURL,
 		Status:          string(p.Status),
 		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),

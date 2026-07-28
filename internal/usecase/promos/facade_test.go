@@ -241,3 +241,60 @@ func TestUpdate_StatusOnlyChangeKeepsTheApproval(t *testing.T) {
 		t.Fatalf("a status-only change demoted the feed approval: %v", fd.demoted)
 	}
 }
+
+// The card's picture is content a moderator approved: swapping it must send the
+// promo back to the review queue, exactly like rewriting its title does.
+func TestUpdate_ChangingTheCoverDemotesFromTheFeed(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), feed)
+	actor := Actor{UserID: actorID, Role: domain.RoleRestaurant}
+
+	old := "https://pub-41b6f06fc8e74b6e959cdd6def081e22.r2.dev/promos/old.jpg"
+	in := validCreate(rid)
+	in.CoverImageURL = &old
+	p, err := f.Create(context.Background(), actor, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if p.CoverImageURL == nil || *p.CoverImageURL != old {
+		t.Fatalf("cover was not stored: %v", p.CoverImageURL)
+	}
+
+	unchanged := UpdateInput{
+		Title: p.Title, StartsAt: p.StartsAt, EndsAt: p.EndsAt,
+		CoverImageURL: &old, Status: domain.PromoPublished,
+	}
+	if _, err := f.Update(context.Background(), actor, p.ID, unchanged); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 0 {
+		t.Fatalf("republishing with the same cover must not demote: %v", feed.demoted)
+	}
+
+	newCover := "https://pub-41b6f06fc8e74b6e959cdd6def081e22.r2.dev/promos/new.jpg"
+	swapped := unchanged
+	swapped.CoverImageURL = &newCover
+	updated, err := f.Update(context.Background(), actor, p.ID, swapped)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.CoverImageURL == nil || *updated.CoverImageURL != newCover {
+		t.Fatalf("cover = %v, want the new one", updated.CoverImageURL)
+	}
+	if len(feed.demoted) != 1 || feed.demoted[0] != p.ID {
+		t.Fatalf("changing the cover must demote the promo, got %v", feed.demoted)
+	}
+
+	// Removing the picture altogether is an edit too.
+	removed := swapped
+	removed.CoverImageURL = nil
+	if _, err := f.Update(context.Background(), actor, p.ID, removed); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 2 {
+		t.Fatalf("removing the cover must demote as well, got %v", feed.demoted)
+	}
+}

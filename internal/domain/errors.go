@@ -210,6 +210,16 @@ const (
 	// present the result as filtered.
 	CodeCatalogVenueStateUnavailable ErrorCode = "catalog_venue_state_unavailable"
 
+	// CodeCityRequired — a city-scoped guest listing (today: the main-screen
+	// feed) was called without a city, or with one the platform does not serve.
+	// The status and the message are exactly what they have always been; what is
+	// new is that the app can now tell this 422 apart from every other 422 on
+	// the same screen and react by asking the guest to pick a city, instead of
+	// rendering "что-то пошло не так" on a first launch that simply has not
+	// chosen one yet. The city itself stays required on the feed: a rail of
+	// Astana offers shown to a guest in Almaty is worse than an empty rail.
+	CodeCityRequired ErrorCode = "city_required"
+
 	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
 	// against) a venue is not a usable IANA zone name. Kept apart from the
 	// generic validation code because it is the one venue field money decisions
