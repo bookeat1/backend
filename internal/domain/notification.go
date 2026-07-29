@@ -154,4 +154,12 @@ type RestaurantNotificationSettingsRepository interface {
 	// ClearTelegramChatID unsets the chat id, silencing the channel while
 	// preserving the rest of the venue's notification settings.
 	ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error
+	// RestaurantByTelegramChatID resolves a chat back to the venue that
+	// connected it. This is the reverse of SetTelegramChatID and it is what
+	// AUTHORISES an inbound button press: the press carries no account, so the
+	// chat it came from is the only credential, and this lookup turns that
+	// credential into a restaurant. Only an ENABLED channel resolves — a venue
+	// that switched Telegram off must not still be able to act through it.
+	// ErrNotFound when no venue owns the chat.
+	RestaurantByTelegramChatID(ctx context.Context, chatID string) (uuid.UUID, error)
 }

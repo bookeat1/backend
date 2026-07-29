@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 )
 
@@ -15,6 +17,17 @@ import (
 // the Bot API response code (2xx = accepted; 400/403 = a bad/blocked chat, not
 // retryable; 429/5xx = transient, retry).
 type TelegramSender func(ctx context.Context, chatID string, text string) (statusCode int, err error)
+
+// TelegramActionSender is the same send with an inline keyboard underneath.
+// Each action is a {label, callback data} pair, opaque to this package. When it
+// is nil the notifier falls back to the plain sender, so a deployment without
+// the answer webhook still gets alerts — just without buttons to press.
+type TelegramActionSender func(ctx context.Context, chatID, text string, actions [][2]string) (statusCode int, err error)
+
+// TelegramActions builds the buttons for one booking. It lives outside this
+// package (the transport layer owns the callback format) and is optional for
+// the same reason TelegramActionSender is.
+type TelegramActions func(bookingID uuid.UUID) [][2]string
 
 // TelegramNotifier is the Telegram channel: on a new booking it sends ONE
 // message to that booking's restaurant chat, and no other venue's chat — the
@@ -29,6 +42,8 @@ type TelegramNotifier struct {
 	settings   domain.RestaurantNotificationSettingsRepository
 	deliveries domain.NotificationDeliveryRepository
 	send       TelegramSender
+	sendWith   TelegramActionSender
+	actions    TelegramActions
 	enabled    bool // bot token configured
 	log        *slog.Logger
 }
@@ -46,6 +61,16 @@ func NewTelegramNotifier(
 		settings: settings, deliveries: deliveries,
 		send: send, enabled: enabled && send != nil, log: log,
 	}
+}
+
+// WithActions turns the alert's buttons on. Both arguments must be non-nil:
+// buttons the venue cannot answer (no webhook) would be worse than no buttons,
+// because staff would press them and nothing would happen.
+func (t *TelegramNotifier) WithActions(send TelegramActionSender, actions TelegramActions) *TelegramNotifier {
+	if send != nil && actions != nil {
+		t.sendWith, t.actions = send, actions
+	}
+	return t
 }
 
 var _ Notifier = (*TelegramNotifier)(nil)
@@ -93,7 +118,16 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		return nil
 	}
 
-	status, err := t.send(ctx, cfg.ChatID, buildTelegramText(e))
+	text := buildTelegramText(e)
+	var status int
+	if t.sendWith != nil && t.actions != nil && e.Type == domain.EventBookingCreated {
+		// Buttons only on a NEW booking: that is the only event the venue is
+		// being asked to answer. A cancellation alert with a "Confirm" button
+		// under it would be nonsense.
+		status, err = t.sendWith(ctx, cfg.ChatID, text, t.actions(e.BookingID))
+	} else {
+		status, err = t.send(ctx, cfg.ChatID, text)
+	}
 	if err != nil {
 		// A transport error (timeout/DNS/etc.) is retryable — leave the event
 		// unpublished so the next tick retries.

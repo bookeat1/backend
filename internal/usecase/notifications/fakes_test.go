@@ -190,6 +190,18 @@ func (f *fakeSettings) SetTelegramChatID(_ context.Context, restaurantID uuid.UU
 	return nil
 }
 
+// RestaurantByTelegramChatID is the reverse lookup the inbound webhook uses.
+// This fake keeps the same map the forward lookup reads, so a chat connected in
+// a test resolves back to its venue.
+func (f *fakeSettings) RestaurantByTelegramChatID(_ context.Context, chatID string) (uuid.UUID, error) {
+	for rid, c := range f.tgChat {
+		if c == chatID {
+			return rid, nil
+		}
+	}
+	return uuid.Nil, domain.ErrNotFound
+}
+
 func (f *fakeSettings) ClearTelegramChatID(_ context.Context, restaurantID uuid.UUID) error {
 	delete(f.tgChat, restaurantID)
 	return nil
