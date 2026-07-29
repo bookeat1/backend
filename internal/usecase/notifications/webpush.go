@@ -76,9 +76,17 @@ type pushPayload struct {
 }
 
 func (w *WebPushNotifier) Notify(ctx context.Context, e Event) error {
+	// The three early returns below are the ONLY ways a booking can produce no
+	// push while the dispatcher still reports success. They used to be silent
+	// (two at debug level, one with no line at all), so "dispatched: 2, errors:
+	// 0" was indistinguishable from a delivered notification and diagnosing a
+	// missing alert meant guessing. They log at INFO now, with the reason
+	// named, because "nobody was notified" is an operational fact, not a debug
+	// detail.
 	if !w.enabled {
-		w.log.Debug("web push disabled (no VAPID keys), skipping",
-			slog.String("booking_id", e.BookingID.String()))
+		w.log.Info("web push skipped: no VAPID keys configured",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
 
@@ -87,7 +95,8 @@ func (w *WebPushNotifier) Notify(ctx context.Context, e Event) error {
 		return fmt.Errorf("web push: read settings: %w", err)
 	}
 	if !enabled {
-		w.log.Debug("web push disabled for restaurant, skipping",
+		w.log.Info("web push skipped: channel switched off for this venue",
+			slog.String("booking_id", e.BookingID.String()),
 			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
@@ -97,6 +106,9 @@ func (w *WebPushNotifier) Notify(ctx context.Context, e Event) error {
 		return fmt.Errorf("web push: list subscriptions: %w", err)
 	}
 	if len(subs) == 0 {
+		w.log.Info("web push skipped: venue has no push subscriptions",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
 

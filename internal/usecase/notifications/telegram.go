@@ -59,8 +59,9 @@ func (t *TelegramNotifier) Interested(et domain.BookingEventType) bool {
 
 func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 	if !t.enabled {
-		t.log.Debug("telegram disabled (no bot token), skipping",
-			slog.String("booking_id", e.BookingID.String()))
+		t.log.Info("telegram skipped: no bot token configured",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
 
@@ -69,14 +70,16 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		return fmt.Errorf("telegram: read settings: %w", err)
 	}
 	if !cfg.Enabled {
-		t.log.Debug("telegram disabled for restaurant, skipping",
+		t.log.Info("telegram skipped: channel switched off for this venue",
+			slog.String("booking_id", e.BookingID.String()),
 			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
 	if cfg.ChatID == "" {
 		// No chat connected yet — nothing to send to. Not an error: the event is
 		// still processed (drained) so it never blocks the outbox.
-		t.log.Debug("telegram has no chat id for restaurant, skipping",
+		t.log.Info("telegram skipped: venue has not connected a chat",
+			slog.String("booking_id", e.BookingID.String()),
 			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
 	}
