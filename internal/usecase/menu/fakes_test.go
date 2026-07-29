@@ -17,6 +17,11 @@ type fakeItems struct {
 	avail       bool
 	tagsFor     map[uuid.UUID][]domain.MenuItemTag
 	replaceCall int
+	featured    []domain.FeaturedMenuItem
+	featuredArg domain.FeaturedMenuFilter
+	featuredID  uuid.UUID
+	featuredSet bool
+	featuredErr error
 }
 
 func newFakeItems() *fakeItems {
@@ -57,6 +62,19 @@ func (f *fakeItems) SetAvailableBulk(_ context.Context, restaurantID uuid.UUID, 
 	}
 	f.avail = a
 	return n, nil
+}
+func (f *fakeItems) ListFeatured(_ context.Context, flt domain.FeaturedMenuFilter) ([]domain.FeaturedMenuItem, error) {
+	f.featuredArg = flt
+	return f.featured, f.featuredErr
+}
+func (f *fakeItems) SetFeatured(_ context.Context, restaurantID, id uuid.UUID, featured bool) error {
+	m, ok := f.store[id]
+	if !ok || m.RestaurantID != restaurantID {
+		return domain.ErrNotFound
+	}
+	m.IsFeatured = featured
+	f.featuredID, f.featuredSet = id, featured
+	return nil
 }
 func (f *fakeItems) ReplaceTags(_ context.Context, itemID uuid.UUID, tags []domain.MenuItemTag) error {
 	f.replaceCall++

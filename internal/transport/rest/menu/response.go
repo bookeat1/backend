@@ -16,6 +16,7 @@ type menuItemResponse struct {
 	Price           string            `json:"price"`
 	ImageURL        *string           `json:"image_url"`
 	IsAvailable     bool              `json:"is_available"`
+	IsFeatured      bool              `json:"is_featured"`
 	Category        *string           `json:"category"`
 	CategoryI18n    map[string]string `json:"category_i18n,omitempty"`
 	Subcategory     *string           `json:"subcategory"`
@@ -45,7 +46,7 @@ func itemToResponse(m *domain.MenuItem) menuItemResponse {
 	return menuItemResponse{
 		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(), Name: m.Name, NameI18n: m.NameI18n,
 		Description: m.Description, DescriptionI18n: m.DescriptionI18n, Price: m.Price, ImageURL: m.ImageURL,
-		IsAvailable: m.IsAvailable, Category: m.Category, CategoryI18n: m.CategoryI18n,
+		IsAvailable: m.IsAvailable, IsFeatured: m.IsFeatured, Category: m.Category, CategoryI18n: m.CategoryI18n,
 		Subcategory: m.Subcategory, SubcategoryI18n: m.SubcategoryI18n, PortionSize: m.PortionSize,
 		PortionSizeI18n: m.PortionSizeI18n, Language: m.Language, DisplayOrder: m.DisplayOrder,
 		Tags: tags, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
@@ -59,4 +60,23 @@ func categoryToResponse(c domain.MenuCategory) menuCategoryResponse {
 		parent = &s
 	}
 	return menuCategoryResponse{ID: c.ID.String(), Name: c.Name, NameI18n: c.NameI18n, ParentID: parent, DisplayOrder: c.DisplayOrder}
+}
+
+// featuredItemResponse is one card of the cross-venue "chef's picks" rail. It
+// carries the venue name alongside the dish so the card needs no second call,
+// and it deliberately reuses menuItemResponse rather than defining a parallel
+// dish shape the clients would have to map twice.
+type featuredItemResponse struct {
+	menuItemResponse
+	RestaurantName     string            `json:"restaurant_name"`
+	RestaurantNameI18n map[string]string `json:"restaurant_name_i18n,omitempty"`
+}
+
+func featuredToResponse(f domain.FeaturedMenuItem) featuredItemResponse {
+	item := f.Item
+	return featuredItemResponse{
+		menuItemResponse:   itemToResponse(&item),
+		RestaurantName:     f.RestaurantName,
+		RestaurantNameI18n: f.RestaurantI18n,
+	}
 }

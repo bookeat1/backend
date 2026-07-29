@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,7 +30,7 @@ var _ domain.MenuItemRepository = (*Repository)(nil)
 // selCols lists menu_items columns for reads; price is rendered as text so the
 // domain can carry it as a decimal string without a float round-trip.
 const selCols = `id, restaurant_id, name, name_i18n, description, description_i18n,
-	price::text, image_url, is_available, category, category_i18n, subcategory,
+	price::text, image_url, is_available, is_featured, category, category_i18n, subcategory,
 	subcategory_i18n, portion_size, portion_size_i18n, language, display_order,
 	created_at, updated_at`
 
@@ -177,6 +178,94 @@ func (r *Repository) SetAvailable(ctx context.Context, id uuid.UUID, available b
 	return nil
 }
 
+// ListFeatured reads the cross-venue "chef's picks" rail. The join to
+// restaurants is what makes it a CITY rail and what keeps dishes of hidden
+// venues out: is_active is checked on the venue, is_available on the dish, so a
+// stop-listed dish or a venue taken off the platform disappears from the rail
+// with no extra bookkeeping. Ordering is by the pick's own recency
+// (menu_items.updated_at), which is what the partial index is built on.
+func (r *Repository) ListFeatured(ctx context.Context, f domain.FeaturedMenuFilter) ([]domain.FeaturedMenuItem, error) {
+	q := `SELECT ` + prefixed(selCols, "m") + `, r.name, r.name_i18n
+	      FROM menu_items m
+	      JOIN restaurants r ON r.id = m.restaurant_id
+	      WHERE m.is_featured AND m.is_available AND r.is_active AND r.city = $1`
+	args := []any{string(f.City)}
+	if f.Language == nil {
+		q += ` AND (m.language = 'ru' OR m.language IS NULL)`
+	} else {
+		args = append(args, *f.Language)
+		q += fmt.Sprintf(` AND m.language = $%d`, len(args))
+	}
+	args = append(args, f.Limit)
+	q += fmt.Sprintf(` ORDER BY m.updated_at DESC, m.id LIMIT $%d`, len(args))
+
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list featured menu items: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.FeaturedMenuItem{}
+	for rows.Next() {
+		var m domain.MenuItem
+		var name, desc, cat, subcat, portion, venueI18n []byte
+		var venueName string
+		if err := rows.Scan(
+			&m.ID, &m.RestaurantID, &m.Name, &name, &m.Description, &desc, &m.Price,
+			&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.Category, &cat, &m.Subcategory, &subcat,
+			&m.PortionSize, &portion, &m.Language, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
+			&venueName, &venueI18n,
+		); err != nil {
+			return nil, fmt.Errorf("list featured menu items: %w", err)
+		}
+		m.NameI18n = i18nFromDB(name)
+		m.DescriptionI18n = i18nFromDB(desc)
+		m.CategoryI18n = i18nFromDB(cat)
+		m.SubcategoryI18n = i18nFromDB(subcat)
+		m.PortionSizeI18n = i18nFromDB(portion)
+		out = append(out, domain.FeaturedMenuItem{
+			Item:           m,
+			RestaurantName: venueName,
+			RestaurantI18n: i18nFromDB(venueI18n),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list featured menu items: %w", err)
+	}
+	return out, nil
+}
+
+// SetFeatured flips is_featured for one dish of restaurantID. Both predicates
+// are in the WHERE clause on purpose: the restaurant_id is the tenant guard, so
+// an id belonging to another venue matches zero rows and comes back as
+// ErrNotFound rather than silently promoting somebody else's dish.
+func (r *Repository) SetFeatured(ctx context.Context, restaurantID, id uuid.UUID, featured bool) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE menu_items SET is_featured=$3, updated_at=now()
+		 WHERE restaurant_id=$1 AND id=$2`, restaurantID, id, featured)
+	if err != nil {
+		return fmt.Errorf("set featured: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// prefixed qualifies every bare column of a select list with a table alias, so
+// selCols can be reused in a join without repeating it.
+func prefixed(cols, alias string) string {
+	parts := strings.Split(cols, ",")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "price::text" {
+			parts[i] = alias + ".price::text"
+			continue
+		}
+		parts[i] = alias + "." + p
+	}
+	return strings.Join(parts, ", ")
+}
+
 // SetAvailableBulk flips is_available for the given ids that belong to
 // restaurantID in one UPDATE. The restaurant_id predicate is the tenant guard:
 // any id in the list that belongs to another venue matches zero rows and is
@@ -231,7 +320,7 @@ func scanItem(row scanner) (*domain.MenuItem, error) {
 	var name, desc, cat, subcat, portion []byte
 	if err := row.Scan(
 		&m.ID, &m.RestaurantID, &m.Name, &name, &m.Description, &desc, &m.Price,
-		&m.ImageURL, &m.IsAvailable, &m.Category, &cat, &m.Subcategory, &subcat,
+		&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.Category, &cat, &m.Subcategory, &subcat,
 		&m.PortionSize, &portion, &m.Language, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err

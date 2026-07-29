@@ -2,6 +2,7 @@ package menu
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 
@@ -24,6 +25,15 @@ type Facade interface {
 	// another venue are silently skipped). Returns the count actually changed.
 	// This is the fast "we ran out" stop-list path.
 	SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID, available bool) (int, error)
+	// SetFeatured marks one dish of restaurantID as an editorial pick (or drops
+	// the mark). The tenant guard lives in SQL, so an item of another venue
+	// comes back as ErrNotFound instead of being promoted.
+	SetFeatured(ctx context.Context, restaurantID, itemID uuid.UUID, featured bool) error
+	// ListFeatured returns the cross-venue "chef's picks" rail for one city.
+	// limit is clamped here (not in the repository) because it is a transport
+	// concern: an unbounded rail is a slow query a client can ask for by
+	// accident.
+	ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error)
 
 	CreateCategory(ctx context.Context, in CategoryInput) (*domain.MenuCategory, error)
 	UpdateCategory(ctx context.Context, id uuid.UUID, in CategoryInput) (*domain.MenuCategory, error)
@@ -148,6 +158,31 @@ func (f *facade) SetAvailable(ctx context.Context, restaurantID, itemID uuid.UUI
 
 func (f *facade) SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID, available bool) (int, error) {
 	return f.items.SetAvailableBulk(ctx, restaurantID, itemIDs, available)
+}
+
+func (f *facade) SetFeatured(ctx context.Context, restaurantID, itemID uuid.UUID, featured bool) error {
+	return f.items.SetFeatured(ctx, restaurantID, itemID, featured)
+}
+
+// featuredLimit bounds the rail. The default matches what the main screen
+// renders; the ceiling exists so a client cannot turn a home-screen rail into a
+// full catalogue dump.
+const (
+	featuredLimitDefault = 10
+	featuredLimitMax     = 50
+)
+
+func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error) {
+	if !city.Valid() {
+		return nil, domain.WithCode(domain.CodeCityRequired, fmt.Errorf("%w: city is required", domain.ErrValidation))
+	}
+	switch {
+	case limit <= 0:
+		limit = featuredLimitDefault
+	case limit > featuredLimitMax:
+		limit = featuredLimitMax
+	}
+	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Language: lang, Limit: limit})
 }
 
 // ownedThen verifies itemID belongs to restaurantID (IDOR) then runs fn.
