@@ -69,6 +69,12 @@ type MenuItem struct {
 	Price           string
 	ImageURL        *string
 	IsAvailable     bool
+	// IsFeatured marks the dish as an editorial pick for the cross-venue
+	// "chef's picks" rail on the main screen. It is independent of
+	// IsAvailable: a picked dish that ran out stays picked but drops out of the
+	// guest rail until it is available again, so staff do not have to re-pick
+	// it after every stop list.
+	IsFeatured      bool
 	Category        *string
 	CategoryI18n    I18n
 	Subcategory     *string
@@ -97,6 +103,24 @@ type MenuItemFilter struct {
 	Language     *string
 }
 
+// FeaturedMenuFilter narrows the cross-venue "chef's picks" rail. City is
+// required: the rail is a city feed, and showing an Almaty dish to a guest in
+// Astana is the same mistake the main feed already refuses to make. Limit is
+// clamped by the usecase, not here.
+type FeaturedMenuFilter struct {
+	City     City
+	Language *string
+	Limit    int
+}
+
+// FeaturedMenuItem is one card of the "chef's picks" rail: the dish plus the
+// venue it belongs to, so the card can be opened without a second request.
+type FeaturedMenuItem struct {
+	Item           MenuItem
+	RestaurantName string
+	RestaurantI18n I18n
+}
+
 // MenuItemRepository persists menu items. Get* return ErrNotFound when absent.
 type MenuItemRepository interface {
 	// ListByRestaurant returns items (with Tags) for f.RestaurantID, ordered by
@@ -108,6 +132,21 @@ type MenuItemRepository interface {
 	Update(ctx context.Context, m *MenuItem) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	SetAvailable(ctx context.Context, id uuid.UUID, available bool) error
+	// ListFeatured returns editorially picked dishes ACROSS venues for the main
+	// screen, newest pick first. It returns only dishes that are both featured
+	// and available, and only from active venues in f.City — a rail that offers
+	// a dish from a hidden venue, or one the kitchen has stopped, is worse than
+	// a shorter rail. Tags are NOT loaded: the rail card shows a photo, a name,
+	// a price and the venue, and loading tags would cost a second query per
+	// screen for something nothing renders.
+	ListFeatured(ctx context.Context, f FeaturedMenuFilter) ([]FeaturedMenuItem, error)
+	// SetFeatured flips is_featured for one item that belongs to restaurantID.
+	// The restaurant_id filter is the tenant guard, exactly as in
+	// SetAvailableBulk: a manager of one venue cannot promote another venue's
+	// dish onto the main screen by guessing an id. Returns ErrNotFound when the
+	// item does not exist or belongs elsewhere — the two are deliberately
+	// indistinguishable to the caller.
+	SetFeatured(ctx context.Context, restaurantID, id uuid.UUID, featured bool) error
 	// SetAvailableBulk flips is_available for every item in ids that belongs to
 	// restaurantID, in ONE statement. The restaurant_id filter is the tenant
 	// guard: ids belonging to another restaurant are silently skipped, never

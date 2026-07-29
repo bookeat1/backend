@@ -43,6 +43,10 @@ type availabilityRequest struct {
 	IsAvailable bool `json:"is_available"`
 }
 
+type featuredRequest struct {
+	IsFeatured bool `json:"is_featured"`
+}
+
 type menuCategoryRequest struct {
 	Name         string            `json:"name"`
 	NameI18n     map[string]string `json:"name_i18n"`
