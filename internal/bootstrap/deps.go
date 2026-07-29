@@ -46,6 +46,7 @@ import (
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
+	venuedashboardrepo "backend-core/internal/infrastructure/postgres/venuedashboard"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/staticmap/twogis"
 	"backend-core/internal/infrastructure/telegramnotify"
@@ -75,6 +76,7 @@ import (
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
+	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
 )
 
 // Deps holds the constructed usecases and shared infrastructure.
@@ -102,6 +104,9 @@ type Deps struct {
 	BookingCreate      bookings.CreateUseCase
 	BookingIdempotent  bookings.IdempotentCreateUseCase
 	BookingStatus      bookings.StatusUseCase
+	// VenueDashboard serves one restaurant its own numbers (as opposed to the
+	// platform-wide dashboard, which is the owner's view).
+	VenueDashboard *venuedashboarduc.UseCase
 	// NotificationSettings backs the inbound Telegram webhook: it resolves the
 	// chat a button press came from back to the venue that connected it.
 	NotificationSettings domain.RestaurantNotificationSettingsRepository
@@ -381,6 +386,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingCreate:         bookingCreate,
 		BookingIdempotent:     bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
 		BookingStatus:         bookingStatus,
+		VenueDashboard:        venuedashboarduc.NewUseCase(venuedashboardrepo.New(db)),
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
