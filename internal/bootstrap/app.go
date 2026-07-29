@@ -40,6 +40,7 @@ import (
 	"backend-core/internal/transport/rest/telegramhook"
 	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
+	venuedashboardrest "backend-core/internal/transport/rest/venuedashboard"
 )
 
 // HTTP server timeouts. httpWriteTimeout is a named constant rather than a
@@ -283,6 +284,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	menuScoped := authed.Group("")
 	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
 	menuHandler.RegisterScoped(menuScoped)
+
+	// A venue's own dashboard. Same gate as every other venue screen: the
+	// numbers are the venue's, so the caller must manage it.
+	venueDashScoped := authed.Group("")
+	venueDashScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
+	venuedashboardrest.NewHandler(deps.VenueDashboard).RegisterScoped(venueDashScoped)
 
 	// Venue cabinet: the calendar, manual bookings and the guest stop list.
 	bookingScoped := authed.Group("")
