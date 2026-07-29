@@ -90,7 +90,10 @@ type Config struct {
 	DefaultConfirmSLA     time.Duration
 	DefaultMaxGuests      int
 	DefaultAutoConfirm    bool
-	TimezoneFallback      string
+	// DefaultConfirmOnCreate: confirm a new booking immediately, without the
+	// venue seeing it as a request. Off by default — see BookingPolicy.
+	DefaultConfirmOnCreate bool
+	TimezoneFallback       string
 
 	// RateWindow / RateLimit throttle booking attempts per normalized phone
 	// (booking_rate_log). Zero values fall back to the constants below.

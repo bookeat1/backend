@@ -148,7 +148,19 @@ type BookingPolicy struct {
 	CancelDeadline      time.Duration // guest may cancel until starts_at - CancelDeadline
 	ConfirmSLA          time.Duration // pending → auto-confirm / escalation after this
 	MaxGuestsPerBooking int
-	AutoConfirm         bool
+	// AutoConfirm decides what happens when ConfirmSLA elapses on a booking the
+	// venue never answered: true confirms it, false escalates once and leaves
+	// the decision with the venue.
+	AutoConfirm bool
+	// ConfirmOnCreate decides whether a NEW booking is confirmed the moment it
+	// is made, without the venue ever seeing it as a request.
+	//
+	// It is deliberately a SEPARATE flag from AutoConfirm, which used to carry
+	// both meanings. One field could not express the arrangement venues
+	// actually want — "let me answer first, but do not leave the guest hanging
+	// if I am busy" — because turning instant confirmation off also turned the
+	// safety net off, and a silent venue left the guest pending forever.
+	ConfirmOnCreate bool
 	// CapacityMode selects the availability engine for this venue; see
 	// CapacityMode. Always a valid value after resolution (never empty).
 	CapacityMode CapacityMode
@@ -169,6 +181,7 @@ type BookingPolicyOverride struct {
 	ConfirmSLAMinutes      *int
 	MaxGuestsPerBooking    *int
 	AutoConfirm            *bool
+	ConfirmOnCreate        *bool
 	// BookingCapacityMode / BookingCapacitySeats are the table-less switch
 	// (migration 0054). They follow the same PATCH semantics as the fields
 	// above — nil means "leave this column alone" — but a NULL

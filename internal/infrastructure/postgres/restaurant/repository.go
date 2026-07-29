@@ -41,7 +41,7 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 // stays untouched.
 const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 	booking_lead_minutes, booking_horizon_days, cancel_deadline_minutes,
-	confirm_sla_minutes, max_guests_per_booking, auto_confirm,
+	confirm_sla_minutes, max_guests_per_booking, auto_confirm, confirm_on_create,
 	booking_capacity_mode, booking_capacity_seats`
 
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
@@ -162,6 +162,9 @@ func (r *Repository) UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o do
 	}
 	if v := o.AutoConfirm; v != nil {
 		set("auto_confirm", *v)
+	}
+	if v := o.ConfirmOnCreate; v != nil {
+		set("confirm_on_create", *v)
 	}
 	if v := o.BookingCapacityMode; v != nil {
 		set("booking_capacity_mode", string(*v))
@@ -440,7 +443,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
 		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
-		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm,
+		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
 		&capacityMode, &p.BookingCapacitySeats,
 	); err != nil {
 		return nil, err

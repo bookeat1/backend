@@ -277,6 +277,7 @@ type effectiveBookingPolicy struct {
 	ConfirmSLAMinutes     int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking   int    `json:"max_guests_per_booking"`
 	AutoConfirm           bool   `json:"auto_confirm"`
+	ConfirmOnCreate       bool   `json:"confirm_on_create"`
 	CapacityMode          string `json:"capacity_mode"`
 	CapacitySeats         int    `json:"capacity_seats"`
 }
@@ -291,6 +292,7 @@ type bookingPolicyOverrideBlock struct {
 	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
 	AutoConfirm            *bool   `json:"auto_confirm"`
+	ConfirmOnCreate        *bool   `json:"confirm_on_create"`
 	BookingCapacityMode    *string `json:"booking_capacity_mode"`
 	BookingCapacitySeats   *int    `json:"booking_capacity_seats"`
 }
@@ -309,6 +311,7 @@ func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyRespon
 			ConfirmSLAMinutes:     int(e.ConfirmSLA / time.Minute),
 			MaxGuestsPerBooking:   e.MaxGuestsPerBooking,
 			AutoConfirm:           e.AutoConfirm,
+			ConfirmOnCreate:       e.ConfirmOnCreate,
 			CapacityMode:          string(e.CapacityMode),
 			CapacitySeats:         e.CapacitySeats,
 		},
@@ -322,6 +325,7 @@ func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyRespon
 			ConfirmSLAMinutes:      o.ConfirmSLAMinutes,
 			MaxGuestsPerBooking:    o.MaxGuestsPerBooking,
 			AutoConfirm:            o.AutoConfirm,
+			ConfirmOnCreate:        o.ConfirmOnCreate,
 			BookingCapacityMode:    capacityModePtr(o.BookingCapacityMode),
 			BookingCapacitySeats:   o.BookingCapacitySeats,
 		},

@@ -362,10 +362,14 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			acc.actorType(), actorID(actor), nil, now); err != nil {
 			return err
 		}
-		if !policy.AutoConfirm {
+		if !policy.ConfirmOnCreate {
+			// The booking stays pending: the venue is notified and answers it.
+			// If it never does, the confirm-SLA worker decides, using
+			// AutoConfirm — that is the safety net, and it is a different
+			// question from whether to skip the venue entirely right now.
 			return nil
 		}
-		// Auto-confirmation is a real transition: its own status update,
+		// Instant confirmation is a real transition: its own status update,
 		// history row and event, inside the same transaction.
 		from := b.Status
 		b.Status = domain.BookingConfirmed
