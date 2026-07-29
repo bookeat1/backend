@@ -46,6 +46,7 @@ import (
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
+	userrolerepo "backend-core/internal/infrastructure/postgres/userrole"
 	venuedashboardrepo "backend-core/internal/infrastructure/postgres/venuedashboard"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/staticmap/twogis"
@@ -73,6 +74,7 @@ import (
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
+	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
@@ -104,6 +106,9 @@ type Deps struct {
 	BookingCreate      bookings.CreateUseCase
 	BookingIdempotent  bookings.IdempotentCreateUseCase
 	BookingStatus      bookings.StatusUseCase
+	// Roles changes global roles and reads their audit. Also the home of the
+	// bootstrap that promotes the first administrator on an empty platform.
+	Roles *rolesuc.UseCase
 	// VenueDashboard serves one restaurant its own numbers (as opposed to the
 	// platform-wide dashboard, which is the owner's view).
 	VenueDashboard *venuedashboarduc.UseCase
@@ -386,6 +391,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingCreate:         bookingCreate,
 		BookingIdempotent:     bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
 		BookingStatus:         bookingStatus,
+		Roles:                 rolesuc.NewUseCase(userrolerepo.New(db, txm), usersRepo),
 		VenueDashboard:        venuedashboarduc.NewUseCase(venuedashboardrepo.New(db)),
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
