@@ -170,12 +170,17 @@ type RateLimiterConfig struct {
 }
 
 type AppConfig struct {
-	Name               string
-	Environment        string
-	URL                string
-	LogLevel           string
-	LogFormat          string // env: APP_LOG_FORMAT — "json" (default) or "text"
-	CORSAllowedOrigins []string
+	Name        string
+	Environment string
+	// BootstrapAdminEmail is promoted to platform administrator on startup, but
+	// ONLY while the platform has no administrator at all. It answers "where
+	// does the first administrator come from" without leaving a way to quietly
+	// re-grant rights somebody removed on purpose.
+	BootstrapAdminEmail string // env: BOOTSTRAP_ADMIN_EMAIL
+	URL                 string
+	LogLevel            string
+	LogFormat           string // env: APP_LOG_FORMAT — "json" (default) or "text"
+	CORSAllowedOrigins  []string
 
 	// TrustedProxies lists the IPs/CIDRs allowed to set X-Forwarded-For /
 	// X-Real-IP and have gin's Context.ClientIP() believe them (env:
@@ -538,13 +543,14 @@ func NewConfig() (Config, error) {
 
 	cfg := Config{
 		App: AppConfig{
-			Name:               getEnv("APP_NAME", "backend-core"),
-			Environment:        getEnv("APP_ENV", "development"),
-			URL:                getEnv("APP_URL", "0.0.0.0:8080"),
-			LogLevel:           getEnv("APP_LOG_LEVEL", "info"),
-			LogFormat:          getEnv("APP_LOG_FORMAT", "json"),
-			CORSAllowedOrigins: getEnvList("APP_CORS_ORIGINS", "*"),
-			TrustedProxies:     getEnvList("APP_TRUSTED_PROXIES", ""),
+			Name:                getEnv("APP_NAME", "backend-core"),
+			Environment:         getEnv("APP_ENV", "development"),
+			BootstrapAdminEmail: getEnv("BOOTSTRAP_ADMIN_EMAIL", ""),
+			URL:                 getEnv("APP_URL", "0.0.0.0:8080"),
+			LogLevel:            getEnv("APP_LOG_LEVEL", "info"),
+			LogFormat:           getEnv("APP_LOG_FORMAT", "json"),
+			CORSAllowedOrigins:  getEnvList("APP_CORS_ORIGINS", "*"),
+			TrustedProxies:      getEnvList("APP_TRUSTED_PROXIES", ""),
 		},
 		DB: DBConfig{
 			Postgres: PostgresConfig{

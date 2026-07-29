@@ -35,6 +35,7 @@ import (
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
+	rolesrest "backend-core/internal/transport/rest/roles"
 	staticmaprest "backend-core/internal/transport/rest/staticmap"
 	"backend-core/internal/transport/rest/swaggerui"
 	"backend-core/internal/transport/rest/telegramhook"
@@ -104,6 +105,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	// Interactive API docs at /docs — mounted only outside production.
 	swaggerui.Register(r, cfg.App.Environment)
+
+	// The first administrator. Runs once per start and does nothing unless the
+	// platform has none, so it cannot silently restore rights that were taken
+	// away on purpose. A failure is logged, never fatal: the service must still
+	// come up.
+	if err := deps.Roles.EnsureBootstrapAdmin(context.Background(), cfg.App.BootstrapAdminEmail); err != nil {
+		log.Error("bootstrap admin failed", slog.String("error", err.Error()))
+	}
 
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
@@ -235,6 +244,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
+
+	// Global role management. This is the endpoint that hands out the rights to
+	// every other admin endpoint, so the usecase checks the caller's role again
+	// on top of this group's gate.
+	rolesrest.NewHandler(deps.Roles).RegisterAdmin(adminGlobal)
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregate
 	// statistics. Mounted on the RequireRole(RoleAdmin) group so ONLY the global
 	// superadmin passes; a restaurant owner/manager/hostess or a guest gets 403.

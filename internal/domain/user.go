@@ -16,6 +16,18 @@ const (
 	RoleAdmin      Role = "admin"
 )
 
+// Valid reports whether r is a role the platform knows. It exists so a typo in
+// an API call cannot store a role nothing recognises, which would silently deny
+// the user everything rather than fail loudly at the moment of the mistake.
+func (r Role) Valid() bool {
+	switch r {
+	case RoleUser, RoleRestaurant, RoleAdmin:
+		return true
+	default:
+		return false
+	}
+}
+
 // User is a person who can authenticate. Email and Phone are optional but at
 // least one is always present (unless the account was deleted — see
 // DeletedAt). ID equals the original Supabase auth.users id.
