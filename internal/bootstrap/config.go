@@ -226,15 +226,16 @@ type AuthConfig struct {
 // override any of these per venue (restaurants.booking_* columns, all NULLABLE
 // — NULL means "use the value from here"). Resolution: usecase/bookings.
 type BookingConfig struct {
-	DefaultDuration       time.Duration // env: BOOKING_DEFAULT_DURATION_MINUTES
-	DefaultBuffer         time.Duration // env: BOOKING_DEFAULT_BUFFER_MINUTES — cleanup gap added on both sides of the occupied slot
-	DefaultLead           time.Duration // env: BOOKING_DEFAULT_LEAD_MINUTES — minimum distance from now to starts_at
-	DefaultHorizonDays    int           // env: BOOKING_DEFAULT_HORIZON_DAYS — furthest bookable day ahead
-	DefaultCancelDeadline time.Duration // env: BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES — guest may cancel until starts_at minus this
-	DefaultConfirmSLA     time.Duration // env: BOOKING_DEFAULT_CONFIRM_SLA_MINUTES — pending auto-confirm / escalation deadline
-	DefaultMaxGuests      int           // env: BOOKING_DEFAULT_MAX_GUESTS
-	DefaultAutoConfirm    bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM
-	TimezoneFallback      string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
+	DefaultDuration        time.Duration // env: BOOKING_DEFAULT_DURATION_MINUTES
+	DefaultBuffer          time.Duration // env: BOOKING_DEFAULT_BUFFER_MINUTES — cleanup gap added on both sides of the occupied slot
+	DefaultLead            time.Duration // env: BOOKING_DEFAULT_LEAD_MINUTES — minimum distance from now to starts_at
+	DefaultHorizonDays     int           // env: BOOKING_DEFAULT_HORIZON_DAYS — furthest bookable day ahead
+	DefaultCancelDeadline  time.Duration // env: BOOKING_DEFAULT_CANCEL_DEADLINE_MINUTES — guest may cancel until starts_at minus this
+	DefaultConfirmSLA      time.Duration // env: BOOKING_DEFAULT_CONFIRM_SLA_MINUTES — pending auto-confirm / escalation deadline
+	DefaultMaxGuests       int           // env: BOOKING_DEFAULT_MAX_GUESTS
+	DefaultAutoConfirm     bool          // env: BOOKING_DEFAULT_AUTO_CONFIRM — confirm a pending booking when the SLA elapses
+	DefaultConfirmOnCreate bool          // env: BOOKING_DEFAULT_CONFIRM_ON_CREATE — confirm a NEW booking without asking the venue
+	TimezoneFallback       string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
 
 	// Anti-fraud: at most RateLimit booking attempts per normalized phone
 	// within RateWindow (booking_rate_log).
@@ -573,10 +574,14 @@ func NewConfig() (Config, error) {
 			DefaultConfirmSLA:     getEnvMinutes("BOOKING_DEFAULT_CONFIRM_SLA_MINUTES", 120),
 			DefaultMaxGuests:      getEnvInt("BOOKING_DEFAULT_MAX_GUESTS", 20),
 			DefaultAutoConfirm:    getEnvBool("BOOKING_DEFAULT_AUTO_CONFIRM", true),
-			TimezoneFallback:      getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
-			RateLimit:             getEnvInt("BOOKING_RATE_LIMIT", 10),
-			RateWindow:            getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
-			SlotStep:              getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+			// OFF by default (owner decision, 29.07.2026): the venue answers
+			// its own bookings, and the SLA worker above is what keeps a guest
+			// from waiting on a venue that never looks at the panel.
+			DefaultConfirmOnCreate: getEnvBool("BOOKING_DEFAULT_CONFIRM_ON_CREATE", false),
+			TimezoneFallback:       getEnv("BOOKING_TIMEZONE_FALLBACK", "Asia/Almaty"),
+			RateLimit:              getEnvInt("BOOKING_RATE_LIMIT", 10),
+			RateWindow:             getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
+			SlotStep:               getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
 		},
 		Worker: WorkerConfig{
 			TickInterval:          getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),

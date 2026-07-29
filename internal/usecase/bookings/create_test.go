@@ -85,8 +85,13 @@ func (h *createHarness) input() CreateInput {
 	}
 }
 
+// Instant confirmation is no longer the default (a venue answers its own
+// bookings — see confirm_on_create_test.go), so this test asks for it
+// explicitly. Everything else it checks — contact normalisation, duration,
+// table choice, the buffer around the slot — is unchanged.
 func TestCreateAutoConfirm(t *testing.T) {
-	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	confirmOnCreate := true
+	h := newCreateHarness(t, domain.BookingPolicyOverride{ConfirmOnCreate: &confirmOnCreate})
 
 	got, err := h.uc.Create(context.Background(), h.guest, h.input())
 	if err != nil {

@@ -257,6 +257,7 @@ type bookingPolicyRequest struct {
 	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
 	AutoConfirm            *bool   `json:"auto_confirm"`
+	ConfirmOnCreate        *bool   `json:"confirm_on_create"`
 	// BookingCapacityMode / BookingCapacitySeats switch the venue between
 	// seating a guest at a specific table and booking against a declared total
 	// capacity (migration 0054). Same PATCH semantics as the fields above.
@@ -270,6 +271,7 @@ func (r bookingPolicyRequest) Validate() error {
 	if r.Timezone == nil && r.BookingDurationMinutes == nil && r.BookingBufferMinutes == nil &&
 		r.BookingLeadMinutes == nil && r.BookingHorizonDays == nil && r.CancelDeadlineMinutes == nil &&
 		r.ConfirmSLAMinutes == nil && r.MaxGuestsPerBooking == nil && r.AutoConfirm == nil &&
+		r.ConfirmOnCreate == nil &&
 		r.BookingCapacityMode == nil && r.BookingCapacitySeats == nil {
 		return fmt.Errorf("%w: no policy fields provided", domain.ErrValidation)
 	}
@@ -294,6 +296,7 @@ func (r bookingPolicyRequest) toDomain() domain.BookingPolicyOverride {
 		ConfirmSLAMinutes:      r.ConfirmSLAMinutes,
 		MaxGuestsPerBooking:    r.MaxGuestsPerBooking,
 		AutoConfirm:            r.AutoConfirm,
+		ConfirmOnCreate:        r.ConfirmOnCreate,
 		BookingCapacityMode:    mode,
 		BookingCapacitySeats:   r.BookingCapacitySeats,
 	}

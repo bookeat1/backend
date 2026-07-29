@@ -68,6 +68,7 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 		ConfirmSLA:          cfg.DefaultConfirmSLA,
 		MaxGuestsPerBooking: cfg.DefaultMaxGuests,
 		AutoConfirm:         cfg.DefaultAutoConfirm,
+		ConfirmOnCreate:     cfg.DefaultConfirmOnCreate,
 		// DEFAULT DECISION (owner, 25.07.2026): table mode. A NULL
 		// booking_capacity_mode — which is every venue that existed before
 		// migration 0054 — resolves to exactly the behaviour it had yesterday.
@@ -117,6 +118,9 @@ func resolvePolicy(r domain.Restaurant, cfg Config) domain.BookingPolicy {
 	}
 	if v := o.MaxGuestsPerBooking; v != nil && *v > 0 {
 		p.MaxGuestsPerBooking = *v
+	}
+	if o.ConfirmOnCreate != nil {
+		p.ConfirmOnCreate = *o.ConfirmOnCreate
 	}
 	if o.AutoConfirm != nil {
 		p.AutoConfirm = *o.AutoConfirm
