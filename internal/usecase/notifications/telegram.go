@@ -130,5 +130,14 @@ func buildTelegramText(e Event) string {
 		name = "Гость"
 	}
 	local := e.StartsAt.Local().Format("02.01 15:04")
-	return fmt.Sprintf("Новая бронь\nВремя: %s\nГостей: %d\nИмя: %s", local, e.Guests, name)
+	text := fmt.Sprintf("Новая бронь\nВремя: %s\nГостей: %d\nИмя: %s", local, e.Guests, name)
+	// The phone is the difference between an alert staff can act on and one
+	// that sends them to the panel: it is what they use to confirm a large
+	// party or to find a guest who has not arrived. Omitted, not blanked, when
+	// a booking has no number at all — an empty "Телефон:" line reads like a
+	// bug in the message.
+	if e.GuestPhone != "" {
+		text += "\nТелефон: " + e.GuestPhone
+	}
+	return text
 }

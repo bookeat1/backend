@@ -26,8 +26,17 @@ type Event struct {
 	RestaurantID  uuid.UUID
 	Type          domain.BookingEventType
 	GuestName     string
-	Guests        int
-	StartsAt      time.Time
+	// GuestPhone is the number staff call when they need the guest: to confirm
+	// a large party, to warn about a delay, to find someone who has not shown
+	// up. It has always been in the outbox payload and was simply not decoded,
+	// so the venue got an alert it could not act on without opening the panel.
+	//
+	// STAFF CHANNELS ONLY. It is the one piece of personal data in this Event,
+	// and it goes to the venue that is already hosting this guest — never to a
+	// guest-facing channel.
+	GuestPhone string
+	Guests     int
+	StartsAt   time.Time
 	// GuestUserID is the booking's account owner, nil for a booking made without
 	// an account (phone / admin-entered). Guest-facing channels need it to find
 	// the devices to notify and to consult the guest's opt-out; staff channels
@@ -61,6 +70,7 @@ type outboxPayload struct {
 	RestaurantID uuid.UUID          `json:"restaurant_id"`
 	UserID       *uuid.UUID         `json:"user_id,omitempty"`
 	Name         string             `json:"name"`
+	Phone        string             `json:"phone"`
 	Guests       int                `json:"guests"`
 	StartsAt     time.Time          `json:"starts_at"`
 	CancelledBy  domain.CancelledBy `json:"cancelled_by,omitempty"`
@@ -78,6 +88,7 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		RestaurantID:  p.RestaurantID,
 		Type:          row.EventType,
 		GuestName:     p.Name,
+		GuestPhone:    p.Phone,
 		Guests:        p.Guests,
 		StartsAt:      p.StartsAt,
 		GuestUserID:   p.UserID,
