@@ -51,6 +51,7 @@ import (
 	"backend-core/internal/infrastructure/telegramnotify"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/webpush"
+	"backend-core/internal/transport/rest/telegramhook"
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/analytics"
 	"backend-core/internal/usecase/auth"
@@ -101,13 +102,21 @@ type Deps struct {
 	BookingCreate      bookings.CreateUseCase
 	BookingIdempotent  bookings.IdempotentCreateUseCase
 	BookingStatus      bookings.StatusUseCase
-	BookingUpdate      bookings.UpdateUseCase
-	BookingAvail       bookings.AvailabilityUseCase
-	BookingBlacklist   bookings.BlacklistUseCase
-	BookingPolicy      bookings.PolicyUseCase
-	AdminPanel         *admin.UseCase
-	Dashboard          *dashboard.UseCase
-	BookingExternal    bookings.ExternalReservationUseCase
+	// NotificationSettings backs the inbound Telegram webhook: it resolves the
+	// chat a button press came from back to the venue that connected it.
+	NotificationSettings domain.RestaurantNotificationSettingsRepository
+	// TelegramAnswerer acknowledges a press and rewrites the alert. Nil when the
+	// bot token is unset, which is also when the webhook stays unmounted.
+	TelegramAnswerer telegramhook.Answerer
+	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
+	TelegramWebhookSecret string
+	BookingUpdate         bookings.UpdateUseCase
+	BookingAvail          bookings.AvailabilityUseCase
+	BookingBlacklist      bookings.BlacklistUseCase
+	BookingPolicy         bookings.PolicyUseCase
+	AdminPanel            *admin.UseCase
+	Dashboard             *dashboard.UseCase
+	BookingExternal       bookings.ExternalReservationUseCase
 	// BookingOverrides is the read side of the deliberate-overbooking audit
 	// (migration 0056): the venue cabinet's answer to "who seated a party we
 	// could not fit, and when".
@@ -349,29 +358,32 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	payoutUC := payouts.NewUseCase(newPayoutPorts(db, restaurantManagers, txm, log), newPayoutsConfig(cfg), log)
 
 	return &Deps{
-		AuthFacade:         authFacade,
-		AuthOTP:            authOTP,
-		UsersFacade:        users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
-		UsersRepo:          usersRepo,
-		RestaurantsFacade:  restaurantsFacade,
-		RestaurantManagers: restaurantManagers,
-		MyRestaurants:      myRestaurants,
-		PushSubscriptions:  pushSubscriptions,
-		DeviceTokens:       deviceTokens,
-		FavoritesFacade:    favoritesFacade,
-		ConsentFacade:      consentFacade,
-		ReviewsFacade:      reviewsFacade,
-		EventsFacade:       eventsFacade,
-		PromosFacade:       promosFacade,
-		GastroguideFacade:  gastroguideFacade,
-		GastroguideEditor:  gastroguideEditor,
-		ContentFacade:      contentFacade,
-		FeedFacade:         feedFacade,
-		MenuFacade:         menuFacade,
-		BookingsFacade:     bookingsFacade,
-		BookingCreate:      bookingCreate,
-		BookingIdempotent:  bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
-		BookingStatus:      bookingStatus,
+		AuthFacade:            authFacade,
+		AuthOTP:               authOTP,
+		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
+		UsersRepo:             usersRepo,
+		RestaurantsFacade:     restaurantsFacade,
+		RestaurantManagers:    restaurantManagers,
+		MyRestaurants:         myRestaurants,
+		PushSubscriptions:     pushSubscriptions,
+		DeviceTokens:          deviceTokens,
+		FavoritesFacade:       favoritesFacade,
+		ConsentFacade:         consentFacade,
+		ReviewsFacade:         reviewsFacade,
+		EventsFacade:          eventsFacade,
+		PromosFacade:          promosFacade,
+		GastroguideFacade:     gastroguideFacade,
+		GastroguideEditor:     gastroguideEditor,
+		ContentFacade:         contentFacade,
+		FeedFacade:            feedFacade,
+		MenuFacade:            menuFacade,
+		BookingsFacade:        bookingsFacade,
+		BookingCreate:         bookingCreate,
+		BookingIdempotent:     bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),
+		BookingStatus:         bookingStatus,
+		NotificationSettings:  notificationrepo.NewSettings(db),
+		TelegramAnswerer:      newTelegramAnswerer(cfg),
+		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
 		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingOutbox,
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
 		BookingAvail: bookings.NewAvailabilityUseCase(bookingLinks, bookingCapacity, restRepo,
@@ -427,6 +439,18 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 // stack (NewDeps) and the worker (NewDailyPayoutRunner) build the SAME set of
 // ports — a scheduled payout and a manual one must not be able to drift apart.
 // perms may be nil for the worker: it never authorizes an Actor.
+// newTelegramAnswerer builds the client that acknowledges a button press and
+// rewrites the alert. It returns nil unless BOTH the bot token and the webhook
+// secret are set: those are exactly the conditions under which buttons are put
+// on a message in the first place, so the two decisions cannot drift apart.
+func newTelegramAnswerer(cfg Config) telegramhook.Answerer {
+	tgCfg := telegramnotify.Config{BotToken: cfg.Push.TelegramBotToken}
+	if !tgCfg.Configured() || strings.TrimSpace(cfg.Push.TelegramWebhookSecret) == "" {
+		return nil
+	}
+	return telegramnotify.NewSender(tgCfg)
+}
+
 func newPayoutPorts(db *pgxpool.Pool, perms permissionCheckerPort, txm domain.TxManager, log *slog.Logger) payouts.Ports {
 	return payouts.Ports{
 		Perms:        perms,
@@ -912,6 +936,19 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		tgCfg.Configured(),
 		log,
 	)
+	// Buttons go under the alert only when the venue can actually answer them:
+	// that needs both the bot token (to send) and the webhook secret (to receive
+	// the press). Buttons that lead nowhere are worse than none — staff press
+	// them and conclude the product is broken.
+	if tgCfg.Configured() && strings.TrimSpace(cfg.Push.TelegramWebhookSecret) != "" {
+		sender := telegramnotify.NewSender(tgCfg)
+		telegram = telegram.WithActions(sender.SendWithActions, func(bookingID uuid.UUID) [][2]string {
+			return [][2]string{
+				{"Подтвердить", telegramhook.CallbackConfirm(bookingID)},
+				{"Отклонить", telegramhook.CallbackReject(bookingID)},
+			}
+		})
+	}
 
 	// Guest channel: a THIRD notifier on the same dispatcher — the first one
 	// addressed to the guest rather than to venue staff, so it is the only one

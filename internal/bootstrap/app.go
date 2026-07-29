@@ -37,6 +37,7 @@ import (
 	reviewsrest "backend-core/internal/transport/rest/reviews"
 	staticmaprest "backend-core/internal/transport/rest/staticmap"
 	"backend-core/internal/transport/rest/swaggerui"
+	"backend-core/internal/transport/rest/telegramhook"
 	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
 )
@@ -121,6 +122,18 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// unconditionally — without a provider key it answers a clean
 	// 503/map_not_configured, which the app already handles like "no map".
 	staticmaprest.NewHandler(deps.StaticMap).RegisterPublic(api)
+
+	// Inbound Telegram updates: the Confirm/Reject buttons under a venue's
+	// booking alert. Mounted OUTSIDE every auth group because Telegram cannot
+	// carry a bearer token — the handler authenticates the request by a secret
+	// header and the chat it came from instead (see package telegramhook).
+	// Registered unconditionally: without the secret the handler answers 404 and
+	// decides nothing, which is the same as not existing but keeps the wiring in
+	// one place.
+	telegramhook.NewHandler(
+		deps.BookingStatus, deps.NotificationSettings,
+		deps.TelegramAnswerer, deps.TelegramWebhookSecret,
+	).RegisterRoutes(api)
 
 	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
 	// SAME OptionalAuth group and for the same reason as the catalog: it is a

@@ -331,3 +331,9 @@ func (f *fakeCapacityOverrides) List(_ context.Context, _ uc.Actor, _ uuid.UUID,
 	}
 	return f.list, nil
 }
+
+// DecideAsVenue is part of StatusUseCase but is exercised by the Telegram
+// webhook's own tests, not through this handler.
+func (f *fakeStatus) DecideAsVenue(context.Context, uuid.UUID, uuid.UUID, uc.VenueDecision) (uc.VenueDecisionResult, error) {
+	return uc.VenueDecisionResult{}, nil
+}

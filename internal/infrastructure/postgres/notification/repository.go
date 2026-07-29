@@ -166,6 +166,28 @@ func (r *Settings) TelegramSettings(ctx context.Context, restaurantID uuid.UUID)
 	return out, nil
 }
 
+// RestaurantByTelegramChatID resolves a chat id back to its venue. The
+// telegram_enabled predicate is part of the authorisation, not an optimisation:
+// switching the channel off in the panel must also stop the buttons in messages
+// that are already sitting in the chat.
+//
+// The chat id is unique per venue in practice (staff connect one chat), but the
+// column carries no unique constraint, so LIMIT 1 keeps a duplicated row from
+// turning a lookup into an error for everybody.
+func (r *Settings) RestaurantByTelegramChatID(ctx context.Context, chatID string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT restaurant_id FROM restaurant_notification_settings
+		 WHERE telegram_chat_id = $1 AND telegram_enabled LIMIT 1`, chatID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("resolve telegram chat: %w", err)
+	}
+	return id, nil
+}
+
 // SetTelegramChatID upserts the venue's telegram chat id and marks the channel
 // enabled. The row is created on first use (web_push_enabled keeps its column
 // default of true). Re-connecting a new chat id overwrites in place.

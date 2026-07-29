@@ -446,6 +446,11 @@ type PushConfig struct {
 	// only and never logged (a bot credential). Absent → the telegram channel
 	// no-ops cleanly, exactly like absent VAPID keys for web push.
 	TelegramBotToken string // env: TELEGRAM_NOTIFY_BOT_TOKEN
+	// TelegramWebhookSecret is the secret_token given to Telegram's setWebhook
+	// and required back on every inbound update. EMPTY DISABLES the inbound
+	// webhook entirely: the buttons under an alert are only as safe as this
+	// header, so an unset secret must mean "no endpoint", never "no check".
+	TelegramWebhookSecret string // env: TELEGRAM_NOTIFY_WEBHOOK_SECRET
 
 	// GuestPushProvider selects the GUEST mobile-push provider. Empty (the
 	// default) means no provider is configured and the guest channel is a clean
@@ -637,13 +642,14 @@ func NewConfig() (Config, error) {
 			FeeBearer:       getEnv("PAYOUTS_FEE_BEARER", "platform"),
 		},
 		Push: PushConfig{
-			VAPIDPublicKey:   getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
-			VAPIDPrivateKey:  getEnv("PUSH_VAPID_PRIVATE_KEY", ""),
-			VAPIDSubject:     getEnv("PUSH_VAPID_SUBJECT", ""),
-			TTL:              getEnvDuration("PUSH_TTL", 24*time.Hour),
-			DispatchTick:     getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
-			DispatchBatch:    getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
-			TelegramBotToken: getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
+			VAPIDPublicKey:        getEnv("PUSH_VAPID_PUBLIC_KEY", ""),
+			VAPIDPrivateKey:       getEnv("PUSH_VAPID_PRIVATE_KEY", ""),
+			VAPIDSubject:          getEnv("PUSH_VAPID_SUBJECT", ""),
+			TTL:                   getEnvDuration("PUSH_TTL", 24*time.Hour),
+			DispatchTick:          getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
+			DispatchBatch:         getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
+			TelegramBotToken:      getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
+			TelegramWebhookSecret: getEnv("TELEGRAM_NOTIFY_WEBHOOK_SECRET", ""),
 
 			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
 			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),

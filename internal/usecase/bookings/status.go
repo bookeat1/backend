@@ -25,6 +25,10 @@ type StatusUseCase interface {
 	NoShow(ctx context.Context, actor Actor, id uuid.UUID, reason *string) (*domain.Booking, error)
 	Cancel(ctx context.Context, actor Actor, id uuid.UUID, in CancelInput) (*domain.Booking, error)
 	Waitlist(ctx context.Context, actor Actor, id uuid.UUID, reason *string) (*domain.Booking, error)
+	// DecideAsVenue answers a booking on behalf of the venue itself, for
+	// channels that carry no signed-in user (the Telegram alert's buttons).
+	// See venue_action.go for why the authority is the channel, not a person.
+	DecideAsVenue(ctx context.Context, restaurantID, bookingID uuid.UUID, decision VenueDecision) (VenueDecisionResult, error)
 }
 
 // CancelInput carries the cancellation metadata stored on the booking.
