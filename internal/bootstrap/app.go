@@ -303,7 +303,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// numbers are the venue's, so the caller must manage it.
 	venueDashScoped := authed.Group("")
 	venueDashScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
-	venuedashboardrest.NewHandler(deps.VenueDashboard).RegisterScoped(venueDashScoped)
+	venuedashboardrest.NewHandler(deps.VenueDashboard, deps.VenueToday).RegisterScoped(venueDashScoped)
 
 	// Venue cabinet: the calendar, manual bookings and the guest stop list.
 	bookingScoped := authed.Group("")
