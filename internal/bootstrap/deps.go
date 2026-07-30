@@ -112,6 +112,9 @@ type Deps struct {
 	// VenueDashboard serves one restaurant its own numbers (as opposed to the
 	// platform-wide dashboard, which is the owner's view).
 	VenueDashboard *venuedashboarduc.UseCase
+	// VenueToday serves the operational top of the same panel: the requests
+	// still waiting for an answer and the venue's current local day.
+	VenueToday *venuedashboarduc.TodayUseCase
 	// NotificationSettings backs the inbound Telegram webhook: it resolves the
 	// chat a button press came from back to the venue that connected it.
 	NotificationSettings domain.RestaurantNotificationSettingsRepository
@@ -393,6 +396,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		BookingStatus:         bookingStatus,
 		Roles:                 rolesuc.NewUseCase(userrolerepo.New(db, txm), usersRepo),
 		VenueDashboard:        venuedashboarduc.NewUseCase(venuedashboardrepo.New(db)),
+		VenueToday:            venuedashboarduc.NewTodayUseCase(venuedashboardrepo.NewToday(db)),
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
