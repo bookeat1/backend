@@ -61,6 +61,56 @@ func TestListActiveByRestaurant(t *testing.T) {
 	}
 }
 
+// TestListActiveByRestaurantStableTieBreak: two cards sharing both sort_order
+// AND created_at (the realistic case — now() is constant within one INSERT
+// transaction) must come back in a deterministic order, broken by id, and never
+// reshuffle between reads.
+func TestListActiveByRestaurantStableTieBreak(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_stories", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'A','Алматы','₸')`,
+		rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+
+	// Same sort_order (0) and the same explicit created_at for both rows, so only
+	// the id tie-break decides their order.
+	loID, hiID := uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+		uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, sort_order, is_active, created_at) VALUES
+		 ($2,$1,'https://cdn/hi.jpg',0,true,'2026-01-01T00:00:00Z'),
+		 ($3,$1,'https://cdn/lo.jpg',0,true,'2026-01-01T00:00:00Z')`,
+		rid, hiID, loID); err != nil {
+		t.Fatalf("seed stories: %v", err)
+	}
+
+	repo := New(pool)
+	first, err := repo.ListActiveByRestaurant(ctx, rid)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("len = %d, want 2", len(first))
+	}
+	// id ASC: the all-zeros id sorts before the all-fs id, regardless of insert order.
+	if first[0].ID != loID || first[1].ID != hiID {
+		t.Fatalf("tie-break order = [%v, %v], want [%v, %v]", first[0].ID, first[1].ID, loID, hiID)
+	}
+	// And it is stable — a second read returns the same order.
+	second, err := repo.ListActiveByRestaurant(ctx, rid)
+	if err != nil {
+		t.Fatalf("list again: %v", err)
+	}
+	if second[0].ID != first[0].ID || second[1].ID != first[1].ID {
+		t.Errorf("order not stable between reads: %v then %v", first, second)
+	}
+}
+
 // TestListActiveByRestaurantEmpty: a restaurant with no stories is not an error,
 // it lists as an empty result.
 func TestListActiveByRestaurantEmpty(t *testing.T) {

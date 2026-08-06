@@ -27,11 +27,14 @@ CREATE TABLE restaurant_stories (
 );
 
 -- The one query this table serves is "active stories of this restaurant, in
--- display order": the index carries restaurant_id + is_active + sort_order so
--- that read is an index scan with no sort node, and inactive rows stay out of
--- the way of it.
+-- display order" (ORDER BY sort_order, created_at, id). The index carries every
+-- column that read touches — restaurant_id + is_active for the filter, then all
+-- three sort keys — so it is served as an index-ordered scan with no separate
+-- sort node, and inactive rows stay out of the way of it. id is included as the
+-- deterministic final tie-break (now() is constant per transaction, so bulk
+-- inserts share created_at).
 CREATE INDEX idx_restaurant_stories_listing
-    ON restaurant_stories (restaurant_id, is_active, sort_order);
+    ON restaurant_stories (restaurant_id, is_active, sort_order, created_at, id);
 
 -- +goose Down
 

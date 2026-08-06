@@ -24,9 +24,13 @@ var _ domain.StoryRepository = (*Repository)(nil)
 const selCols = `id, restaurant_id, image_url, caption, sort_order, is_active, created_at`
 
 func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
+	// id is the final tie-break: now() is constant within a transaction, so a
+	// bulk insert gives every row the same created_at — without id the order of
+	// same-sort_order cards would not be stable between reads. The listing index
+	// carries all three sort columns so this stays an index-ordered scan.
 	q := `SELECT ` + selCols + ` FROM restaurant_stories
 	      WHERE restaurant_id=$1 AND is_active
-	      ORDER BY sort_order ASC, created_at ASC`
+	      ORDER BY sort_order ASC, created_at ASC, id ASC`
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, restaurantID)
 	if err != nil {
 		return nil, fmt.Errorf("list restaurant stories: %w", err)
