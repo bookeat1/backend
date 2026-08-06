@@ -16,6 +16,7 @@ import (
 	"backend-core/internal/domain"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	homefeedsrest "backend-core/internal/transport/rest/homefeeds"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	paymentsrest "backend-core/internal/transport/rest/payments"
@@ -79,6 +80,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers)
 	restHandler.RegisterPublic(api)
+
+	// Mobile Home ("Explore") feeds: cuisines, promotions, articles. Public
+	// reads, same as the restaurant catalog. "Выбрали для вас" (recommended
+	// venues) is NOT a new endpoint — the app reuses GET /restaurants?is_popular=true.
+	homeFeedsHandler := homefeedsrest.NewHandler(deps.HomeFeedsFacade)
+	homeFeedsHandler.RegisterPublic(api)
 
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))

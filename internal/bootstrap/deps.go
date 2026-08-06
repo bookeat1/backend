@@ -14,6 +14,7 @@ import (
 	"backend-core/internal/infrastructure/payment/freedompay"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	homefeedrepo "backend-core/internal/infrastructure/postgres/homefeed"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
@@ -26,6 +27,7 @@ import (
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	"backend-core/internal/usecase/homefeeds"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/restaurants"
@@ -40,6 +42,7 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
+	HomeFeedsFacade    homefeeds.Facade
 	MenuFacade         menu.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
@@ -106,6 +109,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	menuItems := menurepo.New(db)
 	menuCategories := menurepo.NewCategories(db)
 
+	homeCuisines := homefeedrepo.NewCuisines(db)
+	homePromotions := homefeedrepo.NewPromotions(db)
+	homeArticles := homefeedrepo.NewArticles(db)
+
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo)
 
 	bookingRepo := bookingrepo.New(db)
@@ -157,6 +164,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersRepo:          usersRepo,
 		RestaurantsFacade:  restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm),
 		RestaurantManagers: restaurantManagers,
+		HomeFeedsFacade:    homefeeds.NewFacade(homeCuisines, homePromotions, homeArticles),
 		MenuFacade:         menu.NewFacade(menuItems, menuCategories, txm),
 		BookingsFacade: bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 			bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm),
