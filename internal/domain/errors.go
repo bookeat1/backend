@@ -27,4 +27,14 @@ var (
 	// ErrProviderOutcomeUnknown, this IS a definite "no": safe to record as a
 	// terminal failure without further reconciliation.
 	ErrProviderDeclined = errors.New("acquirer declined the request")
+
+	// ErrNotImplemented marks a port method that exists to satisfy an interface
+	// but has no working body yet — a template/scaffold adapter whose real
+	// protocol is not wired in. It is deliberately distinct from
+	// ErrProviderOutcomeUnknown (a call that WAS made and whose result is
+	// unclear): nothing was attempted here at all, so it is always safe to
+	// treat as a plain, non-money-moving failure. Used by the POS adapter
+	// stubs (infrastructure/pos/*) until each POS API contract and credentials
+	// are supplied.
+	ErrNotImplemented = errors.New("not implemented")
 )

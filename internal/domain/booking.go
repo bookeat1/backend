@@ -100,12 +100,20 @@ const (
 	SourceAdmin  BookingSource = "admin"
 	SourcePhone  BookingSource = "phone"
 	SourceWidget BookingSource = "widget"
+	// SourcePOS marks a booking that originated in the venue's own POS system
+	// (iiko / r_keeper / Poster / Kwaaka) and was mirrored into BookEat, as
+	// opposed to one BookEat created and pushed out. It shares the source-
+	// agnostic occupancy machinery from PR #22: a POS-origin hold occupies a
+	// slot exactly like any other so the availability engine never resells it.
+	// Stored as VARCHAR like every other source, so this constant needs no DB
+	// migration — the column already accepts any string and the app validates.
+	SourcePOS BookingSource = "pos"
 )
 
 // Valid reports whether s is a known booking source.
 func (s BookingSource) Valid() bool {
 	switch s {
-	case SourceApp, SourceAdmin, SourcePhone, SourceWidget:
+	case SourceApp, SourceAdmin, SourcePhone, SourceWidget, SourcePOS:
 		return true
 	}
 	return false
