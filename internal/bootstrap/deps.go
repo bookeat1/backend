@@ -43,6 +43,7 @@ import (
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
 	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
+	storyrepo "backend-core/internal/infrastructure/postgres/story"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
@@ -76,6 +77,7 @@ import (
 	"backend-core/internal/usecase/reviews"
 	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
+	"backend-core/internal/usecase/stories"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
@@ -102,6 +104,7 @@ type Deps struct {
 	ContentFacade      content.Facade
 	FeedFacade         feed.Facade
 	MenuFacade         menu.Facade
+	StoriesFacade      stories.Facade
 	BookingsFacade     bookings.Facade
 	BookingCreate      bookings.CreateUseCase
 	BookingIdempotent  bookings.IdempotentCreateUseCase
@@ -210,6 +213,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	menuItems := menurepo.New(db)
 	menuCategories := menurepo.NewCategories(db)
+	storyItems := storyrepo.New(db)
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
@@ -336,6 +340,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
 		restaurants.WithVenueState(venueState))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
+	storiesFacade := stories.NewFacade(storyItems)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
@@ -390,6 +395,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		ContentFacade:         contentFacade,
 		FeedFacade:            feedFacade,
 		MenuFacade:            menuFacade,
+		StoriesFacade:         storiesFacade,
 		BookingsFacade:        bookingsFacade,
 		BookingCreate:         bookingCreate,
 		BookingIdempotent:     bookings.NewIdempotentCreateUseCase(bookingCreate, idempotencyKeys, txm),

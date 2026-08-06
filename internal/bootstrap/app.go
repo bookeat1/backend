@@ -37,6 +37,7 @@ import (
 	reviewsrest "backend-core/internal/transport/rest/reviews"
 	rolesrest "backend-core/internal/transport/rest/roles"
 	staticmaprest "backend-core/internal/transport/rest/staticmap"
+	storiesrest "backend-core/internal/transport/rest/stories"
 	"backend-core/internal/transport/rest/swaggerui"
 	"backend-core/internal/transport/rest/telegramhook"
 	ticketsrest "backend-core/internal/transport/rest/tickets"
@@ -181,6 +182,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)
+
+	// Restaurant stories — Instagram-highlight-style promo cards a venue pins to
+	// its storefront. Public read only (no auth), same plain public group as the
+	// menu GET: nothing here is personalized, so the user lookup an OptionalAuth
+	// group costs would buy nothing. The curating venue cabinet is a later task.
+	storiesHandler := storiesrest.NewHandler(deps.StoriesFacade)
+	storiesHandler.RegisterPublic(api)
 
 	// Reviews & ratings. Public: a restaurant's published reviews + aggregate
 	// rating (no auth). Guest own-review + staff reply/moderation mount on the
