@@ -23,6 +23,8 @@ type saveRestaurantRequest struct {
 	OpeningHours  *string           `json:"opening_hours"`
 	City          *string           `json:"city"`
 	PriceCategory *string           `json:"price_category"`
+	PriceMin      *int              `json:"price_min"`
+	PriceMax      *int              `json:"price_max"`
 	Email         *string           `json:"email"`
 	Phone         *string           `json:"phone"`
 	Latitude      *float64          `json:"latitude"`
@@ -64,7 +66,8 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 	in := uc.SaveInput{
 		Name: r.Name, NameI18n: domain.I18n(r.NameI18n), Description: r.Description,
 		CuisineType: r.CuisineType, Address: r.Address, OpeningHours: r.OpeningHours,
-		City: r.City, PriceCategory: r.PriceCategory, Email: r.Email, Phone: r.Phone,
+		City: r.City, PriceCategory: r.PriceCategory, PriceMin: r.PriceMin, PriceMax: r.PriceMax,
+		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
 	}
