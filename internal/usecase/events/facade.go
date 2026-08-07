@@ -88,6 +88,10 @@ type CreateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// Tags are the «Афиша» chips ("Бранч", "Живая музыка", ...). Blank entries
+	// are dropped and the list is capped (see normalizeTags); empty means the
+	// card draws no chips.
+	Tags []string
 	// RefundPolicy is the venue's own ticket-refund rules for this event. The
 	// zero value is the conservative platform default (not refundable) — same
 	// as the migration 0047 backfill, so an old client that does not send the
@@ -110,6 +114,10 @@ type UpdateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// Tags replaces the event's «Афиша» chips (full replace, like the rest of
+	// this struct). Blank entries are dropped and the list is capped; an empty
+	// or absent list clears the chips.
+	Tags []string
 	// RefundPolicy replaces the event's refund rules. Unlike every other field
 	// here, it is OPTIONAL: nil means "leave the rules as they are". Update is a
 	// full replace, and a cabinet build that predates this feature sends the
@@ -154,6 +162,7 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		Ticketed:         in.Ticketed,
 		TicketPriceMinor: in.TicketPriceMinor,
 		Capacity:         in.Capacity,
+		Tags:             normalizeTags(in.Tags),
 
 		TicketsRefundable:         in.RefundPolicy.Refundable,
 		TicketRefundCutoffMinutes: in.RefundPolicy.CutoffMinutes,
@@ -193,6 +202,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.Ticketed = in.Ticketed
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
+	e.Tags = normalizeTags(in.Tags)
 	if in.RefundPolicy != nil {
 		e.TicketsRefundable = in.RefundPolicy.Refundable
 		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
@@ -374,10 +384,48 @@ func eventContentChanged(cur domain.Event, in UpdateInput) bool {
 		!int64PtrEqual(in.TicketPriceMinor, cur.TicketPriceMinor),
 		!intPtrEqual(in.Capacity, cur.Capacity),
 		!i18nEqual(in.TitleI18n, cur.TitleI18n),
-		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n):
+		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n),
+		!tagsEqual(normalizeTags(in.Tags), cur.Tags):
 		return true
 	}
 	return false
+}
+
+// maxTags bounds the «Афиша» chip list. A card shows a handful of chips; a
+// caller sending hundreds is a mistake, not a use case, so the extras are
+// dropped rather than persisted. Same defensive spirit as maxRefundCutoffMinutes.
+const maxTags = 10
+
+// normalizeTags trims each chip, drops the blank ones, and caps the list at
+// maxTags. It always returns a non-nil slice so the domain value and the JSON
+// response never carry a nil-surprise (empty = "no chips", serialized as []).
+func normalizeTags(tags []string) []string {
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		out = append(out, t)
+		if len(out) == maxTags {
+			break
+		}
+	}
+	return out
+}
+
+// tagsEqual compares two chip lists by content and order: a nil and an empty
+// list read the same to a guest, so they must not count as an edit.
+func tagsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // i18nEqual compares localized maps by content: nil and empty read the same to a

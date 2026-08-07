@@ -30,7 +30,7 @@ var _ domain.EventRepository = (*Repository)(nil)
 
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
 	starts_at, ends_at, venue, cover_image_url, status, ticketed,
-	ticket_price_minor, capacity, tickets_refundable, ticket_refund_cutoff_minutes,
+	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
 	created_at, updated_at`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
@@ -42,12 +42,12 @@ func (r *Repository) Create(ctx context.Context, e *domain.Event) error {
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
 			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor, capacity,
-			tickets_refundable, ticket_refund_cutoff_minutes)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			tags, tickets_refundable, ticket_refund_cutoff_minutes)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		 RETURNING created_at, updated_at`,
 		e.ID, e.RestaurantID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		e.TicketsRefundable, e.TicketRefundCutoffMinutes).
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes).
 		Scan(&e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -72,12 +72,12 @@ func (r *Repository) Update(ctx context.Context, e *domain.Event) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE events SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
 			starts_at = $6, ends_at = $7, venue = $8, cover_image_url = $9, status = $10,
-			ticketed = $11, ticket_price_minor = $12, capacity = $13,
-			tickets_refundable = $14, ticket_refund_cutoff_minutes = $15, updated_at = now()
+			ticketed = $11, ticket_price_minor = $12, capacity = $13, tags = $14,
+			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, updated_at = now()
 		 WHERE id = $1`,
 		e.ID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		e.TicketsRefundable, e.TicketRefundCutoffMinutes)
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes)
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
@@ -167,7 +167,7 @@ func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uui
 // as selectCols — scanListItemRow reuses that order.
 const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e.description_i18n,
 	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
-	e.ticket_price_minor, e.capacity, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
+	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
 	e.created_at, e.updated_at,
 	r.name, r.name_i18n, r.city`
 
@@ -267,12 +267,13 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	var titleI18n, descI18n []byte
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
-		&e.TicketPriceMinor, &e.Capacity, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
+		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
 		&e.CreatedAt, &e.UpdatedAt); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
+	e.Tags = tagsFromDB(e.Tags)
 	return &e, nil
 }
 
@@ -282,13 +283,14 @@ func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	var titleI18n, descI18n, venueNameI18n []byte
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
-		&e.TicketPriceMinor, &e.Capacity, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
+		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
 		&e.CreatedAt, &e.UpdatedAt,
 		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
+	e.Tags = tagsFromDB(e.Tags)
 	it.Restaurant.ID = e.RestaurantID
 	it.Restaurant.NameI18n = i18nFromDB(venueNameI18n)
 	return &it, nil
@@ -310,6 +312,26 @@ func normalizePage(page, perPage int) (int, int) {
 		perPage = 20
 	}
 	return page, perPage
+}
+
+// tagsToDB guarantees the value bound to the text[] NOT NULL column is a real
+// array, never SQL NULL: pgx encodes a nil slice as NULL, which the column
+// refuses. A nil (or empty) tags list writes as the empty array '{}'.
+func tagsToDB(tags []string) []string {
+	if tags == nil {
+		return []string{}
+	}
+	return tags
+}
+
+// tagsFromDB normalizes nil→[] on read so no consumer meets a nil-surprise. A
+// text[] '{}' already scans into a non-nil empty slice; this only guards the
+// defensive case.
+func tagsFromDB(tags []string) []string {
+	if tags == nil {
+		return []string{}
+	}
+	return tags
 }
 
 func i18nToDB(m domain.I18n) any {
