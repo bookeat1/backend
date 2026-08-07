@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	authuc "backend-core/internal/usecase/auth"
 	uc "backend-core/internal/usecase/users"
 )
 
@@ -94,4 +95,40 @@ func (f *fakeFacade) DeleteMe(_ context.Context, id uuid.UUID) error {
 	f.lastDeleteID = id
 	f.deleteCalled++
 	return f.err
+}
+
+// fakeOTP is a scriptable authuc.OTPUseCase. Only the two phone-change methods
+// carry behavior; the login methods are unused by the users handler and panic
+// if ever reached, so a wiring mistake fails loudly instead of silently.
+type fakeOTP struct {
+	code         string
+	user         *domain.User
+	requestErr   error
+	verifyErr    error
+	lastReqID    uuid.UUID
+	lastReqPhone string
+	lastVerID    uuid.UUID
+	lastVerPhone string
+	lastVerCode  string
+}
+
+func (f *fakeOTP) RequestOTP(context.Context, string) (string, error) {
+	panic("unused by users handler")
+}
+func (f *fakeOTP) VerifyOTP(context.Context, string, string) (*authuc.TokenPair, error) {
+	panic("unused by users handler")
+}
+func (f *fakeOTP) RequestPhoneChangeOTP(_ context.Context, id uuid.UUID, newPhone string) (string, error) {
+	f.lastReqID, f.lastReqPhone = id, newPhone
+	if f.requestErr != nil {
+		return "", f.requestErr
+	}
+	return f.code, nil
+}
+func (f *fakeOTP) VerifyPhoneChange(_ context.Context, id uuid.UUID, newPhone, code string) (*domain.User, error) {
+	f.lastVerID, f.lastVerPhone, f.lastVerCode = id, newPhone, code
+	if f.verifyErr != nil {
+		return nil, f.verifyErr
+	}
+	return f.user, nil
 }

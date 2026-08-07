@@ -29,6 +29,18 @@ type updateMeRequest struct {
 	CuisineCategoryIDs *[]string `json:"cuisine_category_ids"`
 }
 
+// phoneChangeRequestRequest asks for an OTP to be sent to a NEW number the
+// signed-in user wants to move to.
+type phoneChangeRequestRequest struct {
+	NewPhone string `json:"new_phone" example:"+77011234567"`
+}
+
+// phoneChangeVerifyRequest submits the code delivered to the new number.
+type phoneChangeVerifyRequest struct {
+	NewPhone string `json:"new_phone" example:"+77011234567"`
+	Code     string `json:"code" example:"123456"`
+}
+
 func (r updateMeRequest) toInput() (uc.UpdateInput, error) {
 	in := uc.UpdateInput{
 		FullName:          r.FullName,

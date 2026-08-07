@@ -15,10 +15,12 @@ import (
 	"backend-core/internal/transport/rest/response"
 )
 
-func newRouter(f *fakeFacade) *gin.Engine {
+func newRouter(f *fakeFacade) *gin.Engine { return newRouterOTP(f, &fakeOTP{}) }
+
+func newRouterOTP(f *fakeFacade, o *fakeOTP) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := NewHandler(f)
+	h := NewHandler(f, o)
 
 	api := r.Group("/api/v1")
 	authed := api.Group("")
@@ -144,6 +146,87 @@ func TestUpdateMeRejectsMalformedBirthDate(t *testing.T) {
 	w := do(newRouter(f), http.MethodPatch, "/api/v1/users/me", body, id.String())
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequestPhoneChangeForwardsCallerIDAndReturnsSent(t *testing.T) {
+	id := uuid.New()
+	o := &fakeOTP{code: "123456"}
+	body := map[string]any{"new_phone": "+77019998877"}
+	w := do(newRouterOTP(&fakeFacade{}, o), http.MethodPost, "/api/v1/users/me/phone/otp/request", body, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if o.lastReqID != id {
+		t.Errorf("RequestPhoneChangeOTP called with %v, want caller id %v", o.lastReqID, id)
+	}
+	if o.lastReqPhone != "+77019998877" {
+		t.Errorf("new_phone = %q, not forwarded", o.lastReqPhone)
+	}
+	var env response.Envelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	raw, _ := json.Marshal(env.Data)
+	var got phoneChangeRequestedResponse
+	_ = json.Unmarshal(raw, &got)
+	if !got.Sent || got.Code != "123456" {
+		t.Errorf("response = %+v, want sent=true code=123456", got)
+	}
+}
+
+func TestRequestPhoneChangeMapsInUseTo409(t *testing.T) {
+	id := uuid.New()
+	o := &fakeOTP{requestErr: domain.WithCode(domain.CodePhoneInUse,
+		domain.ErrAlreadyExists)}
+	body := map[string]any{"new_phone": "+77019998877"}
+	w := do(newRouterOTP(&fakeFacade{}, o), http.MethodPost, "/api/v1/users/me/phone/otp/request", body, id.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestVerifyPhoneChangeReturnsUpdatedUser(t *testing.T) {
+	id := uuid.New()
+	newPhone := "+77019998877"
+	o := &fakeOTP{user: &domain.User{ID: id, Phone: &newPhone, Role: domain.RoleUser, PreferredLanguage: "ru"}}
+	body := map[string]any{"new_phone": newPhone, "code": "123456"}
+	w := do(newRouterOTP(&fakeFacade{}, o), http.MethodPost, "/api/v1/users/me/phone/otp/verify", body, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if o.lastVerID != id || o.lastVerPhone != newPhone || o.lastVerCode != "123456" {
+		t.Errorf("verify args = (%v,%q,%q), want (%v,%q,%q)",
+			o.lastVerID, o.lastVerPhone, o.lastVerCode, id, newPhone, "123456")
+	}
+	var env response.Envelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	raw, _ := json.Marshal(env.Data)
+	var got userResponse
+	_ = json.Unmarshal(raw, &got)
+	if got.Phone == nil || *got.Phone != newPhone {
+		t.Errorf("phone = %v, want %q", got.Phone, newPhone)
+	}
+}
+
+func TestVerifyPhoneChangeMapsBadCodeTo401(t *testing.T) {
+	id := uuid.New()
+	o := &fakeOTP{verifyErr: domain.WithCode(domain.CodeOTPInvalid, domain.ErrUnauthorized)}
+	body := map[string]any{"new_phone": "+77019998877", "code": "000000"}
+	w := do(newRouterOTP(&fakeFacade{}, o), http.MethodPost, "/api/v1/users/me/phone/otp/verify", body, id.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPhoneChangeRoutesRequireAuth(t *testing.T) {
+	o := &fakeOTP{}
+	r := newRouterOTP(&fakeFacade{}, o)
+	for _, path := range []string{"/api/v1/users/me/phone/otp/request", "/api/v1/users/me/phone/otp/verify"} {
+		w := do(r, http.MethodPost, path, map[string]any{"new_phone": "+77019998877"}, "")
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s status = %d, want 401", path, w.Code)
+		}
 	}
 }
 

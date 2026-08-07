@@ -207,10 +207,15 @@ var exemptRoutes = map[string]bool{
 // regardless of the concrete id in the URL.
 var routeTiers = map[string]RateLimitTier{
 	// Public sensitive: booking/OTP/payment/checkout creation. See TierStrict's doc.
-	"POST /api/v1/auth/signup":                 TierStrict,
-	"POST /api/v1/auth/login":                  TierStrict,
-	"POST /api/v1/auth/otp/request":            TierStrict,
-	"POST /api/v1/auth/otp/verify":             TierStrict,
+	"POST /api/v1/auth/signup":      TierStrict,
+	"POST /api/v1/auth/login":       TierStrict,
+	"POST /api/v1/auth/otp/request": TierStrict,
+	"POST /api/v1/auth/otp/verify":  TierStrict,
+	// Signed-in phone change is an OTP flow: same money/enumeration profile as
+	// the login OTP routes (a code send costs, and 409 phone_in_use /
+	// 422 phone_unchanged are an account-enumeration oracle worth throttling).
+	"POST /api/v1/users/me/phone/otp/request":  TierStrict,
+	"POST /api/v1/users/me/phone/otp/verify":   TierStrict,
 	"POST /api/v1/partnership-requests":        TierStrict,
 	"POST /api/v1/bookings":                    TierStrict,
 	"POST /api/v1/bookings/:id/payment":        TierStrict,

@@ -232,6 +232,24 @@ func TestRateLimit_HealthCheckIsExempt(t *testing.T) {
 	}
 }
 
+// TestRouteTiers_OTPRoutesAreStrict pins that every OTP-bearing route — the
+// login pair AND the signed-in phone-change pair — sits in TierStrict, not the
+// weaker TierDefault fallback. A code send costs money and 409/422 on the
+// phone-change routes is an account-enumeration oracle; both need the strict
+// budget, and the exact key must match FullPath() (with the /api/v1 prefix).
+func TestRouteTiers_OTPRoutesAreStrict(t *testing.T) {
+	for _, key := range []string{
+		"POST /api/v1/auth/otp/request",
+		"POST /api/v1/auth/otp/verify",
+		"POST /api/v1/users/me/phone/otp/request",
+		"POST /api/v1/users/me/phone/otp/verify",
+	} {
+		if got := routeTiers[key]; got != TierStrict {
+			t.Errorf("routeTiers[%q] = %q, want %q", key, got, TierStrict)
+		}
+	}
+}
+
 // TestRateLimit_EndToEndWithInMemoryLimiter exercises RateLimit wired to the
 // real InMemoryLimiter (not a fake), against a real gin engine: the
 // sensitive-tier budget triggers after its limit, then recovers once the
