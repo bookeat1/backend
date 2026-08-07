@@ -53,6 +53,93 @@ func TestTelegram_SendsToRestaurantChat(t *testing.T) {
 	}
 }
 
+// Interested reacts to both a new booking and a cancellation, and to nothing
+// else — the cancellation is filtered further inside Notify.
+func TestTelegram_InterestedInCreatedAndCancelled(t *testing.T) {
+	tg := newTelegram(newFakeSettings(), newFakeDeliveries(), newRecordingTelegramSender().send, true)
+	if !tg.Interested(domain.EventBookingCreated) {
+		t.Fatal("must be interested in booking.created")
+	}
+	if !tg.Interested(domain.EventBookingCancelled) {
+		t.Fatal("must be interested in booking.cancelled")
+	}
+	if tg.Interested(domain.EventBookingConfirmed) {
+		t.Fatal("must NOT be interested in booking.confirmed")
+	}
+}
+
+// A GUEST-cancelled booking is news the venue must act on (free the table): it
+// IS sent, with the cancellation wording and the same detail block.
+func TestTelegram_GuestCancelSendsToRestaurant(t *testing.T) {
+	rest := uuid.New()
+	set := newFakeSettings()
+	set.tgChat[rest] = "-1001234567890"
+	sender := newRecordingTelegramSender()
+	tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
+
+	ev, err := toEvent(cancelledEvent(rest, domain.CancelledByGuest))
+	if err != nil {
+		t.Fatalf("toEvent: %v", err)
+	}
+	if err := tg.Notify(context.Background(), ev); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+
+	got := sender.sends()
+	if len(got) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(got))
+	}
+	if got[0].chatID != "-1001234567890" {
+		t.Fatalf("sent to chat %q, want -1001234567890", got[0].chatID)
+	}
+	if !strings.Contains(got[0].text, "отменена") {
+		t.Fatalf("cancellation text missing:\n%s", got[0].text)
+	}
+	if strings.Contains(got[0].text, "Новая бронь") {
+		t.Fatalf("cancellation must not read as a new booking:\n%s", got[0].text)
+	}
+	// Reuses the shared detail block: name + party size + phone.
+	if !strings.Contains(got[0].text, "Damir") || !strings.Contains(got[0].text, "Гостей: 4") {
+		t.Fatalf("cancellation lost the booking details:\n%s", got[0].text)
+	}
+}
+
+// A RESTAURANT-cancelled booking is NOT echoed back at the venue that just
+// performed it: skipped before any send.
+func TestTelegram_RestaurantCancelNoSend(t *testing.T) {
+	rest := uuid.New()
+	set := newFakeSettings()
+	set.tgChat[rest] = "-1001234567890"
+	sender := newRecordingTelegramSender()
+	tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
+
+	ev, _ := toEvent(cancelledEvent(rest, domain.CancelledByRestaurant))
+	if err := tg.Notify(context.Background(), ev); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if n := len(sender.sends()); n != 0 {
+		t.Fatalf("sent %d messages for a restaurant-side cancel, want 0", n)
+	}
+}
+
+// An unknown (empty) CancelledBy defaults to sending — over-notifying is safer
+// than dropping a genuine guest cancel when the field is missing.
+func TestTelegram_UnknownCancelStillSends(t *testing.T) {
+	rest := uuid.New()
+	set := newFakeSettings()
+	set.tgChat[rest] = "-1001234567890"
+	sender := newRecordingTelegramSender()
+	tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
+
+	ev, _ := toEvent(cancelledEvent(rest, ""))
+	if err := tg.Notify(context.Background(), ev); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if n := len(sender.sends()); n != 1 {
+		t.Fatalf("sent %d messages for an unknown-actor cancel, want 1", n)
+	}
+}
+
 // A restaurant with no connected chat id → nothing to send to → clean no-op.
 func TestTelegram_NoChatIDNoOp(t *testing.T) {
 	rest := uuid.New()

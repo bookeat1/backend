@@ -298,6 +298,27 @@ func createdEvent(restaurantID uuid.UUID) domain.BookingOutboxEvent {
 	}
 }
 
+// cancelledEvent builds a booking.cancelled outbox row with the given restaurant
+// and the actor that performed the cancellation (guest | restaurant | system |
+// "" for unknown).
+func cancelledEvent(restaurantID uuid.UUID, by domain.CancelledBy) domain.BookingOutboxEvent {
+	payload, _ := json.Marshal(outboxPayload{
+		RestaurantID: restaurantID,
+		Name:         "Damir",
+		Phone:        "+77078692233",
+		Guests:       4,
+		StartsAt:     time.Date(2026, 8, 1, 19, 30, 0, 0, time.UTC),
+		CancelledBy:  by,
+	})
+	return domain.BookingOutboxEvent{
+		ID:        uuid.New(),
+		BookingID: uuid.New(),
+		EventType: domain.EventBookingCancelled,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	}
+}
+
 // fakeDeviceTokens is an in-memory guest device-token repository. Upsert mirrors
 // the production ON CONFLICT (token) semantics: keyed on the TOKEN, so a repeat
 // registration re-points the existing row instead of adding a second one.
