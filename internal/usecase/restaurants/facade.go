@@ -92,15 +92,20 @@ type SaveInput struct {
 	OpeningHours  *string
 	City          *string
 	PriceCategory *string
-	Email         *string
-	Phone         *string
-	Latitude      *float64
-	Longitude     *float64
-	IsActive      *bool // nil = leave is_active unchanged (Update) / default true (Create)
-	IsNew         *bool
-	IsPopular     *bool
-	IsPremium     *bool
-	DisplayOrder  *int
+	// PriceMin / PriceMax are the average-check range in whole tenge. Applied
+	// independently on Update (read-modify-write); the final merged pair is
+	// validated by validatePriceRange (both-or-neither, 0 <= min <= max).
+	PriceMin     *int
+	PriceMax     *int
+	Email        *string
+	Phone        *string
+	Latitude     *float64
+	Longitude    *float64
+	IsActive     *bool // nil = leave is_active unchanged (Update) / default true (Create)
+	IsNew        *bool
+	IsPopular    *bool
+	IsPremium    *bool
+	DisplayOrder *int
 
 	Images      *[]domain.Image // nil = collection not provided (preserve on Update)
 	Features    *[]domain.Feature
@@ -252,6 +257,9 @@ func (f *facade) Create(ctx context.Context, in SaveInput) (*domain.RestaurantAg
 	if err := validateRestaurant(rest); err != nil {
 		return nil, err
 	}
+	if err := validatePriceRange(rest); err != nil {
+		return nil, err
+	}
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := f.repo.Create(ctx, &rest); err != nil {
 			return err
@@ -280,6 +288,9 @@ func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domai
 		rest := existing.Restaurant
 		applyRestaurant(&rest, in)
 		rest.ID = id
+		if err := validatePriceRange(rest); err != nil {
+			return err
+		}
 		if err := f.repo.Update(ctx, &rest); err != nil {
 			return err
 		}
@@ -415,6 +426,12 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	if in.DisplayOrder != nil {
 		m.DisplayOrder = in.DisplayOrder
 	}
+	if in.PriceMin != nil {
+		m.PriceMin = in.PriceMin
+	}
+	if in.PriceMax != nil {
+		m.PriceMax = in.PriceMax
+	}
 }
 
 // validateProvided rejects invalid values for the enumerated/required fields
@@ -429,6 +446,27 @@ func validateProvided(in SaveInput) error {
 		return domain.ErrValidation
 	}
 	if in.PriceCategory != nil && !domain.PriceCategory(*in.PriceCategory).Valid() {
+		return domain.ErrValidation
+	}
+	return nil
+}
+
+// validatePriceRange enforces the average-check bounds on the FINAL restaurant
+// row — i.e. AFTER the PATCH merge, so a request that sets only price_min while
+// the stored row already has a price_max is judged against the merged pair, not
+// the lone provided field. The rule mirrors migration 0068's CHECK exactly:
+// both bounds unset (no range) is fine, otherwise both must be set with
+// 0 <= price_min <= price_max. A half-set pair is rejected here as 422 rather
+// than deferred to the DB constraint. Validating the merged row (not the raw
+// input) is deliberate: it is the only place that knows the effective pair.
+func validatePriceRange(m domain.Restaurant) error {
+	if m.PriceMin == nil && m.PriceMax == nil {
+		return nil
+	}
+	if m.PriceMin == nil || m.PriceMax == nil {
+		return domain.ErrValidation
+	}
+	if *m.PriceMin < 0 || *m.PriceMax < *m.PriceMin {
 		return domain.ErrValidation
 	}
 	return nil

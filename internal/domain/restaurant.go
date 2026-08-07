@@ -80,20 +80,26 @@ func (i I18n) Resolve(lang, base string) string {
 
 // Restaurant is a venue in the catalog. ID equals the original Supabase id.
 type Restaurant struct {
-	ID                 uuid.UUID
-	CategoryID         *uuid.UUID
-	Name               string
-	NameI18n           I18n
-	Description        string
-	DescriptionI18n    I18n
-	CuisineType        string
-	CuisineTypeI18n    I18n
-	Address            string
-	AddressI18n        I18n
-	OpeningHours       string
-	OpeningHoursI18n   I18n
-	City               City
-	PriceCategory      PriceCategory
+	ID               uuid.UUID
+	CategoryID       *uuid.UUID
+	Name             string
+	NameI18n         I18n
+	Description      string
+	DescriptionI18n  I18n
+	CuisineType      string
+	CuisineTypeI18n  I18n
+	Address          string
+	AddressI18n      I18n
+	OpeningHours     string
+	OpeningHoursI18n I18n
+	City             City
+	PriceCategory    PriceCategory
+	// PriceMin / PriceMax are the average-check range in WHOLE tenge, shown
+	// alongside the categorical PriceCategory. Both nil (range not declared) or
+	// both set with 0 <= PriceMin <= PriceMax — see migration 0068's CHECK.
+	// Pointers so "not set" is distinct from a genuine 0.
+	PriceMin           *int
+	PriceMax           *int
 	Email              string
 	Phone              string
 	Latitude           *float64

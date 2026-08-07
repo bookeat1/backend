@@ -87,6 +87,10 @@ type publicPayload struct {
 		ExceptionsUntil string `json:"exceptions_until"`
 	} `json:"schedule"`
 	AcceptsOnlineBookings *bool `json:"accepts_online_bookings"`
+	PriceRange            *struct {
+		Min int `json:"min"`
+		Max int `json:"max"`
+	} `json:"price_range"`
 }
 
 func newTestRouter(f uc.Facade) *gin.Engine {
@@ -259,6 +263,76 @@ func TestPublicPayloadOmitsBothFieldsWhenNotComputed(t *testing.T) {
 	}
 	if _, ok := raw["opening_hours"]; !ok {
 		t.Error("opening_hours must always be present")
+	}
+}
+
+// TestPublicPayloadCarriesPriceRange proves the numeric average-check range is
+// serialized as a nested {min,max} object on BOTH the listing/search items and
+// the detail payload when the venue has declared both bounds.
+func TestPublicPayloadCarriesPriceRange(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	min, max := 8000, 15000
+	rest.PriceMin, rest.PriceMax = &min, &max
+	f := &fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	}
+	r := newTestRouter(f)
+
+	for _, tc := range []struct {
+		name string
+		got  publicPayload
+	}{
+		{"list", listPayload(t, r, "/api/v1/restaurants")},
+		{"search", listPayload(t, r, "/api/v1/restaurants/search?q=x")},
+		{"detail", detailPayload(t, r, "/api/v1/restaurants/"+id.String())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got.PriceRange == nil {
+				t.Fatal("price_range missing from the payload")
+			}
+			if tc.got.PriceRange.Min != 8000 || tc.got.PriceRange.Max != 15000 {
+				t.Errorf("price_range = %+v, want {8000 15000}", *tc.got.PriceRange)
+			}
+		})
+	}
+}
+
+// TestPublicPayloadOmitsPriceRangeWhenUnset proves the object disappears
+// entirely (not a 0–0) when the venue has declared no range, on both routes.
+func TestPublicPayloadOmitsPriceRangeWhenUnset(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id) // PriceMin/PriceMax left nil
+	f := &fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	}
+	r := newTestRouter(f)
+
+	// detail: assert the key is absent from the raw object, not merely nil.
+	env := doGET(t, r, "/api/v1/restaurants/"+id.String())
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(env["data"], &raw); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if _, ok := raw["price_range"]; ok {
+		t.Error("price_range must be omitted when the venue has no range")
+	}
+
+	// list item: same absence assertion on the paginated envelope's item.
+	listEnv := doGET(t, r, "/api/v1/restaurants")
+	var page struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(listEnv["data"], &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(page.Items))
+	}
+	if _, ok := page.Items[0]["price_range"]; ok {
+		t.Error("price_range must be omitted from list items when the venue has no range")
 	}
 }
 

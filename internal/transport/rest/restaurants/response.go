@@ -17,21 +17,26 @@ type restaurantResponse struct {
 	OpeningHours  string            `json:"opening_hours"`
 	City          string            `json:"city"`
 	PriceCategory string            `json:"price_category"`
-	Email         string            `json:"email"`
-	Phone         string            `json:"phone"`
-	Latitude      *float64          `json:"latitude"`
-	Longitude     *float64          `json:"longitude"`
-	IsActive      bool              `json:"is_active"`
-	IsNew         *bool             `json:"is_new"`
-	IsPopular     *bool             `json:"is_popular"`
-	IsPremium     *bool             `json:"is_premium"`
-	DisplayOrder  *int              `json:"display_order"`
-	PrimaryImage  *string           `json:"primary_image,omitempty"`
-	Images        []imageResponse   `json:"images,omitempty"`
-	Features      []featureResponse `json:"features,omitempty"`
-	Tags          []tagResponse     `json:"tags,omitempty"`
-	SocialLinks   []socialResponse  `json:"social_links,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
+	// PriceRange is the numeric average-check range in whole tenge, shown next
+	// to the categorical PriceCategory. A pointer with omitempty so it is absent
+	// entirely when the venue has not declared a range (both bounds NULL) —
+	// never serialized as a 0–0.
+	PriceRange   *priceRangeResponse `json:"price_range,omitempty"`
+	Email        string              `json:"email"`
+	Phone        string              `json:"phone"`
+	Latitude     *float64            `json:"latitude"`
+	Longitude    *float64            `json:"longitude"`
+	IsActive     bool                `json:"is_active"`
+	IsNew        *bool               `json:"is_new"`
+	IsPopular    *bool               `json:"is_popular"`
+	IsPremium    *bool               `json:"is_premium"`
+	DisplayOrder *int                `json:"display_order"`
+	PrimaryImage *string             `json:"primary_image,omitempty"`
+	Images       []imageResponse     `json:"images,omitempty"`
+	Features     []featureResponse   `json:"features,omitempty"`
+	Tags         []tagResponse       `json:"tags,omitempty"`
+	SocialLinks  []socialResponse    `json:"social_links,omitempty"`
+	CreatedAt    time.Time           `json:"created_at"`
 	// IsFavorite is nil for an anonymous caller (omitted from the JSON
 	// entirely) and an explicit true/false for an authenticated one — a
 	// pointer so "not favorited" and "we don't know because you're not
@@ -142,6 +147,15 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	}
 }
 
+// priceRangeResponse is the venue's average-check range in whole tenge. Both
+// bounds are always present together (the domain guarantees both-or-neither),
+// so they are plain ints, not pointers — the whole object is omitted upstream
+// when there is no range.
+type priceRangeResponse struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
 type imageResponse struct {
 	ID        string `json:"id"`
 	ImageURL  string `json:"image_url"`
@@ -189,6 +203,10 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 		s := r.CategoryID.String()
 		cat = &s
 	}
+	var priceRange *priceRangeResponse
+	if r.PriceMin != nil && r.PriceMax != nil {
+		priceRange = &priceRangeResponse{Min: *r.PriceMin, Max: *r.PriceMax}
+	}
 	return restaurantResponse{
 		ID: r.ID.String(), CategoryID: cat,
 		Name:         r.NameI18n.Resolve(lang, r.Name),
@@ -198,7 +216,8 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 		Address:      r.AddressI18n.Resolve(lang, r.Address),
 		OpeningHours: r.OpeningHoursI18n.Resolve(lang, r.OpeningHours),
 		City:         string(r.City), PriceCategory: string(r.PriceCategory),
-		Email: r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
+		PriceRange: priceRange,
+		Email:      r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
 		IsActive: r.IsActive, IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium,
 		DisplayOrder: r.DisplayOrder, CreatedAt: r.CreatedAt,
 	}

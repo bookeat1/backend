@@ -229,6 +229,126 @@ func TestCreateRejectsMissingName(t *testing.T) {
 	}
 }
 
+func intp(i int) *int { return &i }
+
+// TestCreateRejectsHalfSetPriceRange proves the both-or-neither rule: a range
+// with only one bound provided is refused before any DB round-trip, mirroring
+// migration 0068's CHECK. Two sub-cases: only price_min, only price_max.
+func TestCreateRejectsHalfSetPriceRange(t *testing.T) {
+	cases := map[string]SaveInput{
+		"only min": {PriceMin: intp(8000)},
+		"only max": {PriceMax: intp(15000)},
+	}
+	for name, prices := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+			in := validInput()
+			in.PriceMin = prices.PriceMin
+			in.PriceMax = prices.PriceMax
+			_, err := f.Create(context.Background(), in)
+			if !errors.Is(err, domain.ErrValidation) {
+				t.Errorf("err = %v, want ErrValidation", err)
+			}
+		})
+	}
+}
+
+// TestCreateRejectsInvertedPriceRange rejects price_max < price_min.
+func TestCreateRejectsInvertedPriceRange(t *testing.T) {
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+	in := validInput()
+	in.PriceMin = intp(15000)
+	in.PriceMax = intp(8000)
+	_, err := f.Create(context.Background(), in)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+// TestCreateRejectsNegativePriceRange rejects a negative lower bound.
+func TestCreateRejectsNegativePriceRange(t *testing.T) {
+	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+	in := validInput()
+	in.PriceMin = intp(-1)
+	in.PriceMax = intp(15000)
+	_, err := f.Create(context.Background(), in)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+// TestCreateAcceptsValidPriceRange accepts a normal range and an equal-bounds
+// range, and threads both bounds onto the persisted row.
+func TestCreateAcceptsValidPriceRange(t *testing.T) {
+	cases := map[string]struct{ min, max int }{
+		"normal": {8000, 15000},
+		"equal":  {5000, 5000},
+	}
+	for name, want := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{}}
+			f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+			in := validInput()
+			in.PriceMin = intp(want.min)
+			in.PriceMax = intp(want.max)
+			_, err := f.Create(context.Background(), in)
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			got := repo.created
+			if got == nil || got.PriceMin == nil || got.PriceMax == nil {
+				t.Fatalf("expected persisted row with both bounds set, got %+v", got)
+			}
+			if *got.PriceMin != want.min || *got.PriceMax != want.max {
+				t.Errorf("range = %d/%d, want %d/%d", *got.PriceMin, *got.PriceMax, want.min, want.max)
+			}
+		})
+	}
+}
+
+// TestUpdateValidatesMergedPriceRange is the important one: validation runs on
+// the FINAL merged row, not the raw PATCH input. The stored row already has a
+// full range; a PATCH that carries only price_min is judged against the merged
+// pair — accepted when the merge stays ordered, rejected when it inverts.
+func TestUpdateValidatesMergedPriceRange(t *testing.T) {
+	newRepo := func() *fakeRestaurantRepo {
+		return &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+			Name: "Old", City: domain.CityAlmaty, PriceCategory: domain.PriceLow,
+			PriceMin: intp(8000), PriceMax: intp(15000),
+		}}}
+	}
+
+	t.Run("merged pair stays valid", func(t *testing.T) {
+		repo := newRepo()
+		f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+		// Only price_min provided; merged with stored max=15000 → 10000/15000 (valid).
+		_, err := f.Update(context.Background(), uuid.New(), SaveInput{PriceMin: intp(10000)})
+		if err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		got := repo.updated
+		if got == nil || got.PriceMin == nil || got.PriceMax == nil {
+			t.Fatalf("expected updated row with both bounds, got %+v", got)
+		}
+		if *got.PriceMin != 10000 || *got.PriceMax != 15000 {
+			t.Errorf("merged range = %d/%d, want 10000/15000", *got.PriceMin, *got.PriceMax)
+		}
+	})
+
+	t.Run("merged pair becomes inverted", func(t *testing.T) {
+		repo := newRepo()
+		f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+		// Only price_min provided; merged with stored max=15000 → 20000/15000 (inverted).
+		_, err := f.Update(context.Background(), uuid.New(), SaveInput{PriceMin: intp(20000)})
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Errorf("err = %v, want ErrValidation", err)
+		}
+		if repo.updated != nil {
+			t.Error("expected no Update call when the merged range is invalid")
+		}
+	})
+}
+
 func TestSubmitPartnershipValidates(t *testing.T) {
 	p := &fakePartners{}
 	f := NewFacade(&fakeRestaurantRepo{}, &fakeRelated{}, &fakeCategories{}, p, &inlineTx{})
