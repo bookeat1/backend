@@ -77,14 +77,33 @@ var _ Notifier = (*TelegramNotifier)(nil)
 
 func (t *TelegramNotifier) Channel() domain.NotificationChannel { return domain.ChannelTelegram }
 
-// Interested: increment 1 alerts staff only on a NEW booking.
+// Interested: the staff channel reacts to a NEW booking (the venue is asked to
+// answer it) and to a CANCELLATION (the venue needs to free the table). The
+// cancellation is filtered further in Notify — see the CancelledBy skip.
 func (t *TelegramNotifier) Interested(et domain.BookingEventType) bool {
-	return et == domain.EventBookingCreated
+	return et == domain.EventBookingCreated || et == domain.EventBookingCancelled
 }
 
 func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 	if !t.enabled {
 		t.log.Info("telegram skipped: no bot token configured",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
+		return nil
+	}
+
+	// PRODUCT RULE: a cancellation is pushed to the venue ONLY when the GUEST
+	// cancelled — that is news the venue must act on (free the table). A
+	// restaurant-side cancellation (staff pressed the Telegram button, hit
+	// Reject in the venue cabinet, etc.) is NOT echoed back at them: they just
+	// performed it and already know. This mirrors the guest channel, which
+	// suppresses the echo of a cancellation the guest performed themselves.
+	//
+	// ASSUMPTION: an empty/unknown CancelledBy (and a system cancellation) still
+	// sends — over-notifying the venue is safer than silently dropping a genuine
+	// guest cancel when the field is missing.
+	if e.Type == domain.EventBookingCancelled && e.CancelledBy == domain.CancelledByRestaurant {
+		t.log.Info("telegram skipped: restaurant cancelled its own booking, no echo",
 			slog.String("booking_id", e.BookingID.String()),
 			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
@@ -159,12 +178,32 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 // no payment data — only what staff already see in the venue cabinet: that a
 // booking came in, for when, for how many, under what name.
 func buildTelegramText(e Event) string {
+	title := "Новая бронь"
+	if e.Type == domain.EventBookingCancelled {
+		// A restaurant-side cancel is filtered out before send, so here the actor
+		// is guest, system, or unknown. Name the guest only when we actually know
+		// it was the guest; otherwise stay neutral rather than mislabel a system
+		// (or unknown-actor) cancellation as the guest's doing.
+		if e.CancelledBy == domain.CancelledByGuest {
+			title = "❌ Бронь отменена гостем"
+		} else {
+			title = "❌ Бронь отменена"
+		}
+	}
+	return title + "\n" + telegramBookingDetails(e)
+}
+
+// telegramBookingDetails renders the shared, non-sensitive detail block reused
+// by every staff alert: when, how many, under what name, and — for staff only —
+// the phone. Kept separate so the "created" and "cancelled" messages cannot
+// drift apart in formatting.
+func telegramBookingDetails(e Event) string {
 	name := e.GuestName
 	if name == "" {
 		name = "Гость"
 	}
 	local := e.StartsAt.Local().Format("02.01 15:04")
-	text := fmt.Sprintf("Новая бронь\nВремя: %s\nГостей: %d\nИмя: %s", local, e.Guests, name)
+	text := fmt.Sprintf("Время: %s\nГостей: %d\nИмя: %s", local, e.Guests, name)
 	// The phone is the difference between an alert staff can act on and one
 	// that sends them to the panel: it is what they use to confirm a large
 	// party or to find a guest who has not arrived. Omitted, not blanked, when
