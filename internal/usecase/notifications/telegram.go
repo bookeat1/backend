@@ -180,9 +180,15 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 func buildTelegramText(e Event) string {
 	title := "Новая бронь"
 	if e.Type == domain.EventBookingCancelled {
-		// A cancellation the guest performed (a restaurant-side cancel is skipped
-		// before this point, so the wording can safely name the guest).
-		title = "❌ Бронь отменена гостем"
+		// A restaurant-side cancel is filtered out before send, so here the actor
+		// is guest, system, or unknown. Name the guest only when we actually know
+		// it was the guest; otherwise stay neutral rather than mislabel a system
+		// (or unknown-actor) cancellation as the guest's doing.
+		if e.CancelledBy == domain.CancelledByGuest {
+			title = "❌ Бронь отменена гостем"
+		} else {
+			title = "❌ Бронь отменена"
+		}
 	}
 	return title + "\n" + telegramBookingDetails(e)
 }

@@ -92,8 +92,8 @@ func TestTelegram_GuestCancelSendsToRestaurant(t *testing.T) {
 	if got[0].chatID != "-1001234567890" {
 		t.Fatalf("sent to chat %q, want -1001234567890", got[0].chatID)
 	}
-	if !strings.Contains(got[0].text, "отменена") {
-		t.Fatalf("cancellation text missing:\n%s", got[0].text)
+	if !strings.Contains(got[0].text, "отменена гостем") {
+		t.Fatalf("guest-cancel must name the guest:\n%s", got[0].text)
 	}
 	if strings.Contains(got[0].text, "Новая бронь") {
 		t.Fatalf("cancellation must not read as a new booking:\n%s", got[0].text)
@@ -122,21 +122,34 @@ func TestTelegram_RestaurantCancelNoSend(t *testing.T) {
 	}
 }
 
-// An unknown (empty) CancelledBy defaults to sending — over-notifying is safer
-// than dropping a genuine guest cancel when the field is missing.
-func TestTelegram_UnknownCancelStillSends(t *testing.T) {
-	rest := uuid.New()
-	set := newFakeSettings()
-	set.tgChat[rest] = "-1001234567890"
-	sender := newRecordingTelegramSender()
-	tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
+// An unknown (empty) or system CancelledBy defaults to sending — over-notifying
+// is safer than dropping a genuine guest cancel when the field is missing — but
+// the wording stays NEUTRAL: it must not mislabel the cancel as the guest's.
+func TestTelegram_UnknownOrSystemCancelSendsNeutralTitle(t *testing.T) {
+	for _, by := range []domain.CancelledBy{"", domain.CancelledBySystem} {
+		by := by
+		t.Run(string(by), func(t *testing.T) {
+			rest := uuid.New()
+			set := newFakeSettings()
+			set.tgChat[rest] = "-1001234567890"
+			sender := newRecordingTelegramSender()
+			tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
 
-	ev, _ := toEvent(cancelledEvent(rest, ""))
-	if err := tg.Notify(context.Background(), ev); err != nil {
-		t.Fatalf("notify: %v", err)
-	}
-	if n := len(sender.sends()); n != 1 {
-		t.Fatalf("sent %d messages for an unknown-actor cancel, want 1", n)
+			ev, _ := toEvent(cancelledEvent(rest, by))
+			if err := tg.Notify(context.Background(), ev); err != nil {
+				t.Fatalf("notify: %v", err)
+			}
+			got := sender.sends()
+			if len(got) != 1 {
+				t.Fatalf("sent %d messages, want 1", len(got))
+			}
+			if !strings.Contains(got[0].text, "❌ Бронь отменена") {
+				t.Fatalf("neutral cancellation title missing:\n%s", got[0].text)
+			}
+			if strings.Contains(got[0].text, "гостем") {
+				t.Fatalf("a non-guest cancel must NOT be labelled as the guest's:\n%s", got[0].text)
+			}
+		})
 	}
 }
 
