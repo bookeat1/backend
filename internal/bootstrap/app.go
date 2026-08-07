@@ -28,6 +28,7 @@ import (
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
+	notificationsrest "backend-core/internal/transport/rest/notifications"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	payoutsrest "backend-core/internal/transport/rest/payouts"
 	preorderrest "backend-core/internal/transport/rest/preorder"
@@ -179,6 +180,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// guest registers the device they are signed in on and is notified about
 	// their own bookings only.
 	devicetokensrest.NewHandler(deps.DeviceTokens).RegisterRoutes(authed)
+	// Guest in-app «Уведомления» feed. Same own-user pattern: list / mark-read
+	// act on the caller's own history, no restaurant gate.
+	notificationsrest.NewHandler(deps.NotificationFeed).RegisterRoutes(authed)
 
 	menuHandler := menurest.NewHandler(deps.MenuFacade)
 	menuHandler.RegisterPublic(api)
