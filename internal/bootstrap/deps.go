@@ -94,6 +94,7 @@ type Deps struct {
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
 	DeviceTokens       *notifications.DeviceTokenUseCase
+	NotificationFeed   *notifications.NotificationFeedUseCase
 	FavoritesFacade    favorites.Facade
 	ConsentFacade      consent.Facade
 	ReviewsFacade      reviews.Facade
@@ -222,6 +223,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// notified about the guest's own bookings, so owning the account IS the
 	// authorization.
 	deviceTokens := notifications.NewDeviceTokenUseCase(notificationrepo.NewDeviceTokens(db))
+	// In-app «Уведомления» feed: the read side of the durable per-guest history
+	// that FeedNotifier (wired on the dispatcher below) writes. Same "owning the
+	// account IS the authorization" shape as device tokens — no restaurant, no
+	// RBAC.
+	notificationFeed := notifications.NewNotificationFeedUseCase(notificationrepo.NewFeed(db))
 	favoritesRepo := favoriterepo.New(db)
 	consentFacade := consent.NewFacade(
 		consentrepo.NewConsentRepository(db),
@@ -385,6 +391,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		MyRestaurants:         myRestaurants,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,
+		NotificationFeed:      notificationFeed,
 		FavoritesFacade:       favoritesFacade,
 		ConsentFacade:         consentFacade,
 		ReviewsFacade:         reviewsFacade,
@@ -1003,12 +1010,22 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		log,
 	)
 
+	// In-app feed channel: a FOURTH notifier on the same dispatcher. Unlike the
+	// three push channels it needs no provider or credentials — it only writes a
+	// durable row — so it is always active. Its idempotency is the notifications
+	// table's own unique key, not the delivery ledger.
+	feedNotifier := notifications.NewFeedNotifier(
+		notificationrepo.NewFeed(db),
+		notificationrepo.NewVenues(db),
+		log,
+	)
+
 	return notifications.NewDispatcher(
 		bookingrepo.NewOutbox(db), txm,
 		notifications.DispatcherConfig{
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
-		}, log, webPush, telegram, guestPush)
+		}, log, webPush, telegram, guestPush, feedNotifier)
 }
 
 // newOTPSender builds the login-code delivery sender.

@@ -20,6 +20,13 @@ const (
 	// staff alert, so every send through it must first pass the guest's opt-out
 	// (see notifications.GuestNotificationGate).
 	ChannelMobilePush NotificationChannel = "mobile_push"
+	// ChannelInApp is the GUEST-facing DURABLE feed: instead of firing a message
+	// at a device it appends a row to the notifications table the mobile app's
+	// «Уведомления» screen reads back. It shares the dispatcher and the booking
+	// outbox with the push channels but not the notification_deliveries ledger —
+	// its idempotency is the notifications table's own (outbox_event_id, user_id)
+	// unique key.
+	ChannelInApp NotificationChannel = "in_app"
 )
 
 // PushSubscription is a staff member's browser Web Push subscription, as handed
