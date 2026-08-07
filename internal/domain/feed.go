@@ -132,6 +132,10 @@ type FeedItem struct {
 	CoverImageURL *string
 	// Terms is set for promos only (the fine print).
 	Terms string
+	// DiscountPercent is the promo card's «−30%» badge value, 0..100. Set for
+	// PROMOS only — events have no discount, so the union projects NULL for them
+	// and this stays nil. Nil (either kind) means "no badge".
+	DiscountPercent *int
 	// ItemStatus is the venue's own publication status — "draft"/"published"/
 	// "hidden", the shared vocabulary of PromoStatus and EventStatus. Carried as
 	// a plain string because a card does not care which of the two types it came
