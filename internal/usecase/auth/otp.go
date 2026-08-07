@@ -413,6 +413,11 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 	if err != nil {
 		return nil, err
 	}
+	// TODO(security): the read + IncrementAttempts here is not atomic (the same
+	// pre-existing gap as login VerifyOTP: two concurrent guesses can both read
+	// the same Attempts snapshot and each spend one of the same budget slot).
+	// Deferred as a separate hardening task that must fix BOTH paths together —
+	// do not diverge this one from VerifyOTP in the meantime.
 	if rec.Attempts >= maxOTPAttempts {
 		return nil, errOTPTooManyAttempts()
 	}
@@ -447,6 +452,14 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 		u.Phone = &p
 		u.PhoneVerifiedAt = &now
 		if err := o.users.Update(ctx, u); err != nil {
+			// The advisory assertPhoneFree above cannot close the race between
+			// its read and this write; the users.phone UNIQUE constraint does,
+			// surfacing as ErrAlreadyExists. Tag it with the same CodePhoneInUse
+			// the pre-check returns so this rare path answers the identical 409
+			// the handler documents, not a generic already_exists.
+			if errors.Is(err, domain.ErrAlreadyExists) {
+				return domain.WithCode(domain.CodePhoneInUse, err)
+			}
 			return err
 		}
 		out = u

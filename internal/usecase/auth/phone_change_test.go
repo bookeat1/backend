@@ -163,6 +163,38 @@ func TestVerifyPhoneChangeUniquenessConflict(t *testing.T) {
 	_ = otp
 }
 
+// updateConflictUsers wraps fakeUsers to simulate the users.phone UNIQUE
+// constraint firing at write time: GetByPhone still reports the number free
+// (the advisory pre-check passes), but Update rejects with ErrAlreadyExists —
+// the exact race the DB-level wrap must tag with CodePhoneInUse.
+type updateConflictUsers struct{ *fakeUsers }
+
+func (u updateConflictUsers) Update(context.Context, *domain.User) error {
+	return domain.ErrAlreadyExists
+}
+
+func TestVerifyPhoneChangeDBRaceMappedToPhoneInUse(t *testing.T) {
+	users := newFakeUsers()
+	otp := newFakeOTP()
+	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 5, OTPPerHour: 20, OTPDevExpose: true}
+	uc := NewOTPUseCase(updateConflictUsers{users}, otp, newFakeRefresh(), noTx{}, testIssuer(t), &stubSender{}, cfg)
+	ctx := context.Background()
+	u := seedUser(t, users, "+77011110000")
+	newPhone := "+77072223333"
+
+	code, err := uc.RequestPhoneChangeOTP(ctx, u.ID, newPhone)
+	if err != nil {
+		t.Fatalf("RequestPhoneChangeOTP: %v", err)
+	}
+	_, err = uc.VerifyPhoneChange(ctx, u.ID, newPhone, code)
+	if !errors.Is(err, domain.ErrAlreadyExists) {
+		t.Fatalf("DB-race err = %v, want ErrAlreadyExists", err)
+	}
+	if c, _ := domain.CodeOf(err); c != domain.CodePhoneInUse {
+		t.Errorf("code = %q, want phone_in_use (DB-race path must match the pre-check)", c)
+	}
+}
+
 func TestRequestPhoneChangeSameNumberRejected(t *testing.T) {
 	uc, users, _ := newTestOTPWithUsers(t)
 	ctx := context.Background()
