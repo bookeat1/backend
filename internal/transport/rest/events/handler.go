@@ -141,6 +141,7 @@ func (h *Handler) create(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		Tags:             req.Tags,
 		RefundPolicy:     req.refundPolicy(),
 	})
 	if err != nil {
@@ -187,6 +188,7 @@ func (h *Handler) update(c *gin.Context) {
 		Ticketed:         req.Ticketed,
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
+		Tags:             req.Tags,
 		RefundPolicy:     refundPolicy,
 	})
 	if err != nil {
@@ -393,6 +395,9 @@ type eventRequest struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor"`
 	Capacity         *int              `json:"capacity"`
+	// The «Афиша» chips ("Бранч", "Живая музыка", ...). The usecase trims blanks
+	// and caps the count; absent/empty means the card draws no chips.
+	Tags []string `json:"tags"`
 	// The venue's own refund rules for this event. POINTERS on purpose: this is a
 	// full-replace payload, and a cabinet build that predates the feature sends
 	// the event without these fields. On create, absent means the conservative
@@ -471,6 +476,10 @@ type eventResponse struct {
 	Ticketed         bool              `json:"ticketed"`
 	TicketPriceMinor *int64            `json:"ticket_price_minor,omitempty"`
 	Capacity         *int              `json:"capacity,omitempty"`
+	// The «Афиша» chips. Always present and serialized as [] when empty (never
+	// null, never omitted): the app renders a chip row and an absent field would
+	// read as "unknown".
+	Tags []string `json:"tags"`
 	// The refund rules a guest must be able to read BEFORE buying. Always
 	// present (never omitempty): "false" is a rule too, and an absent field
 	// would read as "unknown" in the app.
@@ -478,6 +487,17 @@ type eventResponse struct {
 	TicketRefundCutoffMinutes int    `json:"ticket_refund_cutoff_minutes"`
 	CreatedAt                 string `json:"created_at"`
 	UpdatedAt                 string `json:"updated_at"`
+}
+
+// tagsOrEmpty guarantees the JSON tags field serializes as [] rather than null:
+// a domain event read from the store is already non-nil, but events built
+// in-memory (or by a fake) may carry a nil slice. Mirrors the feed's make([]T,0)
+// approach to keeping empty lists honest arrays.
+func tagsOrEmpty(tags []string) []string {
+	if tags == nil {
+		return []string{}
+	}
+	return tags
 }
 
 // adminResponse is the full staff-facing shape: base scalar + the raw i18n maps
@@ -498,6 +518,7 @@ func adminResponse(e domain.Event) eventResponse {
 		Ticketed:         e.Ticketed,
 		TicketPriceMinor: e.TicketPriceMinor,
 		Capacity:         e.Capacity,
+		Tags:             tagsOrEmpty(e.Tags),
 
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,

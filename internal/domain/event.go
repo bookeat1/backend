@@ -60,6 +60,11 @@ type Event struct {
 	TicketPriceMinor *int64
 	// Capacity is the maximum number of attendees, nil when unbounded/unknown.
 	Capacity *int
+	// Tags are short free-text chips shown under the venue·date line on the
+	// «Афиша» card and the event detail ("Бранч", "Живая музыка", "Коктейли",
+	// "Красивый вид"). Empty slice = no tags; never nil once read from the
+	// store (the column is text[] NOT NULL DEFAULT '{}').
+	Tags []string
 	// TicketsRefundable / TicketRefundCutoffMinutes are the venue's OWN refund
 	// rules for this event (migration 0047) — see TicketRefundPolicy and
 	// TicketRefundAllowed in event_refund_policy.go. They are the rules shown to

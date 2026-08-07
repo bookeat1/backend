@@ -387,3 +387,74 @@ func TestListPublicUpcoming_Pagination(t *testing.T) {
 		}
 	}
 }
+
+// Tags round-trip through every read path: a set list survives create→get and a
+// full-replace update, an event created without tags reads back as a non-nil
+// empty slice (never nil), and the cross-venue listing carries the chips so the
+// «Афиша» card needs no follow-up query.
+func TestTags_RoundTrip(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	// Created WITH tags: they survive create→get.
+	tagged := mkEvent(rid, domain.EventPublished, 24*time.Hour, 2*time.Hour)
+	tagged.Tags = []string{"Бранч", "Живая музыка"}
+	if err := repo.Create(ctx, tagged); err != nil {
+		t.Fatalf("create tagged: %v", err)
+	}
+	got, err := repo.GetByID(ctx, tagged.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "Бранч" || got.Tags[1] != "Живая музыка" {
+		t.Fatalf("tags not persisted in order: %#v", got.Tags)
+	}
+
+	// Created WITHOUT tags: reads back as a non-nil empty slice, never nil.
+	untagged := mkEvent(rid, domain.EventPublished, 48*time.Hour, 2*time.Hour)
+	if err := repo.Create(ctx, untagged); err != nil {
+		t.Fatalf("create untagged: %v", err)
+	}
+	gotEmpty, err := repo.GetByID(ctx, untagged.ID)
+	if err != nil {
+		t.Fatalf("get untagged: %v", err)
+	}
+	if gotEmpty.Tags == nil {
+		t.Fatalf("empty tags read back as nil, want an empty slice")
+	}
+	if len(gotEmpty.Tags) != 0 {
+		t.Fatalf("tags = %#v, want empty", gotEmpty.Tags)
+	}
+
+	// Full-replace update rewrites the list.
+	got.Tags = []string{"Коктейли"}
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after, _ := repo.GetByID(ctx, tagged.ID)
+	if len(after.Tags) != 1 || after.Tags[0] != "Коктейли" {
+		t.Fatalf("tags not updated: %#v", after.Tags)
+	}
+
+	// The cross-venue public listing carries the chips inline.
+	items, _, err := repo.ListPublicUpcoming(ctx, domain.PublicEventFilter{RestaurantID: &rid}, time.Now())
+	if err != nil {
+		t.Fatalf("ListPublicUpcoming: %v", err)
+	}
+	byID := map[uuid.UUID][]string{}
+	for _, it := range items {
+		if it.Tags == nil {
+			t.Fatalf("listing item %s carries nil tags, want an empty slice at least", it.ID)
+		}
+		byID[it.ID] = it.Tags
+	}
+	if tags := byID[tagged.ID]; len(tags) != 1 || tags[0] != "Коктейли" {
+		t.Fatalf("listing tags for tagged event = %#v, want [Коктейли]", tags)
+	}
+	if tags, ok := byID[untagged.ID]; !ok || len(tags) != 0 {
+		t.Fatalf("listing tags for untagged event = %#v (present=%v), want empty", tags, ok)
+	}
+}

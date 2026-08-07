@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ type fakeFacade struct {
 	err   error
 	items []domain.EventListItem
 	total int
+	// event, when set, is what GetPublic answers with — drives the detail-shape
+	// assertions without a database.
+	event *domain.Event
 
 	gotFilter domain.PublicEventFilter
 	calls     int
@@ -67,7 +71,10 @@ func (f *fakeFacade) ListPublic(context.Context, uuid.UUID, int, int) ([]domain.
 }
 
 func (f *fakeFacade) GetPublic(context.Context, uuid.UUID, uuid.UUID) (*domain.Event, error) {
-	return nil, f.err
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.event, nil
 }
 
 var _ uc.Facade = (*fakeFacade)(nil)
@@ -118,6 +125,7 @@ func sampleItem(startsIn time.Duration, title, venueName string, city domain.Cit
 			Description: "описание", DescriptionI18n: domain.I18n{"en": "description"},
 			StartsAt: start, EndsAt: start.Add(2 * time.Hour),
 			Venue: "rooftop", CoverImageURL: &cover, Status: domain.EventPublished,
+			Tags: []string{"Бранч", "Живая музыка"},
 		},
 		Restaurant: domain.EventRestaurant{
 			ID: rid, Name: venueName, NameI18n: domain.I18n{"en": venueName + " (en)"}, City: city,
@@ -390,5 +398,83 @@ func TestPublicRoutesRegisterWithoutConflict(t *testing.T) {
 		if !found {
 			t.Errorf("route not registered: %s", key)
 		}
+	}
+}
+
+// newDetailRouter mounts the public routes so the event-detail path
+// (GET /restaurants/:id/events/:eventId) can be exercised against a canned event.
+func newDetailRouter(f uc.Facade) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	NewHandler(f).RegisterPublic(r.Group("/api/v1"))
+	return r
+}
+
+// detailEnvelope mirrors the standard envelope around a single event (the
+// eventResponse shape is embedded in eventListItemResponse, so decoding into the
+// item type reads the same fields plus an empty restaurant object).
+type detailEnvelope struct {
+	Data  eventListItemResponse `json:"data"`
+	Error string                `json:"error"`
+}
+
+// The «Афиша» chips must arrive on the cross-venue list item, in order.
+func TestListUpcoming_CarriesTags(t *testing.T) {
+	it := sampleItem(24*time.Hour, "Винный ужин", "Bistro", domain.CityAlmaty)
+	f := &fakeFacade{items: []domain.EventListItem{it}}
+
+	env := decode(t, do(t, newPublicRouter(f), "/api/v1/events"))
+	got := env.Data.Items[0].Tags
+	if len(got) != 2 || got[0] != "Бранч" || got[1] != "Живая музыка" {
+		t.Fatalf("list item tags = %#v, want [Бранч Живая музыка]", got)
+	}
+}
+
+// An event with no chips serializes tags as [] — never null, never absent — so
+// the app can render the chip row unconditionally.
+func TestListUpcoming_EmptyTagsSerializeAsArray(t *testing.T) {
+	it := sampleItem(24*time.Hour, "Без тегов", "Bistro", domain.CityAlmaty)
+	it.Tags = nil
+	f := &fakeFacade{items: []domain.EventListItem{it}}
+
+	rec := do(t, newPublicRouter(f), "/api/v1/events")
+	// Assert on the raw JSON: a decoded []string cannot tell [] from null.
+	if !strings.Contains(rec.Body.String(), `"tags":[]`) {
+		t.Fatalf("empty tags must serialize as [], body: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"tags":null`) {
+		t.Fatalf("tags must never serialize as null, body: %s", rec.Body.String())
+	}
+}
+
+// The event-detail endpoint carries the chips too, and an event without chips
+// still answers tags:[] rather than null.
+func TestGetPublic_CarriesTags(t *testing.T) {
+	start := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: uuid.New(),
+		Title: "Винный ужин", StartsAt: start, EndsAt: start.Add(2 * time.Hour),
+		Status: domain.EventPublished, Tags: []string{"Коктейли", "Красивый вид"},
+	}
+	f := &fakeFacade{event: ev}
+
+	rec := do(t, newDetailRouter(f), "/api/v1/restaurants/"+ev.RestaurantID.String()+"/events/"+ev.ID.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var env detailEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	got := env.Data.Tags
+	if len(got) != 2 || got[0] != "Коктейли" || got[1] != "Красивый вид" {
+		t.Fatalf("detail tags = %#v, want [Коктейли Красивый вид]", got)
+	}
+
+	// Same endpoint, an event with no chips → tags:[] in the raw body.
+	ev.Tags = nil
+	rec = do(t, newDetailRouter(&fakeFacade{event: ev}), "/api/v1/restaurants/"+ev.RestaurantID.String()+"/events/"+ev.ID.String())
+	if !strings.Contains(rec.Body.String(), `"tags":[]`) || strings.Contains(rec.Body.String(), `"tags":null`) {
+		t.Fatalf("detail empty tags must be [], not null, body: %s", rec.Body.String())
 	}
 }
