@@ -27,6 +27,13 @@ type userResponse struct {
 	CuisineCategoryIDs []string `json:"cuisine_category_ids"`
 }
 
+// phoneChangeRequestedResponse mirrors the auth OTP request response: Sent is
+// always true on the 200, Code is populated only under AUTH_OTP_DEV_EXPOSE.
+type phoneChangeRequestedResponse struct {
+	Sent bool   `json:"sent" example:"true"`
+	Code string `json:"code,omitempty" example:"123456"`
+}
+
 func fromDomain(u *domain.User, cuisineIDs []uuid.UUID) userResponse {
 	var birthDate *string
 	if u.BirthDate != nil {

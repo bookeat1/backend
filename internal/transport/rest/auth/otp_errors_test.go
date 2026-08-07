@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
 	uc "backend-core/internal/usecase/auth"
@@ -25,6 +26,12 @@ type stubOTP struct{ err error }
 
 func (s *stubOTP) RequestOTP(context.Context, string) (string, error) { return "", s.err }
 func (s *stubOTP) VerifyOTP(context.Context, string, string) (*uc.TokenPair, error) {
+	return nil, s.err
+}
+func (s *stubOTP) RequestPhoneChangeOTP(context.Context, uuid.UUID, string) (string, error) {
+	return "", s.err
+}
+func (s *stubOTP) VerifyPhoneChange(context.Context, uuid.UUID, string, string) (*domain.User, error) {
 	return nil, s.err
 }
 

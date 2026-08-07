@@ -290,6 +290,23 @@ const (
 	// A venue may sit in any number of DIFFERENT collections; what the primary
 	// key forbids is the same venue twice in one.
 	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
+
+	// Phone change for a signed-in user (POST /users/me/phone/otp/request,
+	// POST /users/me/phone/otp/verify). Both narrow a status that on its own
+	// reads as something else on this authenticated, own-account flow.
+
+	// CodePhoneInUse — the new number the caller asked to move to already
+	// belongs to ANOTHER live account. Kept apart from the generic
+	// already_exists (which reads as "you tried to create a duplicate") because
+	// here the caller changed nothing of their own: the app must tell them the
+	// NUMBER is taken, not that their account already exists. 409, not
+	// retryable until the number is freed.
+	CodePhoneInUse ErrorCode = "phone_in_use"
+
+	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
+	// number. Nothing to verify and nothing to change; a plain validation_failed
+	// would make the app show a field error with no actionable reason. 422.
+	CodePhoneUnchanged ErrorCode = "phone_unchanged"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

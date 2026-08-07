@@ -156,7 +156,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed := api.Group("")
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	authed.Use(middleware.LogUserContext())
-	usersrest.NewHandler(deps.UsersFacade).RegisterRoutes(authed)
+	usersrest.NewHandler(deps.UsersFacade, deps.AuthOTP).RegisterRoutes(authed)
 	favoritesrest.NewHandler(deps.FavoritesFacade).RegisterRoutes(authed)
 	// Guest data-processing consent + notification opt-out. Authenticated and
 	// scoped to the caller's OWN user id (no restaurant/RBAC gate) — same

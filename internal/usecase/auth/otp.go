@@ -30,6 +30,20 @@ const (
 type OTPUseCase interface {
 	RequestOTP(ctx context.Context, rawPhone string) (string, error)
 	VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error)
+
+	// RequestPhoneChangeOTP sends an OTP to a NEW number a signed-in user wants
+	// to move to. It runs the same generation/send/rate-limit path as
+	// RequestOTP (so the new number shares its own per-phone budget) after two
+	// guards: the new number must differ from the caller's current one, and it
+	// must not already belong to another live account.
+	RequestPhoneChangeOTP(ctx context.Context, userID uuid.UUID, rawNewPhone string) (string, error)
+
+	// VerifyPhoneChange verifies the OTP delivered to newPhone and, on success,
+	// moves the authenticated user to that number (setting phone_verified_at).
+	// It reuses the code-check of VerifyOTP (match / expiry / used / attempt
+	// budget) but issues NO token pair and does NOT find-or-create a user.
+	// Returns the updated user.
+	VerifyPhoneChange(ctx context.Context, userID uuid.UUID, rawNewPhone, code string) (*domain.User, error)
 }
 
 type otpUseCase struct {
@@ -220,6 +234,21 @@ func errOTPTooManyAttempts() error {
 	return domain.WithCode(domain.CodeOTPTooManyAttempts, domain.ErrUnauthorized)
 }
 
+// errPhoneInUse — the new number belongs to another live account. Wraps
+// ErrAlreadyExists so the transport layer maps it to 409, with a code the app
+// can tell apart from the generic "already exists".
+func errPhoneInUse() error {
+	return domain.WithCode(domain.CodePhoneInUse,
+		fmt.Errorf("%w: phone already in use", domain.ErrAlreadyExists))
+}
+
+// errPhoneUnchanged — the new number normalizes to the caller's current one.
+// Wraps ErrValidation → 422.
+func errPhoneUnchanged() error {
+	return domain.WithCode(domain.CodePhoneUnchanged,
+		fmt.Errorf("%w: new phone is the same as the current one", domain.ErrValidation))
+}
+
 // VerifyOTP checks the latest active code for the phone; on success it marks the
 // code used, finds-or-creates the user, and returns a token pair.
 func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error) {
@@ -301,4 +330,140 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 	// exactly the proof (the guest typed the code back) that no provider API can
 	// give us — WhatsApp and SMS both "accept" messages they then drop.
 	return pair, nil
+}
+
+// RequestPhoneChangeOTP guards a signed-in user's request to move to a new
+// number, then delegates delivery to RequestOTP so the number gets exactly the
+// same generation, waterfall send and rate-limit budget an unauthenticated
+// login request would. The uniqueness check here is only a courtesy 409 before
+// spending an SMS — the users.phone UNIQUE constraint is the real guarantee,
+// re-checked at write time in VerifyPhoneChange.
+func (o *otpUseCase) RequestPhoneChangeOTP(ctx context.Context, userID uuid.UUID, rawNewPhone string) (string, error) {
+	p := phone.Normalize(rawNewPhone)
+	if p == "" {
+		return "", domain.WithCode(domain.CodeOTPInvalidPhone,
+			fmt.Errorf("%w: phone required", domain.ErrValidation))
+	}
+
+	caller, err := o.users.GetByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if caller.Phone != nil && *caller.Phone == p {
+		return "", errPhoneUnchanged()
+	}
+	if err := o.assertPhoneFree(ctx, p, userID); err != nil {
+		return "", err
+	}
+
+	// Same path as an unauthenticated request: generate, send through the
+	// waterfall, record the row that spends the NEW number's rate-limit budget.
+	return o.RequestOTP(ctx, p)
+}
+
+// assertPhoneFree returns errPhoneInUse when p already belongs to a different,
+// non-soft-deleted account. A soft-deleted row NULLs its phone (see
+// UserRepository.Delete), so it never collides here. ErrNotFound — nobody has
+// the number — is the success case.
+func (o *otpUseCase) assertPhoneFree(ctx context.Context, p string, userID uuid.UUID) error {
+	existing, err := o.users.GetByPhone(ctx, p)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existing.ID != userID && existing.DeletedAt == nil {
+		return errPhoneInUse()
+	}
+	return nil
+}
+
+// VerifyPhoneChange checks the OTP for newPhone with the SAME logic as
+// VerifyOTP (read + attempt accounting outside the transaction so a wrong guess
+// durably counts), but on success it neither creates a user nor issues tokens:
+// it moves the authenticated caller to newPhone and marks it verified, inside
+// one transaction that re-checks uniqueness at write time.
+func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, rawNewPhone, code string) (*domain.User, error) {
+	p := phone.Normalize(rawNewPhone)
+	if p == "" {
+		return nil, domain.WithCode(domain.CodeOTPInvalidPhone,
+			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
+	}
+	if code == "" {
+		return nil, domain.WithCode(domain.CodeOTPCodeRequired,
+			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
+	}
+
+	caller, err := o.users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if caller.Phone != nil && *caller.Phone == p {
+		return nil, errPhoneUnchanged()
+	}
+
+	// Attempt accounting stays OUTSIDE the transaction, exactly as VerifyOTP
+	// does it: a failed guess must durably count even though the request
+	// returns an error, or the lockout would never fire.
+	rec, err := o.otp.LatestActiveByPhone(ctx, p)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil, errOTPInvalid()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if rec.Attempts >= maxOTPAttempts {
+		return nil, errOTPTooManyAttempts()
+	}
+	if otpcode.Hash(code) != rec.CodeHash {
+		attempts := rec.Attempts + 1
+		if err := o.otp.IncrementAttempts(ctx, rec.ID); err == nil &&
+			attempts >= maxOTPAttempts {
+			return nil, errOTPTooManyAttempts()
+		}
+		return nil, errOTPInvalid()
+	}
+
+	// Correct code. Mark it used and move the caller to the new number in ONE
+	// transaction, re-checking uniqueness at write time: the pre-check in the
+	// request step is advisory, the UNIQUE constraint (via Update →
+	// ErrAlreadyExists) is what actually forbids a collision that raced in.
+	var out *domain.User
+	var oldPhone *string
+	err = o.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
+			return err
+		}
+		if err := o.assertPhoneFree(ctx, p, userID); err != nil {
+			return err
+		}
+		u, err := o.users.GetByID(ctx, userID)
+		if err != nil {
+			return err
+		}
+		oldPhone = u.Phone
+		now := time.Now()
+		u.Phone = &p
+		u.PhoneVerifiedAt = &now
+		if err := o.users.Update(ctx, u); err != nil {
+			return err
+		}
+		out = u
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Best-effort hygiene AFTER the change is committed: any other live code for
+	// the old or the new number can no longer complete anything useful, so kill
+	// them. Deliberately outside the transaction and error-swallowed — a cleanup
+	// hiccup must never undo a phone change the caller already succeeded at.
+	if oldPhone != nil && *oldPhone != p {
+		_ = o.otp.InvalidateActiveByPhone(ctx, *oldPhone)
+	}
+	_ = o.otp.InvalidateActiveByPhone(ctx, p)
+
+	return out, nil
 }
