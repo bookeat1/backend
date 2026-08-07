@@ -313,7 +313,10 @@ type cardResponse struct {
 	EndsAt         string  `json:"ends_at"`
 	CoverImageURL  *string `json:"cover_image_url,omitempty"`
 	Terms          string  `json:"terms,omitempty"`
-	Score          int     `json:"score"`
+	// DiscountPercent is the promo card's «−30%» badge, 0..100. Omitted for
+	// events (they have no discount) and for promos with no badge.
+	DiscountPercent *int `json:"discount_percent,omitempty"`
+	Score           int  `json:"score"`
 	// ScoreReasons is the full, ordered breakdown that produced Score.
 	ScoreReasons []scoreReasonResponse `json:"score_reasons"`
 }
@@ -332,18 +335,19 @@ func newCardResponse(r domain.RankedFeedItem, lang string) cardResponse {
 		})
 	}
 	return cardResponse{
-		Kind:           string(r.Item.Kind),
-		ID:             r.Item.ID.String(),
-		RestaurantID:   r.Item.RestaurantID.String(),
-		RestaurantName: r.Item.RestaurantNameI18n.Resolve(lang, r.Item.RestaurantName),
-		Title:          r.Item.TitleI18n.Resolve(lang, r.Item.Title),
-		Description:    r.Item.DescriptionI18n.Resolve(lang, r.Item.Description),
-		StartsAt:       r.Item.StartsAt.Format(time.RFC3339),
-		EndsAt:         r.Item.EndsAt.Format(time.RFC3339),
-		CoverImageURL:  r.Item.CoverImageURL,
-		Terms:          r.Item.Terms,
-		Score:          r.Score.Total,
-		ScoreReasons:   reasons,
+		Kind:            string(r.Item.Kind),
+		ID:              r.Item.ID.String(),
+		RestaurantID:    r.Item.RestaurantID.String(),
+		RestaurantName:  r.Item.RestaurantNameI18n.Resolve(lang, r.Item.RestaurantName),
+		Title:           r.Item.TitleI18n.Resolve(lang, r.Item.Title),
+		Description:     r.Item.DescriptionI18n.Resolve(lang, r.Item.Description),
+		StartsAt:        r.Item.StartsAt.Format(time.RFC3339),
+		EndsAt:          r.Item.EndsAt.Format(time.RFC3339),
+		CoverImageURL:   r.Item.CoverImageURL,
+		Terms:           r.Item.Terms,
+		DiscountPercent: r.Item.DiscountPercent,
+		Score:           r.Score.Total,
+		ScoreReasons:    reasons,
 	}
 }
 

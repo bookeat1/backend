@@ -58,6 +58,7 @@ type CreateInput struct {
 	EndsAt          time.Time
 	Terms           string
 	CoverImageURL   *string
+	DiscountPercent *int
 	Status          domain.PromoStatus
 }
 
@@ -71,6 +72,7 @@ type UpdateInput struct {
 	EndsAt          time.Time
 	Terms           string
 	CoverImageURL   *string
+	DiscountPercent *int
 	Status          domain.PromoStatus
 }
 
@@ -104,6 +106,7 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		EndsAt:          in.EndsAt,
 		Terms:           in.Terms,
 		CoverImageURL:   in.CoverImageURL,
+		DiscountPercent: in.DiscountPercent,
 		Status:          status,
 	}
 	if err := validatePromo(p); err != nil {
@@ -138,6 +141,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	p.EndsAt = in.EndsAt
 	p.Terms = in.Terms
 	p.CoverImageURL = in.CoverImageURL
+	p.DiscountPercent = in.DiscountPercent
 	p.Status = in.Status
 	if err := validatePromo(p); err != nil {
 		return nil, err
@@ -223,6 +227,12 @@ func validatePromo(p *domain.Promo) error {
 	if !p.EndsAt.After(p.StartsAt) {
 		return fmt.Errorf("%w: ends_at must be after starts_at", domain.ErrValidation)
 	}
+	// The DB CHECK is the last line of defense; validating here turns a raw
+	// constraint violation into a clean 422 with a readable message. Nil is
+	// valid (no discount badge); a set value must be a real percentage.
+	if p.DiscountPercent != nil && (*p.DiscountPercent < 0 || *p.DiscountPercent > 100) {
+		return fmt.Errorf("%w: discount_percent must be between 0 and 100", domain.ErrValidation)
+	}
 	return nil
 }
 
@@ -235,6 +245,7 @@ func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
 		in.Description != cur.Description ||
 		in.Terms != cur.Terms ||
 		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL) ||
+		!intPtrEqual(in.DiscountPercent, cur.DiscountPercent) ||
 		!in.StartsAt.Equal(cur.StartsAt) ||
 		!in.EndsAt.Equal(cur.EndsAt) ||
 		!i18nEqual(in.TitleI18n, cur.TitleI18n) ||
@@ -244,6 +255,15 @@ func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
 // strPtrEqual compares two optional strings by value: two nils are equal, and a
 // nil never equals a set value ("the picture was removed" IS an edit).
 func strPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// intPtrEqual compares two optional ints by value: two nils are equal, and a
+// nil never equals a set value ("the discount was removed" IS an edit).
+func intPtrEqual(a, b *int) bool {
 	if a == nil || b == nil {
 		return a == b
 	}

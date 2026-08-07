@@ -152,3 +152,76 @@ func TestCoverImageURL_RoundTripAndNull(t *testing.T) {
 		t.Fatalf("cover after clearing = %v (err %v)", cleared.CoverImageURL, err)
 	}
 }
+
+// discount_percent round-trips as an int and "no discount" stays a real NULL —
+// the «−30%» badge value must be distinguishable from a promo that has no badge
+// at all (a NULL is not a 0%). An update can both set and clear it.
+func TestDiscountPercent_RoundTripAndNull(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "promos", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	thirty := 30
+	withDiscount := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	withDiscount.DiscountPercent = &thirty
+	withoutDiscount := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	for _, p := range []*domain.Promo{withDiscount, withoutDiscount} {
+		if err := repo.Create(ctx, p); err != nil {
+			t.Fatalf("create promo: %v", err)
+		}
+	}
+
+	got, err := repo.GetByID(ctx, withDiscount.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.DiscountPercent == nil || *got.DiscountPercent != thirty {
+		t.Fatalf("discount = %v, want %d", got.DiscountPercent, thirty)
+	}
+
+	got, err = repo.GetByID(ctx, withoutDiscount.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.DiscountPercent != nil {
+		t.Fatalf("discount = %v, want nil for a promo with no badge", *got.DiscountPercent)
+	}
+
+	// An update can set the discount on a promo that had none.
+	got.DiscountPercent = &thirty
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	reread, err := repo.GetByID(ctx, withoutDiscount.ID)
+	if err != nil || reread.DiscountPercent == nil || *reread.DiscountPercent != thirty {
+		t.Fatalf("discount after update = %v (err %v)", reread.DiscountPercent, err)
+	}
+	// ...and clear it again.
+	reread.DiscountPercent = nil
+	if err := repo.Update(ctx, reread); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	cleared, err := repo.GetByID(ctx, withoutDiscount.ID)
+	if err != nil || cleared.DiscountPercent != nil {
+		t.Fatalf("discount after clearing = %v (err %v)", cleared.DiscountPercent, err)
+	}
+}
+
+// The DB CHECK is the schema's last line of defense: an out-of-range discount
+// must be refused even if some future code path skips the usecase validation.
+func TestDiscountPercent_CheckRejectsOutOfRange(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "promos", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	over := 150
+	bad := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	bad.DiscountPercent = &over
+	if err := repo.Create(ctx, bad); err == nil {
+		t.Fatal("a discount over 100 must be refused by the CHECK constraint, got no error")
+	}
+}

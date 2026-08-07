@@ -516,3 +516,56 @@ func TestListCandidates_CarriesThePromoCover(t *testing.T) {
 		t.Fatalf("a promo with no picture must carry nil, got %v", got)
 	}
 }
+
+// The «Акции» card renders a photo AND a «−30%» badge. A published, in-window,
+// approved promo must surface through the feed carrying BOTH its cover and its
+// discount; a promo with no badge carries nil; and an event — which has no
+// discount at all — must carry nil (the union projects NULL for it) rather than
+// a bogus 0.
+func TestListCandidates_CarriesThePromoDiscount(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	rid := seedVenue(ctx, t, pool, "Bistro", activeVenue())
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(time.Hour)
+
+	cover := "https://pub-41b6f06fc8e74b6e959cdd6def081e22.r2.dev/promos/happy-hour.jpg"
+	withBadge := seedPromo(ctx, t, pool, rid, "−30%", domain.PromoPublished, open, close, domain.FeedApproved, 0)
+	if _, err := pool.Exec(ctx,
+		`UPDATE promos SET cover_image_url = $2, discount_percent = 30 WHERE id = $1`,
+		withBadge, cover); err != nil {
+		t.Fatalf("set cover+discount: %v", err)
+	}
+	noBadge := seedPromo(ctx, t, pool, rid, "no badge", domain.PromoPublished, open, close, domain.FeedApproved, 0)
+	event := seedEvent(ctx, t, pool, rid, "gig", domain.EventPublished, open, feedNow.Add(48*time.Hour), domain.FeedApproved, 0)
+
+	items, err := New(pool).ListCandidates(ctx, domain.FeedQuery{
+		City: domain.CityAlmaty, Now: feedNow, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("list candidates: %v", err)
+	}
+	byID := map[uuid.UUID]domain.FeedItem{}
+	for _, it := range items {
+		byID[it.ID] = it
+	}
+
+	// The promo with a badge carries both its cover and its discount.
+	if it, ok := byID[withBadge]; !ok {
+		t.Fatal("the approved in-window promo must be in the feed")
+	} else if it.DiscountPercent == nil || *it.DiscountPercent != 30 {
+		t.Fatalf("promo discount = %v, want 30", it.DiscountPercent)
+	} else if it.CoverImageURL == nil || *it.CoverImageURL != cover {
+		t.Fatalf("promo cover = %v, want %q", it.CoverImageURL, cover)
+	}
+	// A promo with no badge carries a real nil.
+	if it, ok := byID[noBadge]; !ok || it.DiscountPercent != nil {
+		t.Fatalf("a promo with no badge must carry nil discount, got %v (present=%v)", byID[noBadge].DiscountPercent, ok)
+	}
+	// An event never has a discount — the union projects NULL, not 0.
+	if it, ok := byID[event]; !ok {
+		t.Fatal("the approved in-window event must be in the feed")
+	} else if it.DiscountPercent != nil {
+		t.Fatalf("an event must carry nil discount, got %v", *it.DiscountPercent)
+	}
+}

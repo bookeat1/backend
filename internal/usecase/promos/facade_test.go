@@ -298,3 +298,78 @@ func TestUpdate_ChangingTheCoverDemotesFromTheFeed(t *testing.T) {
 		t.Fatalf("removing the cover must demote as well, got %v", feed.demoted)
 	}
 }
+
+// A discount outside 0..100 is refused before anything is written — the usecase
+// turns what would otherwise be a raw DB CHECK violation into a clean 422.
+func TestCreate_DiscountOutOfRangeRejected(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	over := 150
+	in := validCreate(rid)
+	in.DiscountPercent = &over
+	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("a discount over 100 must be ErrValidation, got %v", err)
+	}
+	if repo.created != nil {
+		t.Fatal("no promo must be written when the discount is out of range")
+	}
+}
+
+// The «−N%» badge is content a moderator approved: changing the discount must
+// send the promo back to the review queue, exactly like swapping the cover.
+func TestUpdate_ChangingTheDiscountDemotesFromTheFeed(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), feed)
+	actor := Actor{UserID: actorID, Role: domain.RoleRestaurant}
+
+	thirty := 30
+	in := validCreate(rid)
+	in.DiscountPercent = &thirty
+	p, err := f.Create(context.Background(), actor, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if p.DiscountPercent == nil || *p.DiscountPercent != thirty {
+		t.Fatalf("discount was not stored: %v", p.DiscountPercent)
+	}
+
+	// Republishing with the same discount is not an edit.
+	unchanged := UpdateInput{
+		Title: p.Title, StartsAt: p.StartsAt, EndsAt: p.EndsAt,
+		DiscountPercent: &thirty, Status: domain.PromoPublished,
+	}
+	if _, err := f.Update(context.Background(), actor, p.ID, unchanged); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 0 {
+		t.Fatalf("republishing with the same discount must not demote: %v", feed.demoted)
+	}
+
+	// Changing the badge value demotes.
+	fifty := 50
+	swapped := unchanged
+	swapped.DiscountPercent = &fifty
+	if _, err := f.Update(context.Background(), actor, p.ID, swapped); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 1 || feed.demoted[0] != p.ID {
+		t.Fatalf("changing the discount must demote the promo, got %v", feed.demoted)
+	}
+
+	// Removing the badge altogether is an edit too.
+	removed := swapped
+	removed.DiscountPercent = nil
+	if _, err := f.Update(context.Background(), actor, p.ID, removed); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 2 {
+		t.Fatalf("removing the discount must demote as well, got %v", feed.demoted)
+	}
+}

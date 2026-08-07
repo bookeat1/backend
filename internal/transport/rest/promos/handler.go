@@ -94,6 +94,7 @@ func (h *Handler) create(c *gin.Context) {
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
 		CoverImageURL:   req.CoverImageURL,
+		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
 	})
 	if err != nil {
@@ -130,6 +131,7 @@ func (h *Handler) update(c *gin.Context) {
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
 		CoverImageURL:   req.CoverImageURL,
+		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
 	})
 	if err != nil {
@@ -257,7 +259,10 @@ type promoRequest struct {
 	// CoverImageURL is the full public image URL. Omitted or null means the
 	// promo has no picture — that is a valid, honest state, not a missing field.
 	CoverImageURL *string `json:"cover_image_url"`
-	Status        string  `json:"status"`
+	// DiscountPercent is the «−30%» badge value, 0..100. Omitted or null means
+	// the promo has no discount badge — a valid state, validated in the usecase.
+	DiscountPercent *int   `json:"discount_percent"`
+	Status          string `json:"status"`
 }
 
 func (r promoRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, ok bool) {
@@ -287,9 +292,12 @@ type promoResponse struct {
 	// CoverImageURL is omitted entirely when the promo has no picture: the
 	// client must render its own placeholder, never a made-up URL.
 	CoverImageURL *string `json:"cover_image_url,omitempty"`
-	Status        string  `json:"status"`
-	CreatedAt     string  `json:"created_at"`
-	UpdatedAt     string  `json:"updated_at"`
+	// DiscountPercent is omitted when the promo carries no discount badge: the
+	// client renders no «−N%» badge, never a made-up 0%.
+	DiscountPercent *int   `json:"discount_percent,omitempty"`
+	Status          string `json:"status"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
 func adminResponse(p domain.Promo) promoResponse {
@@ -304,6 +312,7 @@ func adminResponse(p domain.Promo) promoResponse {
 		EndsAt:          p.EndsAt.Format(time.RFC3339),
 		Terms:           p.Terms,
 		CoverImageURL:   p.CoverImageURL,
+		DiscountPercent: p.DiscountPercent,
 		Status:          string(p.Status),
 		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),

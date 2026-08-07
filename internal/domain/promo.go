@@ -54,9 +54,13 @@ type Promo struct {
 	// picture: the API omits the field rather than inventing a placeholder, and
 	// the client draws its own.
 	CoverImageURL *string
-	Status        PromoStatus
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// DiscountPercent is the whole-percent price cut the card's «−30%» badge
+	// renders, 0..100. Nil means the promo is not a percentage-off offer: the
+	// API omits the field and the client draws no badge (a NULL is not a 0%).
+	DiscountPercent *int
+	Status          PromoStatus
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // PromoRepository persists restaurant promos. Get* return ErrNotFound when
