@@ -220,6 +220,11 @@ var routeTiers = map[string]RateLimitTier{
 	"POST /api/v1/bookings":                    TierStrict,
 	"POST /api/v1/bookings/:id/payment":        TierStrict,
 	"POST /api/v1/bookings/:id/payment/settle": TierStrict,
+	// Admin image upload: an authed multipart write that lands up to 8 MiB in R2
+	// per request. TierDefault (the authed floor) is far too generous for a
+	// storage-cost/DoS vector — strict-throttle it like the other side-effecting
+	// writes above, even though it sits behind Auth+RequireRole.
+	"POST /api/v1/admin/media/images": TierStrict,
 
 	// Public reading: browsing traffic.
 	"GET /api/v1/restaurants":     TierSoft,

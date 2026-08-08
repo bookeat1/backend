@@ -68,6 +68,15 @@ func NewHandler(store Store) *Handler { return &Handler{store: store} }
 // A plain guest (RoleUser) is forbidden.
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	grp := rg.Group("")
+	// TODO(security): this is a COARSE, global-role gate — any staff user
+	// (RoleRestaurant, which includes a hostess) or the superadmin may upload an
+	// object that is not yet attached to any restaurant. That is a known
+	// first-version tradeoff: PermRestaurantManage cannot be evaluated without a
+	// restaurant id in the path, and the upload alone attaches nothing (the
+	// restaurant-scoped, RBAC-gated write happens when the URL is saved onto a
+	// promo/story). Proper fix = a media-scoped permission (or move the write
+	// into a restaurant-scoped usecase). Deferred — do not widen or narrow here
+	// without that design.
 	grp.Use(middleware.RequireRole(domain.RoleAdmin, domain.RoleRestaurant))
 	grp.POST("/admin/media/images", h.upload)
 }

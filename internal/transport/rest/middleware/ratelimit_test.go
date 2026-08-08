@@ -250,6 +250,17 @@ func TestRouteTiers_OTPRoutesAreStrict(t *testing.T) {
 	}
 }
 
+// TestRouteTiers_MediaUploadIsStrict pins the admin image-upload route to
+// TierStrict rather than the authed TierDefault floor: it lands up to 8 MiB in
+// R2 per request, a storage-cost/DoS vector. The key must match FullPath()
+// exactly (with the /api/v1 prefix).
+func TestRouteTiers_MediaUploadIsStrict(t *testing.T) {
+	const key = "POST /api/v1/admin/media/images"
+	if got := routeTiers[key]; got != TierStrict {
+		t.Errorf("routeTiers[%q] = %q, want %q", key, got, TierStrict)
+	}
+}
+
 // TestRateLimit_EndToEndWithInMemoryLimiter exercises RateLimit wired to the
 // real InMemoryLimiter (not a fake), against a real gin engine: the
 // sensitive-tier budget triggers after its limit, then recovers once the
