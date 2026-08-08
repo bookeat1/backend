@@ -1,6 +1,8 @@
 package stories
 
 import (
+	"time"
+
 	"backend-core/internal/domain"
 )
 
@@ -20,5 +22,28 @@ func storyToResponse(s *domain.Story) storyResponse {
 		ImageURL:  s.ImageURL,
 		Caption:   s.Caption,
 		SortOrder: s.SortOrder,
+	}
+}
+
+// adminStoryResponse is a story as the venue cabinet sees it: the public shape
+// plus is_active (the cabinet lists retired cards too) and created_at. Same
+// caption-omitted-when-nil convention.
+type adminStoryResponse struct {
+	ID        string  `json:"id"`
+	ImageURL  string  `json:"image_url"`
+	Caption   *string `json:"caption,omitempty"`
+	SortOrder int     `json:"sort_order"`
+	IsActive  bool    `json:"is_active"`
+	CreatedAt string  `json:"created_at"`
+}
+
+func adminStoryToResponse(s *domain.Story) adminStoryResponse {
+	return adminStoryResponse{
+		ID:        s.ID.String(),
+		ImageURL:  s.ImageURL,
+		Caption:   s.Caption,
+		SortOrder: s.SortOrder,
+		IsActive:  s.IsActive,
+		CreatedAt: s.CreatedAt.Format(time.RFC3339),
 	}
 }

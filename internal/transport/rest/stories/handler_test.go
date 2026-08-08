@@ -12,13 +12,23 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	uc "backend-core/internal/usecase/stories"
 )
 
 // fakeFacade: one settable err drives the error→HTTP mapping, canned return
-// values drive the happy path (mirrors the reviews handler test).
+// values drive the happy path (mirrors the reviews handler test). The admin
+// methods are exercised by the admin router in admin_handler_test.go.
 type fakeFacade struct {
 	err error
 	rv  []domain.Story
+
+	// admin knobs
+	story        *domain.Story   // canned Create/Update result
+	adminErr     error           // overrides err for admin methods when set
+	reordered    []uuid.UUID     // last ReorderStories argument
+	reorderedRID uuid.UUID       // last ReorderStories restaurant id
+	created      *uc.CreateInput // last CreateStory input
+	updated      *uc.UpdateInput // last UpdateStory input
 }
 
 func (f *fakeFacade) List(context.Context, uuid.UUID) ([]domain.Story, error) {
@@ -26,6 +36,46 @@ func (f *fakeFacade) List(context.Context, uuid.UUID) ([]domain.Story, error) {
 		return nil, f.err
 	}
 	return f.rv, nil
+}
+
+func (f *fakeFacade) adminError() error {
+	if f.adminErr != nil {
+		return f.adminErr
+	}
+	return f.err
+}
+
+func (f *fakeFacade) ListForAdmin(context.Context, uc.Actor, uuid.UUID) ([]domain.Story, error) {
+	if err := f.adminError(); err != nil {
+		return nil, err
+	}
+	return f.rv, nil
+}
+
+func (f *fakeFacade) CreateStory(_ context.Context, _ uc.Actor, in uc.CreateInput) (*domain.Story, error) {
+	f.created = &in
+	if err := f.adminError(); err != nil {
+		return nil, err
+	}
+	return f.story, nil
+}
+
+func (f *fakeFacade) UpdateStory(_ context.Context, _ uc.Actor, _ uuid.UUID, in uc.UpdateInput) (*domain.Story, error) {
+	f.updated = &in
+	if err := f.adminError(); err != nil {
+		return nil, err
+	}
+	return f.story, nil
+}
+
+func (f *fakeFacade) DeleteStory(context.Context, uc.Actor, uuid.UUID) error {
+	return f.adminError()
+}
+
+func (f *fakeFacade) ReorderStories(_ context.Context, _ uc.Actor, rid uuid.UUID, orderedIDs []uuid.UUID) error {
+	f.reorderedRID = rid
+	f.reordered = orderedIDs
+	return f.adminError()
 }
 
 func newRouter(f *fakeFacade) *gin.Engine {
