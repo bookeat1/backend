@@ -16,6 +16,7 @@ import (
 	"backend-core/internal/infrastructure/amplitude"
 	"backend-core/internal/infrastructure/expopush"
 	"backend-core/internal/infrastructure/legacysource"
+	"backend-core/internal/infrastructure/mediastore"
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
 	"backend-core/internal/infrastructure/payment/freedompay"
@@ -176,6 +177,13 @@ type Deps struct {
 	// the transport layer can build the FreedomPay CallbackURL without
 	// importing bootstrap.Config.
 	PaymentsPublicBaseURL string
+
+	// MediaStore is the R2 object store backing the admin image-upload
+	// endpoint. It is OPTIONAL: nil when R2 is not configured (missing creds or
+	// no R2_PUBLIC_BASE), in which case the media routes answer 503 instead of
+	// the server refusing to boot. Never nil-panics anywhere — the media
+	// handler checks for nil.
+	MediaStore *mediastore.Store
 }
 
 // NewDeps constructs repositories, infrastructure clients, and usecases.
@@ -381,6 +389,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// lives in the usecase.
 	payoutUC := payouts.NewUseCase(newPayoutPorts(db, restaurantManagers, txm, log), newPayoutsConfig(cfg), log)
 
+	// Admin image upload (R2). OPTIONAL by design: if the R2 credentials or the
+	// public base are not set, we log once and leave MediaStore nil — the media
+	// routes then return 503 "not configured" instead of the server failing to
+	// boot. This is the same "an optional dependency being absent is not a bug"
+	// posture as the payout gateway above.
+	mediaStore := newMediaStore(log)
+
 	return &Deps{
 		AuthFacade:            authFacade,
 		AuthOTP:               authOTP,
@@ -461,6 +476,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentDepositCancel:  paymentDepositCancel,
 		Payouts:               payoutUC,
 		PaymentsPublicBaseURL: cfg.Payments.PublicBaseURL,
+		MediaStore:            mediaStore,
 	}, nil
 }
 
@@ -567,6 +583,32 @@ func newPayoutGateway(log *slog.Logger) domain.PayoutGateway {
 	}
 	log.Warn("freedompay payout gateway ENABLED — payouts will move real money; ensure the payout product is verified on the sandbox")
 	return gw
+}
+
+// newMediaStore builds the R2-backed object store for the admin image-upload
+// endpoint, or returns nil (logged) when R2 is not configured. Returning nil is
+// a supported, non-fatal state: the server still boots and the media routes
+// answer 503. A public base is required in addition to the credentials —
+// without it PutOriginal could succeed but we would have no URL to return, so
+// we treat "no public base" as "not configured" here rather than shipping a
+// half-working upload.
+func newMediaStore(log *slog.Logger) *mediastore.Store {
+	cfg, err := mediastore.ConfigFromEnv()
+	if err != nil {
+		log.Info("media upload disabled: R2 not configured", slog.String("reason", err.Error()))
+		return nil
+	}
+	if cfg.PublicBase == "" {
+		log.Info("media upload disabled: R2_PUBLIC_BASE is not set (no public URL to return)")
+		return nil
+	}
+	store, err := mediastore.New(context.Background(), cfg)
+	if err != nil {
+		log.Warn("media upload disabled: building the R2 client failed", slog.String("reason", err.Error()))
+		return nil
+	}
+	log.Info("media upload enabled", slog.String("bucket", cfg.Bucket), slog.String("public_base", cfg.PublicBase))
+	return store
 }
 
 // NewPayoutReconciler wires the background payout reconciliation worker

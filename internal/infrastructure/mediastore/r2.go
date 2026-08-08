@@ -34,6 +34,15 @@ import (
 // the key is constructed.
 const CacheControl = "public, max-age=31536000, immutable"
 
+// UploadsPrefix is the single top-level prefix under which every ORIGINAL
+// uploaded through the admin panel lives (PutOriginal). It is the write-side
+// twin of media.DerivedPrefix: the derived guard keeps generated thumbnails
+// out of the originals' namespace, this one keeps admin uploads in a namespace
+// of their own and out of the legacy `restaurants/`, `menu/`, `events/` trees.
+// A key that does not start here is refused, so no bug in an upload path can
+// land bytes on top of a legacy original.
+const UploadsPrefix = "uploads/"
+
 // Config is the connection to one bucket. Every field comes from the
 // environment; nothing here is ever logged.
 type Config struct {
@@ -41,6 +50,12 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 	Bucket    string
+	// PublicBase is the read-only public origin the bucket is served from
+	// (managed r2.dev or a custom domain), no trailing slash. It is NOT a
+	// credential and is the one field here safe to log. Empty when the bucket
+	// has no public base configured — a store built that way can still write
+	// (backfill) but PublicURL returns "".
+	PublicBase string
 }
 
 // ConfigFromEnv reads the R2 credentials.
@@ -49,12 +64,20 @@ type Config struct {
 //	R2_ACCESS_KEY_ID
 //	R2_SECRET_ACCESS_KEY
 //	R2_BUCKET             default "book-eat-media"
+//	R2_PUBLIC_BASE        public read origin, e.g. https://pub-<id>.r2.dev
+//
+// Only the three credentials are mandatory. R2_BUCKET defaults to
+// "book-eat-media"; R2_PUBLIC_BASE is optional here (the backfill tool never
+// needs it) — the upload feature that does need it checks Config.PublicBase
+// itself and stays disabled when it is empty, rather than failing every other
+// R2 caller.
 func ConfigFromEnv() (Config, error) {
 	c := Config{
-		Endpoint:  strings.TrimSpace(os.Getenv("R2_ENDPOINT")),
-		AccessKey: strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
-		SecretKey: strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
-		Bucket:    strings.TrimSpace(os.Getenv("R2_BUCKET")),
+		Endpoint:   strings.TrimSpace(os.Getenv("R2_ENDPOINT")),
+		AccessKey:  strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
+		SecretKey:  strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
+		Bucket:     strings.TrimSpace(os.Getenv("R2_BUCKET")),
+		PublicBase: strings.TrimRight(strings.TrimSpace(os.Getenv("R2_PUBLIC_BASE")), "/"),
 	}
 	if c.Bucket == "" {
 		c.Bucket = "book-eat-media"
@@ -77,8 +100,9 @@ func ConfigFromEnv() (Config, error) {
 
 // Store is an R2 bucket behind the media.Store port.
 type Store struct {
-	client *s3.Client
-	bucket string
+	client     *s3.Client
+	bucket     string
+	publicBase string
 	// readOnly refuses every Put. Set it when a tool has no business writing;
 	// it is a second lock on top of the caller's dry-run flag.
 	readOnly bool
@@ -106,7 +130,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		// bucket name into a hostname that does not exist.
 		o.UsePathStyle = true
 	})
-	return &Store{client: client, bucket: cfg.Bucket}, nil
+	return &Store{client: client, bucket: cfg.Bucket, publicBase: cfg.PublicBase}, nil
 }
 
 // ReadOnly returns a view of the store that refuses every write.
@@ -210,6 +234,56 @@ func (s *Store) Put(ctx context.Context, key string, body []byte, contentType st
 		return fmt.Errorf("put %q: %w", key, err)
 	}
 	return nil
+}
+
+// ErrNotUpload is returned by PutOriginal for a key outside the uploads/
+// prefix. It is the write-side twin of media.ErrNotDerived: reaching it means
+// a caller tried to write an original somewhere it must never go, and the write
+// must not happen.
+var ErrNotUpload = errors.New("mediastore: refusing to write outside the uploads/ prefix")
+
+// PutOriginal writes an ORIGINAL uploaded through the admin panel.
+//
+// It is the sibling of Put, deliberately NOT the same method: Put refuses
+// anything outside derived/ (thumbnails only), PutOriginal refuses anything
+// outside uploads/ (admin originals only). Neither can write into the other's
+// namespace, and neither can touch the legacy `restaurants/`/`menu/`/`events/`
+// originals — the two guards partition the bucket's writable surface into two
+// disjoint prefixes and leave the legacy tree unwritable by construction.
+//
+// CacheControl is the same year-immutable value as derivatives: the key carries
+// a random hex suffix, so a given uploads/ key names one immutable set of bytes
+// forever (see the media rest handler's key generator).
+func (s *Store) PutOriginal(ctx context.Context, key string, body []byte, contentType string) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	if !strings.HasPrefix(key, UploadsPrefix) {
+		return fmt.Errorf("%w: %q", ErrNotUpload, key)
+	}
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:       aws.String(s.bucket),
+		Key:          aws.String(key),
+		Body:         strings.NewReader(string(body)),
+		ContentType:  aws.String(contentType),
+		CacheControl: aws.String(CacheControl),
+	})
+	if err != nil {
+		return fmt.Errorf("put original %q: %w", key, err)
+	}
+	return nil
+}
+
+// PublicURL is the public read URL of an object at key, or "" when this store
+// has no public base configured. The join is trivial (base + "/" + key)
+// because R2 serves an object at key `<k>` under `<base>/<k>` verbatim; key is
+// never percent-escaped here since the keys we generate are already
+// URL-safe (digits, slashes, hex, a dot).
+func (s *Store) PublicURL(key string) string {
+	if s.publicBase == "" {
+		return ""
+	}
+	return s.publicBase + "/" + key
 }
 
 // Bucket is the bucket name, for a tool that wants to print what it is about

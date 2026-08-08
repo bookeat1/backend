@@ -25,6 +25,7 @@ import (
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
 	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
+	mediarest "backend-core/internal/transport/rest/media"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
 	myrestaurantsrest "backend-core/internal/transport/rest/myrestaurants"
@@ -223,6 +224,17 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler := promosrest.NewHandler(deps.PromosFacade)
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
+
+	// Admin image upload (R2). Mounts on the authed group; a further RequireRole
+	// gate (staff or superadmin) is applied inside RegisterRoutes. deps.MediaStore
+	// is a *mediastore.Store that may be nil when R2 is unconfigured — pass it
+	// through a nil-safe interface var so the handler sees a TRUE nil interface
+	// (a typed-nil pointer boxed in an interface is not == nil) and answers 503.
+	var mediaStore mediarest.Store
+	if deps.MediaStore != nil {
+		mediaStore = deps.MediaStore
+	}
+	mediarest.NewHandler(mediaStore).RegisterRoutes(authed)
 
 	// Gastroguide — the home screen's editorial collections. Plain public group,
 	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the
