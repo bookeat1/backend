@@ -340,7 +340,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
 		restaurants.WithVenueState(venueState))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
-	storiesFacade := stories.NewFacade(storyItems)
+	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path

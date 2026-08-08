@@ -189,6 +189,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// group costs would buy nothing. The curating venue cabinet is a later task.
 	storiesHandler := storiesrest.NewHandler(deps.StoriesFacade)
 	storiesHandler.RegisterPublic(api)
+	// Admin CRUD/reorder for the story rail. Same authenticated group and same
+	// in-usecase RBAC gate (PermRestaurantManage at the story's own restaurant)
+	// as the promos/events admin routes, so no RequireRestaurantManager here.
+	storiesHandler.RegisterAdminRoutes(authed)
 
 	// Reviews & ratings. Public: a restaurant's published reviews + aggregate
 	// rating (no auth). Guest own-review + staff reply/moderation mount on the
