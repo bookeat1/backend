@@ -142,6 +142,7 @@ func (h *Handler) create(c *gin.Context) {
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
 		Tags:             req.Tags,
+		Images:           req.Images,
 		RefundPolicy:     req.refundPolicy(),
 	})
 	if err != nil {
@@ -189,6 +190,7 @@ func (h *Handler) update(c *gin.Context) {
 		TicketPriceMinor: req.TicketPriceMinor,
 		Capacity:         req.Capacity,
 		Tags:             req.Tags,
+		Images:           req.Images,
 		RefundPolicy:     refundPolicy,
 	})
 	if err != nil {
@@ -398,6 +400,10 @@ type eventRequest struct {
 	// The «Афиша» chips ("Бранч", "Живая музыка", ...). The usecase trims blanks
 	// and caps the count; absent/empty means the card draws no chips.
 	Tags []string `json:"tags"`
+	// Images — галерея события БЕЗ обложки, в порядке редактора. Отсутствующий
+	// или пустой список очищает галерею (запись — полная замена, как и всё
+	// остальное в этой структуре).
+	Images []string `json:"images"`
 	// The venue's own refund rules for this event. POINTERS on purpose: this is a
 	// full-replace payload, and a cabinet build that predates the feature sends
 	// the event without these fields. On create, absent means the conservative
@@ -480,6 +486,10 @@ type eventResponse struct {
 	// null, never omitted): the app renders a chip row and an absent field would
 	// read as "unknown".
 	Tags []string `json:"tags"`
+	// Images — дополнительные фотографии события, обложки среди них НЕТ. Всегда
+	// массив (пустой, если фотографий нет): клиент рисует ленту и отсутствующее
+	// поле читалось бы как «неизвестно».
+	Images []string `json:"images"`
 	// The refund rules a guest must be able to read BEFORE buying. Always
 	// present (never omitempty): "false" is a rule too, and an absent field
 	// would read as "unknown" in the app.
@@ -519,6 +529,7 @@ func adminResponse(e domain.Event) eventResponse {
 		TicketPriceMinor: e.TicketPriceMinor,
 		Capacity:         e.Capacity,
 		Tags:             tagsOrEmpty(e.Tags),
+		Images:           tagsOrEmpty(e.Images),
 
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,

@@ -352,3 +352,51 @@ func i18nFromDB(b []byte) domain.I18n {
 	}
 	return m
 }
+
+// ReplaceImages rewrites an event's gallery in one transaction-visible pass:
+// the old rows go, the new ones land with their index as `position`. Delete +
+// insert rather than a diff because the set is small (a handful of photos) and
+// the editor sends the whole ordered list — reconciling it row by row would be
+// more code for the same result.
+func (r *Repository) ReplaceImages(ctx context.Context, eventID uuid.UUID, urls []string) error {
+	q := sqltx.From(ctx, r.pool)
+	if _, err := q.Exec(ctx, `DELETE FROM event_images WHERE event_id=$1`, eventID); err != nil {
+		return fmt.Errorf("clear event images: %w", err)
+	}
+	for i, url := range urls {
+		if _, err := q.Exec(ctx,
+			`INSERT INTO event_images (id, event_id, image_url, position) VALUES ($1,$2,$3,$4)`,
+			uuid.New(), eventID, url, i); err != nil {
+			return fmt.Errorf("insert event image: %w", err)
+		}
+	}
+	return nil
+}
+
+// ImagesByEvent loads the galleries of several events in ONE query. The map has
+// no entry for an event without photos — an absent key and an empty slice mean
+// the same thing to every caller, and building empty slices for the majority
+// would be waste.
+func (r *Repository) ImagesByEvent(ctx context.Context, eventIDs []uuid.UUID) (map[uuid.UUID][]string, error) {
+	out := make(map[uuid.UUID][]string, len(eventIDs))
+	if len(eventIDs) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT event_id, image_url FROM event_images
+		 WHERE event_id = ANY($1)
+		 ORDER BY event_id, position, created_at`, eventIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list event images: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var url string
+		if err := rows.Scan(&id, &url); err != nil {
+			return nil, fmt.Errorf("scan event image: %w", err)
+		}
+		out[id] = append(out[id], url)
+	}
+	return out, rows.Err()
+}

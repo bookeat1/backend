@@ -60,6 +60,8 @@ type CreateInput struct {
 	CoverImageURL   *string
 	DiscountPercent *int
 	Status          domain.PromoStatus
+	// Images — галерея акции в порядке редактора, без обложки.
+	Images []string
 }
 
 // UpdateInput carries a promo's mutable fields (full replace).
@@ -74,6 +76,8 @@ type UpdateInput struct {
 	CoverImageURL   *string
 	DiscountPercent *int
 	Status          domain.PromoStatus
+	// Images заменяет галерею целиком; пустой список её очищает.
+	Images []string
 }
 
 type facade struct {
@@ -115,6 +119,13 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if err := f.repo.Create(ctx, p); err != nil {
 		return nil, err
 	}
+	// Галерея — отдельная таблица, пишется после того, как акция получила id.
+	// Ошибка тут не отменяет саму акцию: она уже создана и показывается с
+	// обложкой (см. тот же порядок в usecase/events).
+	if err := f.repo.ReplaceImages(ctx, p.ID, normalizeImages(in.Images)); err != nil {
+		return nil, err
+	}
+	p.Images = normalizeImages(in.Images)
 	return p, nil
 }
 
@@ -164,6 +175,10 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	if err := f.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
+	if err := f.repo.ReplaceImages(ctx, p.ID, normalizeImages(in.Images)); err != nil {
+		return nil, err
+	}
+	p.Images = normalizeImages(in.Images)
 	return p, nil
 }
 
@@ -186,8 +201,29 @@ func (f *facade) GetAdmin(ctx context.Context, actor Actor, promoID uuid.UUID) (
 	if err := f.authorize(ctx, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
+	if byID, err := f.repo.ImagesByPromo(ctx, []uuid.UUID{p.ID}); err == nil {
+		p.Images = byID[p.ID]
+	}
 	return p, nil
 }
+
+// normalizeImages — то же правило, что у событий: пустые строки выбрасываем,
+// длину ограничиваем.
+func normalizeImages(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if trimmed := strings.TrimSpace(u); trimmed != "" {
+			out = append(out, trimmed)
+		}
+		if len(out) == maxGalleryImages {
+			break
+		}
+	}
+	return out
+}
+
+// maxGalleryImages — потолок на галерею одной акции.
+const maxGalleryImages = 20
 
 func (f *facade) ListAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID, statuses []domain.PromoStatus, page, perPage int) ([]domain.Promo, int, error) {
 	if err := f.authorize(ctx, actor, restaurantID); err != nil {

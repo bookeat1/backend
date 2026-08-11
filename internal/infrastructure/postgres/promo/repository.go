@@ -228,3 +228,45 @@ func i18nFromDB(b []byte) domain.I18n {
 	}
 	return m
 }
+
+// ReplaceImages rewrites a promo's gallery — see the event repository's twin
+// for why this is a delete-then-insert and not a row-by-row diff.
+func (r *Repository) ReplaceImages(ctx context.Context, promoID uuid.UUID, urls []string) error {
+	q := sqltx.From(ctx, r.pool)
+	if _, err := q.Exec(ctx, `DELETE FROM promo_images WHERE promo_id=$1`, promoID); err != nil {
+		return fmt.Errorf("clear promo images: %w", err)
+	}
+	for i, url := range urls {
+		if _, err := q.Exec(ctx,
+			`INSERT INTO promo_images (id, promo_id, image_url, position) VALUES ($1,$2,$3,$4)`,
+			uuid.New(), promoID, url, i); err != nil {
+			return fmt.Errorf("insert promo image: %w", err)
+		}
+	}
+	return nil
+}
+
+// ImagesByPromo loads the galleries of several promos in one query.
+func (r *Repository) ImagesByPromo(ctx context.Context, promoIDs []uuid.UUID) (map[uuid.UUID][]string, error) {
+	out := make(map[uuid.UUID][]string, len(promoIDs))
+	if len(promoIDs) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT promo_id, image_url FROM promo_images
+		 WHERE promo_id = ANY($1)
+		 ORDER BY promo_id, position, created_at`, promoIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list promo images: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var url string
+		if err := rows.Scan(&id, &url); err != nil {
+			return nil, fmt.Errorf("scan promo image: %w", err)
+		}
+		out[id] = append(out[id], url)
+	}
+	return out, rows.Err()
+}

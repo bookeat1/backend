@@ -1152,3 +1152,11 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 }
 
 func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
+
+// Галерея в этих тестах не участвует: фейк принимает запись и отдаёт пустую
+// выборку — ровно столько, сколько нужно, чтобы удовлетворить интерфейс.
+func (f *fakeEventRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakeEventRepo) ImagesByEvent(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}

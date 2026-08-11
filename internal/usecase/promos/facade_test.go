@@ -373,3 +373,10 @@ func TestUpdate_ChangingTheDiscountDemotesFromTheFeed(t *testing.T) {
 		t.Fatalf("removing the discount must demote as well, got %v", feed.demoted)
 	}
 }
+
+// См. комментарий у фейка событий: галерея в этих тестах не проверяется.
+func (f *fakePromoRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakePromoRepo) ImagesByPromo(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}
