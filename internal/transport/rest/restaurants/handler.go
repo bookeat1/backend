@@ -46,8 +46,10 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
-// RegisterAdminGlobal mounts admin-only routes: creating a new restaurant.
+// RegisterAdminGlobal mounts admin-only routes: the superadmin catalog listing
+// and creating a new restaurant.
 func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
+	rg.GET("/admin/restaurants", h.adminList)
 	rg.POST("/restaurants", h.create)
 }
 
@@ -86,6 +88,36 @@ func staffActorFrom(c *gin.Context) (uc.Actor, bool) {
 		return uc.Actor{}, false
 	}
 	return uc.Actor{UserID: au.ID, Role: domain.Role(au.Role)}, true
+}
+
+// adminList is the catalog as its OWNER sees it: hidden venues included.
+//
+// The public listing filters `is_active = true`, which is right for a guest and
+// wrong for the person who hid the venue — without this they could hide a venue
+// and never find it again. Same filters and same response shape as the public
+// list, so the panel reuses one renderer; the only difference is that a hidden
+// venue is present and says so through `is_active`.
+func (h *Handler) adminList(c *gin.Context) {
+	f := domain.RestaurantFilter{Search: c.Query("search"), IncludeInactive: true}
+	if v := c.Query("city"); v != "" {
+		city := domain.City(v)
+		f.City = &city
+	}
+	f.Page, _ = strconv.Atoi(c.Query("page"))
+	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
+
+	items, total, err := h.facade.List(c.Request.Context(), f, domain.VenueStateFilter{})
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	lang := resolveLocale(c)
+	out := make([]restaurantResponse, 0, len(items))
+	for _, it := range items {
+		out = append(out, listItemToResponse(it, lang))
+	}
+	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
+	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
 }
 
 func (h *Handler) list(c *gin.Context) {

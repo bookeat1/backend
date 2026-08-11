@@ -183,6 +183,12 @@ type RestaurantFilter struct {
 	// evaluated in Go, after the rows are read, so paging before it would page
 	// the wrong set and report a page-local total. No transport layer sets it.
 	Unpaginated bool
+	// IncludeInactive lifts the `is_active = true` restriction every public
+	// listing carries. ONLY the superadmin catalog screen sets it: a hidden
+	// venue has to be visible to whoever hid it, or it can never be brought
+	// back. Guest-facing paths must leave this false — an inactive venue is
+	// unbookable, so showing one to a guest is a dead end.
+	IncludeInactive bool
 }
 
 // RestaurantSearchFilter narrows a full-text restaurant search. The zero value
