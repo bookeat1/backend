@@ -235,7 +235,14 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Restaur
 }
 
 func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
-	where := []string{"r.is_active = true"}
+	// The admin catalog asks for hidden venues too (see IncludeInactive); every
+	// other caller gets the active-only listing this method is named after.
+	// "true" keeps the WHERE clause valid when the admin listing asks for every
+	// venue and no other filter is set.
+	where := []string{"true"}
+	if !f.IncludeInactive {
+		where = append(where, "r.is_active = true")
+	}
 	args := []any{}
 	add := func(cond string, val any) {
 		args = append(args, val)
