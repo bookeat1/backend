@@ -434,3 +434,89 @@ func TestCategories(t *testing.T) {
 		t.Fatalf("unknown category: total=%d err=%v", total, err)
 	}
 }
+
+// A block illustrated with an EVENT carries the event's own title and text, the
+// venue's Instagram, and stays a link to the venue — the «Статья» design draws
+// exactly that. Read against a real Postgres because every field here comes
+// from a join, and a join that names a column wrong compiles perfectly.
+func TestGetCollection_VenueBlockCarriesItsEventAndInstagram(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	testdb.Truncate(t, pool, "events", "restaurant_social_links")
+
+	venue := seedVenue(t, pool, ctx, "Mongol", true)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_social_links (id, restaurant_id, type, url)
+		 VALUES ($1, $2, 'instagram', 'https://instagram.com/mongol.almaty')`,
+		uuid.New(), venue); err != nil {
+		t.Fatalf("seed social link: %v", err)
+	}
+
+	eventID := uuid.New()
+	starts := time.Date(2026, 8, 20, 18, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO events (id, restaurant_id, title, description, starts_at, ends_at, status, cover_image_url)
+		 VALUES ($1, $2, 'Коктейльная среда', 'Еженедельное событие', $3, $4, 'published', 'https://x/cover.jpg')`,
+		eventID, venue, starts, starts.Add(3*time.Hour)); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	collection := seedCollection(t, pool, ctx, collectionSeed{
+		slug: "mongol", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(time.Now().Add(-time.Hour)),
+	})
+	addVenue(t, pool, ctx, collection, venue, 1)
+	if _, err := pool.Exec(ctx,
+		`UPDATE gastroguide_collection_venues SET event_id = $1
+		 WHERE collection_id = $2 AND restaurant_id = $3`, eventID, collection, venue); err != nil {
+		t.Fatalf("attach event to the block: %v", err)
+	}
+
+	got, err := repo.GetPublishedCollectionBySlug(ctx, "mongol", time.Now())
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	if len(got.Venues) != 1 {
+		t.Fatalf("venues = %d, want 1", len(got.Venues))
+	}
+	block := got.Venues[0]
+	if block.Instagram != "https://instagram.com/mongol.almaty" {
+		t.Fatalf("instagram = %q, want the venue's own link", block.Instagram)
+	}
+	if block.Highlight == nil {
+		t.Fatal("block lost its event: highlight is nil")
+	}
+	if block.Highlight.Kind != domain.GuideHighlightEvent || block.Highlight.ID != eventID {
+		t.Fatalf("highlight = %s/%s, want event/%s", block.Highlight.Kind, block.Highlight.ID, eventID)
+	}
+	if block.Highlight.Title != "Коктейльная среда" || block.Highlight.Description != "Еженедельное событие" {
+		t.Fatalf("highlight text = %q / %q, want the event's own", block.Highlight.Title, block.Highlight.Description)
+	}
+	if !block.Highlight.StartsAt.Equal(starts) {
+		t.Fatalf("highlight starts at %s, want %s", block.Highlight.StartsAt, starts)
+	}
+}
+
+// A venue with NO social links and no attached event stays the plain card it
+// was: an empty Instagram, not a stray value borrowed from another venue.
+func TestGetCollection_PlainVenueBlockHasNoHighlightAndNoInstagram(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	testdb.Truncate(t, pool, "events", "restaurant_social_links")
+
+	venue := seedVenue(t, pool, ctx, "Без соцсетей", true)
+	collection := seedCollection(t, pool, ctx, collectionSeed{
+		slug: "plain", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(time.Now().Add(-time.Hour)),
+	})
+	addVenue(t, pool, ctx, collection, venue, 1)
+
+	got, err := repo.GetPublishedCollectionBySlug(ctx, "plain", time.Now())
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	if len(got.Venues) != 1 {
+		t.Fatalf("venues = %d, want 1", len(got.Venues))
+	}
+	if got.Venues[0].Instagram != "" || got.Venues[0].Highlight != nil {
+		t.Fatalf("plain block invented content: %+v", got.Venues[0])
+	}
+}
