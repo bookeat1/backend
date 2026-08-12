@@ -423,3 +423,11 @@ func filterEqual(a, b domain.PublicEventFilter) bool {
 	toEq := (a.To == nil) == (b.To == nil) && (a.To == nil || a.To.Equal(*b.To))
 	return cityEq && ridEq && fromEq && toEq && a.Page == b.Page && a.PerPage == b.PerPage
 }
+
+// Галерея в этих тестах не участвует: фейк принимает запись и отдаёт пустую
+// выборку — ровно столько, сколько нужно, чтобы удовлетворить интерфейс.
+func (f *fakeEventRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakeEventRepo) ImagesByEvent(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}

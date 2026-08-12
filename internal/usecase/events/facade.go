@@ -92,6 +92,9 @@ type CreateInput struct {
 	// are dropped and the list is capped (see normalizeTags); empty means the
 	// card draws no chips.
 	Tags []string
+	// Images — галерея события в порядке редактора, без обложки. Пустой список
+	// означает «галереи нет»; обложка задаётся отдельно (CoverImageURL).
+	Images []string
 	// RefundPolicy is the venue's own ticket-refund rules for this event. The
 	// zero value is the conservative platform default (not refundable) — same
 	// as the migration 0047 backfill, so an old client that does not send the
@@ -118,6 +121,9 @@ type UpdateInput struct {
 	// this struct). Blank entries are dropped and the list is capped; an empty
 	// or absent list clears the chips.
 	Tags []string
+	// Images заменяет галерею целиком, как и остальные поля этой структуры:
+	// пустой или отсутствующий список её очищает.
+	Images []string
 	// RefundPolicy replaces the event's refund rules. Unlike every other field
 	// here, it is OPTIONAL: nil means "leave the rules as they are". Update is a
 	// full replace, and a cabinet build that predates this feature sends the
@@ -139,6 +145,10 @@ type facade struct {
 func NewFacade(repo domain.EventRepository, perms permissionChecker, feed feedModerator) Facade {
 	return &facade{repo: repo, perms: perms, feed: feed, clock: time.Now}
 }
+
+// maxGalleryImages — потолок на галерею одной карточки. Двадцать фотографий
+// гость всё равно не пролистает, а сотня превратит запись в длинную транзакцию.
+const maxGalleryImages = 20
 
 func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*domain.Event, error) {
 	if err := f.authorize(ctx, actor, in.RestaurantID); err != nil {
@@ -173,6 +183,14 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if err := f.repo.Create(ctx, e); err != nil {
 		return nil, err
 	}
+	// Галерея пишется отдельной таблицей и ТОЛЬКО после того, как событие
+	// получило id. Ошибка здесь не откатывает событие: оно уже существует и
+	// показывается с обложкой, а фотографии редактор допишет повторным
+	// сохранением — терять созданное событие из-за картинки хуже.
+	if err := f.repo.ReplaceImages(ctx, e.ID, normalizeImages(in.Images)); err != nil {
+		return nil, err
+	}
+	e.Images = normalizeImages(in.Images)
 	return e, nil
 }
 
@@ -223,6 +241,10 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	if err := f.repo.Update(ctx, e); err != nil {
 		return nil, err
 	}
+	if err := f.repo.ReplaceImages(ctx, e.ID, normalizeImages(in.Images)); err != nil {
+		return nil, err
+	}
+	e.Images = normalizeImages(in.Images)
 	return e, nil
 }
 
@@ -269,6 +291,7 @@ func (f *facade) GetAdmin(ctx context.Context, actor Actor, eventID uuid.UUID) (
 	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
 		return nil, err
 	}
+	f.attachImages(ctx, e)
 	return e, nil
 }
 
@@ -306,7 +329,35 @@ func (f *facade) GetPublic(ctx context.Context, restaurantID, eventID uuid.UUID)
 	if e.RestaurantID != restaurantID || e.Status != domain.EventPublished {
 		return nil, fmt.Errorf("get public event: %w", domain.ErrNotFound)
 	}
+	f.attachImages(ctx, e)
 	return e, nil
+}
+
+// attachImages дочитывает галерею одного события. Ошибку здесь НЕ поднимаем:
+// карточка события живёт и без галереи (у неё есть обложка), а уронить весь
+// экран из-за необязательного блока — плохой размен.
+func (f *facade) attachImages(ctx context.Context, e *domain.Event) {
+	byID, err := f.repo.ImagesByEvent(ctx, []uuid.UUID{e.ID})
+	if err != nil {
+		return
+	}
+	e.Images = byID[e.ID]
+}
+
+// normalizeImages выбрасывает пустые строки и подрезает список: редактор
+// присылает то, что набрал руками, и один случайный пустой слот не должен
+// становиться «фотографией без адреса».
+func normalizeImages(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if trimmed := strings.TrimSpace(u); trimmed != "" {
+			out = append(out, trimmed)
+		}
+		if len(out) == maxGalleryImages {
+			break
+		}
+	}
+	return out
 }
 
 // authorize enforces PermRestaurantManage at restaurantID; a superadmin

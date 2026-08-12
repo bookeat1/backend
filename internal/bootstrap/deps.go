@@ -266,7 +266,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// because nothing in it writes; the editor takes the write repository (which
 	// needs the transaction manager, since attach/detach/reorder are only correct
 	// as a unit) and enforces the superadmin gate itself.
-	gastroguideFacade := gastroguide.NewFacade(gastroguiderepo.New(db))
+	gastroguideFacade := gastroguide.NewFacade(gastroguiderepo.New(db), eventrepo.New(db), promorepo.New(db))
 	gastroguideEditor := gastroguide.NewEditor(gastroguiderepo.NewEditor(db, txm))
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)

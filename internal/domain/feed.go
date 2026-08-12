@@ -130,6 +130,10 @@ type FeedItem struct {
 	// column in migration 0060). Nil means the item has no picture — never a
 	// placeholder URL.
 	CoverImageURL *string
+	// Images is the item's gallery WITHOUT the cover, in the editor's order
+	// (migration 0070). Empty for an item that has no extra photos — the card
+	// then draws the cover alone, never a placeholder.
+	Images []string
 	// Terms is set for promos only (the fine print).
 	Terms string
 	// DiscountPercent is the promo card's «−30%» badge value, 0..100. Set for

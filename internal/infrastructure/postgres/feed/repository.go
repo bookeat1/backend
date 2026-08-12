@@ -42,6 +42,17 @@ var _ domain.FeedRepository = (*Repository)(nil)
 func itemSelect(kind domain.FeedItemKind) string {
 	table, alias := tableFor(kind), "i"
 	cover, terms, discount := alias+".cover_image_url", alias+".terms", alias+".discount_percent"
+	// Галерея (migration 0070) живёт в дочерней таблице, своей у каждого вида.
+	// Читаем её тем же запросом коррелированным подзапросом: карточка ленты
+	// рисует ленту фотографий, и добор по одному запросу на карточку вернул бы
+	// N+1 в самый горячий экран приложения. Порядок — редакторский position,
+	// created_at как устойчивый тай-брейк, как и в остальных чтениях галерей.
+	images := `(SELECT COALESCE(array_agg(g.image_url ORDER BY g.position, g.created_at), '{}'::varchar[])
+			FROM event_images g WHERE g.event_id = ` + alias + `.id)`
+	if kind == domain.FeedItemPromo {
+		images = `(SELECT COALESCE(array_agg(g.image_url ORDER BY g.position, g.created_at), '{}'::varchar[])
+			FROM promo_images g WHERE g.promo_id = ` + alias + `.id)`
+	}
 	if kind == domain.FeedItemEvent {
 		terms = "''::text"
 		discount = "NULL::int"
@@ -52,7 +63,8 @@ func itemSelect(kind domain.FeedItemKind) string {
 		r.city, r.category_id, r.is_active AS venue_is_active, r.hidden_from_home AS venue_hidden_from_home,
 		` + alias + `.title, ` + alias + `.title_i18n, ` + alias + `.description, ` + alias + `.description_i18n,
 		` + alias + `.starts_at, ` + alias + `.ends_at,
-		` + cover + ` AS cover_image_url, ` + terms + ` AS terms, ` + discount + ` AS discount_percent,
+		` + cover + ` AS cover_image_url, ` + images + ` AS images,
+		` + terms + ` AS terms, ` + discount + ` AS discount_percent,
 		` + alias + `.status AS item_status,
 		` + alias + `.feed_status, ` + alias + `.feed_submitted_at, ` + alias + `.feed_reviewed_by,
 		` + alias + `.feed_reviewed_at, ` + alias + `.feed_rejection_reason, ` + alias + `.feed_placement_weight,
@@ -345,7 +357,7 @@ func scanItem(row pgx.Row) (*domain.FeedItem, error) {
 		&it.City, &it.CategoryID, &it.VenueIsActive, &it.VenueHiddenFromHome,
 		&it.Title, &titleI18n, &it.Description, &descI18n,
 		&it.StartsAt, &it.EndsAt,
-		&it.CoverImageURL, &it.Terms, &it.DiscountPercent,
+		&it.CoverImageURL, &it.Images, &it.Terms, &it.DiscountPercent,
 		&it.ItemStatus,
 		&it.Placement.Status, &it.Placement.SubmittedAt, &it.Placement.ReviewedBy,
 		&it.Placement.ReviewedAt, &it.Placement.RejectionReason, &it.Placement.PlacementWeight,
@@ -370,7 +382,7 @@ func scanCandidate(row pgx.Row) (*domain.FeedItem, error) {
 		&it.City, &it.CategoryID, &it.VenueIsActive, &it.VenueHiddenFromHome,
 		&it.Title, &titleI18n, &it.Description, &descI18n,
 		&it.StartsAt, &it.EndsAt,
-		&it.CoverImageURL, &it.Terms, &it.DiscountPercent,
+		&it.CoverImageURL, &it.Images, &it.Terms, &it.DiscountPercent,
 		&it.ItemStatus,
 		&it.Placement.Status, &it.Placement.SubmittedAt, &it.Placement.ReviewedBy,
 		&it.Placement.ReviewedAt, &it.Placement.RejectionReason, &it.Placement.PlacementWeight,

@@ -52,7 +52,11 @@ type Event struct {
 	// "rooftop terrace", "banquet hall". Empty means "at the restaurant".
 	Venue         string
 	CoverImageURL *string
-	Status        EventStatus
+	// Images — дополнительная галерея события в порядке редактора, БЕЗ обложки:
+	// обложка живёт в CoverImageURL и её читают карточки и лента. Пустой срез —
+	// «галереи нет», а не «фотографий нет вообще».
+	Images []string
+	Status EventStatus
 	// Ticketed marks an event that will (in a later increment) sell tickets.
 	Ticketed bool
 	// TicketPriceMinor is the per-ticket price in integer minor units. nil when
@@ -130,6 +134,12 @@ type EventRepository interface {
 	Update(ctx context.Context, e *Event) error
 	// Delete removes an event. Returns ErrNotFound if id is absent.
 	Delete(ctx context.Context, id uuid.UUID) error
+	// ReplaceImages overwrites the event's gallery with urls, in the given
+	// order. An empty slice clears it. The cover is NOT part of this set.
+	ReplaceImages(ctx context.Context, eventID uuid.UUID, urls []string) error
+	// ImagesByEvent loads galleries for several events at once — the collection
+	// screen renders many of them and one query per event would be a burst.
+	ImagesByEvent(ctx context.Context, eventIDs []uuid.UUID) (map[uuid.UUID][]string, error)
 	// ListByRestaurant returns a restaurant's events for the admin cabinet,
 	// optionally filtered to the given statuses (empty = all), newest-start
 	// first with id as a stable tie-breaker, paginated, plus the total count.

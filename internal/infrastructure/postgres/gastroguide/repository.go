@@ -202,7 +202,12 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 		`SELECT cv.restaurant_id, cv.position, cv.note, cv.note_i18n,
 			rest.name, rest.name_i18n, rest.address, rest.address_i18n,
 			rest.cuisine_type, rest.cuisine_type_i18n, rest.city, rest.price_category,
-			img.image_url, rest.is_active
+			img.image_url, rest.is_active,
+			COALESCE(soc.url, '') AS instagram,
+			ev.id, ev.title, ev.title_i18n, ev.description, ev.description_i18n,
+			ev.starts_at, ev.cover_image_url,
+			pr.id, pr.title, pr.title_i18n, pr.description, pr.description_i18n,
+			pr.starts_at, pr.cover_image_url
 		 FROM gastroguide_collection_venues cv
 		 JOIN restaurants rest ON rest.id = cv.restaurant_id
 		 LEFT JOIN LATERAL (
@@ -211,6 +216,18 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 			ORDER BY ri.is_primary DESC, ri.created_at, ri.id
 			LIMIT 1
 		 ) img ON true
+		 -- Инстаграм берём у ЗАВЕДЕНИЯ (в макете подпись «адрес · @инстаграм»),
+		 -- первую подходящую ссылку: у заведения их может быть несколько.
+		 LEFT JOIN LATERAL (
+			SELECT rs.url FROM restaurant_social_links rs
+			WHERE rs.restaurant_id = rest.id AND lower(rs.platform) = 'instagram'
+			ORDER BY rs.created_at, rs.id
+			LIMIT 1
+		 ) soc ON true
+		 -- Событие и акция подтягиваются целиком: заголовок и текст блока в
+		 -- макете принадлежат им, а не заведению.
+		 LEFT JOIN events ev ON ev.id = cv.event_id
+		 LEFT JOIN promos pr ON pr.id = cv.promo_id
 		 WHERE cv.collection_id = $1 AND rest.is_active
 		 ORDER BY cv.position, cv.restaurant_id`, collectionID)
 	if err != nil {
@@ -222,16 +239,27 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 	for rows.Next() {
 		var v domain.GuideCollectionVenue
 		var noteI18n, nameI18n, addrI18n, cuisineI18n []byte
+		var ev, pr highlightRow
 		if err := rows.Scan(&v.RestaurantID, &v.Position, &v.Note, &noteI18n,
 			&v.Name, &nameI18n, &v.Address, &addrI18n,
 			&v.CuisineType, &cuisineI18n, &v.City, &v.PriceCategory, &v.PrimaryImageURL,
-			&v.IsActive); err != nil {
+			&v.IsActive, &v.Instagram,
+			&ev.id, &ev.title, &ev.titleI18n, &ev.description, &ev.descriptionI18n,
+			&ev.startsAt, &ev.cover,
+			&pr.id, &pr.title, &pr.titleI18n, &pr.description, &pr.descriptionI18n,
+			&pr.startsAt, &pr.cover); err != nil {
 			return nil, fmt.Errorf("scan guide collection venue: %w", err)
 		}
 		v.NoteI18n = i18nFromDB(noteI18n)
 		v.NameI18n = i18nFromDB(nameI18n)
 		v.AddressI18n = i18nFromDB(addrI18n)
 		v.CuisineTypeI18n = i18nFromDB(cuisineI18n)
+		// Проверка в схеме гарантирует, что заполнено не больше одного из двух.
+		if h := ev.toDomain(domain.GuideHighlightEvent); h != nil {
+			v.Highlight = h
+		} else if h := pr.toDomain(domain.GuideHighlightPromo); h != nil {
+			v.Highlight = h
+		}
 		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -289,4 +317,38 @@ func i18nFromDB(b []byte) domain.I18n {
 		return nil
 	}
 	return m
+}
+
+// highlightRow — сырые колонки события или акции из LEFT JOIN: все NULL, когда
+// блок ни с чем не связан.
+type highlightRow struct {
+	id              *uuid.UUID
+	title           *string
+	titleI18n       []byte
+	description     *string
+	descriptionI18n []byte
+	startsAt        *time.Time
+	cover           *string
+}
+
+// toDomain собирает подсветку блока; nil, когда джойн ничего не дал. Галерея
+// здесь НЕ читается: её дочитывает usecase одним батчем на всю подборку, чтобы
+// не делать по запросу на каждый блок.
+func (h highlightRow) toDomain(kind domain.GuideHighlightKind) *domain.GuideHighlight {
+	if h.id == nil {
+		return nil
+	}
+	out := &domain.GuideHighlight{Kind: kind, ID: *h.id, CoverImageURL: h.cover}
+	if h.title != nil {
+		out.Title = *h.title
+	}
+	if h.description != nil {
+		out.Description = *h.description
+	}
+	if h.startsAt != nil {
+		out.StartsAt = *h.startsAt
+	}
+	out.TitleI18n = i18nFromDB(h.titleI18n)
+	out.DescriptionI18n = i18nFromDB(h.descriptionI18n)
+	return out
 }

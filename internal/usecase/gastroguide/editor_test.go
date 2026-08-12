@@ -401,3 +401,9 @@ func TestEditor_ReorderPassesTheOrderThroughUntouched(t *testing.T) {
 		t.Error("empty id reached the repository")
 	}
 }
+
+// См. остальные фейки: метод нужен для соответствия интерфейсу, поведение
+// подсветки проверяется отдельно.
+func (r *fakeEditorRepo) SetVenueHighlight(_ context.Context, _, _ uuid.UUID, _, _ *uuid.UUID) error {
+	return nil
+}

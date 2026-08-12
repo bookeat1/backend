@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 )
 
@@ -42,13 +44,19 @@ type ListInput struct {
 }
 
 type facade struct {
-	repo  domain.GastroguideRepository
-	clock func() time.Time
+	repo   domain.GastroguideRepository
+	events domain.EventRepository
+	promos domain.PromoRepository
+	clock  func() time.Time
 }
 
-// NewFacade constructs the gastroguide Facade.
-func NewFacade(repo domain.GastroguideRepository) Facade {
-	return &facade{repo: repo, clock: time.Now}
+// NewFacade constructs the gastroguide Facade. The event and promo
+// repositories are here for ONE thing: a block illustrated by an event or a
+// promo shows its gallery, and those live in their own tables. Both may be nil
+// — then a block simply renders without a photo row, which is what every
+// collection did before galleries existed.
+func NewFacade(repo domain.GastroguideRepository, events domain.EventRepository, promos domain.PromoRepository) Facade {
+	return &facade{repo: repo, events: events, promos: promos, clock: time.Now}
 }
 
 func (f *facade) ListCategories(ctx context.Context, city *domain.City) ([]domain.GuideCategory, error) {
@@ -69,5 +77,61 @@ func (f *facade) GetCollection(ctx context.Context, slug string) (*domain.GuideC
 	if slug == "" {
 		return nil, fmt.Errorf("%w: slug is required", domain.ErrValidation)
 	}
-	return f.repo.GetPublishedCollectionBySlug(ctx, slug, f.clock())
+	detail, err := f.repo.GetPublishedCollectionBySlug(ctx, slug, f.clock())
+	if err != nil {
+		return nil, err
+	}
+	f.attachHighlightGalleries(ctx, detail)
+	return detail, nil
+}
+
+// attachHighlightGalleries дочитывает фотографии событий и акций, которыми
+// проиллюстрированы блоки — ДВУМЯ запросами на всю подборку, а не по одному на
+// блок.
+//
+// Ошибки намеренно проглатываются: галерея — украшение блока, а подборка
+// читается целиком. Уронить статью из-за не загрузившихся фотографий значит
+// показать гостю ошибку там, где можно показать текст.
+func (f *facade) attachHighlightGalleries(ctx context.Context, detail *domain.GuideCollectionDetail) {
+	if detail == nil {
+		return
+	}
+	var eventIDs, promoIDs []uuid.UUID
+	for i := range detail.Venues {
+		h := detail.Venues[i].Highlight
+		if h == nil {
+			continue
+		}
+		switch h.Kind {
+		case domain.GuideHighlightEvent:
+			eventIDs = append(eventIDs, h.ID)
+		case domain.GuideHighlightPromo:
+			promoIDs = append(promoIDs, h.ID)
+		}
+	}
+
+	var eventImages, promoImages map[uuid.UUID][]string
+	if f.events != nil && len(eventIDs) > 0 {
+		if m, err := f.events.ImagesByEvent(ctx, eventIDs); err == nil {
+			eventImages = m
+		}
+	}
+	if f.promos != nil && len(promoIDs) > 0 {
+		if m, err := f.promos.ImagesByPromo(ctx, promoIDs); err == nil {
+			promoImages = m
+		}
+	}
+
+	for i := range detail.Venues {
+		h := detail.Venues[i].Highlight
+		if h == nil {
+			continue
+		}
+		switch h.Kind {
+		case domain.GuideHighlightEvent:
+			h.Images = eventImages[h.ID]
+		case domain.GuideHighlightPromo:
+			h.Images = promoImages[h.ID]
+		}
+	}
 }

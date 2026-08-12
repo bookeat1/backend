@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -223,6 +224,28 @@ type venueResponse struct {
 	City            string  `json:"city"`
 	PriceCategory   string  `json:"price_category,omitempty"`
 	PrimaryImageURL *string `json:"primary_image_url,omitempty"`
+	// Instagram — ссылка на инстаграм ЗАВЕДЕНИЯ; отсутствует, если её нет.
+	// В макете подпись блока выглядит как «адрес · @инстаграм».
+	Instagram string `json:"instagram,omitempty"`
+	// Highlight — событие или акция, которыми проиллюстрирован блок. Поля нет,
+	// когда блок остаётся простой карточкой заведения.
+	Highlight *highlightResponse `json:"highlight,omitempty"`
+}
+
+// highlightResponse — событие или акция внутри блока подборки: заголовок, текст
+// и лента фотографий, которые в макете стоят выше адреса заведения.
+type highlightResponse struct {
+	// Kind — "event" или "promo": по нему клиент выбирает, куда вести по тапу.
+	Kind        string  `json:"kind"`
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Description string  `json:"description,omitempty"`
+	StartsAt    *string `json:"starts_at,omitempty"`
+	// CoverImageURL — обложка события/акции; отсутствует, если её нет.
+	CoverImageURL *string `json:"cover_image_url,omitempty"`
+	// Images — лента фотографий БЕЗ обложки. Всегда массив: клиент рисует
+	// ленту, и null пришлось бы защищать отдельно в каждом месте.
+	Images []string `json:"images"`
 }
 
 func newVenueResponse(v domain.GuideCollectionVenue, lang string) venueResponse {
@@ -236,5 +259,29 @@ func newVenueResponse(v domain.GuideCollectionVenue, lang string) venueResponse 
 		City:            string(v.City),
 		PriceCategory:   string(v.PriceCategory),
 		PrimaryImageURL: v.PrimaryImageURL,
+		Instagram:       v.Instagram,
+		Highlight:       newHighlightResponse(v.Highlight, lang),
 	}
+}
+
+func newHighlightResponse(h *domain.GuideHighlight, lang string) *highlightResponse {
+	if h == nil {
+		return nil
+	}
+	out := &highlightResponse{
+		Kind:          string(h.Kind),
+		ID:            h.ID.String(),
+		Title:         h.TitleI18n.Resolve(lang, h.Title),
+		Description:   h.DescriptionI18n.Resolve(lang, h.Description),
+		CoverImageURL: h.CoverImageURL,
+		Images:        h.Images,
+	}
+	if out.Images == nil {
+		out.Images = []string{}
+	}
+	if !h.StartsAt.IsZero() {
+		formatted := h.StartsAt.UTC().Format(time.RFC3339)
+		out.StartsAt = &formatted
+	}
+	return out
 }

@@ -67,6 +67,9 @@ type Editor interface {
 	// --- membership ---
 	SetCategories(ctx context.Context, actor EditorActor, collectionID uuid.UUID, categoryIDs []uuid.UUID) error
 	AttachVenue(ctx context.Context, actor EditorActor, collectionID uuid.UUID, in AttachVenueInput) error
+	// SetVenueHighlight ставит или снимает событие/акцию у уже добавленного
+	// заведения. Оба nil — снять подсветку.
+	SetVenueHighlight(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, eventID, promoID *uuid.UUID) error
 	DetachVenue(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID) error
 	SetVenueNote(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, note string, noteI18n domain.I18n) error
 	// ReorderVenues writes the intended FINAL order of the collection's venues.
@@ -111,6 +114,9 @@ type AttachVenueInput struct {
 	RestaurantID uuid.UUID
 	Note         string
 	NoteI18n     domain.I18n
+	// EventID / PromoID — необязательная подсветка блока: событие ИЛИ акция.
+	EventID *uuid.UUID
+	PromoID *uuid.UUID
 }
 
 type editor struct {
@@ -305,11 +311,26 @@ func (e *editor) AttachVenue(ctx context.Context, actor EditorActor, collectionI
 	if in.RestaurantID == uuid.Nil {
 		return fmt.Errorf("%w: restaurant_id is required", domain.ErrValidation)
 	}
+	if in.EventID != nil && in.PromoID != nil {
+		return fmt.Errorf("%w: a block may highlight an event or a promo, not both", domain.ErrValidation)
+	}
 	return e.repo.AttachVenue(ctx, collectionID, domain.GuideVenueAttachment{
 		RestaurantID: in.RestaurantID,
 		Note:         strings.TrimSpace(in.Note),
 		NoteI18n:     in.NoteI18n,
+		EventID:      in.EventID,
+		PromoID:      in.PromoID,
 	})
+}
+
+func (e *editor) SetVenueHighlight(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, eventID, promoID *uuid.UUID) error {
+	if err := e.authorize(actor); err != nil {
+		return err
+	}
+	if eventID != nil && promoID != nil {
+		return fmt.Errorf("%w: a block may highlight an event or a promo, not both", domain.ErrValidation)
+	}
+	return e.repo.SetVenueHighlight(ctx, collectionID, restaurantID, eventID, promoID)
 }
 
 func (e *editor) DetachVenue(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID) error {

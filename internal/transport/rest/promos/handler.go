@@ -96,6 +96,7 @@ func (h *Handler) create(c *gin.Context) {
 		CoverImageURL:   req.CoverImageURL,
 		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
+		Images:          req.Images,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -133,6 +134,7 @@ func (h *Handler) update(c *gin.Context) {
 		CoverImageURL:   req.CoverImageURL,
 		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
+		Images:          req.Images,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -263,6 +265,8 @@ type promoRequest struct {
 	// the promo has no discount badge — a valid state, validated in the usecase.
 	DiscountPercent *int   `json:"discount_percent"`
 	Status          string `json:"status"`
+	// Images — галерея акции БЕЗ обложки; полная замена, пустой список очищает.
+	Images []string `json:"images"`
 }
 
 func (r promoRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, ok bool) {
@@ -296,8 +300,10 @@ type promoResponse struct {
 	// client renders no «−N%» badge, never a made-up 0%.
 	DiscountPercent *int   `json:"discount_percent,omitempty"`
 	Status          string `json:"status"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	// Images — дополнительные фотографии акции, без обложки. Всегда массив.
+	Images    []string `json:"images"`
+	CreatedAt string   `json:"created_at"`
+	UpdatedAt string   `json:"updated_at"`
 }
 
 func adminResponse(p domain.Promo) promoResponse {
@@ -314,6 +320,7 @@ func adminResponse(p domain.Promo) promoResponse {
 		CoverImageURL:   p.CoverImageURL,
 		DiscountPercent: p.DiscountPercent,
 		Status:          string(p.Status),
+		Images:          imagesOrEmpty(p.Images),
 		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),
 	}
@@ -326,4 +333,13 @@ func publicResponse(p domain.Promo, lang string) promoResponse {
 	r.TitleI18n = nil
 	r.DescriptionI18n = nil
 	return r
+}
+
+// imagesOrEmpty гарантирует, что галерея в JSON — массив, а не null: клиент
+// рисует ленту и null пришлось бы отдельно защищать в каждом месте.
+func imagesOrEmpty(urls []string) []string {
+	if urls == nil {
+		return []string{}
+	}
+	return urls
 }

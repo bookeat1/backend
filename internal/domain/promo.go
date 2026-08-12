@@ -54,6 +54,9 @@ type Promo struct {
 	// picture: the API omits the field rather than inventing a placeholder, and
 	// the client draws its own.
 	CoverImageURL *string
+	// Images — дополнительная галерея акции в порядке редактора, БЕЗ обложки
+	// (та в CoverImageURL). Пустой срез — «галереи нет».
+	Images []string
 	// DiscountPercent is the whole-percent price cut the card's «−30%» badge
 	// renders, 0..100. Nil means the promo is not a percentage-off offer: the
 	// API omits the field and the client draws no badge (a NULL is not a 0%).
@@ -76,6 +79,11 @@ type PromoRepository interface {
 	Update(ctx context.Context, p *Promo) error
 	// Delete removes a promo. Returns ErrNotFound if id is absent.
 	Delete(ctx context.Context, id uuid.UUID) error
+	// ReplaceImages overwrites the promo's gallery with urls, in order. An empty
+	// slice clears it. The cover is NOT part of this set.
+	ReplaceImages(ctx context.Context, promoID uuid.UUID, urls []string) error
+	// ImagesByPromo loads galleries for several promos at once.
+	ImagesByPromo(ctx context.Context, promoIDs []uuid.UUID) (map[uuid.UUID][]string, error)
 	// ListByRestaurant returns a restaurant's promos for the admin cabinet,
 	// optionally filtered to the given statuses (empty = all), newest-start
 	// first with id as a stable tie-breaker, paginated, plus the total count.

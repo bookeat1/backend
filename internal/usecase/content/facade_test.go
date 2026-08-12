@@ -320,3 +320,18 @@ func TestApprove_MissingWindowRejected(t *testing.T) {
 		t.Fatal("no entity must be created for an incomplete draft")
 	}
 }
+
+// Галерея в этих тестах не участвует: фейк принимает запись и отдаёт пустую
+// выборку — ровно столько, сколько нужно, чтобы удовлетворить интерфейс.
+func (f *fakeEventRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakeEventRepo) ImagesByEvent(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}
+
+// См. комментарий у фейка событий: галерея в этих тестах не проверяется.
+func (f *fakePromoRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakePromoRepo) ImagesByPromo(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}

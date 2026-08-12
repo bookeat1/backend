@@ -53,6 +53,7 @@ func (h *EditorHandler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.POST("/admin/gastroguide/collections/:id/venues", h.attachVenue)
 	rg.PUT("/admin/gastroguide/collections/:id/venues/order", h.reorderVenues)
 	rg.PUT("/admin/gastroguide/collections/:id/venues/:restaurantId/note", h.setVenueNote)
+	rg.PUT("/admin/gastroguide/collections/:id/venues/:restaurantId/highlight", h.setVenueHighlight)
 	rg.DELETE("/admin/gastroguide/collections/:id/venues/:restaurantId", h.detachVenue)
 }
 
@@ -405,8 +406,13 @@ func (h *EditorHandler) attachVenue(c *gin.Context) {
 		response.Error(c.Writer, http.StatusBadRequest, "invalid restaurant id")
 		return
 	}
+	eventID, promoID, ok := parseHighlight(c, req.EventID, req.PromoID)
+	if !ok {
+		return
+	}
 	if err := h.editor.AttachVenue(c.Request.Context(), actor, id, uc.AttachVenueInput{
 		RestaurantID: rid, Note: req.Note, NoteI18n: req.NoteI18n,
+		EventID: eventID, PromoID: promoID,
 	}); err != nil {
 		response.HandleError(c.Writer, err)
 		return
@@ -614,6 +620,9 @@ type setCategoriesRequest struct {
 }
 
 type attachVenueRequest struct {
+	// EventID / PromoID — необязательная подсветка блока: событие ИЛИ акция.
+	EventID      string      `json:"event_id"`
+	PromoID      string      `json:"promo_id"`
 	RestaurantID string      `json:"restaurant_id"`
 	Note         string      `json:"note"`
 	NoteI18n     domain.I18n `json:"note_i18n"`
@@ -734,4 +743,77 @@ type adminVenueResponse struct {
 	PriceCategory   string      `json:"price_category"`
 	PrimaryImageURL *string     `json:"primary_image_url"`
 	IsActive        bool        `json:"is_active"`
+}
+
+// setVenueHighlight ставит или снимает событие/акцию у блока подборки.
+// @Summary     Set the event/promo a collection block highlights (superadmin)
+// @Tags        admin
+// @Accept      json
+// @Produce     json
+// @Security    BearerAuth
+// @Success     204 "no content"
+// @Router      /api/v1/admin/gastroguide/collections/{id}/venues/{restaurantId}/highlight [put]
+func (h *EditorHandler) setVenueHighlight(c *gin.Context) {
+	actor, ok := h.actor(c)
+	if !ok {
+		return
+	}
+	id, ok := pathUUID(c, "id", "invalid collection id")
+	if !ok {
+		return
+	}
+	rid, ok := pathUUID(c, "restaurantId", "invalid restaurant id")
+	if !ok {
+		return
+	}
+	var req venueHighlightRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	eventID, promoID, ok := parseHighlight(c, req.EventID, req.PromoID)
+	if !ok {
+		return
+	}
+	if err := h.editor.SetVenueHighlight(c.Request.Context(), actor, id, rid, eventID, promoID); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// venueHighlightRequest — тело PUT .../highlight. Оба поля пустые = снять
+// подсветку и оставить обычную карточку заведения.
+type venueHighlightRequest struct {
+	EventID string `json:"event_id"`
+	PromoID string `json:"promo_id"`
+}
+
+// parseHighlight разбирает пару «событие или акция». Пустая строка означает
+// «не задано»; заданы оба — это ошибка запроса, а не повод выбирать за
+// редактора.
+func parseHighlight(c *gin.Context, rawEvent, rawPromo string) (eventID, promoID *uuid.UUID, ok bool) {
+	rawEvent = strings.TrimSpace(rawEvent)
+	rawPromo = strings.TrimSpace(rawPromo)
+	if rawEvent != "" && rawPromo != "" {
+		response.Error(c.Writer, http.StatusUnprocessableEntity,
+			"a block may highlight an event or a promo, not both")
+		return nil, nil, false
+	}
+	if rawEvent != "" {
+		parsed, err := uuid.Parse(rawEvent)
+		if err != nil {
+			response.Error(c.Writer, http.StatusBadRequest, "invalid event id")
+			return nil, nil, false
+		}
+		eventID = &parsed
+	}
+	if rawPromo != "" {
+		parsed, err := uuid.Parse(rawPromo)
+		if err != nil {
+			response.Error(c.Writer, http.StatusBadRequest, "invalid promo id")
+			return nil, nil, false
+		}
+		promoID = &parsed
+	}
+	return eventID, promoID, true
 }
