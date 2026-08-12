@@ -61,6 +61,12 @@ type telegramSettings interface {
 	TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error)
 	SetTelegramChatID(ctx context.Context, restaurantID uuid.UUID, chatID string) error
 	ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error
+
+	// Тот же порт обслуживает и WhatsApp: это ОДНА настройка уведомлений
+	// заведения с двумя адресами доставки, а не две независимые сущности.
+	WhatsAppSettings(ctx context.Context, restaurantID uuid.UUID) (domain.WhatsAppSettings, error)
+	SetWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID, phone string) error
+	ClearWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID) error
 }
 
 // menuStore is the slice of menu.Facade this package needs. Every mutating

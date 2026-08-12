@@ -174,6 +174,7 @@ type fakeTelegramSettings struct {
 	stored     map[uuid.UUID]domain.TelegramSettings
 	setCalls   int
 	clearCalls int
+	whatsapp   map[uuid.UUID]string
 }
 
 func (f *fakeTelegramSettings) TelegramSettings(_ context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
@@ -199,6 +200,26 @@ func (f *fakeTelegramSettings) ClearTelegramChatID(_ context.Context, restaurant
 	f.clearCalls++
 	if f.stored != nil {
 		delete(f.stored, restaurantID)
+	}
+	return nil
+}
+
+// Тот же фейк обслуживает и WhatsApp-часть порта; тесты ниже про телеграм.
+func (f *fakeTelegramSettings) WhatsAppSettings(context.Context, uuid.UUID) (domain.WhatsAppSettings, error) {
+	return domain.WhatsAppSettings{}, nil
+}
+func (f *fakeTelegramSettings) SetWhatsAppPhone(_ context.Context, restaurantID uuid.UUID, phone string) error {
+	f.setCalls++
+	if f.whatsapp == nil {
+		f.whatsapp = map[uuid.UUID]string{}
+	}
+	f.whatsapp[restaurantID] = phone
+	return nil
+}
+func (f *fakeTelegramSettings) ClearWhatsAppPhone(_ context.Context, restaurantID uuid.UUID) error {
+	f.clearCalls++
+	if f.whatsapp != nil {
+		delete(f.whatsapp, restaurantID)
 	}
 	return nil
 }
@@ -696,5 +717,54 @@ func TestGetPreorderSettings(t *testing.T) {
 	hh := newHarness(nil)
 	if _, err := hh.uc.GetPreorderSettings(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("non-staff GetPreorderSettings: got %v, want ErrForbidden", err)
+	}
+}
+
+// Номер сохраняется в НОРМАЛИЗОВАННОМ виде, потому что он же служит пропуском
+// для входящего нажатия кнопки: «8 701…» и «+7 701…» должны стать одним и тем
+// же заведением, иначе нажатие просто не найдёт, к кому относится.
+func TestSetWhatsAppPhone_NormalizesBeforeStoring(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+
+	stored, err := h.uc.SetWhatsAppPhone(ctx, staffActor(uid), rid, " 8 (701) 000-00-01 ")
+	if err != nil {
+		t.Fatalf("set whatsapp: %v", err)
+	}
+	if stored != "+77010000001" {
+		t.Fatalf("сохранено %q, want +77010000001", stored)
+	}
+	if h.telegram.whatsapp[rid] != "+77010000001" {
+		t.Fatalf("в хранилище %q, want нормализованный номер", h.telegram.whatsapp[rid])
+	}
+}
+
+func TestSetWhatsAppPhone_RejectsGarbage(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+
+	for _, raw := range []string{"", "не телефон", "12345"} {
+		if _, err := h.uc.SetWhatsAppPhone(ctx, staffActor(uid), rid, raw); !errors.Is(err, domain.ErrValidation) {
+			t.Fatalf("вход %q: err = %v, want ErrValidation", raw, err)
+		}
+	}
+}
+
+// Тот же RBAC, что и у телеграма: хостес не настраивает каналы заведения.
+func TestWhatsAppSettings_RequireManagePermission(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	ctx := context.Background()
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
+
+	if _, err := h.uc.SetWhatsAppPhone(ctx, staffActor(uid), rid, "+77010000001"); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("set: err = %v, want ErrForbidden", err)
+	}
+	if err := h.uc.ClearWhatsAppPhone(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("clear: err = %v, want ErrForbidden", err)
+	}
+	if _, err := h.uc.GetWhatsAppSettings(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("get: err = %v, want ErrForbidden", err)
 	}
 }

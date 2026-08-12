@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"backend-core/internal/auth/phone"
 	"backend-core/internal/domain"
 	"backend-core/internal/usecase/bookings"
 	"backend-core/internal/usecase/menu"
@@ -185,6 +186,47 @@ func (u *UseCase) GetTelegramSettings(ctx context.Context, actor Actor, restaura
 		return domain.TelegramSettings{}, err
 	}
 	return u.telegram.TelegramSettings(ctx, restaurantID)
+}
+
+// SetWhatsAppPhone connects (or re-connects) the venue's WhatsApp number for
+// booking alerts. Same shape as the Telegram pair above, one difference that
+// matters: the number is NORMALIZED to E.164 before storage, because it is also
+// the credential an inbound button press is matched against — "+77010000001"
+// and "8 701 000 00 01" must not become two different venues.
+// owner/manager (PermRestaurantManage).
+func (u *UseCase) SetWhatsAppPhone(ctx context.Context, actor Actor, restaurantID uuid.UUID, raw string) (string, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return "", err
+	}
+	normalized := phone.Normalize(raw)
+	// 11 цифр + «+» — минимальная длина казахстанского/российского номера в
+	// E.164. Проверка формы, а не существования: что номер действительно
+	// доступен в WhatsApp, покажет только первая отправка.
+	if len(normalized) < 12 || !strings.HasPrefix(normalized, "+") {
+		return "", fmt.Errorf("%w: whatsapp_phone must be a phone number in international format", domain.ErrValidation)
+	}
+	if err := u.telegram.SetWhatsAppPhone(ctx, restaurantID, normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
+// ClearWhatsAppPhone disconnects the venue's WhatsApp number. Idempotent.
+// owner/manager (PermRestaurantManage).
+func (u *UseCase) ClearWhatsAppPhone(ctx context.Context, actor Actor, restaurantID uuid.UUID) error {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return err
+	}
+	return u.telegram.ClearWhatsAppPhone(ctx, restaurantID)
+}
+
+// GetWhatsAppSettings returns the venue's WhatsApp target + toggle.
+// owner/manager (PermRestaurantManage).
+func (u *UseCase) GetWhatsAppSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID) (domain.WhatsAppSettings, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return domain.WhatsAppSettings{}, err
+	}
+	return u.telegram.WhatsAppSettings(ctx, restaurantID)
 }
 
 // authorize is the single RBAC gate for every admin-panel action. A superadmin

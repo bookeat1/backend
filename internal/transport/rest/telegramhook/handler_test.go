@@ -34,6 +34,16 @@ func (f *fakeSettings) TelegramSettings(context.Context, uuid.UUID) (domain.Tele
 func (f *fakeSettings) SetTelegramChatID(context.Context, uuid.UUID, string) error { return nil }
 func (f *fakeSettings) ClearTelegramChatID(context.Context, uuid.UUID) error       { return nil }
 
+// WhatsApp-половина того же порта: этот тест про телеграм, поэтому здесь заглушки.
+func (f *fakeSettings) WhatsAppSettings(context.Context, uuid.UUID) (domain.WhatsAppSettings, error) {
+	return domain.WhatsAppSettings{}, nil
+}
+func (f *fakeSettings) SetWhatsAppPhone(context.Context, uuid.UUID, string) error { return nil }
+func (f *fakeSettings) ClearWhatsAppPhone(context.Context, uuid.UUID) error       { return nil }
+func (f *fakeSettings) RestaurantByWhatsAppPhone(context.Context, string) (uuid.UUID, error) {
+	return uuid.Nil, domain.ErrNotFound
+}
+
 type fakeAnswer struct {
 	toast  string
 	edited string

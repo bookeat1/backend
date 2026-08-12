@@ -230,3 +230,11 @@ type preorderSettingsRequest struct {
 type telegramChatRequest struct {
 	TelegramChatID string `json:"telegram_chat_id" binding:"required"`
 }
+
+// whatsAppPhoneRequest connects the venue's WhatsApp number for booking alerts.
+// Deliberately free-form: staff paste the number the way they know it, and the
+// usecase normalizes it to E.164 — refusing "8 701 …" here would be pedantry
+// aimed at the person least able to fix it.
+type whatsAppPhoneRequest struct {
+	WhatsAppPhone string `json:"whatsapp_phone"`
+}

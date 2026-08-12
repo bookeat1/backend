@@ -481,3 +481,15 @@ func (fakeTelegramSettings) SetTelegramChatID(_ context.Context, _ uuid.UUID, _ 
 func (fakeTelegramSettings) ClearTelegramChatID(_ context.Context, _ uuid.UUID) error {
 	return nil
 }
+
+func (fakeTelegramSettings) WhatsAppSettings(_ context.Context, _ uuid.UUID) (domain.WhatsAppSettings, error) {
+	return domain.WhatsAppSettings{Enabled: true}, nil
+}
+
+func (fakeTelegramSettings) SetWhatsAppPhone(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
+func (fakeTelegramSettings) ClearWhatsAppPhone(_ context.Context, _ uuid.UUID) error {
+	return nil
+}

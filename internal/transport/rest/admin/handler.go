@@ -46,6 +46,9 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
 	rg.PUT("/admin/restaurants/:id/notification-settings/telegram", h.setTelegramChat)
 	rg.DELETE("/admin/restaurants/:id/notification-settings/telegram", h.clearTelegramChat)
+	rg.GET("/admin/restaurants/:id/notification-settings/whatsapp", h.getWhatsAppSettings)
+	rg.PUT("/admin/restaurants/:id/notification-settings/whatsapp", h.setWhatsAppPhone)
+	rg.DELETE("/admin/restaurants/:id/notification-settings/whatsapp", h.clearWhatsAppPhone)
 
 	// Menu.
 	rg.GET("/admin/restaurants/:id/menu", h.listMenu)
@@ -220,6 +223,64 @@ func (h *Handler) clearTelegramChat(c *gin.Context) {
 		return
 	}
 	if err := h.panel.ClearTelegramChatID(c.Request.Context(), actor, rid); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, gin.H{"status": "cleared"})
+}
+
+// getWhatsAppSettings returns whether the venue has a WhatsApp number connected
+// for booking alerts. owner/manager (restaurant.manage), enforced in the usecase.
+func (h *Handler) getWhatsAppSettings(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	s, err := h.panel.GetWhatsAppSettings(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, whatsAppSettingsResponse{
+		Connected:     s.Phone != "",
+		WhatsAppPhone: s.Phone,
+		Enabled:       s.Enabled,
+	})
+}
+
+// setWhatsAppPhone connects the venue's WhatsApp number. Answers with the
+// NORMALIZED number the server stored, not the one that was typed — otherwise
+// the panel would keep showing "8 701 …" while inbound presses are matched
+// against "+7 701 …", and the difference would only surface as silence.
+func (h *Handler) setWhatsAppPhone(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req whatsAppPhoneRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	stored, err := h.panel.SetWhatsAppPhone(c.Request.Context(), actor, rid, req.WhatsAppPhone)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, whatsAppSettingsResponse{
+		Connected:     true,
+		WhatsAppPhone: stored,
+		Enabled:       true,
+	})
+}
+
+// clearWhatsAppPhone disconnects the venue's WhatsApp number. Idempotent.
+func (h *Handler) clearWhatsAppPhone(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	if err := h.panel.ClearWhatsAppPhone(c.Request.Context(), actor, rid); err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}

@@ -145,6 +145,16 @@ type TelegramSettings struct {
 	Enabled bool
 }
 
+// WhatsAppSettings is a venue's WhatsApp channel state: the number staff
+// asked us to notify (empty when unset) and whether the channel is enabled.
+// Deliberately NOT the venue's public phone: that number is for guests, while
+// this one may be the manager's personal number, and merging the two would one
+// day show a guest a private number.
+type WhatsAppSettings struct {
+	Phone   string
+	Enabled bool
+}
+
 // RestaurantNotificationSettingsRepository backs the per-restaurant channel
 // toggles. Web push defaults to ON: a MISSING settings row means enabled, so
 // WebPushEnabled returns true when the venue has never touched its settings.
@@ -169,4 +179,20 @@ type RestaurantNotificationSettingsRepository interface {
 	// that switched Telegram off must not still be able to act through it.
 	// ErrNotFound when no venue owns the chat.
 	RestaurantByTelegramChatID(ctx context.Context, chatID string) (uuid.UUID, error)
+
+	// WhatsAppSettings mirrors TelegramSettings for the WhatsApp channel: a
+	// missing row is WhatsAppSettings{Phone: "", Enabled: true} — enabled, but
+	// silent until a number is set.
+	WhatsAppSettings(ctx context.Context, restaurantID uuid.UUID) (WhatsAppSettings, error)
+	// SetWhatsAppPhone upserts the venue's notification number (E.164) and marks
+	// the channel enabled.
+	SetWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID, phone string) error
+	// ClearWhatsAppPhone unsets the number, silencing the channel.
+	ClearWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID) error
+	// RestaurantByWhatsAppPhone is what AUTHORISES an inbound button press from
+	// WhatsApp, exactly as RestaurantByTelegramChatID does for Telegram: the
+	// press carries no account, so the number it came from is the only
+	// credential. Only an ENABLED channel resolves. ErrNotFound when no venue
+	// owns the number.
+	RestaurantByWhatsAppPhone(ctx context.Context, phone string) (uuid.UUID, error)
 }
