@@ -332,9 +332,10 @@ func (r *EditorRepository) AttachVenue(ctx context.Context, collectionID uuid.UU
 		}
 		_, err := q.Exec(ctx,
 			`INSERT INTO gastroguide_collection_venues
-				(collection_id, restaurant_id, position, note, note_i18n)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			collectionID, in.RestaurantID, next, in.Note, i18nToDB(in.NoteI18n))
+				(collection_id, restaurant_id, position, note, note_i18n, event_id, promo_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			collectionID, in.RestaurantID, next, in.Note, i18nToDB(in.NoteI18n),
+			in.EventID, in.PromoID)
 		if err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) {
@@ -643,4 +644,23 @@ func i18nToDB(m domain.I18n) any {
 		return nil
 	}
 	return b
+}
+
+// SetVenueHighlight ставит (или снимает, когда оба аргумента nil) событие либо
+// акцию у уже добавленного в подборку заведения. Отсутствующая связка — это
+// ErrNotFound, а не молчаливый ноль строк: редактор должен узнать, что правил
+// блок, которого в подборке уже нет.
+func (r *EditorRepository) SetVenueHighlight(ctx context.Context, collectionID, restaurantID uuid.UUID, eventID, promoID *uuid.UUID) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE gastroguide_collection_venues
+		 SET event_id = $3, promo_id = $4
+		 WHERE collection_id = $1 AND restaurant_id = $2`,
+		collectionID, restaurantID, eventID, promoID)
+	if err != nil {
+		return fmt.Errorf("set guide venue highlight: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("set guide venue highlight: %w", domain.ErrNotFound)
+	}
+	return nil
 }

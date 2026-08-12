@@ -354,3 +354,9 @@ func TestEditorHandler_PublishAcceptsAnEmptyBody(t *testing.T) {
 		t.Errorf("usecase called %d times, want 1", f.calls)
 	}
 }
+
+// Подсветка блока в этих тестах не проверяется — фейку нужен метод только
+// затем, чтобы удовлетворить интерфейс.
+func (f *fakeEditor) SetVenueHighlight(_ context.Context, _ uc.EditorActor, _, _ uuid.UUID, _, _ *uuid.UUID) error {
+	return nil
+}

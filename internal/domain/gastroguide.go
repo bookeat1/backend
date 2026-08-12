@@ -98,12 +98,46 @@ type GuideCollectionVenue struct {
 	PriceCategory   PriceCategory
 	// PrimaryImageURL is the venue's primary catalog image, nil when it has none.
 	PrimaryImageURL *string
+	// Instagram — ссылка на инстаграм заведения из его соцсетей, пустая строка,
+	// если её нет. В макете подпись блока выглядит как «адрес · @инстаграм», и
+	// берётся она у ЗАВЕДЕНИЯ, а не у события.
+	Instagram string
+	// Highlight — событие или акция, которыми проиллюстрирован блок. nil, когда
+	// блок остаётся простой карточкой заведения (в том числе если событие
+	// удалили: ссылка обнуляется, а блок остаётся).
+	Highlight *GuideHighlight
 	// IsActive is the venue's catalog state. On a GUEST read it is always true —
 	// the SQL filters deactivated venues out — and it exists for the EDITOR
 	// read, which shows them: an editor has to see that a slot in their
 	// collection is currently dark, otherwise the venue count in the cabinet and
 	// the one a guest sees differ with no visible reason.
 	IsActive bool
+}
+
+// GuideHighlightKind различает, чем проиллюстрирован блок подборки.
+type GuideHighlightKind string
+
+const (
+	GuideHighlightEvent GuideHighlightKind = "event"
+	GuideHighlightPromo GuideHighlightKind = "promo"
+)
+
+// GuideHighlight — событие или акция внутри блока подборки: заголовок, текст и
+// галерея, которые в макете стоят выше адреса заведения.
+type GuideHighlight struct {
+	Kind            GuideHighlightKind
+	ID              uuid.UUID
+	Title           string
+	TitleI18n       I18n
+	Description     string
+	DescriptionI18n I18n
+	// StartsAt имеет смысл только у события; у акции это начало действия.
+	StartsAt time.Time
+	// Images — галерея (event_images / promo_images) в порядке редактора. Может
+	// быть пустой: тогда блок показывает обложку заведения, как и раньше.
+	Images []string
+	// CoverImageURL — обложка события или акции, nil при её отсутствии.
+	CoverImageURL *string
 }
 
 // GuideCollectionDetail is a collection together with its ordered, guest-visible

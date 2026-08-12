@@ -90,6 +90,10 @@ type GuideVenueAttachment struct {
 	RestaurantID uuid.UUID
 	Note         string
 	NoteI18n     I18n
+	// EventID / PromoID — чем проиллюстрирован блок. Не больше одного из двух
+	// (схема это проверяет); оба nil — обычная карточка заведения.
+	EventID *uuid.UUID
+	PromoID *uuid.UUID
 }
 
 // GastroguideEditorRepository is the write model of the guide plus the reads the
@@ -145,6 +149,10 @@ type GastroguideEditorRepository interface {
 	// that collection is ErrAlreadyExists tagged CodeGuideVenueAlreadyAttached.
 	// An unknown restaurant is ErrNotFound.
 	AttachVenue(ctx context.Context, collectionID uuid.UUID, in GuideVenueAttachment) error
+	// SetVenueHighlight переставляет (или снимает, если оба nil) событие/акцию
+	// у уже добавленного заведения — отдельным вызовом, чтобы не пересобирать
+	// привязку целиком ради одного поля.
+	SetVenueHighlight(ctx context.Context, collectionID, restaurantID uuid.UUID, eventID, promoID *uuid.UUID) error
 	// DetachVenue removes a venue from a collection and closes the gap it left,
 	// so positions stay 1..N with no hole. Not in the collection is ErrNotFound.
 	DetachVenue(ctx context.Context, collectionID, restaurantID uuid.UUID) error
