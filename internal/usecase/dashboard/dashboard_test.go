@@ -29,6 +29,10 @@ type fakeRepo struct {
 	gotLimit       int
 	byGMVCalled    bool
 	byBookCalled   bool
+
+	guests      []domain.PlatformGuest
+	guestsTotal int
+	gotGuestQ   domain.PlatformGuestQuery
 }
 
 func (f *fakeRepo) Overview(context.Context) (domain.PlatformOverview, error) {
@@ -49,6 +53,11 @@ func (f *fakeRepo) TopRestaurantsByBookings(_ context.Context, from, to any, lim
 func (f *fakeRepo) TopRestaurantsByGMV(_ context.Context, from, to any, currency string, limit int) ([]domain.TopRestaurant, error) {
 	f.gotFrom, f.gotTo, f.gotCurrency, f.gotLimit, f.byGMVCalled = from, to, currency, limit, true
 	return f.topGMV, f.err
+}
+
+func (f *fakeRepo) Guests(_ context.Context, q domain.PlatformGuestQuery) ([]domain.PlatformGuest, int, error) {
+	f.gotGuestQ = q
+	return f.guests, f.guestsTotal, f.err
 }
 
 func superadmin() Actor { return Actor{UserID: uuid.New(), Role: domain.RoleAdmin} }
@@ -226,5 +235,73 @@ func TestTopRestaurantsDimensionRouting(t *testing.T) {
 	// Unknown dimension is a validation error.
 	if _, err := u.TopRestaurants(context.Background(), superadmin(), time.Time{}, time.Time{}, "revenue", "", 0); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("unknown dimension: got %v, want ErrValidation", err)
+	}
+}
+
+// Список гостей — вход из панели, значит его надо валидировать, а не чинить
+// молча: подставленный «на всякий случай» сегмент показал бы человеку не тех
+// людей, а он на этом основании отправит рассылку.
+func TestGuests_RejectsUnknownSegmentAndSort(t *testing.T) {
+	repo := &fakeRepo{}
+	u := NewUseCase(repo)
+
+	if _, _, err := u.Guests(context.Background(), superadmin(), domain.PlatformGuestQuery{
+		Segment: domain.PlatformGuestSegment("вип"),
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("незнакомый сегмент: err = %v, want ErrValidation", err)
+	}
+	if _, _, err := u.Guests(context.Background(), superadmin(), domain.PlatformGuestQuery{
+		Sort: domain.PlatformGuestSort("по-настроению"),
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("незнакомая сортировка: err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGuests_RejectsInvertedWindows(t *testing.T) {
+	u := NewUseCase(&fakeRepo{})
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	late := early.AddDate(0, 1, 0)
+
+	if _, _, err := u.Guests(context.Background(), superadmin(), domain.PlatformGuestQuery{
+		RegisteredFrom: &late, RegisteredTo: &early,
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("перевёрнутое окно регистрации: err = %v, want ErrValidation", err)
+	}
+	if _, _, err := u.Guests(context.Background(), superadmin(), domain.PlatformGuestQuery{
+		BookedFrom: &late, BookedTo: &early,
+	}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("перевёрнутое окно броней: err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGuests_AppliesDefaultsAndCapsPageSize(t *testing.T) {
+	repo := &fakeRepo{}
+	u := NewUseCase(repo)
+
+	if _, _, err := u.Guests(context.Background(), superadmin(), domain.PlatformGuestQuery{PerPage: 10_000}); err != nil {
+		t.Fatalf("guests: %v", err)
+	}
+	got := repo.gotGuestQ
+	if got.Segment != domain.GuestSegmentAll {
+		t.Fatalf("сегмент по умолчанию = %q, want all", got.Segment)
+	}
+	if got.Sort != domain.GuestSortLastBooking {
+		t.Fatalf("сортировка по умолчанию = %q, want last_booking", got.Sort)
+	}
+	if got.Page != 1 {
+		t.Fatalf("страница по умолчанию = %d, want 1", got.Page)
+	}
+	if got.PerPage != maxGuestsPerPage {
+		t.Fatalf("размер страницы = %d, want потолок %d", got.PerPage, maxGuestsPerPage)
+	}
+}
+
+func TestGuests_OnlySuperadmin(t *testing.T) {
+	u := NewUseCase(&fakeRepo{})
+	for _, role := range []domain.Role{domain.RoleUser, domain.RoleRestaurant} {
+		_, _, err := u.Guests(context.Background(), Actor{UserID: uuid.New(), Role: role}, domain.PlatformGuestQuery{})
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("роль %s: err = %v, want ErrForbidden", role, err)
+		}
 	}
 }

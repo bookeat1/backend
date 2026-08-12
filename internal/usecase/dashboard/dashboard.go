@@ -206,3 +206,55 @@ func normalizeLimit(limit int) int {
 	}
 	return limit
 }
+
+// Пагинация списка гостей. Потолок в 200 строк — чтобы «показать всех» не
+// превратилось в выгрузку всей базы одним запросом из браузера.
+const (
+	defaultGuestsPerPage = 50
+	maxGuestsPerPage     = 200
+)
+
+// Guests — платформенный список гостей с фильтрами и сегментами.
+//
+// Валидирует ВВОД, а не молча его чинит: незнакомый сегмент или порядок — это
+// ошибка ввода (ErrValidation), потому что иначе панель показала бы всех и
+// человек решил бы, что в сегменте действительно все. Пустые же значения —
+// законное «фильтра нет», им подставляются умолчания.
+func (u *UseCase) Guests(ctx context.Context, actor Actor, q domain.PlatformGuestQuery) ([]domain.PlatformGuest, int, error) {
+	if err := u.authorize(actor); err != nil {
+		return nil, 0, err
+	}
+	if q.Segment == "" {
+		q.Segment = domain.GuestSegmentAll
+	}
+	if !q.Segment.Valid() {
+		return nil, 0, domain.ErrValidation
+	}
+	if q.Sort == "" {
+		q.Sort = domain.GuestSortLastBooking
+	}
+	if !q.Sort.Valid() {
+		return nil, 0, domain.ErrValidation
+	}
+	if q.MinBookings < 0 {
+		return nil, 0, domain.ErrValidation
+	}
+	// Окно «от больше чем до» — это опечатка в фильтре, и пустой ответ на неё
+	// выглядел бы как «таких гостей нет».
+	if q.RegisteredFrom != nil && q.RegisteredTo != nil && q.RegisteredFrom.After(*q.RegisteredTo) {
+		return nil, 0, domain.ErrValidation
+	}
+	if q.BookedFrom != nil && q.BookedTo != nil && q.BookedFrom.After(*q.BookedTo) {
+		return nil, 0, domain.ErrValidation
+	}
+	if q.Page < 1 {
+		q.Page = 1
+	}
+	switch {
+	case q.PerPage < 1:
+		q.PerPage = defaultGuestsPerPage
+	case q.PerPage > maxGuestsPerPage:
+		q.PerPage = maxGuestsPerPage
+	}
+	return u.repo.Guests(ctx, q)
+}

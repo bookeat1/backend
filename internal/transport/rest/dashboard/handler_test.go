@@ -56,6 +56,7 @@ type fakeRepo struct {
 	captured domain.MoneyAggregate
 	refunded domain.MoneyAggregate
 	top      []domain.TopRestaurant
+	guests   []domain.PlatformGuest
 }
 
 func (f fakeRepo) Overview(context.Context) (domain.PlatformOverview, error) {
@@ -69,6 +70,9 @@ func (f fakeRepo) PaymentsGMV(context.Context, any, any, string) (domain.MoneyAg
 }
 func (f fakeRepo) TopRestaurantsByBookings(context.Context, any, any, int) ([]domain.TopRestaurant, error) {
 	return f.top, nil
+}
+func (f fakeRepo) Guests(context.Context, domain.PlatformGuestQuery) ([]domain.PlatformGuest, int, error) {
+	return f.guests, len(f.guests), nil
 }
 func (f fakeRepo) TopRestaurantsByGMV(context.Context, any, any, string, int) ([]domain.TopRestaurant, error) {
 	return f.top, nil
