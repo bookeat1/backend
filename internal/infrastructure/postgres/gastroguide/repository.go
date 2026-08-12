@@ -220,7 +220,7 @@ func (r *Repository) listVenues(ctx context.Context, collectionID uuid.UUID) ([]
 		 -- первую подходящую ссылку: у заведения их может быть несколько.
 		 LEFT JOIN LATERAL (
 			SELECT rs.url FROM restaurant_social_links rs
-			WHERE rs.restaurant_id = rest.id AND lower(rs.platform) = 'instagram'
+			WHERE rs.restaurant_id = rest.id AND lower(rs.type) = 'instagram'
 			ORDER BY rs.created_at, rs.id
 			LIMIT 1
 		 ) soc ON true
