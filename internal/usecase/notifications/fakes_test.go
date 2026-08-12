@@ -163,6 +163,10 @@ type fakeSettings struct {
 	disabled   map[uuid.UUID]bool
 	tgChat     map[uuid.UUID]string
 	tgDisabled map[uuid.UUID]bool
+	// waPhone/waDisabled — то же самое для WhatsApp: канал ведёт себя как
+	// телеграм, поэтому и фейк устроен одинаково.
+	waPhone    map[uuid.UUID]string
+	waDisabled map[uuid.UUID]bool
 }
 
 func newFakeSettings() *fakeSettings {
@@ -170,6 +174,8 @@ func newFakeSettings() *fakeSettings {
 		disabled:   map[uuid.UUID]bool{},
 		tgChat:     map[uuid.UUID]string{},
 		tgDisabled: map[uuid.UUID]bool{},
+		waPhone:    map[uuid.UUID]string{},
+		waDisabled: map[uuid.UUID]bool{},
 	}
 }
 
@@ -205,6 +211,35 @@ func (f *fakeSettings) RestaurantByTelegramChatID(_ context.Context, chatID stri
 func (f *fakeSettings) ClearTelegramChatID(_ context.Context, restaurantID uuid.UUID) error {
 	delete(f.tgChat, restaurantID)
 	return nil
+}
+
+func (f *fakeSettings) WhatsAppSettings(_ context.Context, restaurantID uuid.UUID) (domain.WhatsAppSettings, error) {
+	return domain.WhatsAppSettings{
+		Phone:   f.waPhone[restaurantID],
+		Enabled: !f.waDisabled[restaurantID],
+	}, nil
+}
+
+func (f *fakeSettings) SetWhatsAppPhone(_ context.Context, restaurantID uuid.UUID, phone string) error {
+	f.waPhone[restaurantID] = phone
+	f.waDisabled[restaurantID] = false
+	return nil
+}
+
+func (f *fakeSettings) ClearWhatsAppPhone(_ context.Context, restaurantID uuid.UUID) error {
+	delete(f.waPhone, restaurantID)
+	return nil
+}
+
+// RestaurantByWhatsAppPhone — обратный поиск, которым авторизуется входящее
+// нажатие кнопки: номер отправителя и есть единственное доказательство права.
+func (f *fakeSettings) RestaurantByWhatsAppPhone(_ context.Context, phone string) (uuid.UUID, error) {
+	for rid, p := range f.waPhone {
+		if p == phone && !f.waDisabled[rid] {
+			return rid, nil
+		}
+	}
+	return uuid.Nil, domain.ErrNotFound
 }
 
 // recordingTelegramSender captures every (chatID, text) it was asked to send

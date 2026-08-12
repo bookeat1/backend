@@ -217,6 +217,15 @@ type preorderSettingsResponse struct {
 	MinAmountMinor *int64 `json:"min_amount_minor"`
 }
 
+// whatsAppSettingsResponse reports the venue's WhatsApp alert configuration.
+// `connected` is derived, not stored: a channel with no number is not connected
+// however enabled it claims to be, and the panel should say so.
+type whatsAppSettingsResponse struct {
+	Connected     bool   `json:"connected"`
+	WhatsAppPhone string `json:"whatsapp_phone"`
+	Enabled       bool   `json:"enabled"`
+}
+
 // telegramSettingsResponse reports the venue's Telegram alert configuration.
 type telegramSettingsResponse struct {
 	Connected      bool   `json:"connected"`

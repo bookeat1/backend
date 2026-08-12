@@ -2,6 +2,7 @@ package notification
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -265,5 +266,87 @@ func TestDeliveries_DedupeOnConflict(t *testing.T) {
 	}
 	if !already {
 		t.Fatal("delivery not recorded")
+	}
+}
+
+// WhatsApp повторяет форму телеграма, поэтому проверяется то же самое плюс
+// одно, чего у телеграма нет: обратный поиск по номеру — это АВТОРИЗАЦИЯ
+// входящего нажатия, и выключённый канал не должен по нему находиться.
+func TestWhatsAppSettings_DefaultSetClearAndReverseLookup(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	rid := seedRestaurant(t, pool)
+	repo := NewSettings(pool)
+
+	// Нет строки → канал включён, но номера нет: молчит.
+	s, err := repo.WhatsAppSettings(ctx, rid)
+	if err != nil {
+		t.Fatalf("whatsapp settings (нет строки): %v", err)
+	}
+	if s.Phone != "" || !s.Enabled {
+		t.Fatalf("по умолчанию = %+v, want {Phone:'' Enabled:true}", s)
+	}
+
+	if err := repo.SetWhatsAppPhone(ctx, rid, "+77010000001"); err != nil {
+		t.Fatalf("set phone: %v", err)
+	}
+	s, _ = repo.WhatsAppSettings(ctx, rid)
+	if s.Phone != "+77010000001" || !s.Enabled {
+		t.Fatalf("после записи = %+v, want номер и включён", s)
+	}
+	// Подключение WhatsApp не должно трогать соседние каналы.
+	if enabled, _ := repo.WebPushEnabled(ctx, rid); !enabled {
+		t.Fatal("подключение whatsapp выключило браузерные уведомления")
+	}
+	if tg, _ := repo.TelegramSettings(ctx, rid); tg.ChatID != "" || !tg.Enabled {
+		t.Fatalf("подключение whatsapp задело телеграм: %+v", tg)
+	}
+
+	// Обратный поиск находит заведение по номеру отправителя.
+	got, err := repo.RestaurantByWhatsAppPhone(ctx, "+77010000001")
+	if err != nil || got != rid {
+		t.Fatalf("обратный поиск = %v / %v, want %v", got, err, rid)
+	}
+	if _, err := repo.RestaurantByWhatsAppPhone(ctx, "+77019999999"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("чужой номер: err = %v, want ErrNotFound", err)
+	}
+
+	// Выключенный канал не резолвится: снятая галочка должна обезвредить и
+	// кнопки в сообщениях, которые уже лежат у человека в переписке.
+	if _, err := pool.Exec(ctx,
+		`UPDATE restaurant_notification_settings SET whatsapp_enabled = false WHERE restaurant_id = $1`, rid); err != nil {
+		t.Fatalf("disable channel: %v", err)
+	}
+	if _, err := repo.RestaurantByWhatsAppPhone(ctx, "+77010000001"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("выключенный канал всё ещё авторизует нажатие: err = %v", err)
+	}
+
+	// Очистка номера: канал снова молчит, строка настроек цела.
+	if err := repo.ClearWhatsAppPhone(ctx, rid); err != nil {
+		t.Fatalf("clear phone: %v", err)
+	}
+	s, _ = repo.WhatsAppSettings(ctx, rid)
+	if s.Phone != "" {
+		t.Fatalf("после очистки номер = %q, want пусто", s.Phone)
+	}
+}
+
+// Один и тот же номер не может обслуживать два заведения: иначе нажатие
+// «подтвердить» невозможно приписать кому-то одному, и чужая бронь
+// подтверждалась бы с чужого телефона.
+func TestWhatsAppPhone_IsUniqueAcrossVenues(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	first := seedRestaurant(t, pool)
+	second := seedRestaurant(t, pool)
+	repo := NewSettings(pool)
+
+	if err := repo.SetWhatsAppPhone(ctx, first, "+77010000002"); err != nil {
+		t.Fatalf("первое заведение: %v", err)
+	}
+	if err := repo.SetWhatsAppPhone(ctx, second, "+77010000002"); err == nil {
+		t.Fatal("один номер записался двум заведениям — обратный поиск станет неоднозначным")
 	}
 }

@@ -320,3 +320,73 @@ func (r *Venues) Name(ctx context.Context, restaurantID uuid.UUID) (string, erro
 	}
 	return name, nil
 }
+
+// WhatsAppSettings returns the venue's WhatsApp target + toggle. A missing row
+// is WhatsAppSettings{Phone: "", Enabled: true}: like Telegram, the channel
+// defaults enabled but stays silent until a number is set.
+func (r *Settings) WhatsAppSettings(ctx context.Context, restaurantID uuid.UUID) (domain.WhatsAppSettings, error) {
+	var phone *string
+	var enabled bool
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT whatsapp_phone, whatsapp_enabled FROM restaurant_notification_settings WHERE restaurant_id=$1`,
+		restaurantID).Scan(&phone, &enabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.WhatsAppSettings{Phone: "", Enabled: true}, nil
+	}
+	if err != nil {
+		return domain.WhatsAppSettings{}, fmt.Errorf("read whatsapp settings: %w", err)
+	}
+	out := domain.WhatsAppSettings{Enabled: enabled}
+	if phone != nil {
+		out.Phone = *phone
+	}
+	return out, nil
+}
+
+// RestaurantByWhatsAppPhone resolves a sender number back to its venue. The
+// whatsapp_enabled predicate is part of the authorisation, not an optimisation:
+// switching the channel off must also disarm the buttons in messages already
+// sitting in someone's WhatsApp.
+func (r *Settings) RestaurantByWhatsAppPhone(ctx context.Context, phone string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT restaurant_id FROM restaurant_notification_settings
+		 WHERE whatsapp_phone = $1 AND whatsapp_enabled LIMIT 1`, phone).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("resolve whatsapp phone: %w", err)
+	}
+	return id, nil
+}
+
+// SetWhatsAppPhone upserts the venue's notification number and marks the
+// channel enabled. The number is stored as given by the usecase, which
+// normalizes it to E.164 first — two venues must not end up with "+77010000001"
+// and "87010000001" for the same phone, or the inbound lookup would miss.
+func (r *Settings) SetWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID, phone string) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`INSERT INTO restaurant_notification_settings (restaurant_id, whatsapp_phone, whatsapp_enabled, updated_at)
+		 VALUES ($1, $2, true, now())
+		 ON CONFLICT (restaurant_id) DO UPDATE
+		   SET whatsapp_phone   = EXCLUDED.whatsapp_phone,
+		       whatsapp_enabled = true,
+		       updated_at       = now()`,
+		restaurantID, phone); err != nil {
+		return fmt.Errorf("set whatsapp phone: %w", err)
+	}
+	return nil
+}
+
+// ClearWhatsAppPhone unsets the number, silencing the channel. Idempotent.
+func (r *Settings) ClearWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurant_notification_settings
+		    SET whatsapp_phone = NULL, updated_at = now()
+		  WHERE restaurant_id = $1`,
+		restaurantID); err != nil {
+		return fmt.Errorf("clear whatsapp phone: %w", err)
+	}
+	return nil
+}
