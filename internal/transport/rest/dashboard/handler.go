@@ -35,6 +35,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/dashboard/bookings", h.bookings)
 	rg.GET("/admin/dashboard/payments", h.payments)
 	rg.GET("/admin/dashboard/top-restaurants", h.topRestaurants)
+	rg.GET("/admin/dashboard/guests", h.guests)
 }
 
 func (h *Handler) actor(c *gin.Context) (uc.Actor, bool) {
@@ -225,4 +226,158 @@ func parseTimeQuery(c *gin.Context, key string) (time.Time, bool) {
 	}
 	response.Error(c.Writer, http.StatusUnprocessableEntity, key+" must be an RFC3339 timestamp or YYYY-MM-DD date")
 	return time.Time{}, false
+}
+
+// guests returns the platform-wide guest list with filters and segments.
+// @Summary     Platform guest list with segments (superadmin)
+// @Tags        admin
+// @Produce     json
+// @Param       search   query string false "имя, телефон или почта, подстрока"
+// @Param       segment  query string false "all|registered|booked|visited|never_visited|no_bookings|cancelled"
+// @Param       city     query string false "город аккаунта"
+// @Param       language query string false "язык приложения"
+// @Param       registered_from query string false "RFC3339 или YYYY-MM-DD"
+// @Param       registered_to   query string false "RFC3339 или YYYY-MM-DD"
+// @Param       booked_from     query string false "окно последней брони"
+// @Param       booked_to       query string false "окно последней брони"
+// @Param       min_bookings    query int    false "минимум броней"
+// @Param       sort     query string false "last_booking|bookings|registered"
+// @Param       page     query int    false "страница, с 1"
+// @Param       per_page query int    false "размер страницы, максимум 200"
+// @Security    BearerAuth
+// @Success     200 {object} response.Envelope
+// @Failure     403 {object} response.Envelope "forbidden"
+// @Failure     422 {object} response.Envelope "invalid filter"
+// @Router      /api/v1/admin/dashboard/guests [get]
+func (h *Handler) guests(c *gin.Context) {
+	actor, ok := h.actor(c)
+	if !ok {
+		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	q, ok := parseGuestQuery(c)
+	if !ok {
+		return
+	}
+	list, total, err := h.uc.Guests(c.Request.Context(), actor, q)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	out := make([]guestResponse, 0, len(list))
+	for _, g := range list {
+		out = append(out, newGuestResponse(g))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, q.Page, q.PerPage))
+}
+
+// parseGuestQuery reads the filters off the query string. A malformed value is
+// a 422 with the offending parameter named — a filter that silently does
+// nothing is worse than one that refuses.
+func parseGuestQuery(c *gin.Context) (domain.PlatformGuestQuery, bool) {
+	q := domain.PlatformGuestQuery{
+		Search:   c.Query("search"),
+		Segment:  domain.PlatformGuestSegment(c.Query("segment")),
+		City:     c.Query("city"),
+		Language: c.Query("language"),
+		Sort:     domain.PlatformGuestSort(c.Query("sort")),
+	}
+	var ok bool
+	if q.RegisteredFrom, ok = parseOptionalTime(c, "registered_from"); !ok {
+		return q, false
+	}
+	if q.RegisteredTo, ok = parseOptionalTime(c, "registered_to"); !ok {
+		return q, false
+	}
+	if q.BookedFrom, ok = parseOptionalTime(c, "booked_from"); !ok {
+		return q, false
+	}
+	if q.BookedTo, ok = parseOptionalTime(c, "booked_to"); !ok {
+		return q, false
+	}
+	if v := c.Query("min_bookings"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, "min_bookings must be a non-negative integer")
+			return q, false
+		}
+		q.MinBookings = n
+	}
+	q.Page, q.PerPage = pageParams(c)
+	return q, true
+}
+
+// parseOptionalTime is parseTimeQuery with an absent value meaning "no bound"
+// rather than the zero time, which the query builder would otherwise treat as a
+// real filter for year 1.
+func parseOptionalTime(c *gin.Context, key string) (*time.Time, bool) {
+	if c.Query(key) == "" {
+		return nil, true
+	}
+	t, ok := parseTimeQuery(c, key)
+	if !ok {
+		return nil, false
+	}
+	return &t, true
+}
+
+func pageParams(c *gin.Context) (page, perPage int) {
+	page, _ = strconv.Atoi(c.Query("page"))
+	perPage, _ = strconv.Atoi(c.Query("per_page"))
+	return page, perPage
+}
+
+// guestResponse is one row of the list. Counters are always present (a zero is
+// a fact: "registered, never booked"); the optional fields are pointers so an
+// absent account or an absent booking history reads as null, not as a made-up
+// empty string or epoch.
+type guestResponse struct {
+	Phone string `json:"phone"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+	City  string `json:"city,omitempty"`
+	Lang  string `json:"language,omitempty"`
+	// UserID is null for a guest who booked without registering.
+	UserID       *string `json:"user_id"`
+	RegisteredAt *string `json:"registered_at"`
+
+	BookingsCount  int `json:"bookings_count"`
+	VisitsCount    int `json:"visits_count"`
+	CancelledCount int `json:"cancelled_count"`
+	NoShowCount    int `json:"no_show_count"`
+	VenuesCount    int `json:"venues_count"`
+
+	FirstBookingAt *string `json:"first_booking_at"`
+	LastBookingAt  *string `json:"last_booking_at"`
+}
+
+func newGuestResponse(g domain.PlatformGuest) guestResponse {
+	out := guestResponse{
+		Phone:          g.Phone,
+		Name:           g.Name,
+		Email:          g.Email,
+		City:           g.City,
+		Lang:           g.Language,
+		BookingsCount:  g.BookingsCount,
+		VisitsCount:    g.VisitsCount,
+		CancelledCount: g.CancelledCount,
+		NoShowCount:    g.NoShowCount,
+		VenuesCount:    g.VenuesCount,
+	}
+	if g.UserID != nil {
+		s := g.UserID.String()
+		out.UserID = &s
+	}
+	out.RegisteredAt = formatOptionalTime(g.RegisteredAt)
+	out.FirstBookingAt = formatOptionalTime(g.FirstBookingAt)
+	out.LastBookingAt = formatOptionalTime(g.LastBookingAt)
+	return out
+}
+
+func formatOptionalTime(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.Format(time.RFC3339)
+	return &s
 }

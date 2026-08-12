@@ -16,4 +16,5 @@ type readRepo interface {
 	PaymentsGMV(ctx context.Context, from, to any, currency string) (domain.MoneyAggregate, domain.MoneyAggregate, error)
 	TopRestaurantsByBookings(ctx context.Context, from, to any, limit int) ([]domain.TopRestaurant, error)
 	TopRestaurantsByGMV(ctx context.Context, from, to any, currency string, limit int) ([]domain.TopRestaurant, error)
+	Guests(ctx context.Context, q domain.PlatformGuestQuery) ([]domain.PlatformGuest, int, error)
 }
