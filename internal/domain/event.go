@@ -56,7 +56,7 @@ type Event struct {
 	// обложка живёт в CoverImageURL и её читают карточки и лента. Пустой срез —
 	// «галереи нет», а не «фотографий нет вообще».
 	Images []string
-	Status        EventStatus
+	Status EventStatus
 	// Ticketed marks an event that will (in a later increment) sell tickets.
 	Ticketed bool
 	// TicketPriceMinor is the per-ticket price in integer minor units. nil when

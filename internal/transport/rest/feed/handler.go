@@ -312,7 +312,11 @@ type cardResponse struct {
 	StartsAt       string  `json:"starts_at"`
 	EndsAt         string  `json:"ends_at"`
 	CoverImageURL  *string `json:"cover_image_url,omitempty"`
-	Terms          string  `json:"terms,omitempty"`
+	// Images — дополнительные фотографии карточки, обложки среди них НЕТ.
+	// Всегда массив (пустой, если фотографий нет): клиент рисует ленту, и
+	// отсутствующее поле читалось бы как «неизвестно».
+	Images []string `json:"images"`
+	Terms  string   `json:"terms,omitempty"`
 	// DiscountPercent is the promo card's «−30%» badge, 0..100. Omitted for
 	// events (they have no discount) and for promos with no badge.
 	DiscountPercent *int `json:"discount_percent,omitempty"`
@@ -344,6 +348,7 @@ func newCardResponse(r domain.RankedFeedItem, lang string) cardResponse {
 		StartsAt:        r.Item.StartsAt.Format(time.RFC3339),
 		EndsAt:          r.Item.EndsAt.Format(time.RFC3339),
 		CoverImageURL:   r.Item.CoverImageURL,
+		Images:          imagesOrEmpty(r.Item.Images),
 		Terms:           r.Item.Terms,
 		DiscountPercent: r.Item.DiscountPercent,
 		Score:           r.Score.Total,
@@ -399,4 +404,13 @@ func newStateResponse(st uc.ItemState) stateResponse {
 		out.ReviewedBy = &s
 	}
 	return out
+}
+
+// imagesOrEmpty гарантирует, что галерея в JSON — массив, а не null: клиент
+// рисует ленту, и null пришлось бы отдельно защищать в каждом месте.
+func imagesOrEmpty(urls []string) []string {
+	if urls == nil {
+		return []string{}
+	}
+	return urls
 }
