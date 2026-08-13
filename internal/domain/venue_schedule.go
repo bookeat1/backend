@@ -136,11 +136,41 @@ type VenueStateFilter struct {
 	// boolean (a venue with no readable schedule is not bookable), so here too
 	// true and false partition the catalog.
 	AcceptsOnlineBookings *bool
+	// Availability, when set, keeps only venues that could really seat the
+	// party on that date. It rides HERE rather than on RestaurantFilter for the
+	// same reason the two flags above do — the answer belongs to the booking
+	// engine, not to SQL — and it is applied by usecase/restaurants through the
+	// batch filter in usecase/bookings.
+	Availability *AvailabilitySearch
+}
+
+// AvailabilitySearch narrows the catalog to venues that could actually seat a
+// party on a given date — the honest version of "поиск по гостям и дате".
+//
+// It cannot live on RestaurantFilter for the same reason VenueStateFilter
+// cannot: the answer is the booking engine's, not SQL's. A venue is kept only
+// when the SAME code that draws the slot grid on its booking screen finds at
+// least one bookable start. Any second implementation would eventually offer a
+// table the booking screen then refuses — which is worse than not filtering,
+// because the guest has already chosen the place by then.
+//
+// FromMinutes/ToMinutes narrow the day to a window (minutes since the venue's
+// local midnight, e.g. 19:00 = 1140). Both nil = the whole day.
+type AvailabilitySearch struct {
+	// Date is a calendar date, YYYY-MM-DD, read in EACH venue's own timezone —
+	// "пятница" in Almaty is not the same instant as "пятница" elsewhere.
+	Date   string
+	Guests int
+	// FromMinutes/ToMinutes bound the start time, inclusive. A start exactly at
+	// ToMinutes is kept: the guest asked for "до 21:00", and 21:00 is a time
+	// they named, not one they excluded.
+	FromMinutes *int
+	ToMinutes   *int
 }
 
 // Active reports whether the filter constrains anything at all.
 func (f VenueStateFilter) Active() bool {
-	return f.OpenNow != nil || f.AcceptsOnlineBookings != nil
+	return f.OpenNow != nil || f.AcceptsOnlineBookings != nil || f.Availability != nil
 }
 
 // Matches reports whether a venue with the given computed state survives the
