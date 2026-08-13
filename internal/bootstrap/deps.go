@@ -351,8 +351,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// endpoint — makes the same venue read differently on two screens.
 	venueState := restaurants.NewVenueState(restRelated, bookingCfg)
 	favoritesFacade := favorites.NewFacade(favoritesRepo, favorites.WithVenueState(venueState))
+	// The catalog's "гости + дата" filter runs on the SAME engine as the slot
+	// grid on a venue's booking screen (see bookings.AvailabilitySearch), only
+	// batched by venue id. Wiring a second implementation here is how the
+	// catalog would start promising tables the booking screen then refuses.
+	availabilitySearch := bookings.NewAvailabilitySearch(restRelated, bookingLinks, bookingCapacity, bookingCfg)
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
-		restaurants.WithVenueState(venueState))
+		restaurants.WithVenueState(venueState),
+		restaurants.WithAvailabilityFilter(availabilitySearch))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,

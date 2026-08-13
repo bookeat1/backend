@@ -209,6 +209,12 @@ const (
 	// should retry, or fall back to browsing without the filter — never
 	// present the result as filtered.
 	CodeCatalogVenueStateUnavailable ErrorCode = "catalog_venue_state_unavailable"
+	// CodeCatalogAvailabilityUnavailable — the catalog was asked to filter by
+	// free tables on a date and the booking engine could not answer. Same rule
+	// as above and a separate code so the client can tell the guest WHICH
+	// filter it has to drop: serving the unfiltered catalog under a "на двоих в
+	// пятницу" query would send people to venues that have no table.
+	CodeCatalogAvailabilityUnavailable ErrorCode = "catalog_availability_unavailable"
 
 	// CodeCityRequired — a city-scoped guest listing (today: the main-screen
 	// feed) was called without a city, or with one the platform does not serve.

@@ -188,7 +188,55 @@ func venueStateFilter(c *gin.Context) domain.VenueStateFilter {
 			vs.AcceptsOnlineBookings = &b
 		}
 	}
+	vs.Availability = availabilityFilter(c)
 	return vs
+}
+
+// availabilityFilter reads the "гости + дата" filter: ?date=2026-08-20&guests=2
+// plus the optional window ?time_from=19:00&time_to=21:00.
+//
+// Unlike the boolean filters above, a malformed value here is NOT ignored. They
+// are booleans with two possible answers, and dropping one still gives the
+// guest a catalog that means something; this one carries the guest's whole
+// question. Silently dropping "guests=4" would answer a query about a table for
+// four with the entire catalog — so a broken value fails the request instead
+// (the usecase validates and returns 400).
+//
+// Both parts are required together: a date with no party size cannot be
+// evaluated (the engine needs to know who it is seating), and a party size with
+// no date has no day to look at. One without the other is ignored.
+func availabilityFilter(c *gin.Context) *domain.AvailabilitySearch {
+	date, guests := strings.TrimSpace(c.Query("date")), strings.TrimSpace(c.Query("guests"))
+	if date == "" || guests == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(guests)
+	if err != nil {
+		n = 0 // the usecase rejects it with a message the client can show
+	}
+	q := &domain.AvailabilitySearch{Date: date, Guests: n}
+	if v := clockMinutes(c.Query("time_from")); v != nil {
+		q.FromMinutes = v
+	}
+	if v := clockMinutes(c.Query("time_to")); v != nil {
+		q.ToMinutes = v
+	}
+	return q
+}
+
+// clockMinutes parses "HH:MM" into minutes since midnight, nil on anything
+// else. The window is a narrowing convenience, not the guest's core question,
+// so a broken one degrades to "the whole day" rather than failing the search.
+func clockMinutes(v string) *int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	mins, err := domain.ParseClockMinutes(v)
+	if err != nil || mins < 0 || mins > 24*60 {
+		return nil
+	}
+	return &mins
 }
 
 // search runs the public full-text + fuzzy catalog search. It is a distinct

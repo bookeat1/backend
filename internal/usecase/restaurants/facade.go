@@ -2,6 +2,7 @@ package restaurants
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -40,6 +41,25 @@ type facade struct {
 	// WithVenueState). Nil unless wired; the catalog then simply omits the
 	// schedule / bookability fields rather than guessing them.
 	venue *VenueState
+
+	// availability answers "could this venue seat the party on that date" for a
+	// whole page at once. Optional: unwired, a request that ASKS to filter by
+	// it is refused (see filterByAvailability) rather than answered with the
+	// unfiltered catalog.
+	availability availabilityFilter
+}
+
+// availabilityFilter is the minimal slice of the booking engine this package
+// needs. Declared here, bound in bootstrap/deps.go to
+// usecase/bookings.AvailabilitySearch, so the catalog keeps its one-way
+// dependency on the booking layer down to one method.
+type availabilityFilter interface {
+	Filter(ctx context.Context, venues []domain.Restaurant, q domain.AvailabilitySearch) (map[uuid.UUID]bool, error)
+}
+
+// WithAvailabilityFilter enables the "гости + дата" catalog filter.
+func WithAvailabilityFilter(a availabilityFilter) FacadeOption {
+	return func(f *facade) { f.availability = a }
 }
 
 // FacadeOption configures optional facade dependencies without breaking the
@@ -141,7 +161,7 @@ func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter, vs domai
 		return nil, 0, err
 	}
 	f.venue.AttachList(ctx, items)
-	return f.pageByVenueState(items, matched, vs, flt.Page, flt.PerPage)
+	return f.pageByVenueState(ctx, items, matched, vs, flt.Page, flt.PerPage)
 }
 
 func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
@@ -160,7 +180,7 @@ func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter, 
 		return nil, 0, err
 	}
 	f.venue.AttachList(ctx, items)
-	return f.pageByVenueState(items, matched, vs, flt.Page, flt.PerPage)
+	return f.pageByVenueState(ctx, items, matched, vs, flt.Page, flt.PerPage)
 }
 
 // errVenueStateUnavailable is the one refusal for "you asked me to filter by
@@ -185,6 +205,7 @@ func errVenueStateUnavailable() error {
 // The returned total is therefore the number of venues matching BOTH filters,
 // which is what the client shows the guest.
 func (f *facade) pageByVenueState(
+	ctx context.Context,
 	items []domain.RestaurantListItem, matched int,
 	vs domain.VenueStateFilter, page, perPage int,
 ) ([]domain.RestaurantListItem, int, error) {
@@ -197,6 +218,11 @@ func (f *facade) pageByVenueState(
 		slog.Warn("catalog venue-state filter truncated by the scan limit",
 			"matched", matched, "scanned", len(items), "limit", domain.CatalogScanLimit)
 	}
+	items, err := f.filterByAvailability(ctx, items, vs.Availability)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	kept := make([]domain.RestaurantListItem, 0, len(items))
 	for _, it := range items {
 		if it.VenueState == nil {
@@ -233,6 +259,55 @@ func (f *facade) pageByVenueState(
 		end = total
 	}
 	return kept[start:end], total, nil
+}
+
+// filterByAvailability keeps only the venues that could really seat the party.
+//
+// It runs BEFORE the open-now / bookability filter and before paging, for the
+// same reason those two do: a page-local answer is a wrong answer, and the
+// total the guest is shown ("нашли 3 заведения") has to count what survived
+// every filter.
+//
+// With no booking engine wired the request is REFUSED. Returning the unfiltered
+// catalog under a "на двоих в пятницу" query is the same silent lie as
+// publishing an uncomputed open_now: the guest would pick a venue from a list
+// that promised free tables, and find out at the booking screen.
+func (f *facade) filterByAvailability(
+	ctx context.Context, items []domain.RestaurantListItem, q *domain.AvailabilitySearch,
+) ([]domain.RestaurantListItem, error) {
+	if q == nil {
+		return items, nil
+	}
+	if f.availability == nil {
+		return nil, domain.WithCode(domain.CodeCatalogAvailabilityUnavailable,
+			fmt.Errorf("%w: availability filter is not configured", domain.ErrUnavailable))
+	}
+	if len(items) == 0 {
+		return items, nil
+	}
+	venues := make([]domain.Restaurant, 0, len(items))
+	for _, it := range items {
+		venues = append(venues, it.Restaurant)
+	}
+	free, err := f.availability.Filter(ctx, venues, *q)
+	if err != nil {
+		// A validation error is the guest's (a broken date, zero guests) and
+		// travels through as-is; anything else is ours, and it must not degrade
+		// into an unfiltered list.
+		if errors.Is(err, domain.ErrValidation) {
+			return nil, err
+		}
+		slog.Error("catalog availability filter failed", "error", err)
+		return nil, domain.WithCode(domain.CodeCatalogAvailabilityUnavailable,
+			fmt.Errorf("%w: availability could not be computed", domain.ErrUnavailable))
+	}
+	kept := make([]domain.RestaurantListItem, 0, len(items))
+	for _, it := range items {
+		if free[it.ID] {
+			kept = append(kept, it)
+		}
+	}
+	return kept, nil
 }
 
 func (f *facade) Get(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {

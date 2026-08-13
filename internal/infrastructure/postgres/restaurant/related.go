@@ -600,3 +600,59 @@ func (r *Related) BookableTableCountsFor(ctx context.Context, ids []uuid.UUID) (
 	}
 	return out, rows.Err()
 }
+
+// TimeSlotsFor and TablesFor are the batch twins of ListTimeSlots/ListTables,
+// for the catalog's availability filter (usecase/bookings.AvailabilitySearch).
+// One query per collection whatever the number of venues: the filter runs over
+// a whole catalog page, and per-venue reads there grow without bound.
+//
+// Unlike BookableTableCountsFor, TablesFor returns the tables THEMSELVES,
+// inactive ones included — the availability engine applies its own is_active /
+// capacity filter, and it must stay the one place that rule lives.
+func (r *Related) TimeSlotsFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]domain.TimeSlot, error) {
+	out := make(map[uuid.UUID][]domain.TimeSlot, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, restaurant_id, day_of_week, start_time, end_time, is_manually_disabled, created_at, updated_at
+		 FROM restaurant_time_slots WHERE restaurant_id = ANY($1)
+		 ORDER BY restaurant_id, day_of_week, start_time`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list time slots for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s domain.TimeSlot
+		if err := rows.Scan(&s.ID, &s.RestaurantID, &s.DayOfWeek, &s.StartTime, &s.EndTime,
+			&s.IsManuallyDisabled, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan time slot: %w", err)
+		}
+		out[s.RestaurantID] = append(out[s.RestaurantID], s)
+	}
+	return out, rows.Err()
+}
+
+func (r *Related) TablesFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]domain.RestaurantTable, error) {
+	out := make(map[uuid.UUID][]domain.RestaurantTable, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, restaurant_id, name, capacity, description, is_active, created_at, updated_at
+		 FROM restaurant_tables WHERE restaurant_id = ANY($1)
+		 ORDER BY restaurant_id, name`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list tables for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tb domain.RestaurantTable
+		if err := rows.Scan(&tb.ID, &tb.RestaurantID, &tb.Name, &tb.Capacity, &tb.Description,
+			&tb.IsActive, &tb.CreatedAt, &tb.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan table: %w", err)
+		}
+		out[tb.RestaurantID] = append(out[tb.RestaurantID], tb)
+	}
+	return out, rows.Err()
+}

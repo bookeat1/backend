@@ -216,3 +216,32 @@ func insertHolds(holds []domain.BookingCapacityHold) (string, []any) {
 	}
 	return sb.String(), args
 }
+
+// ListUsageFor is ListUsage for many venues in one query, for the catalog's
+// availability filter. Same half-open [from, to) window as every other
+// occupancy read in this package.
+func (r *Capacity) ListUsageFor(ctx context.Context, ids []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.CapacityUsage, error) {
+	out := make(map[uuid.UUID][]domain.CapacityUsage, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT restaurant_id, bucket_start, seats_taken, seats_limit
+		 FROM restaurant_capacity_buckets
+		 WHERE restaurant_id = ANY($1) AND bucket_start >= $2 AND bucket_start < $3
+		   AND seats_taken > 0
+		 ORDER BY restaurant_id, bucket_start`, ids, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("list capacity usage for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rid uuid.UUID
+		var u domain.CapacityUsage
+		if err := rows.Scan(&rid, &u.BucketStart, &u.SeatsTaken, &u.SeatsLimit); err != nil {
+			return nil, fmt.Errorf("scan capacity usage: %w", err)
+		}
+		out[rid] = append(out[rid], u)
+	}
+	return out, rows.Err()
+}
