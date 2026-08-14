@@ -234,7 +234,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	if deps.MediaStore != nil {
 		mediaStore = deps.MediaStore
 	}
-	mediarest.NewHandler(mediaStore).RegisterRoutes(authed)
+	mediaHandler := mediarest.NewHandler(mediaStore, mediarest.WithAvatarSetter(deps.UsersFacade))
+	mediaHandler.RegisterRoutes(authed)
+	// A guest's own avatar. Separate mount, no role gate: this route writes the
+	// stored URL straight onto the caller's profile, so it cannot produce an
+	// object that is not already theirs — see media/avatar.go.
+	mediaHandler.RegisterUserRoutes(authed)
 
 	// Gastroguide — the home screen's editorial collections. Plain public group,
 	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the

@@ -225,6 +225,10 @@ var routeTiers = map[string]RateLimitTier{
 	// storage-cost/DoS vector — strict-throttle it like the other side-effecting
 	// writes above, even though it sits behind Auth+RequireRole.
 	"POST /api/v1/admin/media/images": TierStrict,
+	// A guest's own avatar: same multipart storage write, and reachable by ANY
+	// signed-in account rather than by staff only. If anything it deserves the
+	// strict tier more than the admin route does.
+	"POST /api/v1/users/me/avatar": TierStrict,
 
 	// Public reading: browsing traffic.
 	"GET /api/v1/restaurants":     TierSoft,

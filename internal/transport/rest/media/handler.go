@@ -53,11 +53,35 @@ type Store interface {
 // Handler serves the admin media endpoints. store is nil when R2 is not
 // configured on this deployment; every route then answers 503 rather than
 // panicking, so the server boots without R2 credentials.
-type Handler struct{ store Store }
+type Handler struct {
+	store Store
+	// avatars writes a guest's uploaded avatar onto their own profile; see
+	// avatar.go. Nil when not wired — the guest route then answers 503 instead
+	// of storing an object nothing points at.
+	avatars AvatarSetter
+}
 
 // NewHandler builds the media HTTP handler. Pass a nil store when R2 is not
 // configured — the handler stays mountable and returns 503 on use.
-func NewHandler(store Store) *Handler { return &Handler{store: store} }
+func NewHandler(store Store, opts ...Option) *Handler {
+	h := &Handler{store: store}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// Option configures optional handler dependencies.
+type Option func(*Handler)
+
+// WithAvatarSetter enables POST /users/me/avatar.
+func WithAvatarSetter(a AvatarSetter) Option {
+	return func(h *Handler) { h.avatars = a }
+}
+
+// nowUTC is the clock the object keys are stamped with. A variable so tests can
+// pin the YYYY/MM segments.
+var nowUTC = func() time.Time { return time.Now().UTC() }
 
 // RegisterRoutes mounts the authed upload route. Mount on a group already
 // running middleware.Auth. The endpoint is NOT restaurant-scoped (it just
@@ -91,58 +115,12 @@ func (h *Handler) upload(c *gin.Context) {
 		return
 	}
 
-	// Bound the request body before parsing so a client cannot make us buffer an
-	// unbounded multipart body. A little slack over the byte cap covers the
-	// multipart envelope (boundaries + headers); the real per-image byte guard
-	// is the LimitReader on the file contents below.
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadBytes+(1<<20))
-
-	fh, err := c.FormFile(fileField)
-	if err != nil {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "a file field named \"file\" is required")
-		return
-	}
-	if fh.Size > maxUploadBytes {
-		response.Error(c.Writer, http.StatusRequestEntityTooLarge, "image exceeds the 8 MB limit")
-		return
-	}
-
-	f, err := fh.Open()
-	if err != nil {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "could not read the uploaded file")
-		return
-	}
-	defer f.Close()
-
-	// Read at most one byte past the cap: if we get that extra byte the file lied
-	// about (or omitted) its declared size and is over the limit.
-	data, err := io.ReadAll(io.LimitReader(f, maxUploadBytes+1))
-	if err != nil {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "could not read the uploaded file")
-		return
-	}
-	if len(data) > maxUploadBytes {
-		response.Error(c.Writer, http.StatusRequestEntityTooLarge, "image exceeds the 8 MB limit")
-		return
-	}
-	if len(data) == 0 {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "the uploaded file is empty")
-		return
-	}
-
-	// Sniff the real type from the bytes; never trust the client's Content-Type.
-	sniffLen := 512
-	if len(data) < sniffLen {
-		sniffLen = len(data)
-	}
-	contentType := http.DetectContentType(data[:sniffLen])
-	ext, ok := extByType[contentType]
+	data, contentType, ext, ok := readImage(c, maxUploadBytes, "image exceeds the 8 MB limit")
 	if !ok {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "unsupported image type: only JPEG, PNG and WebP are allowed")
-		return
+		return // readImage has already answered
 	}
 
-	key, err := newObjectKey(time.Now().UTC(), ext)
+	key, err := newObjectKey(nowUTC(), ext)
 	if err != nil {
 		response.HandleError(c.Writer, fmt.Errorf("media: generate key: %w", err))
 		return
@@ -154,6 +132,63 @@ func (h *Handler) upload(c *gin.Context) {
 	}
 
 	response.OK(c.Writer, uploadResponse{URL: h.store.PublicURL(key)})
+}
+
+// readImage reads, bounds and SNIFFS one multipart image, answering the client
+// itself on every rejection. It returns ok=false once it has done so, which is
+// what keeps the two upload routes from drifting apart on their limits or on
+// the rule that the client's declared Content-Type is never trusted.
+func readImage(c *gin.Context, maxBytes int, tooLargeMsg string) (data []byte, contentType, ext string, ok bool) {
+	// Bound the request body before parsing so a client cannot make us buffer an
+	// unbounded multipart body. A little slack over the byte cap covers the
+	// multipart envelope (boundaries + headers); the real per-image byte guard
+	// is the LimitReader on the file contents below.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(maxBytes)+(1<<20))
+
+	fh, err := c.FormFile(fileField)
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "a file field named \"file\" is required")
+		return nil, "", "", false
+	}
+	if fh.Size > int64(maxBytes) {
+		response.Error(c.Writer, http.StatusRequestEntityTooLarge, tooLargeMsg)
+		return nil, "", "", false
+	}
+	f, err := fh.Open()
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "could not read the uploaded file")
+		return nil, "", "", false
+	}
+	defer f.Close()
+
+	// Read at most one byte past the cap: if we get that extra byte the file lied
+	// about (or omitted) its declared size and is over the limit.
+	data, err = io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "could not read the uploaded file")
+		return nil, "", "", false
+	}
+	if len(data) > maxBytes {
+		response.Error(c.Writer, http.StatusRequestEntityTooLarge, tooLargeMsg)
+		return nil, "", "", false
+	}
+	if len(data) == 0 {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "the uploaded file is empty")
+		return nil, "", "", false
+	}
+
+	// Sniff the real type from the bytes; never trust the client's Content-Type.
+	sniffLen := 512
+	if len(data) < sniffLen {
+		sniffLen = len(data)
+	}
+	contentType = http.DetectContentType(data[:sniffLen])
+	ext, known := extByType[contentType]
+	if !known {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "unsupported image type: only JPEG, PNG and WebP are allowed")
+		return nil, "", "", false
+	}
+	return data, contentType, ext, true
 }
 
 // newObjectKey builds an immutable object key:

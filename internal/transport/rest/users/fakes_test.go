@@ -64,6 +64,8 @@ type fakeFacade struct {
 	lastDeleteID     uuid.UUID
 	deleteCalled     int
 	cuisineCalledFor uuid.UUID
+	lastAvatarID     uuid.UUID
+	lastAvatarURL    string
 }
 
 func (f *fakeFacade) Me(_ context.Context, id uuid.UUID) (*domain.User, error) {
@@ -94,6 +96,11 @@ func (f *fakeFacade) CuisinePreferences(_ context.Context, id uuid.UUID) ([]uuid
 func (f *fakeFacade) DeleteMe(_ context.Context, id uuid.UUID) error {
 	f.lastDeleteID = id
 	f.deleteCalled++
+	return f.err
+}
+
+func (f *fakeFacade) SetAvatarURL(_ context.Context, id uuid.UUID, url string) error {
+	f.lastAvatarID, f.lastAvatarURL = id, url
 	return f.err
 }
 
