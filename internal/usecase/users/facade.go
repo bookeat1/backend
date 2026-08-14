@@ -28,6 +28,13 @@ type Facade interface {
 	// every refresh token and outstanding OTP code tied to it. Idempotent: a
 	// repeat call on an already-deleted account is a no-op success.
 	DeleteMe(ctx context.Context, id uuid.UUID) error
+	// SetAvatarURL points the user's avatar at an already-stored image.
+	//
+	// A named method rather than "just call UpdateMe with one field": the
+	// avatar upload writes on behalf of the CALLER only, and a narrow method is
+	// what the transport layer can be given without also handing it the ability
+	// to rewrite a name, a city or a birth date.
+	SetAvatarURL(ctx context.Context, id uuid.UUID, url string) error
 }
 
 type facade struct {
@@ -71,6 +78,12 @@ func (f *facade) Me(ctx context.Context, id uuid.UUID) (*domain.User, error) {
 // CuisinePreferences returns the user's picked cuisine category ids.
 func (f *facade) CuisinePreferences(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
 	return f.cuisines.ListCategoryIDs(ctx, id)
+}
+
+// SetAvatarURL stores the avatar URL on the user's profile.
+func (f *facade) SetAvatarURL(ctx context.Context, id uuid.UUID, url string) error {
+	_, err := f.UpdateMe(ctx, id, UpdateInput{AvatarURL: &url})
+	return err
 }
 
 // UpdateMe applies the non-nil fields of in and returns the updated user.
