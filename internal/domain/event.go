@@ -76,8 +76,16 @@ type Event struct {
 	// changing them never affects an already-bought ticket.
 	TicketsRefundable         bool
 	TicketRefundCutoffMinutes int
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	// RecurrenceID names the rule that generated this occurrence (see
+	// EventRecurrence), nil for an ordinary one-off event. It is set ONCE, at
+	// generation time, and is never editable: the cabinet edits an occurrence
+	// like any other event, and the generator leaves an existing row alone.
+	// Deleting the rule nulls this field (ON DELETE SET NULL) instead of
+	// deleting the occurrence — an event that already happened, with tickets
+	// sold against it, must survive its rule.
+	RecurrenceID *uuid.UUID
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // EventRestaurant is the minimal venue identity carried next to an event in the

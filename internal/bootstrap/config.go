@@ -38,6 +38,10 @@ type Config struct {
 	// tickets whose payment never completed (or was never created).
 	TicketsSweep TicketsSweepConfig
 
+	// EventRecurrences configures the worker that materialises recurring-event
+	// rules into real `events` rows for a rolling window ahead.
+	EventRecurrences EventRecurrencesConfig
+
 	// Payouts configures the scheduled daily payout pass (one payout per venue
 	// per venue-local day) and the money policy of a payout: the acquirer's
 	// fee, who bears it, and the minimum below which money rolls over.
@@ -396,6 +400,19 @@ type TicketsSweepConfig struct {
 	BatchSize    int           // env: TICKETS_SWEEP_BATCH_SIZE
 }
 
+// EventRecurrencesConfig configures the recurring-event generator
+// (usecase/eventrecurrence.Generator). Every pass is safe-idle: with no active
+// rules it reads one empty page, and with the window already materialised its
+// insert writes nothing (ON CONFLICT DO NOTHING), so a short tick is cheap.
+type EventRecurrencesConfig struct {
+	TickInterval time.Duration // env: EVENT_RECURRENCE_TICK_INTERVAL
+	// Window is how far ahead occurrences are created. 8 weeks by default: far
+	// enough that the Афиша never looks empty, short enough that editing a rule
+	// still reaches most of what guests will actually see.
+	Window    time.Duration // env: EVENT_RECURRENCE_WINDOW
+	BatchSize int           // env: EVENT_RECURRENCE_BATCH_SIZE
+}
+
 // PayoutsConfig configures the scheduled daily payout pass and the money policy
 // of a payout: what moving it costs, who pays that cost, and how little is too
 // little to be worth moving.
@@ -632,6 +649,11 @@ func NewConfig() (Config, error) {
 			TickInterval: getEnvDuration("TICKETS_SWEEP_TICK_INTERVAL", 5*time.Minute),
 			StaleAfter:   getEnvDuration("TICKETS_SWEEP_STALE_AFTER", 100*time.Hour),
 			BatchSize:    getEnvInt("TICKETS_SWEEP_BATCH_SIZE", 100),
+		},
+		EventRecurrences: EventRecurrencesConfig{
+			TickInterval: getEnvDuration("EVENT_RECURRENCE_TICK_INTERVAL", 5*time.Minute),
+			Window:       getEnvDuration("EVENT_RECURRENCE_WINDOW", 8*7*24*time.Hour),
+			BatchSize:    getEnvInt("EVENT_RECURRENCE_BATCH_SIZE", 100),
 		},
 		Payouts: PayoutsConfig{
 			DailyTickInterval: getEnvDuration("PAYOUTS_DAILY_TICK_INTERVAL", 15*time.Minute),
