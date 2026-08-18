@@ -277,15 +277,6 @@ const (
 	// pick a different one. Not retryable.
 	CodeGuideSlugTaken ErrorCode = "guide_slug_taken"
 
-	// CodeGuideCollectionEmpty — publishing was refused because the collection
-	// holds no venue a guest could open. The guest read DOES show such a
-	// collection (an article is worth reading even when it points at nothing
-	// bookable), so this is an editorial guard against publishing a half-filled
-	// draft, not a visibility one. Fixed by attaching at least one ACTIVE venue
-	// — or, if the article is meant to have none, by publishing it directly in
-	// the data layer until the product decides to drop this precondition.
-	CodeGuideCollectionEmpty ErrorCode = "guide_collection_empty"
-
 	// CodeGuideOrderMismatch — the reorder request did not list exactly the
 	// collection's current venues: it repeated one, skipped one, or named a
 	// venue that is not in the collection. The order is sent as the intended

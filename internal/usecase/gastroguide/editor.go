@@ -222,26 +222,19 @@ func (e *editor) UpdateCollection(ctx context.Context, actor EditorActor, id uui
 }
 
 // Publish takes a collection live, and refuses to do so when the result would be
-// invisible or broken.
+// broken.
 //
-// Two preconditions, both of them things the guest read enforces anyway:
+// One precondition: published_at must exist. The DB CHECK says so; we supply
+// `now` when the editor did not name a time, so "опубликовать" means what it
+// says. A time in the FUTURE is accepted — that is scheduled publication, and
+// the guest predicate (published_at <= now) already implements it.
 //
-//   - published_at must exist. The DB CHECK says so; we supply `now` when the
-//     editor did not name a time, so "опубликовать" means what it says. A time
-//     in the FUTURE is accepted — that is scheduled publication, and the guest
-//     predicate (published_at <= now) already implements it.
-//   - the collection must hold at least one ACTIVE venue. This is now an
-//     EDITORIAL guard, not a visibility one: since the guest read stopped
-//     hiding empty collections, publishing one no longer produces an invisible
-//     row — the article is listed and opens with an empty venue list. What the
-//     check still prevents is publishing by accident a collection whose venue
-//     block an editor simply had not filled in yet. Refusing with
-//     CodeGuideCollectionEmpty tells the editor exactly what to do.
-//
-// TODO(product): an article that deliberately writes about venues outside the
-// catalog cannot be published through this handle at all. If that becomes a
-// real editorial need, this precondition is the thing to drop — the guest read
-// already copes.
+// A collection with NO venues publishes fine. It used to be refused, because the
+// guest listing hid such collections and "published but invisible" is a lie. The
+// listing no longer hides them: an editorial piece about places that are not in
+// the catalog is content in its own right, and it is what brings a guest back to
+// the app. So the refusal lost its reason to exist along with the rule it
+// guarded.
 func (e *editor) Publish(ctx context.Context, actor EditorActor, id uuid.UUID, publishedAt *time.Time) (*domain.GuideCollection, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
@@ -252,14 +245,6 @@ func (e *editor) Publish(ctx context.Context, actor EditorActor, id uuid.UUID, p
 	}
 	if strings.TrimSpace(current.Title) == "" || strings.TrimSpace(current.Slug) == "" {
 		return nil, fmt.Errorf("%w: a published collection needs a slug and a title", domain.ErrValidation)
-	}
-	n, err := e.repo.CountActiveVenues(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if n == 0 {
-		return nil, domain.WithCode(domain.CodeGuideCollectionEmpty,
-			fmt.Errorf("%w: a collection with no active venue would be published and invisible", domain.ErrValidation))
 	}
 	at := e.clock()
 	if publishedAt != nil {

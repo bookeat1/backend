@@ -241,15 +241,6 @@ func TestEditorHandler_RefusalsCarryTheirCode(t *testing.T) {
 			wantErr:  domain.CodeGuideOrderMismatch,
 		},
 		{
-			name:     "publishing an empty collection",
-			err:      domain.WithCode(domain.CodeGuideCollectionEmpty, domain.ErrValidation),
-			method:   http.MethodPost,
-			url:      "/api/v1/admin/gastroguide/collections/" + col.String() + "/publish",
-			body:     nil,
-			wantCode: http.StatusUnprocessableEntity,
-			wantErr:  domain.CodeGuideCollectionEmpty,
-		},
-		{
 			name:     "a taken slug",
 			err:      domain.WithCode(domain.CodeGuideSlugTaken, domain.ErrAlreadyExists),
 			method:   http.MethodPost,
