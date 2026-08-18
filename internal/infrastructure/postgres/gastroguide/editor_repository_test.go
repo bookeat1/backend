@@ -326,10 +326,11 @@ func TestEditorCreate_DuplicateSlugIsCoded(t *testing.T) {
 	}
 }
 
-// The cabinet must see drafts and archived collections — that is what
-// distinguishes it from the guest listing — and it must NOT hide a collection
-// just because it is empty or all its venues are dark.
-func TestEditorListCollectionsAdmin_ShowsWhatTheGuestListingHides(t *testing.T) {
+// The cabinet must see drafts and archived collections — that is now the ONLY
+// thing that distinguishes it from the guest listing, which shows empty
+// collections too. It must also keep reporting the guest-visible venue count,
+// so the cabinet and the app never disagree about a number.
+func TestEditorListCollectionsAdmin_ShowsDraftsAndArchivedToo(t *testing.T) {
 	pool, repo, ctx := editorSetup(t)
 	seedEditableCollection(t, pool, ctx, "draft-empty")
 	published := seedCollection(t, pool, ctx, collectionSeed{

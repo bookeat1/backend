@@ -144,6 +144,9 @@ type GuideHighlight struct {
 // venues.
 type GuideCollectionDetail struct {
 	GuideCollection
+	// Venues may be empty: an editorial article stays readable when it points
+	// at no venue the guest can open, and the client renders it without a
+	// venue block instead of treating it as an error.
 	Venues []GuideCollectionVenue
 }
 
@@ -170,10 +173,13 @@ type GuideCollectionFilter struct {
 type GastroguideRepository interface {
 	// ListCategories returns the active rubrics that have at least one live
 	// collection (a rubric that opens into an empty screen is not shown),
-	// in editorial order.
+	// in editorial order. A rubric counts as non-empty even when its only live
+	// collection has no visible venue — the collection itself is the content.
 	ListCategories(ctx context.Context, city *City, now time.Time) ([]GuideCategory, error)
 	// ListPublishedCollections returns live collections in editorial order, with
-	// their guest-visible venue count, paginated, plus the total.
+	// their guest-visible venue count, paginated, plus the total. A live
+	// collection with a venue count of 0 is included: what makes it visible is
+	// its own state, not how many venues it currently links.
 	ListPublishedCollections(ctx context.Context, f GuideCollectionFilter, now time.Time) ([]GuideCollection, int, error)
 	// GetPublishedCollectionBySlug returns a live collection with its ordered,
 	// guest-visible venues. Returns ErrNotFound when the slug is unknown OR the

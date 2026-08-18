@@ -188,3 +188,31 @@ func TestListCategories(t *testing.T) {
 		t.Fatalf("categories = %v", items)
 	}
 }
+
+// An article that links no venue still renders: `venues` must be an empty JSON
+// array, never null and never a missing key — the client draws a list there and
+// would have to guard null in three places otherwise. venue_count is 0 and is
+// still present, so the card can say "0 мест" instead of guessing.
+func TestGetCollection_EmptyVenueListIsAnArrayNotNull(t *testing.T) {
+	f := &fakeFacade{detail: &domain.GuideCollectionDetail{
+		GuideCollection: domain.GuideCollection{
+			ID: uuid.New(), Slug: "city-guide", Title: "Гид по городу", VenueCount: 0,
+		},
+	}}
+
+	w, body := do(t, router(f), "/api/v1/gastroguide/collections/city-guide")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	data := body["data"].(map[string]any)
+	venues, ok := data["venues"].([]any)
+	if !ok {
+		t.Fatalf("venues = %#v, want an empty array", data["venues"])
+	}
+	if len(venues) != 0 {
+		t.Fatalf("venues = %v, want empty", venues)
+	}
+	if data["venue_count"] != float64(0) {
+		t.Fatalf("venue_count = %v, want 0", data["venue_count"])
+	}
+}
