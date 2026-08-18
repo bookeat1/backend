@@ -15,6 +15,16 @@
 //     deactivation is routinely temporary and an editor must not lose their
 //     curation to it.
 //
+// The number of visible venues is NOT a visibility rule. A published
+// collection with zero of them is listed, is offered through its rubric and
+// opens with an empty venue list. The guide is editorial content the platform
+// writes to bring a guest back into the app — an article may legitimately talk
+// about places that are not in the catalog at all, or about places that were
+// deactivated after it was written, and it still has something to read. Hiding
+// it would also make the cabinet lie: a row it calls published that the app
+// never shows. Only the collection's own state (status, published_at) and the
+// city filter decide whether a guest sees it.
+//
 // hidden_from_home is deliberately NOT applied: per the catalog convention that
 // flag hides a venue from the merchandising rail on the main screen, not from
 // the catalog, and a collection an editor curated by hand is catalog content
@@ -50,8 +60,8 @@ var _ domain.GastroguideRepository = (*Repository)(nil)
 const liveCollection = `c.status = 'published' AND c.published_at <= $1::timestamptz`
 
 // visibleVenues counts the venues of collection c a guest can actually open.
-// Used both as the card's venue_count and as the "do not show an empty
-// collection" filter.
+// It is the card's venue_count and nothing else: it is deliberately NOT used as
+// a filter, so a count of 0 shrinks the card instead of removing it.
 const visibleVenues = `(SELECT count(*) FROM gastroguide_collection_venues cv
 		JOIN restaurants r ON r.id = cv.restaurant_id
 		WHERE cv.collection_id = c.id AND r.is_active)`
@@ -65,9 +75,11 @@ const collectionCols = `c.id, c.slug, c.title, c.title_i18n, c.subtitle, c.subti
 		JOIN gastroguide_categories cat ON cat.id = cc.category_id
 		WHERE cc.collection_id = c.id AND cat.is_active), '{}') AS category_slugs`
 
-// ListCategories returns the active rubrics that hold at least one live,
-// non-empty collection. A rubric whose collections are all drafts would open
-// into an empty screen, so it is not offered.
+// ListCategories returns the active rubrics that hold at least one live
+// collection. A rubric whose collections are all drafts (or archived, or
+// scheduled for later) would open into an empty screen, so it is not offered.
+// A rubric whose only live collection has no visible venue IS offered: that
+// collection is still an article a guest can open and read.
 func (r *Repository) ListCategories(ctx context.Context, city *domain.City, now time.Time) ([]domain.GuideCategory, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT cat.id, cat.slug, cat.title, cat.title_i18n, cat.position, cat.is_active,
@@ -81,7 +93,6 @@ func (r *Repository) ListCategories(ctx context.Context, city *domain.City, now 
 			WHERE cc.category_id = cat.id
 			  AND `+liveCollection+`
 			  AND ($2::varchar IS NULL OR c.city IS NULL OR c.city = $2)
-			  AND `+visibleVenues+` > 0
 		   )
 		 ORDER BY cat.position, cat.id`,
 		now, cityArg(city))
@@ -110,16 +121,17 @@ func (r *Repository) ListCategories(ctx context.Context, city *domain.City, now 
 // ListPublishedCollections returns live collections in editorial order
 // (position, then id as the stable tie-break), paginated, plus the total.
 //
-// Collections with no guest-visible venue are excluded: a guide entry that
-// opens into an empty screen is worse than no entry, and after the is_active
-// filter that state is reachable without an editor doing anything wrong.
+// A collection with no guest-visible venue is listed like any other, with
+// venue_count = 0. It is an article first: its text and cover are the reason it
+// exists, and the venues it links are a bonus, not the payload. An editor who
+// published it decided it should be read; a venue going inactive afterwards is
+// not the platform's cue to retract the article.
 func (r *Repository) ListPublishedCollections(ctx context.Context, f domain.GuideCollectionFilter, now time.Time) ([]domain.GuideCollection, int, error) {
 	page, perPage := normalizePage(f.Page, f.PerPage)
 	args := []any{now, cityArg(f.City)}
 	from := ` FROM gastroguide_collections c
 		WHERE ` + liveCollection + `
-		  AND ($2::varchar IS NULL OR c.city IS NULL OR c.city = $2)
-		  AND ` + visibleVenues + ` > 0`
+		  AND ($2::varchar IS NULL OR c.city IS NULL OR c.city = $2)`
 	if f.CategorySlug != nil {
 		args = append(args, *f.CategorySlug)
 		from += `
@@ -166,9 +178,10 @@ func (r *Repository) ListPublishedCollections(ctx context.Context, f domain.Guid
 // the SAME answer (ErrNotFound): telling them apart would confirm the slug of a
 // collection that has not been announced yet.
 //
-// Unlike the listing, a live collection whose venues are all deactivated is
-// still returned — with an empty venue list. The guest followed a link to a
-// page that exists; answering 404 would be a different lie.
+// A live collection with no guest-visible venue is returned too, with an empty
+// venue list and venue_count = 0 — the same rule the listing follows. The guest
+// followed a link to a page that exists; answering 404 would be a different
+// lie.
 func (r *Repository) GetPublishedCollectionBySlug(ctx context.Context, slug string, now time.Time) (*domain.GuideCollectionDetail, error) {
 	q := sqltx.From(ctx, r.pool)
 	row := q.QueryRow(ctx,

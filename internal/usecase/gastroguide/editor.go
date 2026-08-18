@@ -230,14 +230,18 @@ func (e *editor) UpdateCollection(ctx context.Context, actor EditorActor, id uui
 //     editor did not name a time, so "опубликовать" means what it says. A time
 //     in the FUTURE is accepted — that is scheduled publication, and the guest
 //     predicate (published_at <= now) already implements it.
-//   - the collection must hold at least one ACTIVE venue. The guest listing
-//     filters out collections with no guest-visible venue, so publishing an
-//     empty one produces a collection that is "published" everywhere in the
-//     cabinet and absent from the app, with nothing to point at. Refusing with
+//   - the collection must hold at least one ACTIVE venue. This is now an
+//     EDITORIAL guard, not a visibility one: since the guest read stopped
+//     hiding empty collections, publishing one no longer produces an invisible
+//     row — the article is listed and opens with an empty venue list. What the
+//     check still prevents is publishing by accident a collection whose venue
+//     block an editor simply had not filled in yet. Refusing with
 //     CodeGuideCollectionEmpty tells the editor exactly what to do.
 //
-// A collection whose venues are all currently DEACTIVATED fails the second
-// check. That is the honest answer: right now there is nothing to show.
+// TODO(product): an article that deliberately writes about venues outside the
+// catalog cannot be published through this handle at all. If that becomes a
+// real editorial need, this precondition is the thing to drop — the guest read
+// already copes.
 func (e *editor) Publish(ctx context.Context, actor EditorActor, id uuid.UUID, publishedAt *time.Time) (*domain.GuideCollection, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err

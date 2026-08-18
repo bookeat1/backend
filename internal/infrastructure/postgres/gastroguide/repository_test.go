@@ -222,9 +222,11 @@ func TestInactiveVenueIsNotShownAndNotCounted(t *testing.T) {
 	}
 }
 
-// Every venue of a live collection being deactivated empties the collection but
-// does not resurrect it as a broken card in the listing.
-func TestCollectionWithNoVisibleVenueDropsOutOfTheListing(t *testing.T) {
+// Every venue of a live collection being deactivated empties it — and it STAYS
+// in the listing. The guide is editorial content: the article is the payload,
+// the venues are a bonus, and an editor who published it did not ask for it to
+// be retracted the moment a restaurant is switched off.
+func TestCollectionWithNoVisibleVenueStaysInTheListing(t *testing.T) {
 	pool, repo, ctx := setup(t)
 	now := time.Now()
 	inactive := seedVenue(t, pool, ctx, "Отключён", false)
@@ -239,17 +241,105 @@ func TestCollectionWithNoVisibleVenueDropsOutOfTheListing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if total != 0 || len(items) != 0 {
-		t.Fatalf("an empty collection stayed in the listing: %+v", items)
+	if total != 1 || len(items) != 1 || items[0].Slug != "empty-now" {
+		t.Fatalf("an emptied collection was hidden: total=%d items=%+v", total, items)
+	}
+	if items[0].VenueCount != 0 {
+		t.Fatalf("venue_count = %d, want 0 (the deactivated venue must not be counted)", items[0].VenueCount)
 	}
 
-	// Its own page still answers: the guest followed a real link.
+	// Its own page answers with an empty venue list, not a 404.
 	got, err := repo.GetPublishedCollectionBySlug(ctx, "empty-now", now)
 	if err != nil {
 		t.Fatalf("get collection: %v", err)
 	}
 	if len(got.Venues) != 0 || got.VenueCount != 0 {
 		t.Fatalf("expected an empty but existing collection, got %+v", got)
+	}
+}
+
+// A collection that never had a venue at all — an article about places outside
+// the catalog — is listed, is counted in the total and opens by its own slug.
+// This is the state the listing used to swallow.
+func TestCollectionWithNoVenuesAtAllIsListedAndOpens(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "no-venues", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(now.Add(-time.Hour)), position: 1,
+	})
+
+	items, total, err := repo.ListPublishedCollections(ctx, domain.GuideCollectionFilter{}, now)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != 1 || len(items) != 1 || items[0].Slug != "no-venues" {
+		t.Fatalf("a venue-less collection was hidden: total=%d items=%+v", total, items)
+	}
+	if items[0].VenueCount != 0 {
+		t.Fatalf("venue_count = %d, want 0", items[0].VenueCount)
+	}
+
+	got, err := repo.GetPublishedCollectionBySlug(ctx, "no-venues", now)
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	if got.Venues == nil {
+		// nil is fine for the transport (it renders []), but the detail must at
+		// least exist and know its own emptiness.
+		t.Log("venues came back nil; the transport turns that into []")
+	}
+	if len(got.Venues) != 0 || got.VenueCount != 0 {
+		t.Fatalf("expected an empty venue list, got %+v", got)
+	}
+
+	// The city filter still applies to a venue-less collection.
+	almaty := domain.CityAlmaty
+	if _, err := pool.Exec(ctx,
+		`UPDATE gastroguide_collections SET city = $1 WHERE slug = 'no-venues'`,
+		string(domain.CityAstana)); err != nil {
+		t.Fatalf("pin the collection to a city: %v", err)
+	}
+	_, total, err = repo.ListPublishedCollections(ctx, domain.GuideCollectionFilter{City: &almaty}, now)
+	if err != nil {
+		t.Fatalf("list by city: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("an Astana collection leaked into the Almaty listing: total=%d", total)
+	}
+}
+
+// Opening the listing to empty collections must not open it to unpublished
+// ones: a draft, an archived collection and one scheduled for tomorrow stay
+// invisible whether or not they hold a venue.
+func TestVenuelessButUnpublishedCollectionsStayHidden(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "draft-empty", status: domain.GuideCollectionDraft, position: 1,
+	})
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "archived-empty", status: domain.GuideCollectionArchived,
+		publishedAt: ptrTime(now.Add(-48 * time.Hour)), position: 2,
+	})
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "tomorrow-empty", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(now.Add(24 * time.Hour)), position: 3,
+	})
+
+	items, total, err := repo.ListPublishedCollections(ctx, domain.GuideCollectionFilter{}, now)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != 0 || len(items) != 0 {
+		t.Fatalf("unpublished venue-less collections leaked: total=%d items=%+v", total, items)
+	}
+	for _, slug := range []string{"draft-empty", "archived-empty", "tomorrow-empty"} {
+		if _, err := repo.GetPublishedCollectionBySlug(ctx, slug, now); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("get %q: err = %v, want ErrNotFound", slug, err)
+		}
 	}
 }
 
@@ -518,5 +608,67 @@ func TestGetCollection_PlainVenueBlockHasNoHighlightAndNoInstagram(t *testing.T)
 	}
 	if got.Venues[0].Instagram != "" || got.Venues[0].Highlight != nil {
 		t.Fatalf("plain block invented content: %+v", got.Venues[0])
+	}
+}
+
+// A rubric whose only live collection holds no visible venue is still offered:
+// tapping it opens an article, which is exactly what the guide is for. A rubric
+// that holds only a draft is still not offered — that screen really is empty.
+func TestCategories_RubricWithOnlyAnEmptyCollectionIsOffered(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+
+	seedCategory := func(slug string, position int) uuid.UUID {
+		id := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO gastroguide_categories (id, slug, title, position, is_active)
+			 VALUES ($1, $2, $3, $4, true)`, id, slug, "Рубрика "+slug, position); err != nil {
+			t.Fatalf("seed category: %v", err)
+		}
+		return id
+	}
+	link := func(collection, category uuid.UUID) {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO gastroguide_collection_categories (collection_id, category_id, position)
+			 VALUES ($1, $2, 1)`, collection, category); err != nil {
+			t.Fatalf("link collection to category: %v", err)
+		}
+	}
+
+	stories := seedCategory("stories", 10)
+	onlyDraft := seedCategory("only-draft", 20)
+
+	empty := seedCollection(t, pool, ctx, collectionSeed{
+		slug: "story-no-venues", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(now.Add(-time.Hour)), position: 1,
+	})
+	draft := seedCollection(t, pool, ctx, collectionSeed{
+		slug: "still-writing", status: domain.GuideCollectionDraft, position: 2,
+	})
+	link(empty, stories)
+	link(draft, onlyDraft)
+
+	cats, err := repo.ListCategories(ctx, nil, now)
+	if err != nil {
+		t.Fatalf("list categories: %v", err)
+	}
+	var slugs []string
+	for _, c := range cats {
+		slugs = append(slugs, c.Slug)
+	}
+	if len(slugs) != 1 || slugs[0] != "stories" {
+		t.Fatalf("categories = %v, want [stories] (empty-but-live counts, draft does not)", slugs)
+	}
+
+	// And the rubric filter actually returns that collection, so the chip does
+	// not open into a blank screen.
+	storiesSlug := "stories"
+	items, total, err := repo.ListPublishedCollections(ctx,
+		domain.GuideCollectionFilter{CategorySlug: &storiesSlug}, now)
+	if err != nil {
+		t.Fatalf("list by category: %v", err)
+	}
+	if total != 1 || len(items) != 1 || items[0].Slug != "story-no-venues" {
+		t.Fatalf("rubric filter lost the empty collection: total=%d items=%+v", total, items)
 	}
 }
