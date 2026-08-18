@@ -61,6 +61,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// pending tickets every pass finds nothing.
 	ticketSweeper := NewTicketSweeper(cfg, db, log)
 
+	// The recurring-event generator fills the Афиша from the venues' recurrence
+	// rules for a rolling window ahead. Started unconditionally, same safe-idle
+	// rationale as the reconcilers: no rules means an empty page, an already
+	// materialised window means an insert that writes nothing. Running two
+	// instances is safe by construction (unique index on the slot).
+	recurrenceGenerator := NewEventRecurrenceGenerator(cfg, db, log)
+
 	// The analytics dispatcher ships product events (booking/payment) to
 	// Amplitude by re-reading the existing outboxes through its own cursor.
 	// Started unconditionally, same rationale as the notification dispatcher:
@@ -87,7 +94,8 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 
 	var wg sync.WaitGroup
 	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	wg.Add(7)
+	var recurrenceErr error
+	wg.Add(8)
 	go func() {
 		defer wg.Done()
 		bookingErr = NewBookingWorker(cfg, db, log).Run(ctx)
@@ -115,6 +123,10 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	go func() {
 		defer wg.Done()
 		analyticsErr = analyticsDispatcher.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		recurrenceErr = recurrenceGenerator.Run(ctx)
 	}()
 	if legacySync != nil {
 		wg.Add(1)
@@ -145,6 +157,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if analyticsErr != nil {
 		return fmt.Errorf("analytics dispatcher: %w", analyticsErr)
+	}
+	if recurrenceErr != nil {
+		return fmt.Errorf("event recurrence generator: %w", recurrenceErr)
 	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)

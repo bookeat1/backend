@@ -493,10 +493,14 @@ type eventResponse struct {
 	// The refund rules a guest must be able to read BEFORE buying. Always
 	// present (never omitempty): "false" is a rule too, and an absent field
 	// would read as "unknown" in the app.
-	TicketsRefundable         bool   `json:"tickets_refundable"`
-	TicketRefundCutoffMinutes int    `json:"ticket_refund_cutoff_minutes"`
-	CreatedAt                 string `json:"created_at"`
-	UpdatedAt                 string `json:"updated_at"`
+	TicketsRefundable         bool `json:"tickets_refundable"`
+	TicketRefundCutoffMinutes int  `json:"ticket_refund_cutoff_minutes"`
+	// RecurrenceID names the rule this occurrence was generated from, absent
+	// for an ordinary one-off event. The cabinet uses it to tell the venue "this
+	// date comes from a series" before they edit or delete it.
+	RecurrenceID *string `json:"recurrence_id,omitempty"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 // tagsOrEmpty guarantees the JSON tags field serializes as [] rather than null:
@@ -513,6 +517,11 @@ func tagsOrEmpty(tags []string) []string {
 // adminResponse is the full staff-facing shape: base scalar + the raw i18n maps
 // so the cabinet can edit translations.
 func adminResponse(e domain.Event) eventResponse {
+	var recurrenceID *string
+	if e.RecurrenceID != nil {
+		s := e.RecurrenceID.String()
+		recurrenceID = &s
+	}
 	return eventResponse{
 		ID:               e.ID.String(),
 		RestaurantID:     e.RestaurantID.String(),
@@ -533,6 +542,7 @@ func adminResponse(e domain.Event) eventResponse {
 
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
+		RecurrenceID:              recurrenceID,
 		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
 	}

@@ -221,6 +221,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	eventsHandler.RegisterPublic(api)
 	eventsHandler.RegisterAdminRoutes(authed)
 
+	// Recurring-event RULES (migration 0074). Admin only, guarded by exactly the
+	// same PermRestaurantManage gate as the event editor above — a rule is an
+	// event factory, so whoever may create the events may create the rule. There
+	// is no public route: a guest sees the generated events, never the rule.
+	eventRecurrencesHandler := eventsrest.NewRecurrenceHandler(deps.EventRecurrences)
+	eventRecurrencesHandler.RegisterAdminRoutes(authed)
+
 	promosHandler := promosrest.NewHandler(deps.PromosFacade)
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)

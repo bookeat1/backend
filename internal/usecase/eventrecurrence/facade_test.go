@@ -1,0 +1,283 @@
+package eventrecurrence
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"backend-core/internal/domain"
+)
+
+// --- fakes ---
+
+type fakeRepo struct {
+	byID    map[uuid.UUID]*domain.EventRecurrence
+	created *domain.EventRecurrence
+	updated *domain.EventRecurrence
+	active  map[uuid.UUID]bool
+}
+
+func newFakeRepo() *fakeRepo {
+	return &fakeRepo{byID: map[uuid.UUID]*domain.EventRecurrence{}, active: map[uuid.UUID]bool{}}
+}
+
+func (f *fakeRepo) Create(_ context.Context, r *domain.EventRecurrence) error {
+	if r.ID == uuid.Nil {
+		r.ID = uuid.New()
+	}
+	f.created = r
+	f.byID[r.ID] = r
+	return nil
+}
+
+func (f *fakeRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.EventRecurrence, error) {
+	r, ok := f.byID[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	cp := *r
+	return &cp, nil
+}
+
+func (f *fakeRepo) Update(_ context.Context, r *domain.EventRecurrence) error {
+	if _, ok := f.byID[r.ID]; !ok {
+		return domain.ErrNotFound
+	}
+	f.updated = r
+	f.byID[r.ID] = r
+	return nil
+}
+
+func (f *fakeRepo) SetActive(_ context.Context, id uuid.UUID, active bool) error {
+	if _, ok := f.byID[id]; !ok {
+		return domain.ErrNotFound
+	}
+	f.active[id] = active
+	return nil
+}
+
+func (f *fakeRepo) ListByRestaurant(_ context.Context, restaurantID uuid.UUID, _, _ int) ([]domain.EventRecurrence, int, error) {
+	var out []domain.EventRecurrence
+	for _, r := range f.byID {
+		if r.RestaurantID == restaurantID {
+			out = append(out, *r)
+		}
+	}
+	return out, len(out), nil
+}
+
+func (f *fakeRepo) ListActive(_ context.Context, _ uuid.UUID, _ int) ([]domain.ActiveEventRecurrence, error) {
+	return nil, nil
+}
+
+func (f *fakeRepo) InsertOccurrences(_ context.Context, _ *domain.EventRecurrence, _ []time.Time) (int, error) {
+	return 0, nil
+}
+
+func (f *fakeRepo) RecordSkip(_ context.Context, _ uuid.UUID, _ time.Time) error { return nil }
+
+type fakePerms struct {
+	roles map[[2]uuid.UUID]domain.StaffRole
+}
+
+func (f *fakePerms) HasPermission(_ context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error) {
+	role, ok := f.roles[[2]uuid.UUID{userID, restaurantID}]
+	if !ok {
+		return false, nil
+	}
+	return role.HasPermission(perm), nil
+}
+
+func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
+	return &fakePerms{roles: map[[2]uuid.UUID]domain.StaffRole{{userID, rid}: role}}
+}
+
+func validInput(rid uuid.UUID) Input {
+	return Input{
+		RestaurantID:     rid,
+		Title:            "Cocktail Wednesday",
+		OccurrenceStatus: domain.EventPublished,
+		Frequency:        domain.RecurrenceWeekly,
+		Weekdays:         []domain.ISOWeekday{3},
+		StartMinutes:     19 * 60,
+		DurationMinutes:  180,
+		StartsOn:         domain.CalendarDate{Year: 2026, Month: time.August, Day: 17},
+		IsActive:         true,
+	}
+}
+
+// --- authorization: identical to the event editor's, on purpose ---
+
+func TestCreateHostessForbidden(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleHostess))
+
+	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validInput(rid))
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("a hostess must not create a recurrence rule, got %v", err)
+	}
+	if repo.created != nil {
+		t.Fatal("nothing must be written when the caller is denied")
+	}
+}
+
+func TestCreateManagerAllowed(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validInput(rid))
+	if err != nil {
+		t.Fatalf("a manager must be able to create a rule: %v", err)
+	}
+	if rec.RestaurantID != rid || rec.Frequency != domain.RecurrenceWeekly {
+		t.Fatalf("rule stored wrong: %+v", rec)
+	}
+}
+
+// A manager of venue A must not reach venue B's rule — the lateral-move check
+// every admin path in this codebase owes.
+func TestUpdateAnotherVenuesRuleForbidden(t *testing.T) {
+	venueA, venueB, actorID := uuid.New(), uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, venueA, domain.StaffRoleManager))
+	rec := &domain.EventRecurrence{ID: uuid.New(), RestaurantID: venueB}
+	repo.byID[rec.ID] = rec
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, validInput(venueB))
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("a manager of another venue must be refused, got %v", err)
+	}
+	if repo.updated != nil {
+		t.Fatal("nothing must be written")
+	}
+}
+
+func TestSuperadminBypassesRestaurantScope(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, &fakePerms{})
+
+	if _, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleAdmin}, validInput(rid)); err != nil {
+		t.Fatalf("a superadmin must be able to create a rule anywhere: %v", err)
+	}
+}
+
+func TestSetActiveDeactivates(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validInput(rid))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := f.SetActive(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, false); err != nil {
+		t.Fatalf("deactivate: %v", err)
+	}
+	if repo.active[rec.ID] {
+		t.Fatal("the rule must be inactive")
+	}
+}
+
+// --- validation ---
+
+func TestValidationRefusals(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	cases := []struct {
+		name   string
+		mutate func(*Input)
+	}{
+		{"empty title", func(in *Input) { in.Title = "  " }},
+		{"unknown frequency", func(in *Input) { in.Frequency = "yearly" }},
+		{"weekly without weekdays", func(in *Input) { in.Weekdays = nil }},
+		{"weekday out of range", func(in *Input) { in.Weekdays = []domain.ISOWeekday{9} }},
+		{"monthly without month day", func(in *Input) { in.Frequency = domain.RecurrenceMonthly }},
+		{"start time out of the day", func(in *Input) { in.StartMinutes = 24 * 60 }},
+		{"zero duration", func(in *Input) { in.DurationMinutes = 0 }},
+		{"duration longer than a week", func(in *Input) { in.DurationMinutes = 8 * 24 * 60 }},
+		{"unknown occurrence status", func(in *Input) { in.OccurrenceStatus = "archived" }},
+		{"missing starts_on", func(in *Input) { in.StartsOn = domain.CalendarDate{} }},
+		{"until before starts_on", func(in *Input) {
+			d := domain.CalendarDate{Year: 2026, Month: time.August, Day: 1}
+			in.UntilDate = &d
+		}},
+		// The zone rules of domain.NormalizeVenueTimezone apply verbatim: a
+		// fixed-offset legacy name is refused because it does not follow DST.
+		{"legacy fixed-offset timezone", func(in *Input) { in.Timezone = "EST" }},
+		{"server-local timezone", func(in *Input) { in.Timezone = "Local" }},
+		{"negative capacity", func(in *Input) { c := -1; in.Capacity = &c }},
+		{"negative ticket price", func(in *Input) { p := int64(-1); in.TicketPriceMinor = &p }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+			in := validInput(rid)
+			tc.mutate(&in)
+			_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+			if !errors.Is(err, domain.ErrValidation) {
+				t.Fatalf("want a validation error, got %v", err)
+			}
+			if repo.created != nil {
+				t.Fatal("an invalid rule must not be written")
+			}
+		})
+	}
+}
+
+// A monthly rule needs no weekdays, and any that were sent are dropped rather
+// than stored as a lie the next reader has to interpret.
+func TestNonWeeklyRuleDropsWeekdays(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	in := validInput(rid)
+	in.Frequency = domain.RecurrenceDaily
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(rec.Weekdays) != 0 {
+		t.Fatalf("a daily rule must carry no weekdays, got %v", rec.Weekdays)
+	}
+}
+
+func TestWeekdaysAreDedupedAndSorted(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	in := validInput(rid)
+	in.Weekdays = []domain.ISOWeekday{4, 3, 4}
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(rec.Weekdays) != 2 || rec.Weekdays[0] != 3 || rec.Weekdays[1] != 4 {
+		t.Fatalf("want [3 4], got %v", rec.Weekdays)
+	}
+}
+
+// An empty timezone means "follow the venue" and must stay empty — storing ""
+// as a zone would read as UTC to time.LoadLocation.
+func TestEmptyTimezoneStaysEmpty(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	in := validInput(rid)
+	in.Timezone = "   "
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if rec.Timezone != "" {
+		t.Fatalf("want no zone override, got %q", rec.Timezone)
+	}
+}

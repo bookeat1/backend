@@ -31,7 +31,7 @@ var _ domain.EventRepository = (*Repository)(nil)
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
 	starts_at, ends_at, venue, cover_image_url, status, ticketed,
 	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
-	created_at, updated_at`
+	recurrence_id, created_at, updated_at`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as reviews/favorites.
@@ -168,7 +168,7 @@ func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uui
 const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e.description_i18n,
 	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
 	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
-	e.created_at, e.updated_at,
+	e.recurrence_id, e.created_at, e.updated_at,
 	r.name, r.name_i18n, r.city`
 
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
@@ -268,7 +268,7 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.CreatedAt, &e.UpdatedAt); err != nil {
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
@@ -284,7 +284,7 @@ func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.CreatedAt, &e.UpdatedAt,
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt,
 		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
 		return nil, err
 	}

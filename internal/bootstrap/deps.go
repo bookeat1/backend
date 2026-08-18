@@ -27,6 +27,7 @@ import (
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
 	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
+	eventrecurrencerepo "backend-core/internal/infrastructure/postgres/eventrecurrence"
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
@@ -63,6 +64,7 @@ import (
 	"backend-core/internal/usecase/consent"
 	"backend-core/internal/usecase/content"
 	"backend-core/internal/usecase/dashboard"
+	"backend-core/internal/usecase/eventrecurrence"
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
@@ -100,17 +102,20 @@ type Deps struct {
 	ConsentFacade      consent.Facade
 	ReviewsFacade      reviews.Facade
 	EventsFacade       events.Facade
-	PromosFacade       promos.Facade
-	GastroguideFacade  gastroguide.Facade
-	GastroguideEditor  gastroguide.Editor
-	ContentFacade      content.Facade
-	FeedFacade         feed.Facade
-	MenuFacade         menu.Facade
-	StoriesFacade      stories.Facade
-	BookingsFacade     bookings.Facade
-	BookingCreate      bookings.CreateUseCase
-	BookingIdempotent  bookings.IdempotentCreateUseCase
-	BookingStatus      bookings.StatusUseCase
+	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
+	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
+	EventRecurrences  eventrecurrence.Facade
+	PromosFacade      promos.Facade
+	GastroguideFacade gastroguide.Facade
+	GastroguideEditor gastroguide.Editor
+	ContentFacade     content.Facade
+	FeedFacade        feed.Facade
+	MenuFacade        menu.Facade
+	StoriesFacade     stories.Facade
+	BookingsFacade    bookings.Facade
+	BookingCreate     bookings.CreateUseCase
+	BookingIdempotent bookings.IdempotentCreateUseCase
+	BookingStatus     bookings.StatusUseCase
 	// Roles changes global roles and reads their audit. Also the home of the
 	// bootstrap that promotes the first administrator on an empty platform.
 	Roles *rolesuc.UseCase
@@ -260,7 +265,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// content pulls it back into the review queue, so an approved card can
 	// never be rewritten into something nobody approved.
 	feedRepo := feedrepo.New(db)
-	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers, feedRepo)
+	// Recurring events (migration 0074): the rule CRUD, plus the tombstone port
+	// the events facade needs. Deleting or moving a GENERATED occurrence must
+	// record a skip, otherwise the generator recreates the date the venue just
+	// removed — so the recurrence repository is injected into the events facade
+	// as `occurrenceSkipRecorder`, the same one-effect-port shape as feedRepo.
+	recurrenceRepo := eventrecurrencerepo.New(db)
+	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers, feedRepo,
+		events.WithOccurrenceSkips(recurrenceRepo))
+	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
 
@@ -420,6 +433,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		ConsentFacade:         consentFacade,
 		ReviewsFacade:         reviewsFacade,
 		EventsFacade:          eventsFacade,
+		EventRecurrences:      eventRecurrences,
 		PromosFacade:          promosFacade,
 		GastroguideFacade:     gastroguideFacade,
 		GastroguideEditor:     gastroguideEditor,
@@ -961,6 +975,29 @@ func NewTicketSweeper(cfg Config, db *pgxpool.Pool, log *slog.Logger) *tickets.P
 			TickInterval: cfg.TicketsSweep.TickInterval,
 			StaleAfter:   staleAfter,
 			BatchSize:    cfg.TicketsSweep.BatchSize,
+		}, log)
+}
+
+// NewEventRecurrenceGenerator builds the recurring-event generator: it
+// materialises every active rule into real `events` rows for a rolling window
+// ahead (8 weeks by default) and tops that window up on every tick.
+//
+// Safe-idle and safe to run twice, which is why it is started unconditionally
+// like the reconcilers: with no rules a pass reads one empty page, and with the
+// window already filled its INSERT ... ON CONFLICT DO NOTHING writes nothing.
+// Two worker instances cannot double-create an occurrence — the unique index on
+// (recurrence_id, starts_at) decides.
+func NewEventRecurrenceGenerator(cfg Config, db *pgxpool.Pool, log *slog.Logger) *eventrecurrence.Generator {
+	return eventrecurrence.NewGenerator(
+		eventrecurrencerepo.New(db),
+		eventrecurrence.GeneratorConfig{
+			TickInterval: cfg.EventRecurrences.TickInterval,
+			Window:       cfg.EventRecurrences.Window,
+			BatchSize:    cfg.EventRecurrences.BatchSize,
+			// The SAME platform fallback bookings and payouts use — a venue's
+			// day must mean one thing across the system. It applies only when
+			// neither the rule nor the venue names a zone.
+			TimezoneFallback: cfg.Booking.TimezoneFallback,
 		}, log)
 }
 
