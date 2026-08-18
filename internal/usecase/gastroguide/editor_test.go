@@ -200,38 +200,27 @@ func TestEditor_EveryOperationIsSuperadminOnly(t *testing.T) {
 	}
 }
 
-// Publishing a collection with no ACTIVE venue is refused. The guest listing
-// filters out collections with no guest-visible venue, so allowing this would
-// produce a collection the cabinet calls "опубликована" and the app never shows
-// — the single hardest state to explain to the person who published it.
-func TestEditor_PublishRefusesACollectionNoGuestCouldSee(t *testing.T) {
-	cases := map[string]int{
-		"no venues at all":         0,
-		"every venue deactivated":  0,
-		"one active venue is fine": 1,
-	}
-	for name, active := range cases {
+// Публикация подборки БЕЗ заведений разрешена. Гостевой список больше не прячет
+// такие подборки: редакционный материал про места вне каталога — это контент сам
+// по себе, ради него человек и возвращается в приложение. Раньше здесь стоял
+// отказ, и он держался ровно на том правиле, которого больше нет.
+func TestEditor_PublishAllowsACollectionWithNoVenues(t *testing.T) {
+	for name, active := range map[string]int{
+		"no venues at all":        0,
+		"every venue deactivated": 0,
+		"one active venue":        1,
+	} {
 		repo := &fakeEditorRepo{
 			detail:       &domain.GuideCollectionAdminDetail{GuideCollection: domain.GuideCollection{Slug: "kids", Title: "С детьми"}},
 			activeVenues: active,
 		}
 		e := NewEditor(repo)
-		_, err := e.Publish(context.Background(), superadmin(), uuid.New(), nil)
-
-		if active > 0 {
-			if err != nil {
-				t.Errorf("%s: unexpected error %v", name, err)
-			}
+		if _, err := e.Publish(context.Background(), superadmin(), uuid.New(), nil); err != nil {
+			t.Errorf("%s: unexpected error %v", name, err)
 			continue
 		}
-		if !errors.Is(err, domain.ErrValidation) {
-			t.Errorf("%s: got %v, want ErrValidation", name, err)
-		}
-		if code, ok := domain.CodeOf(err); !ok || code != domain.CodeGuideCollectionEmpty {
-			t.Errorf("%s: got code %q ok=%v, want %q", name, code, ok, domain.CodeGuideCollectionEmpty)
-		}
-		if repo.statusCalls != 0 {
-			t.Errorf("%s: the status was written anyway", name)
+		if repo.statusCalls != 1 {
+			t.Errorf("%s: status written %d times, want 1", name, repo.statusCalls)
 		}
 	}
 }

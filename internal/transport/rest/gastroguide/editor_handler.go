@@ -275,7 +275,6 @@ func (h *EditorHandler) updateCollection(c *gin.Context) {
 // @Produce     json
 // @Security    BearerAuth
 // @Success     200 {object} response.Envelope
-// @Failure     422 {object} response.Envelope "guide_collection_empty"
 // @Router      /api/v1/admin/gastroguide/collections/{id}/publish [post]
 func (h *EditorHandler) publish(c *gin.Context) {
 	actor, ok := h.actor(c)
