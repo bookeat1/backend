@@ -21,7 +21,7 @@ import (
 func newOTPWith(t *testing.T, cfg Config) (OTPUseCase, *fakeOTP) {
 	t.Helper()
 	otp := newFakeOTP()
-	uc := NewOTPUseCase(newFakeUsers(), otp, newFakeRefresh(), noTx{},
+	uc := NewOTPUseCase(newFakeUsers(), otp, newFakeRefresh(), &fakeBookingLinker{}, noTx{},
 		testIssuer(t), &stubSender{}, cfg)
 	return uc, otp
 }

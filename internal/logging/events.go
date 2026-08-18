@@ -34,6 +34,13 @@ const (
 	// Anti-fraud, currently only the booking-creation rate limit (spec §4.4).
 	EventAntifraudRejected = "antifraud.rejected"
 
+	// A guest proved ownership of their phone number (OTP) and the bookings
+	// made for that number before they had an account became theirs. Logged on
+	// every successful attach because the counts on migration day (~370
+	// account-less bookings in production at the time this shipped) are the only
+	// way to see the rule doing its work.
+	EventGuestBookingsLinked = "guest.bookings_linked"
+
 	// Payments, wired from internal/usecase/payments.
 	EventPaymentCreated         = "payment.created"
 	EventPaymentAuthorized      = "payment.authorized" // two-stage hold placed

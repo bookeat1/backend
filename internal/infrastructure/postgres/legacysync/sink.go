@@ -205,7 +205,13 @@ INSERT INTO bookings
 VALUES ($1,$2,(SELECT id FROM users WHERE id=$3),$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
         $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
 ON CONFLICT (id) DO UPDATE SET
- restaurant_id=EXCLUDED.restaurant_id, user_id=EXCLUDED.user_id, name=EXCLUDED.name,
+ restaurant_id=EXCLUDED.restaurant_id,
+ -- COALESCE, not a plain overwrite: the old system knows nothing about the
+ -- accounts this one creates, so re-syncing a booking must never take back the
+ -- owner a guest earned by verifying their phone (usecase/auth VerifyOTP →
+ -- booking.Repository.AttachOrphanedByPhone). An owner already set here wins;
+ -- an owner the legacy row carries is still accepted when there is none.
+ user_id=COALESCE(bookings.user_id, EXCLUDED.user_id), name=EXCLUDED.name,
  phone=EXCLUDED.phone, email=EXCLUDED.email, phone_normalized=EXCLUDED.phone_normalized,
  guests=EXCLUDED.guests, starts_at=EXCLUDED.starts_at, ends_at=EXCLUDED.ends_at,
  status=EXCLUDED.status, source=EXCLUDED.source, notes=EXCLUDED.notes,

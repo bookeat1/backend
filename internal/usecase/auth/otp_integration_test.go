@@ -11,6 +11,7 @@ import (
 
 	"backend-core/internal/auth/otpcode"
 	"backend-core/internal/domain"
+	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	"backend-core/internal/infrastructure/postgres/otp"
 	"backend-core/internal/infrastructure/postgres/refreshtoken"
 	"backend-core/internal/infrastructure/postgres/testdb"
@@ -47,6 +48,7 @@ func newRealTestOTP(t *testing.T) (OTPUseCase, domain.OTPRepository, *pgxpool.Po
 		user.New(db),
 		otpRepo,
 		refreshtoken.New(db),
+		bookingrepo.New(db),
 		sqltx.NewManager(db),
 		iss,
 		realStubSender{},

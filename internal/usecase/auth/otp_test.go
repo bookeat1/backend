@@ -14,7 +14,7 @@ func newTestOTP(t *testing.T) (OTPUseCase, *fakeUsers, *stubSender) {
 	users := newFakeUsers()
 	sender := &stubSender{}
 	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 1, OTPPerHour: 5, OTPDevExpose: true}
-	uc := NewOTPUseCase(users, newFakeOTP(), newFakeRefresh(), noTx{}, testIssuer(t), sender, cfg)
+	uc := NewOTPUseCase(users, newFakeOTP(), newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), sender, cfg)
 	return uc, users, sender
 }
 

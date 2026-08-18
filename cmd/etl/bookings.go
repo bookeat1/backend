@@ -172,7 +172,12 @@ const upsertBooking = `
 	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,false,NULL,NULL,$17,NULL,
 	        $18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
 	ON CONFLICT (id) DO UPDATE SET
-	  restaurant_id=EXCLUDED.restaurant_id, user_id=EXCLUDED.user_id, name=EXCLUDED.name,
+	  restaurant_id=EXCLUDED.restaurant_id,
+	  -- Never take back an owner the new system assigned: a guest who verified
+	  -- their phone got these bookings attached (usecase/auth VerifyOTP), and a
+	  -- re-run of the ETL must not undo that. An owner from the legacy row is
+	  -- still used when the booking has none.
+	  user_id=COALESCE(bookings.user_id, EXCLUDED.user_id), name=EXCLUDED.name,
 	  phone=EXCLUDED.phone, email=EXCLUDED.email, phone_normalized=EXCLUDED.phone_normalized,
 	  guests=EXCLUDED.guests, starts_at=EXCLUDED.starts_at, ends_at=EXCLUDED.ends_at,
 	  status=EXCLUDED.status, source=EXCLUDED.source, notes=EXCLUDED.notes,
