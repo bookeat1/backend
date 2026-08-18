@@ -29,6 +29,23 @@ type OTPSender interface {
 	Send(ctx context.Context, phone, code string, hint domain.OTPSendHint) (string, error)
 }
 
+// guestBookingLinker hands a guest the bookings that were made for their phone
+// number before they had an account. Implemented by
+// infrastructure/postgres/booking.Repository.AttachOrphanedByPhone.
+//
+// A narrow port rather than the whole domain.BookingRepository on purpose: this
+// package must be able to give a booking an owner and nothing else — it can
+// neither read, cancel nor rewrite one. It is called INSIDE the usecase's
+// transaction, so the implementation must honour the ambient tx.
+type guestBookingLinker interface {
+	// AttachOrphanedByPhone assigns userID to every booking whose
+	// phone_normalized equals phoneNormalized AND whose user_id is NULL,
+	// returning the number of rows attached. It must never touch a booking that
+	// already has an owner, and calling it twice must attach zero the second
+	// time.
+	AttachOrphanedByPhone(ctx context.Context, userID uuid.UUID, phoneNormalized string) (int64, error)
+}
+
 // TokenPair is the credential set returned to a client on successful auth.
 type TokenPair struct {
 	AccessToken  string

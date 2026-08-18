@@ -78,6 +78,41 @@ func (r *Repository) Update(ctx context.Context, b *domain.Booking) error {
 	return nil
 }
 
+// AttachOrphanedByPhone gives every account-less booking of phoneNormalized to
+// userID and reports how many rows changed. It is how a guest who booked by
+// phone (or was booked in by a hostess) finds that history waiting for them the
+// first time they log in — see usecase/auth.OTPUseCase.VerifyOTP.
+//
+// The WHERE clause is the entire safety argument, so it must stay exactly this
+// narrow:
+//
+//   - `user_id IS NULL` — an owned booking is never re-assigned. Ownership only
+//     ever moves from nobody to somebody, so no login can take another guest's
+//     booking away, and running this twice is a no-op rather than a rewrite.
+//   - an EXACT phone match, no LIKE/trim/lower: both columns are written by the
+//     same internal/auth/phone.Normalize (+7XXXXXXXXXX), and any fuzziness here
+//     would be fuzziness about whose booking this is.
+//   - an empty phone matches nothing. phone_normalized is NOT NULL but legacy
+//     rows can carry ” (see infrastructure/postgres/dashboard/guests.go), and
+//     ” = ” would hand a pile of unrelated strangers' bookings to one caller.
+//
+// Runs on the caller's transaction when there is one (sqltx.From): the OTP
+// usecase needs "this user exists" and "this user owns their history" to commit
+// or fail as one fact.
+func (r *Repository) AttachOrphanedByPhone(ctx context.Context, userID uuid.UUID, phoneNormalized string) (int64, error) {
+	if phoneNormalized == "" {
+		return 0, nil
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE bookings SET user_id=$1, updated_at=$2
+		 WHERE user_id IS NULL AND phone_normalized=$3`,
+		userID, time.Now(), phoneNormalized)
+	if err != nil {
+		return 0, fmt.Errorf("attach orphaned bookings: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Booking, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+` FROM bookings WHERE id=$1`, id)
 	b, err := scanBooking(row)

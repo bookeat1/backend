@@ -19,7 +19,7 @@ func newTestOTPWithUsers(t *testing.T) (OTPUseCase, *fakeUsers, *fakeOTP) {
 	users := newFakeUsers()
 	otp := newFakeOTP()
 	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 5, OTPPerHour: 20, OTPDevExpose: true}
-	uc := NewOTPUseCase(users, otp, newFakeRefresh(), noTx{}, testIssuer(t), &stubSender{}, cfg)
+	uc := NewOTPUseCase(users, otp, newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), &stubSender{}, cfg)
 	return uc, users, otp
 }
 
@@ -177,7 +177,7 @@ func TestVerifyPhoneChangeDBRaceMappedToPhoneInUse(t *testing.T) {
 	users := newFakeUsers()
 	otp := newFakeOTP()
 	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 5, OTPPerHour: 20, OTPDevExpose: true}
-	uc := NewOTPUseCase(updateConflictUsers{users}, otp, newFakeRefresh(), noTx{}, testIssuer(t), &stubSender{}, cfg)
+	uc := NewOTPUseCase(updateConflictUsers{users}, otp, newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), &stubSender{}, cfg)
 	ctx := context.Background()
 	u := seedUser(t, users, "+77011110000")
 	newPhone := "+77072223333"

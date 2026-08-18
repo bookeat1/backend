@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"backend-core/internal/auth/otpcode"
 	"backend-core/internal/auth/phone"
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 )
 
 const maxOTPAttempts = 5
@@ -47,13 +49,14 @@ type OTPUseCase interface {
 }
 
 type otpUseCase struct {
-	users   domain.UserRepository
-	otp     domain.OTPRepository
-	refresh domain.RefreshTokenRepository
-	tx      domain.TxManager
-	tokens  TokenIssuer
-	sender  OTPSender
-	cfg     Config
+	users    domain.UserRepository
+	otp      domain.OTPRepository
+	refresh  domain.RefreshTokenRepository
+	bookings guestBookingLinker
+	tx       domain.TxManager
+	tokens   TokenIssuer
+	sender   OTPSender
+	cfg      Config
 }
 
 // NewOTPUseCase constructs the phone-OTP authentication usecase.
@@ -61,19 +64,21 @@ func NewOTPUseCase(
 	users domain.UserRepository,
 	otp domain.OTPRepository,
 	refresh domain.RefreshTokenRepository,
+	bookings guestBookingLinker,
 	tx domain.TxManager,
 	tokens TokenIssuer,
 	sender OTPSender,
 	cfg Config,
 ) OTPUseCase {
 	return &otpUseCase{
-		users:   users,
-		otp:     otp,
-		refresh: refresh,
-		tx:      tx,
-		tokens:  tokens,
-		sender:  sender,
-		cfg:     cfg,
+		users:    users,
+		otp:      otp,
+		refresh:  refresh,
+		bookings: bookings,
+		tx:       tx,
+		tokens:   tokens,
+		sender:   sender,
+		cfg:      cfg,
 	}
 }
 
@@ -249,6 +254,25 @@ func errPhoneUnchanged() error {
 		fmt.Errorf("%w: new phone is the same as the current one", domain.ErrValidation))
 }
 
+// logAttachedBookings reports how many account-less bookings a proof of phone
+// ownership just handed to a guest. Called AFTER the transaction commits, so
+// the line can never claim an attach that got rolled back, and silent on zero:
+// the vast majority of logins have nothing to attach, and a line per login
+// would bury the ones that matter.
+//
+// The phone is masked (logging.MaskPhone) — a log line is not a place to keep
+// a full contact number.
+func logAttachedBookings(ctx context.Context, userID uuid.UUID, p string, attached int64) {
+	if attached <= 0 {
+		return
+	}
+	logging.FromContext(ctx).Info(logging.EventGuestBookingsLinked,
+		slog.String("user_id", userID.String()),
+		slog.String("phone_masked", logging.MaskPhone(p)),
+		slog.Int64("bookings_attached", attached),
+	)
+}
+
 // VerifyOTP checks the latest active code for the phone; on success it marks the
 // code used, finds-or-creates the user, and returns a token pair.
 func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*TokenPair, error) {
@@ -294,8 +318,11 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 		return nil, errOTPInvalid()
 	}
 
-	// Correct code: mark used + find-or-create the user + issue tokens atomically.
+	// Correct code: mark used + find-or-create the user + attach the bookings
+	// made for this number before the account existed + issue tokens, atomically.
 	var pair *TokenPair
+	var attached int64
+	var userID uuid.UUID
 	err = o.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
 			return err
@@ -318,12 +345,24 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 			}
 		}
 
+		// Same transaction as the user row on purpose: a guest must never end up
+		// created-but-without-their-history, and a failure here must roll the
+		// whole login back so the next attempt does the job. The write itself
+		// cannot take anything from anybody (user_id IS NULL only), so the worst
+		// case of a retry is attaching zero rows.
+		userID = u.ID
+		attached, err = o.bookings.AttachOrphanedByPhone(ctx, u.ID, p)
+		if err != nil {
+			return fmt.Errorf("attach account-less bookings: %w", err)
+		}
+
 		pair, err = issuePair(ctx, o.tokens, o.refresh, o.cfg.RefreshTTL, u)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
+	logAttachedBookings(ctx, userID, p, attached)
 
 	// Nothing to write for the delivery memory: MarkUsed above already recorded
 	// it. The row that just became used carries the channel, and "used" is
@@ -436,6 +475,7 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 	// ErrAlreadyExists) is what actually forbids a collision that raced in.
 	var out *domain.User
 	var oldPhone *string
+	var attached int64
 	err = o.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
 			return err
@@ -462,12 +502,26 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 			}
 			return err
 		}
+		// Same rule as a login, for the same reason: the caller has just proved
+		// ownership of this number, and bookings made for it while it had no
+		// account belong to whoever owns the number. Without this the guest
+		// would have to wait for their next full OTP login to see them — the
+		// hole the "no backfill job, ever" requirement exists to close. Bookings
+		// that came with the OLD number are NOT touched: they already have an
+		// owner (this same user), and the write only ever moves a booking from
+		// nobody to somebody.
+		attached, err = o.bookings.AttachOrphanedByPhone(ctx, u.ID, p)
+		if err != nil {
+			return fmt.Errorf("attach account-less bookings: %w", err)
+		}
+
 		out = u
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	logAttachedBookings(ctx, userID, p, attached)
 
 	// Best-effort hygiene AFTER the change is committed: any other live code for
 	// the old or the new number can no longer complete anything useful, so kill

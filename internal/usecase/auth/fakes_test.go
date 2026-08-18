@@ -200,6 +200,41 @@ func (f *fakeOTP) InvalidateActiveByPhone(_ context.Context, phone string) error
 	return nil
 }
 
+// fakeBookingLinker is an in-memory guestBookingLinker over a tiny booking
+// table: phone -> owner (nil = nobody). It mirrors the SQL of
+// booking.Repository.AttachOrphanedByPhone exactly — only rows whose owner is
+// nil and whose phone matches EXACTLY are taken — so a test that passes here is
+// making a claim about the real behaviour, not about a convenient fake.
+type fakeBookingLinker struct {
+	rows  []*fakeBooking
+	err   error // when set, every attach fails (the "login must roll back" case)
+	calls int
+}
+
+type fakeBooking struct {
+	phone string
+	owner *uuid.UUID
+}
+
+func (f *fakeBookingLinker) AttachOrphanedByPhone(_ context.Context, userID uuid.UUID, phone string) (int64, error) {
+	f.calls++
+	if f.err != nil {
+		return 0, f.err
+	}
+	if phone == "" {
+		return 0, nil
+	}
+	var n int64
+	for _, r := range f.rows {
+		if r.owner == nil && r.phone == phone {
+			id := userID
+			r.owner = &id
+			n++
+		}
+	}
+	return n, nil
+}
+
 // noTx runs fn directly (no real transaction) — fine for unit tests.
 type noTx struct{}
 

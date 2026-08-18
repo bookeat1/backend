@@ -17,7 +17,7 @@ func newTestOTPWith(t *testing.T, sender *stubSender) (OTPUseCase, *fakeOTP) {
 	t.Helper()
 	otpRepo := newFakeOTP()
 	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 3, OTPPerHour: 10, OTPDevExpose: true}
-	uc := NewOTPUseCase(newFakeUsers(), otpRepo, newFakeRefresh(), noTx{}, testIssuer(t), sender, cfg)
+	uc := NewOTPUseCase(newFakeUsers(), otpRepo, newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), sender, cfg)
 	return uc, otpRepo
 }
 
@@ -157,7 +157,7 @@ func TestRequestOTPFailedDeliveryStillConsumesTheRateLimit(t *testing.T) {
 	sender := &stubSender{err: errors.New("delivery failed on every configured channel")}
 	otpRepo := newFakeOTP()
 	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 1, OTPPerHour: 5}
-	uc := NewOTPUseCase(newFakeUsers(), otpRepo, newFakeRefresh(), noTx{}, testIssuer(t), sender, cfg)
+	uc := NewOTPUseCase(newFakeUsers(), otpRepo, newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), sender, cfg)
 	ctx := context.Background()
 
 	if _, err := uc.RequestOTP(ctx, "+77070000006"); err == nil {

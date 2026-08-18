@@ -199,6 +199,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	refreshRepo := rtrepo.New(db)
 	otpRepo := otprepo.New(db)
 	userCuisineRepo := usercuisinerepo.New(db)
+	// Built here, ahead of the other booking wiring below, because the OTP
+	// usecase needs it: a successful phone verification hands the guest the
+	// bookings that were made for their number before they had an account.
+	bookingRepo := bookingrepo.New(db)
 
 	authCfg := auth.Config{
 		RefreshTTL:   cfg.Auth.RefreshTokenTTL,
@@ -209,7 +213,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	}
 	authFacade := auth.NewFacade(usersRepo, credsRepo, refreshRepo, txm, issuer, authCfg)
 	authOTP := auth.NewOTPUseCase(
-		usersRepo, otpRepo, refreshRepo, txm, issuer,
+		usersRepo, otpRepo, refreshRepo, bookingRepo, txm, issuer,
 		newOTPSender(cfg, log),
 		authCfg,
 	)
@@ -242,7 +246,6 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		consentrepo.NewPreferenceRepository(db),
 	)
 
-	bookingRepo := bookingrepo.New(db)
 	reviewsFacade := reviews.NewFacade(reviewrepo.New(db), bookingRepo, restManagers)
 
 	// Events & promos (Ф2): admin CRUD + public listings, both gated by the
