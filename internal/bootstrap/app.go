@@ -159,7 +159,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	authed.Use(middleware.Auth(deps.Issuer, deps.UsersRepo))
 	authed.Use(middleware.LogUserContext())
 	usersrest.NewHandler(deps.UsersFacade, deps.AuthOTP).RegisterRoutes(authed)
-	favoritesrest.NewHandler(deps.FavoritesFacade).RegisterRoutes(authed)
+	favoritesHandler := favoritesrest.NewHandler(deps.FavoritesFacade)
+	favoritesHandler.RegisterRoutes(authed)
+	// Event/promo bookmarks + the combined favorites read. Separate mount
+	// because the writes live on the item's own path (PUT /events/:id/favorite),
+	// which gin cannot host under /favorites next to /favorites/:restaurantId.
+	favoritesHandler.RegisterContentRoutes(authed)
 	// Guest data-processing consent + notification opt-out. Authenticated and
 	// scoped to the caller's OWN user id (no restaurant/RBAC gate) — same
 	// own-user pattern as /users/me and /favorites.

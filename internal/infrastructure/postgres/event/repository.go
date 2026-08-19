@@ -442,3 +442,15 @@ func (r *Repository) ImagesByEvent(ctx context.Context, eventIDs []uuid.UUID) (m
 	}
 	return out, rows.Err()
 }
+
+// ListColumns is the `e.`-qualified event column list followed by the host
+// venue's identity (`r.name, r.name_i18n, r.city`) — exactly what
+// ScanListItem expects, in that order. Exported together with ScanListItem so a
+// sibling package that joins through `events e JOIN restaurants r` (the
+// favorites read) selects the same shape instead of duplicating a 23-column
+// SELECT that would then drift from this one.
+const ListColumns = listCols
+
+// ScanListItem scans one row shaped like ListColumns into an EventListItem.
+// Exported for the same reason as ListColumns.
+func ScanListItem(row pgx.Row) (*domain.EventListItem, error) { return scanListItemRow(row) }
