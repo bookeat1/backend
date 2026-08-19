@@ -300,6 +300,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// group so a venue owner cannot reach it, and re-checked in usecase/feed as
 	// defense-in-depth. A venue must never be able to price its own placement.
 	feedHandler.RegisterPlatformRoutes(adminGlobal)
+	// Series-level feed moderation: the superadmin approves «каждую среду» once
+	// instead of approving every generated date.
+	eventRecurrencesHandler.RegisterPlatformRoutes(adminGlobal)
 
 	// Gastroguide editor cabinet: create/edit/publish collections, manage the
 	// rubrics, attach/detach and reorder venues. Superadmin ONLY, mounted on the

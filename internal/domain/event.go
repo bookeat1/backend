@@ -162,5 +162,12 @@ type EventRepository interface {
 	// a stable tie-breaker, narrowed by f, paginated, plus the total count.
 	// The venue is joined in (EventListItem.Restaurant) so the screen needs no
 	// per-card follow-up query, same choice as the feed read model.
+	//
+	// A RECURRING event appears ONCE, as its nearest upcoming occurrence inside
+	// the filtered window; one-off events are unaffected. The total counts the
+	// collapsed set, so it agrees with what pagination actually walks. This
+	// collapse belongs to the guest catalog only — the detail endpoint, tickets
+	// and bookings address a single occurrence, and the cabinet listing
+	// (ListByRestaurant) still shows every date.
 	ListPublicUpcoming(ctx context.Context, f PublicEventFilter, now time.Time) ([]EventListItem, int, error)
 }

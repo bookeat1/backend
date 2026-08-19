@@ -18,6 +18,16 @@ type fakeRepo struct {
 	created *domain.EventRecurrence
 	updated *domain.EventRecurrence
 	active  map[uuid.UUID]bool
+	// syncs records every SyncOccurrenceFeedStatus call, so a test can assert
+	// that a decision about the series really reached the occurrences.
+	syncs   []syncCall
+	demoted []uuid.UUID
+}
+
+type syncCall struct {
+	recurrenceID uuid.UUID
+	from         []domain.FeedStatus
+	to           domain.FeedStatus
 }
 
 func newFakeRepo() *fakeRepo {
@@ -78,6 +88,47 @@ func (f *fakeRepo) InsertOccurrences(_ context.Context, _ *domain.EventRecurrenc
 }
 
 func (f *fakeRepo) RecordSkip(_ context.Context, _ uuid.UUID, _ time.Time) error { return nil }
+
+func (f *fakeRepo) TransitionFeedStatus(_ context.Context, id uuid.UUID, from []domain.FeedStatus, upd domain.FeedPlacementUpdate) error {
+	r, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	for _, s := range from {
+		if r.OccurrenceFeedStatus == s {
+			r.OccurrenceFeedStatus = upd.Status
+			r.FeedSubmittedAt = upd.SubmittedAt
+			r.FeedReviewedBy = upd.ReviewedBy
+			r.FeedReviewedAt = upd.ReviewedAt
+			r.FeedRejectionReason = upd.RejectionReason
+			return nil
+		}
+	}
+	return domain.ErrInvalidStatus
+}
+
+func (f *fakeRepo) DemoteFeedAfterContentEdit(_ context.Context, id uuid.UUID) error {
+	f.demoted = append(f.demoted, id)
+	if r, ok := f.byID[id]; ok {
+		r.OccurrenceFeedStatus = domain.FeedStatusAfterContentEdit(r.OccurrenceFeedStatus)
+	}
+	return nil
+}
+
+func (f *fakeRepo) SyncOccurrenceFeedStatus(_ context.Context, id uuid.UUID, _ time.Time, from []domain.FeedStatus, upd domain.FeedPlacementUpdate) (int, error) {
+	f.syncs = append(f.syncs, syncCall{recurrenceID: id, from: from, to: upd.Status})
+	return 0, nil
+}
+
+func (f *fakeRepo) ListByFeedStatus(_ context.Context, status domain.FeedStatus, _, _ int) ([]domain.EventRecurrence, int, error) {
+	var out []domain.EventRecurrence
+	for _, r := range f.byID {
+		if r.OccurrenceFeedStatus == status {
+			out = append(out, *r)
+		}
+	}
+	return out, len(out), nil
+}
 
 type fakePerms struct {
 	roles map[[2]uuid.UUID]domain.StaffRole
