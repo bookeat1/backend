@@ -99,6 +99,8 @@ func TestRecurrenceAdminRoutesRequireAuth(t *testing.T) {
 		{http.MethodPut, "/api/v1/admin/event-recurrences/" + rid},
 		{http.MethodPost, "/api/v1/admin/event-recurrences/" + rid + "/deactivate"},
 		{http.MethodPost, "/api/v1/admin/event-recurrences/" + rid + "/activate"},
+		{http.MethodPost, "/api/v1/admin/event-recurrences/" + rid + "/feed/submit"},
+		{http.MethodPost, "/api/v1/admin/event-recurrences/" + rid + "/feed/withdraw"},
 	} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
@@ -107,5 +109,39 @@ func TestRecurrenceAdminRoutesRequireAuth(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s = %d, want 401", tc.method, tc.path, rec.Code)
 		}
+	}
+}
+
+// The platform routes must not be reachable without authentication either — and
+// they are mounted on the RequireRole(RoleAdmin) group in bootstrap, so the
+// venue-side group must NOT expose them. A rule's approval is a platform
+// decision; a route that answered on the venue group would be the whole gate
+// gone.
+func TestRecurrenceFeedReviewIsNotOnTheVenueGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	venue := gin.New()
+	NewRecurrenceHandler(nil).RegisterAdminRoutes(venue.Group("/api/v1"))
+
+	rid := uuid.New().String()
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/admin/event-recurrences/" + rid + "/feed/review"},
+		{http.MethodGet, "/api/v1/admin/feed/event-recurrence-queue"},
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+		req.Header.Set("Content-Type", "application/json")
+		venue.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s %s on the venue group = %d, want 404 (it belongs to the superadmin group)", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	platform := gin.New()
+	NewRecurrenceHandler(nil).RegisterPlatformRoutes(platform.Group("/api/v1"))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/feed/event-recurrence-queue", nil)
+	platform.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("platform queue without auth = %d, want 401", rec.Code)
 	}
 }

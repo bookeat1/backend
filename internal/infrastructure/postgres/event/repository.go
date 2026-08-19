@@ -171,6 +171,15 @@ const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e
 	e.recurrence_id, e.created_at, e.updated_at,
 	r.name, r.name_i18n, r.city`
 
+// collapsedCols reads listCols back out of the derived table the collapse
+// builds (the `e.`/`r.` prefixes are gone there, and `rn` must not reach the
+// scanner). Same columns, same order — scanListItemRow depends on it.
+const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.description, c.description_i18n,
+	c.starts_at, c.ends_at, c.venue, c.cover_image_url, c.status, c.ticketed,
+	c.ticket_price_minor, c.capacity, c.tags, c.tickets_refundable, c.ticket_refund_cutoff_minutes,
+	c.recurrence_id, c.created_at, c.updated_at,
+	c.name, c.name_i18n, c.city`
+
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
 // enforced in SQL and is not negotiable by a filter: published, not yet ended,
 // and hosted by an active restaurant — a deactivated venue disappears from the
@@ -178,6 +187,19 @@ const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e
 // (restaurants.ListActive). hidden_from_home is deliberately NOT applied: it
 // hides a venue from the main screen only, not from the catalog, and this is a
 // catalog-style listing.
+//
+// ONE CARD PER SERIES. A recurring event appears exactly once — as its nearest
+// upcoming occurrence — while one-off events are listed as they always were.
+// Without this a single daily rule ("Живая музыка в ресторане INZHU") filled
+// the Афиша with 55 identical cards in a row and buried every other venue.
+//
+// This is a PRESENTATION rule of the guest catalog and nothing more: the detail
+// endpoint, tickets and bookings still work per individual occurrence (a guest
+// books a specific date), and the cabinet listing (ListByRestaurant) still
+// shows every generated date, because that is where a venue edits or cancels
+// one of them. Grouping by recurrence_id and not by title is deliberate — two
+// venues may both run "Живая музыка", and a rule is the only thing that
+// actually says "these rows are the same happening".
 func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter, now time.Time) ([]domain.EventListItem, int, error) {
 	where := []string{"e.status = 'published'", "r.is_active = true"}
 	args := []any{now}
@@ -201,9 +223,29 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 	whereSQL := strings.Join(where, " AND ")
 	from := ` FROM events e JOIN restaurants r ON r.id = e.restaurant_id WHERE ` + whereSQL
 
+	// The collapse rule (see the doc comment): inside the visible set, a
+	// recurring series contributes exactly ONE row — its nearest upcoming
+	// occurrence. row_number() over the same ordering the listing uses picks it;
+	// one-off events all share recurrence_id IS NULL and would land in a single
+	// meaningless partition, so they are let through by the explicit
+	// `recurrence_id IS NULL` branch instead of by their row number.
+	//
+	// The window function runs over the already-filtered set, so "nearest"
+	// means nearest AMONG WHAT THE GUEST ASKED FOR: a from/to filter picks the
+	// first occurrence inside that range, not the first one overall.
+	collapsed := func(cols string) string {
+		return `SELECT ` + cols + ` FROM (
+			SELECT ` + listCols + `, row_number() OVER (
+				PARTITION BY e.recurrence_id ORDER BY e.starts_at ASC, e.id ASC) AS rn` +
+			from + `
+		) c WHERE c.recurrence_id IS NULL OR c.rn = 1`
+	}
+
 	q := sqltx.From(ctx, r.pool)
 	var total int
-	if err := q.QueryRow(ctx, `SELECT count(*)`+from, args...).Scan(&total); err != nil {
+	// The total is counted over the COLLAPSED set, not the raw one: a list that
+	// shows 3 cards must not claim 57, or the client pages into emptiness.
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM (`+collapsed("c.id")+`) t`, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count public events: %w", err)
 	}
 	if total == 0 {
@@ -213,8 +255,8 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 	page, perPage := normalizePage(f.Page, f.PerPage)
 	args = append(args, perPage, (page-1)*perPage)
 	rows, err := q.Query(ctx,
-		`SELECT `+listCols+from+`
-		 ORDER BY e.starts_at ASC, e.id ASC
+		collapsed(collapsedCols)+`
+		 ORDER BY starts_at ASC, id ASC
 		 LIMIT $`+strconv.Itoa(len(args)-1)+` OFFSET $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list public events: %w", err)

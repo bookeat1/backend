@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -46,6 +47,30 @@ type Facade interface {
 	// against them, so withdrawing them is a per-event decision the venue makes
 	// in the event editor, not a side effect of switching a rule off.
 	SetActive(ctx context.Context, actor Actor, id uuid.UUID, active bool) error
+
+	// SubmitToFeed is the venue asking for the main screen for the WHOLE series
+	// — the rule-level twin of usecase/feed.Submit. It never approves anything:
+	// the rule moves to pending_review and a platform superadmin decides.
+	SubmitToFeed(ctx context.Context, actor Actor, id uuid.UUID) (*domain.EventRecurrence, error)
+	// WithdrawFromFeed takes the series off the main screen: the rule goes back
+	// to not_submitted AND the occurrences it already generated that are still
+	// ahead are pulled off the feed with it. A withdrawal the guest can still
+	// see for eight weeks would not be a withdrawal.
+	WithdrawFromFeed(ctx context.Context, actor Actor, id uuid.UUID) (*domain.EventRecurrence, error)
+	// ReviewFeed is the platform superadmin's decision about a submitted series.
+	// Approving it also promotes the occurrences already materialised (see
+	// FeedReviewInput), which is what makes a decision visible today rather than
+	// only for the dates generated after the click.
+	ReviewFeed(ctx context.Context, actor Actor, id uuid.UUID, in FeedReviewInput) (*domain.EventRecurrence, error)
+	// ListFeedQueue is the superadmin's queue of series awaiting a decision.
+	ListFeedQueue(ctx context.Context, actor Actor, page, perPage int) ([]domain.EventRecurrence, int, error)
+}
+
+// FeedReviewInput is one moderation decision about a series. A rejection must
+// carry a reason — a refusal the venue cannot act on is worse than no refusal.
+type FeedReviewInput struct {
+	Approve         bool
+	RejectionReason string
 }
 
 // Input carries a rule's fields. It is a full replace on update, like
@@ -84,11 +109,26 @@ type Input struct {
 type facade struct {
 	repo  domain.EventRecurrenceRepository
 	perms permissionChecker
+	clock func() time.Time
+}
+
+// Option tunes the facade. Variadic so every existing positional caller (and
+// test) keeps compiling — the same backward-compatible shape usecase/events
+// and usecase/bookings use.
+type Option func(*facade)
+
+// WithClock replaces the wall clock, for tests that need a fixed instant.
+func WithClock(now func() time.Time) Option {
+	return func(f *facade) { f.clock = now }
 }
 
 // NewFacade constructs the recurrence Facade.
-func NewFacade(repo domain.EventRecurrenceRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms}
+func NewFacade(repo domain.EventRecurrenceRepository, perms permissionChecker, opts ...Option) Facade {
+	f := &facade{repo: repo, perms: perms, clock: time.Now}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 func (f *facade) Create(ctx context.Context, actor Actor, in Input) (*domain.EventRecurrence, error) {
@@ -121,14 +161,184 @@ func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input
 	if err := f.authorize(ctx, actor, rec.RestaurantID); err != nil {
 		return nil, err
 	}
+	// Whether the platform's decision about this series survives the edit is
+	// decided against the CURRENT rule, before apply() overwrites it.
+	contentChanged := recurrenceContentChanged(*rec, in)
 	apply(rec, in)
 	if err := validate(rec); err != nil {
 		return nil, err
+	}
+	// Demote BEFORE writing the new template, for the same reason
+	// usecase/events and usecase/promos do: a failed edit after a successful
+	// demotion only costs a re-review, while the reverse order can leave
+	// unreviewed words feeding the main screen.
+	//
+	// Only FUTURE occurrences are affected by this, and only because they are
+	// born from the new template — the occurrences that already exist still
+	// carry the exact words the moderator approved (the generator never
+	// rewrites an existing row), so they keep their own feed status. An edit is
+	// not a withdrawal; WithdrawFromFeed is.
+	if contentChanged {
+		if err := f.repo.DemoteFeedAfterContentEdit(ctx, rec.ID); err != nil {
+			return nil, err
+		}
+		rec.OccurrenceFeedStatus = domain.FeedStatusAfterContentEdit(rec.OccurrenceFeedStatus)
 	}
 	if err := f.repo.Update(ctx, rec); err != nil {
 		return nil, err
 	}
 	return rec, nil
+}
+
+// SubmitToFeed asks the platform for the main screen on behalf of the whole
+// series. The CAS from-set is the arbiter, so two parallel submissions cannot
+// both win and produce two queue entries.
+func (f *facade) SubmitToFeed(ctx context.Context, actor Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
+	rec, err := f.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.authorize(ctx, actor, rec.RestaurantID); err != nil {
+		return nil, err
+	}
+	// A rule that generates nothing any more has nothing to put on the main
+	// screen; letting it into the queue would only waste a moderator's time.
+	if !rec.IsActive {
+		return nil, fmt.Errorf("%w: activate the rule before submitting it to the main screen", domain.ErrInvalidStatus)
+	}
+	// A series whose occurrences are born hidden or draft can never be visible:
+	// the feed needs BOTH axes green (see domain.FeedEligible).
+	if rec.OccurrenceStatus != domain.EventPublished {
+		return nil, fmt.Errorf("%w: occurrences must be published for the series to reach the main screen", domain.ErrInvalidStatus)
+	}
+	now := f.clock()
+	err = f.repo.TransitionFeedStatus(ctx, id,
+		[]domain.FeedStatus{domain.FeedNotSubmitted, domain.FeedRejected},
+		domain.FeedPlacementUpdate{
+			Status:      domain.FeedPendingReview,
+			SubmittedAt: &now,
+			// A new submission wipes the previous decision: a stale rejection
+			// reason on a pending rule reads as if it had already been refused.
+			ReviewedBy:      nil,
+			ReviewedAt:      nil,
+			RejectionReason: nil,
+		})
+	if err != nil {
+		return nil, err
+	}
+	return f.repo.GetByID(ctx, id)
+}
+
+// WithdrawFromFeed pulls the series off the main screen — the rule AND every
+// occurrence ahead that is on the feed because of it. Occurrences that already
+// ended are left alone (history is not rewritten), and so is any occurrence a
+// moderator decided on individually: the from-set only moves the ones this
+// series put there.
+func (f *facade) WithdrawFromFeed(ctx context.Context, actor Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
+	rec, err := f.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.authorize(ctx, actor, rec.RestaurantID); err != nil {
+		return nil, err
+	}
+	if err := f.repo.TransitionFeedStatus(ctx, id,
+		[]domain.FeedStatus{domain.FeedPendingReview, domain.FeedApproved},
+		domain.FeedPlacementUpdate{Status: domain.FeedNotSubmitted}); err != nil {
+		return nil, err
+	}
+	if _, err := f.repo.SyncOccurrenceFeedStatus(ctx, id, f.clock(),
+		[]domain.FeedStatus{domain.FeedApproved},
+		domain.FeedPlacementUpdate{Status: domain.FeedNotSubmitted}); err != nil {
+		return nil, err
+	}
+	return f.repo.GetByID(ctx, id)
+}
+
+// ReviewFeed is the platform's decision about a submitted series, and it is
+// where the whole design pays off: ONE human decision about "Живая музыка по
+// средам" instead of one per generated date.
+//
+// Approving also promotes the occurrences that are already materialised. That
+// is not a shortcut around moderation — it is the moderator's decision being
+// applied to exactly the rows it was made about; without it an approval would
+// only reach dates generated after the click, and the eight weeks already in
+// the table would stay invisible for two months.
+func (f *facade) ReviewFeed(ctx context.Context, actor Actor, id uuid.UUID, in FeedReviewInput) (*domain.EventRecurrence, error) {
+	if err := authorizePlatform(actor); err != nil {
+		return nil, err
+	}
+	reason := strings.TrimSpace(in.RejectionReason)
+	if !in.Approve && reason == "" {
+		return nil, fmt.Errorf("%w: a rejection must carry a reason", domain.ErrValidation)
+	}
+	rec, err := f.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	now := f.clock()
+	upd := domain.FeedPlacementUpdate{
+		Status:          domain.FeedRejected,
+		SubmittedAt:     rec.FeedSubmittedAt,
+		ReviewedBy:      &actor.UserID,
+		ReviewedAt:      &now,
+		RejectionReason: &reason,
+	}
+	if in.Approve {
+		upd.Status = domain.FeedApproved
+		upd.RejectionReason = nil
+	}
+	// Only a pending rule may be decided on — which is also what makes a
+	// double-clicked approve idempotency-safe: the second call gets
+	// ErrInvalidStatus instead of re-stamping the reviewer.
+	if err := f.repo.TransitionFeedStatus(ctx, id,
+		[]domain.FeedStatus{domain.FeedPendingReview}, upd); err != nil {
+		return nil, err
+	}
+
+	occurrenceUpd := domain.FeedPlacementUpdate{
+		Status:          domain.FeedNotSubmitted,
+		SubmittedAt:     rec.FeedSubmittedAt,
+		ReviewedBy:      &actor.UserID,
+		ReviewedAt:      &now,
+		RejectionReason: nil,
+	}
+	from := []domain.FeedStatus{domain.FeedApproved}
+	if in.Approve {
+		occurrenceUpd.Status = domain.FeedApproved
+		// not_submitted is what a generated occurrence is born as while its
+		// series is undecided; pending_review can only be there if the venue
+		// submitted that single date by hand — the platform is answering the
+		// same question either way.
+		from = []domain.FeedStatus{domain.FeedNotSubmitted, domain.FeedPendingReview}
+	}
+	if _, err := f.repo.SyncOccurrenceFeedStatus(ctx, id, now, from, occurrenceUpd); err != nil {
+		return nil, err
+	}
+	return f.repo.GetByID(ctx, id)
+}
+
+func (f *facade) ListFeedQueue(ctx context.Context, actor Actor, page, perPage int) ([]domain.EventRecurrence, int, error) {
+	if err := authorizePlatform(actor); err != nil {
+		return nil, 0, err
+	}
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 20
+	}
+	return f.repo.ListByFeedStatus(ctx, domain.FeedPendingReview, page, perPage)
+}
+
+// authorizePlatform gates the decisions that belong to the platform, never to
+// the venue that owns the rule. Same sentence as usecase/feed: the venue may
+// ask for the main screen, only the superadmin may grant it.
+func authorizePlatform(actor Actor) error {
+	if actor.Role != domain.RoleAdmin {
+		return fmt.Errorf("%w: only the platform superadmin decides what reaches the main screen", domain.ErrForbidden)
+	}
+	return nil
 }
 
 func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
@@ -327,4 +537,87 @@ func normalizeTags(tags []string) []string {
 		}
 	}
 	return out
+}
+
+// contentChanged reports whether this update touches anything a moderator
+// decided about: the words and pictures shown on a card, the ticketing terms a
+// guest sees before paying — and, unlike a single event, the SCHEDULE.
+//
+// The schedule is content here because the series IS the schedule: a rule
+// approved as "Живая музыка по средам" turned into a daily one is a different
+// editorial object (and, before this PR's second half, was exactly what buried
+// the Афиша under 55 identical cards). is_active is deliberately not content —
+// pausing and resuming a rule is not an editorial change.
+func recurrenceContentChanged(cur domain.EventRecurrence, in Input) bool {
+	switch {
+	case strings.TrimSpace(in.Title) != cur.Title,
+		in.Description != cur.Description,
+		in.Venue != cur.Venue,
+		in.Ticketed != cur.Ticketed,
+		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL),
+		!int64PtrEqual(in.TicketPriceMinor, cur.TicketPriceMinor),
+		!intPtrEqual(in.Capacity, cur.Capacity),
+		!stringsEqual(normalizeTags(in.Tags), cur.Tags),
+		in.Frequency != cur.Frequency,
+		!weekdaysEqual(normalizeWeekdays(in.Frequency, in.Weekdays), cur.Weekdays),
+		!intPtrEqual(in.MonthDay, cur.MonthDay),
+		in.StartMinutes != cur.StartMinutes,
+		in.DurationMinutes != cur.DurationMinutes,
+		in.StartsOn != cur.StartsOn,
+		!datePtrEqual(in.UntilDate, cur.UntilDate):
+		return true
+	}
+	return false
+}
+
+func strPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func intPtrEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func int64PtrEqual(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func datePtrEqual(a, b *domain.CalendarDate) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func weekdaysEqual(a, b []domain.ISOWeekday) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -34,14 +34,23 @@ const selectCols = `id, restaurant_id, title, title_i18n, description, descripti
 	venue, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
 	tickets_refundable, ticket_refund_cutoff_minutes,
 	frequency, weekdays, month_day, start_minutes, duration_minutes, timezone,
-	starts_on, until_date, is_active, created_at, updated_at`
+	starts_on, until_date, is_active,
+	occurrence_feed_status, feed_submitted_at, feed_reviewed_by, feed_reviewed_at, feed_rejection_reason,
+	created_at, updated_at`
 
 // Create inserts a new rule. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as the events repository.
+//
+// The series-level feed decision is NOT taken from rec: a rule is always born
+// out of the feed (not_submitted) and moves from there through the moderation
+// flow (TransitionFeedStatus), the same way a promo or an event does. There is
+// deliberately no code path in which a create call carries "approved".
 func (r *Repository) Create(ctx context.Context, rec *domain.EventRecurrence) error {
 	if rec.ID == uuid.Nil {
 		rec.ID = uuid.New()
 	}
+	rec.OccurrenceFeedStatus = domain.FeedNotSubmitted
+	rec.FeedSubmittedAt, rec.FeedReviewedBy, rec.FeedReviewedAt, rec.FeedRejectionReason = nil, nil, nil, nil
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO event_recurrences (id, restaurant_id, title, title_i18n, description, description_i18n,
 			venue, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
@@ -83,6 +92,13 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.EventRe
 // Update overwrites the mutable fields of a rule. restaurant_id is NOT among
 // them: a rule never migrates to another venue, and allowing it would silently
 // re-tenant every occurrence it has already generated.
+//
+// The feed columns are not among them either, and for a stronger reason: this
+// statement is driven by the cabinet's full-replace payload, so writing
+// occurrence_feed_status here would let a venue set its own moderation state —
+// and would silently withdraw an approved rule every time an older cabinet
+// build sent an event edit without the field. The series-level decision moves
+// only through TransitionFeedStatus / DemoteFeedAfterContentEdit.
 func (r *Repository) Update(ctx context.Context, rec *domain.EventRecurrence) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE event_recurrences SET title=$2, title_i18n=$3, description=$4, description_i18n=$5,
@@ -227,12 +243,26 @@ func (r *Repository) InsertOccurrences(ctx context.Context, rec *domain.EventRec
 		starts[i] = s
 		ends[i] = rec.EndOf(s)
 	}
+	// The occurrence's feed_status is decided by domain.OccurrenceFeedStatusOf,
+	// never copied verbatim from the rule: only an APPROVED series produces
+	// approved occurrences (see that function for why a pending series must not
+	// push its dates into the item queue). The reviewer stamp travels with it so
+	// a card on the main screen can name the human who allowed it, and
+	// feed_submitted_at is the moment the venue asked about the series.
+	feedStatus := domain.OccurrenceFeedStatusOf(rec.OccurrenceFeedStatus)
+	var submittedAt, reviewedAt *time.Time
+	var reviewedBy *uuid.UUID
+	if feedStatus == domain.FeedApproved {
+		submittedAt, reviewedBy, reviewedAt = rec.FeedSubmittedAt, rec.FeedReviewedBy, rec.FeedReviewedAt
+	}
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
 			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor,
-			capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes, recurrence_id)
+			capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes, recurrence_id,
+			feed_status, feed_submitted_at, feed_reviewed_by, feed_reviewed_at)
 		 SELECT s.id, $1, $2, $3, $4, $5,
-			s.starts_at, s.ends_at, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+			s.starts_at, s.ends_at, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+			$19::varchar, $20, $21, $22
 		 FROM unnest($16::uuid[], $17::timestamptz[], $18::timestamptz[]) AS s(id, starts_at, ends_at)
 		 WHERE NOT EXISTS (
 			SELECT 1 FROM event_recurrence_skips k
@@ -241,7 +271,8 @@ func (r *Repository) InsertOccurrences(ctx context.Context, rec *domain.EventRec
 		rec.RestaurantID, rec.Title, i18nToDB(rec.TitleI18n), rec.Description, i18nToDB(rec.DescriptionI18n),
 		rec.Venue, rec.CoverImageURL, rec.OccurrenceStatus, rec.Ticketed, rec.TicketPriceMinor,
 		rec.Capacity, tagsToDB(rec.Tags), rec.TicketsRefundable, rec.TicketRefundCutoffMinutes,
-		rec.ID, ids, starts, ends)
+		rec.ID, ids, starts, ends,
+		string(feedStatus), submittedAt, reviewedBy, reviewedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
@@ -270,6 +301,153 @@ func (r *Repository) RecordSkip(ctx context.Context, recurrenceID uuid.UUID, slo
 	return nil
 }
 
+// TransitionFeedStatus is the CAS the series-level moderation rests on, the
+// twin of feed.Repository.TransitionFeedStatus: the expected current status
+// travels in the WHERE clause, so two concurrent decisions cannot both apply —
+// the loser gets ErrInvalidStatus instead of overwriting the winner.
+func (r *Repository) TransitionFeedStatus(ctx context.Context, id uuid.UUID, from []domain.FeedStatus, upd domain.FeedPlacementUpdate) error {
+	if len(from) == 0 {
+		return fmt.Errorf("%w: a feed transition needs an expected current status", domain.ErrValidation)
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE event_recurrences SET
+			occurrence_feed_status = $2::varchar,
+			feed_submitted_at = $3,
+			feed_reviewed_by = $4,
+			feed_reviewed_at = $5,
+			feed_rejection_reason = $6,
+			updated_at = now()
+		 WHERE id = $1 AND occurrence_feed_status = ANY($7::text[])`,
+		id, string(upd.Status), upd.SubmittedAt, upd.ReviewedBy, upd.ReviewedAt,
+		upd.RejectionReason, feedStatusStrings(from))
+	if err != nil {
+		return fmt.Errorf("transition recurrence feed status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return r.explainNoRows(ctx, id, "transition recurrence feed status")
+	}
+	return nil
+}
+
+// DemoteFeedAfterContentEdit implements domain.FeedStatusAfterContentEdit for a
+// rule: a decision made about specific words stops being valid when the
+// template changes. A missing id is not an error — the caller resolved the rule
+// already and turning a benign race into a 404 would only mask the real edit
+// error, exactly as in feed.Repository.DemoteAfterContentEdit.
+func (r *Repository) DemoteFeedAfterContentEdit(ctx context.Context, id uuid.UUID) error {
+	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE event_recurrences SET
+			occurrence_feed_status = $2::varchar,
+			feed_reviewed_by = NULL,
+			feed_reviewed_at = NULL,
+			feed_rejection_reason = NULL,
+			updated_at = now()
+		 WHERE id = $1 AND occurrence_feed_status = ANY($3::text[])`,
+		id, string(domain.FeedPendingReview),
+		[]string{string(domain.FeedApproved), string(domain.FeedRejected)})
+	if err != nil {
+		return fmt.Errorf("demote recurrence feed status after edit: %w", err)
+	}
+	return nil
+}
+
+// SyncOccurrenceFeedStatus carries a decision about the SERIES down to the
+// occurrences that were already materialised.
+//
+// Three bounds make it safe to run on a live table:
+//
+//   - ends_at > $2 — a past occurrence is history and is never rewritten;
+//   - feed_status = ANY(from) — an occurrence a moderator decided on
+//     individually keeps that decision; the series verdict only moves the
+//     undecided ones;
+//   - recurrence_id = $1 — one rule at a time, which is also the index
+//     (idx_events_recurrence_feed_sync).
+//
+// The placement weight is deliberately untouched: a sold placement on one date
+// is not lost because the series was re-approved.
+func (r *Repository) SyncOccurrenceFeedStatus(ctx context.Context, recurrenceID uuid.UUID, notEndedBefore time.Time, from []domain.FeedStatus, upd domain.FeedPlacementUpdate) (int, error) {
+	if len(from) == 0 {
+		return 0, fmt.Errorf("%w: a feed sync needs an expected current status", domain.ErrValidation)
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE events SET
+			feed_status = $3::varchar,
+			feed_submitted_at = $4,
+			feed_reviewed_by = $5,
+			feed_reviewed_at = $6,
+			feed_rejection_reason = $7,
+			updated_at = now()
+		 WHERE recurrence_id = $1 AND ends_at > $2 AND feed_status = ANY($8::text[])`,
+		recurrenceID, notEndedBefore, string(upd.Status), upd.SubmittedAt, upd.ReviewedBy,
+		upd.ReviewedAt, upd.RejectionReason, feedStatusStrings(from))
+	if err != nil {
+		return 0, fmt.Errorf("sync occurrence feed status: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// ListByFeedStatus is the superadmin's rule queue: oldest submission first, id
+// as the stable tie-break (same FIFO shape as the item queue).
+func (r *Repository) ListByFeedStatus(ctx context.Context, status domain.FeedStatus, page, perPage int) ([]domain.EventRecurrence, int, error) {
+	page, perPage = normalizePage(page, perPage)
+	q := sqltx.From(ctx, r.pool)
+
+	var total int
+	if err := q.QueryRow(ctx,
+		`SELECT count(*) FROM event_recurrences WHERE occurrence_feed_status = $1::varchar`,
+		string(status)).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count event recurrences by feed status: %w", err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	rows, err := q.Query(ctx,
+		`SELECT `+selectCols+` FROM event_recurrences
+		 WHERE occurrence_feed_status = $1::varchar
+		 ORDER BY feed_submitted_at ASC, id ASC
+		 LIMIT $2 OFFSET $3`,
+		string(status), perPage, (page-1)*perPage)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list event recurrences by feed status: %w", err)
+	}
+	defer rows.Close()
+
+	var items []domain.EventRecurrence
+	for rows.Next() {
+		rec, err := scanRecurrence(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan event recurrence: %w", err)
+		}
+		items = append(items, *rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate event recurrences: %w", err)
+	}
+	return items, total, nil
+}
+
+// explainNoRows turns a zero-row CAS into the right sentinel: ErrNotFound when
+// the rule is gone, ErrInvalidStatus when it is simply in another state.
+func (r *Repository) explainNoRows(ctx context.Context, id uuid.UUID, op string) error {
+	var exists bool
+	if err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM event_recurrences WHERE id = $1)`, id).Scan(&exists); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if !exists {
+		return fmt.Errorf("%s: %w", op, domain.ErrNotFound)
+	}
+	return fmt.Errorf("%s: %w: the rule is not in the expected feed status", op, domain.ErrInvalidStatus)
+}
+
+func feedStatusStrings(statuses []domain.FeedStatus) []string {
+	out := make([]string, 0, len(statuses))
+	for _, s := range statuses {
+		out = append(out, string(s))
+	}
+	return out
+}
+
 // --- scanning / encoding helpers ---
 
 func scanRecurrence(row pgx.Row) (*domain.EventRecurrence, error) {
@@ -294,7 +472,10 @@ func scanRecurrenceInto(row pgx.Row, rec *domain.EventRecurrence, extra ...any) 
 		&rec.Venue, &rec.CoverImageURL, &rec.Tags, &rec.OccurrenceStatus, &rec.Ticketed,
 		&rec.TicketPriceMinor, &rec.Capacity, &rec.TicketsRefundable, &rec.TicketRefundCutoffMinutes,
 		&rec.Frequency, &weekdays, &rec.MonthDay, &rec.StartMinutes, &rec.DurationMinutes, &timezone,
-		&startsOn, &until, &rec.IsActive, &rec.CreatedAt, &rec.UpdatedAt,
+		&startsOn, &until, &rec.IsActive,
+		&rec.OccurrenceFeedStatus, &rec.FeedSubmittedAt, &rec.FeedReviewedBy, &rec.FeedReviewedAt,
+		&rec.FeedRejectionReason,
+		&rec.CreatedAt, &rec.UpdatedAt,
 	}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
 	"backend-core/internal/transport/rest/response"
@@ -40,6 +41,89 @@ func (h *RecurrenceHandler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.PUT("/admin/event-recurrences/:recurrenceId", h.update)
 	rg.POST("/admin/event-recurrences/:recurrenceId/deactivate", h.deactivate)
 	rg.POST("/admin/event-recurrences/:recurrenceId/activate", h.activate)
+	// The venue side of the main-screen decision: ask, or take it back. It is
+	// the series-level twin of /admin/feed/items/:kind/:itemId/submit, and it
+	// grants nothing — approval belongs to the routes below.
+	rg.POST("/admin/event-recurrences/:recurrenceId/feed/submit", h.submitToFeed)
+	rg.POST("/admin/event-recurrences/:recurrenceId/feed/withdraw", h.withdrawFromFeed)
+}
+
+// RegisterPlatformRoutes mounts the superadmin side of the series-level feed
+// moderation. Mount on the RequireRole(RoleAdmin) group; usecase/eventrecurrence
+// re-checks the role as defence in depth, exactly as usecase/feed does.
+func (h *RecurrenceHandler) RegisterPlatformRoutes(rg *gin.RouterGroup) {
+	rg.GET("/admin/feed/event-recurrence-queue", h.feedQueue)
+	rg.POST("/admin/event-recurrences/:recurrenceId/feed/review", h.reviewFeed)
+}
+
+func (h *RecurrenceHandler) submitToFeed(c *gin.Context) {
+	h.feedAction(c, func(actor uc.Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
+		return h.facade.SubmitToFeed(c.Request.Context(), actor, id)
+	})
+}
+
+func (h *RecurrenceHandler) withdrawFromFeed(c *gin.Context) {
+	h.feedAction(c, func(actor uc.Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
+		return h.facade.WithdrawFromFeed(c.Request.Context(), actor, id)
+	})
+}
+
+func (h *RecurrenceHandler) reviewFeed(c *gin.Context) {
+	var req feedReviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	h.feedAction(c, func(actor uc.Actor, id uuid.UUID) (*domain.EventRecurrence, error) {
+		return h.facade.ReviewFeed(c.Request.Context(), actor, id, uc.FeedReviewInput{
+			Approve:         req.Approve,
+			RejectionReason: req.RejectionReason,
+		})
+	})
+}
+
+func (h *RecurrenceHandler) feedQueue(c *gin.Context) {
+	actor, ok := recurrenceActor(c)
+	if !ok {
+		return
+	}
+	page, perPage := pagination(c)
+	items, total, err := h.facade.ListFeedQueue(c.Request.Context(), actor, page, perPage)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	out := make([]recurrenceResponseBody, 0, len(items))
+	for _, rec := range items {
+		out = append(out, recurrenceResponse(rec))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// feedAction is the shared shape of the four feed mutations: build the actor,
+// read the rule id, run the usecase, render the rule back.
+func (h *RecurrenceHandler) feedAction(c *gin.Context, do func(uc.Actor, uuid.UUID) (*domain.EventRecurrence, error)) {
+	actor, ok := recurrenceActor(c)
+	if !ok {
+		return
+	}
+	id, ok := pathUUID(c, "recurrenceId", "invalid recurrence id")
+	if !ok {
+		return
+	}
+	rec, err := do(actor, id)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, recurrenceResponse(*rec))
+}
+
+// feedReviewRequest is the superadmin's verdict on a series. rejection_reason is
+// required when approve is false — the venue must be told what to fix.
+type feedReviewRequest struct {
+	Approve         bool   `json:"approve"`
+	RejectionReason string `json:"rejection_reason"`
 }
 
 func (h *RecurrenceHandler) create(c *gin.Context) {
@@ -309,8 +393,18 @@ type recurrenceResponseBody struct {
 	StartsOn  string  `json:"starts_on"`
 	UntilDate *string `json:"until_date,omitempty"`
 	IsActive  bool    `json:"is_active"`
-	CreatedAt string  `json:"created_at"`
-	UpdatedAt string  `json:"updated_at"`
+
+	// OccurrenceFeedStatus is the platform's decision about the SERIES on the
+	// main screen (not_submitted / pending_review / approved / rejected), and
+	// what every occurrence generated from now on is born with. The cabinet
+	// renders it next to the same badge a single promo or event shows.
+	OccurrenceFeedStatus string  `json:"occurrence_feed_status"`
+	FeedSubmittedAt      *string `json:"feed_submitted_at,omitempty"`
+	FeedReviewedAt       *string `json:"feed_reviewed_at,omitempty"`
+	FeedRejectionReason  *string `json:"feed_rejection_reason,omitempty"`
+
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 func recurrenceResponse(r domain.EventRecurrence) recurrenceResponseBody {
@@ -350,7 +444,23 @@ func recurrenceResponse(r domain.EventRecurrence) recurrenceResponseBody {
 		StartsOn:        r.StartsOn.String(),
 		UntilDate:       until,
 		IsActive:        r.IsActive,
-		CreatedAt:       r.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:       r.UpdatedAt.Format(time.RFC3339),
+
+		OccurrenceFeedStatus: string(r.OccurrenceFeedStatus),
+		FeedSubmittedAt:      formatTimePtr(r.FeedSubmittedAt),
+		FeedReviewedAt:       formatTimePtr(r.FeedReviewedAt),
+		FeedRejectionReason:  r.FeedRejectionReason,
+
+		CreatedAt: r.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: r.UpdatedAt.Format(time.RFC3339),
 	}
+}
+
+// formatTimePtr renders an optional instant as RFC3339, keeping nil as nil so
+// the field is omitted rather than sent as an empty string.
+func formatTimePtr(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.Format(time.RFC3339)
+	return &s
 }

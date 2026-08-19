@@ -114,9 +114,57 @@ type EventRecurrence struct {
 	UntilDate *CalendarDate
 	// IsActive false stops FUTURE generation. It never removes occurrences that
 	// already exist.
-	IsActive  bool
+	IsActive bool
+
+	// --- the platform's feed decision about the SERIES (migration 0075) ---
+	//
+	// OccurrenceFeedStatus is the second visibility axis, the one the main
+	// screen reads (see FeedStatus): OccurrenceStatus decides whether the
+	// occurrence exists publicly at all, this decides whether it may reach the
+	// home feed. It is the moderation state of the RULE, and every occurrence
+	// generated from now on is born with what OccurrenceFeedStatusOf makes of
+	// it.
+	//
+	// The venue may only ask (FeedPendingReview); FeedApproved and FeedRejected
+	// are written by a platform superadmin, exactly as for a single promo or
+	// event. Default FeedNotSubmitted — a rule nobody submitted keeps producing
+	// occurrences that never touch the main screen, which is what every rule
+	// created before this field did.
+	OccurrenceFeedStatus FeedStatus
+	// FeedSubmittedAt is when the venue last asked for the main screen.
+	FeedSubmittedAt *time.Time
+	// FeedReviewedBy / FeedReviewedAt record the superadmin who decided about
+	// the series. They are copied onto each occurrence the rule generates, so a
+	// card on the main screen can always name the human who allowed it.
+	FeedReviewedBy *uuid.UUID
+	FeedReviewedAt *time.Time
+	// FeedRejectionReason is mandatory on a refusal and nil otherwise.
+	FeedRejectionReason *string
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// OccurrenceFeedStatusOf is the feed status an occurrence is BORN with, given
+// its rule's series-level decision. It is the single written statement of that
+// mapping; the generator's SQL implements exactly this.
+//
+//   - approved → approved: a superadmin reviewed the series, and the
+//     occurrences are that series. This is the whole point of deciding on the
+//     rule.
+//   - anything else → not_submitted, INCLUDING pending_review. A pending rule
+//     must not push its 56 identical occurrences into the item queue: the
+//     object under review is the rule, and it is already in the rule queue. An
+//     occurrence born "pending" would ask a human the same question 56 times.
+//
+// A rejected rule likewise produces plain not_submitted occurrences — they were
+// never judged individually, and marking them "rejected" would show the venue a
+// refusal nobody wrote about that date.
+func OccurrenceFeedStatusOf(rule FeedStatus) FeedStatus {
+	if rule == FeedApproved {
+		return FeedApproved
+	}
+	return FeedNotSubmitted
 }
 
 // ActiveEventRecurrence is one row of the generator's scan: an active rule plus
@@ -265,4 +313,35 @@ type EventRecurrenceRepository interface {
 	// moved to another time — the cases the unique index cannot cover, because
 	// the row that occupied the slot is gone.
 	RecordSkip(ctx context.Context, recurrenceID uuid.UUID, slot time.Time) error
+
+	// TransitionFeedStatus is the compare-and-set behind the series-level feed
+	// moderation, the same shape as FeedRepository.TransitionFeedStatus: upd is
+	// applied only when the rule's current occurrence_feed_status is one of
+	// from, so two concurrent decisions cannot both win. ErrNotFound when the id
+	// is absent, ErrInvalidStatus when the status is not in from. from must be
+	// non-empty. FeedPlacementUpdate.PlacementWeight is ignored — a rule carries
+	// no paid placement (each occurrence carries its own).
+	TransitionFeedStatus(ctx context.Context, id uuid.UUID, from []FeedStatus, upd FeedPlacementUpdate) error
+	// DemoteFeedAfterContentEdit mirrors FeedStatusAfterContentEdit for a rule:
+	// a decision made about specific words stops being valid when the template
+	// changes, so approved/rejected → pending_review with the decision cleared.
+	// A no-op for a rule nobody decided on, and a missing id is not an error
+	// (the caller has already resolved the rule it is about to edit).
+	DemoteFeedAfterContentEdit(ctx context.Context, id uuid.UUID) error
+	// SyncOccurrenceFeedStatus applies a feed decision taken on the RULE to the
+	// occurrences it has ALREADY generated and that have not ended yet
+	// (ends_at > notEndedBefore), moving only those whose current feed_status is
+	// one of from. It returns how many occurrences changed.
+	//
+	// Without it, approving a rule would only ever affect dates generated after
+	// the click, and the eight weeks already materialised would stay invisible
+	// forever. The from-set is what protects an individual decision: an
+	// occurrence a moderator rejected by hand is not swept back onto the main
+	// screen by a decision about its series, and a past occurrence is never
+	// rewritten at all.
+	SyncOccurrenceFeedStatus(ctx context.Context, recurrenceID uuid.UUID, notEndedBefore time.Time, from []FeedStatus, upd FeedPlacementUpdate) (int, error)
+	// ListByFeedStatus is the superadmin's rule queue: rules platform-wide in
+	// the given series-level feed status, oldest submission first with id as the
+	// stable tie-break, paginated, plus the total count.
+	ListByFeedStatus(ctx context.Context, status FeedStatus, page, perPage int) ([]EventRecurrence, int, error)
 }
