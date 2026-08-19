@@ -120,10 +120,62 @@ func (h *feedHarness) occurrenceIDs(t *testing.T, ruleID uuid.UUID) []uuid.UUID 
 	return out
 }
 
+// feedCardsOfRule is what a guest actually sees of ONE series on the main
+// screen. Since 2026-08-19 the feed collapses a recurrence the same way the
+// public Афиша does, so this is expected to hold at most one id.
+func (h *feedHarness) feedCardsOfRule(t *testing.T, ruleID uuid.UUID) []uuid.UUID {
+	t.Helper()
+	mine := map[uuid.UUID]bool{}
+	for _, id := range h.occurrenceIDs(t, ruleID) {
+		mine[id] = true
+	}
+	var out []uuid.UUID
+	for id := range h.feedEventIDs(t) {
+		if mine[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// nearestUpcoming is what the collapsed card MUST be: the soonest date of the
+// series that a guest can still attend.
+func (h *feedHarness) nearestUpcoming(t *testing.T, ruleID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := h.pool.QueryRow(h.ctx,
+		`SELECT id FROM events
+		  WHERE recurrence_id = $1 AND status = 'published'
+		    AND feed_status = 'approved' AND ends_at > $2
+		  ORDER BY starts_at, id LIMIT 1`, ruleID, h.now).Scan(&id); err != nil {
+		t.Fatalf("read nearest upcoming occurrence: %v", err)
+	}
+	return id
+}
+
+// assertAllApproved states the half of the rule the collapse does NOT change:
+// the approval is written onto EVERY generated date. Only the presentation is
+// collapsed — tomorrow's date is already approved, it is simply not shown
+// today.
+func (h *feedHarness) assertAllApproved(t *testing.T, ids []uuid.UUID) {
+	t.Helper()
+	for _, id := range ids {
+		var status string
+		if err := h.pool.QueryRow(h.ctx, `SELECT feed_status FROM events WHERE id = $1`, id).Scan(&status); err != nil {
+			t.Fatalf("read feed status of %s: %v", id, err)
+		}
+		if status != string(domain.FeedApproved) {
+			t.Fatalf("occurrence %s should carry feed_status=approved after the series was approved, got %q", id, status)
+		}
+	}
+}
+
 // TestApprovedRuleReachesTheHomeFeed walks the whole path the six production
 // rules will walk: generate → nothing on the main screen → the venue asks →
-// still nothing → the superadmin approves → every date already generated is on
-// the main screen, and every date generated afterwards is born there.
+// still nothing → the superadmin approves → every date already generated is
+// approved, and the series shows up as exactly ONE card: its nearest upcoming
+// date. Dates generated afterwards are born approved and change nothing on the
+// screen until their turn comes.
 func TestApprovedRuleReachesTheHomeFeed(t *testing.T) {
 	now := time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)
 	h := newFeedHarness(t, now, 14*24*time.Hour)
@@ -166,19 +218,24 @@ func TestApprovedRuleReachesTheHomeFeed(t *testing.T) {
 		t.Fatalf("the refused self-approval must have changed nothing, got %d cards", len(got))
 	}
 
-	// 4. The superadmin approves ONCE, and the dates already generated follow.
+	// 4. The superadmin approves ONCE, and the dates already generated follow —
+	// in the database. On the screen the fortnight is ONE card, the nearest
+	// date: approving six daily rules used to produce ~98 identical cards
+	// (incident of 2026-08-19), which is why the feed collapses a series.
 	if _, err := h.facade.ReviewFeed(h.ctx, h.superuser, rule.ID, FeedReviewInput{Approve: true}); err != nil {
 		t.Fatalf("ReviewFeed: %v", err)
 	}
-	onFeed := h.feedEventIDs(t)
-	for _, id := range occurrences {
-		if !onFeed[id] {
-			t.Fatalf("occurrence %s should be on the main screen after the series was approved", id)
-		}
+	h.assertAllApproved(t, occurrences)
+	cards := h.feedCardsOfRule(t, rule.ID)
+	if len(cards) != 1 || cards[0] != h.nearestUpcoming(t, rule.ID) {
+		t.Fatalf("the approved series must show exactly one card, the nearest upcoming date %s, got %v",
+			h.nearestUpcoming(t, rule.ID), cards)
 	}
 
 	// 5. Dates generated AFTER the decision are born approved: the venue does
-	// not have to re-submit every week for the rest of the year.
+	// not have to re-submit every week for the rest of the year. A wider
+	// window must NOT add cards — it only fills the queue behind the one that
+	// is shown.
 	h.gen.cfg.Window = 28 * 24 * time.Hour
 	if _, err := h.gen.Generate(h.ctx); err != nil {
 		t.Fatalf("generate second pass: %v", err)
@@ -187,11 +244,11 @@ func TestApprovedRuleReachesTheHomeFeed(t *testing.T) {
 	if len(grown) <= len(occurrences) {
 		t.Fatalf("the wider window should have generated more dates: %d then %d", len(occurrences), len(grown))
 	}
-	onFeed = h.feedEventIDs(t)
-	for _, id := range grown {
-		if !onFeed[id] {
-			t.Fatalf("occurrence %s generated after the approval should be born on the main screen", id)
-		}
+	h.assertAllApproved(t, grown)
+	cards = h.feedCardsOfRule(t, rule.ID)
+	if len(cards) != 1 || cards[0] != h.nearestUpcoming(t, rule.ID) {
+		t.Fatalf("a wider generation window must not multiply the cards: want only %s, got %v",
+			h.nearestUpcoming(t, rule.ID), cards)
 	}
 }
 
@@ -215,16 +272,16 @@ func TestUnapprovedRuleStaysOffTheHomeFeed(t *testing.T) {
 		t.Fatalf("ReviewFeed: %v", err)
 	}
 
-	onFeed := h.feedEventIDs(t)
-	for _, id := range h.occurrenceIDs(t, approved.ID) {
-		if !onFeed[id] {
-			t.Fatalf("approved occurrence %s missing from the main screen", id)
-		}
+	h.assertAllApproved(t, h.occurrenceIDs(t, approved.ID))
+	cards := h.feedCardsOfRule(t, approved.ID)
+	if len(cards) != 1 || cards[0] != h.nearestUpcoming(t, approved.ID) {
+		t.Fatalf("the approved series must show exactly one card, the nearest upcoming date %s, got %v",
+			h.nearestUpcoming(t, approved.ID), cards)
 	}
-	for _, id := range h.occurrenceIDs(t, quiet.ID) {
-		if onFeed[id] {
-			t.Fatalf("occurrence %s of an unsubmitted rule reached the main screen", id)
-		}
+	// The collapse must not swallow the other rule's absence into a false pass:
+	// the unsubmitted series contributes zero cards, not "one, collapsed".
+	if cards := h.feedCardsOfRule(t, quiet.ID); len(cards) != 0 {
+		t.Fatalf("an unsubmitted rule must contribute no card at all, got %v", cards)
 	}
 }
 

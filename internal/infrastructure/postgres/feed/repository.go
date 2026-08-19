@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -39,7 +40,13 @@ var _ domain.FeedRepository = (*Repository)(nil)
 // NULL so the column list stays identical. Both tables carry cover_image_url
 // (promos since migration 0060), so the card picture is read the same way for
 // both kinds; discount is promo-only (migration 0066).
-func itemSelect(kind domain.FeedItemKind) string {
+//
+// extra appends columns AFTER the shared list. It exists for exactly one
+// caller — the recurrence collapse in ListCandidates, which needs
+// recurrence_id and a row_number inside a derived table and then projects the
+// shared list back out (see collapsedEventCols). Anything passed here is a
+// literal from this file, never caller input.
+func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 	table, alias := tableFor(kind), "i"
 	cover, terms, discount := alias+".cover_image_url", alias+".terms", alias+".discount_percent"
 	// Галерея (migration 0070) живёт в дочерней таблице, своей у каждого вида.
@@ -57,6 +64,10 @@ func itemSelect(kind domain.FeedItemKind) string {
 		terms = "''::text"
 		discount = "NULL::int"
 	}
+	tail := ""
+	if len(extra) > 0 {
+		tail = ",\n\t\t" + strings.Join(extra, ",\n\t\t")
+	}
 	return `SELECT '` + string(kind) + `'::text AS kind,
 		` + alias + `.id, ` + alias + `.restaurant_id,
 		r.name AS restaurant_name, r.name_i18n AS restaurant_name_i18n,
@@ -68,10 +79,27 @@ func itemSelect(kind domain.FeedItemKind) string {
 		` + alias + `.status AS item_status,
 		` + alias + `.feed_status, ` + alias + `.feed_submitted_at, ` + alias + `.feed_reviewed_by,
 		` + alias + `.feed_reviewed_at, ` + alias + `.feed_rejection_reason, ` + alias + `.feed_placement_weight,
-		` + alias + `.created_at
+		` + alias + `.created_at` + tail + `
 	FROM ` + table + ` ` + alias + `
 	JOIN restaurants r ON r.id = ` + alias + `.restaurant_id`
 }
+
+// collapsedEventCols reads the shared column list back out of the derived table
+// the recurrence collapse builds: same columns, same ORDER as itemSelect
+// projects them, because scanCandidate depends on that order. The two helper
+// columns of the derived table (recurrence_id, rn) are deliberately absent —
+// they are a filtering device and must never reach the scanner.
+const collapsedEventCols = `ev.kind, ev.id, ev.restaurant_id,
+	ev.restaurant_name, ev.restaurant_name_i18n,
+	ev.city, ev.category_id, ev.venue_is_active, ev.venue_hidden_from_home,
+	ev.title, ev.title_i18n, ev.description, ev.description_i18n,
+	ev.starts_at, ev.ends_at,
+	ev.cover_image_url, ev.images,
+	ev.terms, ev.discount_percent,
+	ev.item_status,
+	ev.feed_status, ev.feed_submitted_at, ev.feed_reviewed_by,
+	ev.feed_reviewed_at, ev.feed_rejection_reason, ev.feed_placement_weight,
+	ev.created_at`
 
 // tableFor maps a kind to its table. The default panics rather than returning
 // an empty name: an unknown kind here is a programming error, and silently
@@ -93,6 +121,12 @@ func tableFor(kind domain.FeedItemKind) string {
 // requested city) and joins in, per candidate, the venue's published-review
 // aggregate and whether the venue's cuisine is one the guest chose.
 //
+// A recurring series is collapsed to its nearest upcoming occurrence inside
+// the event branch, before the union — see the comment on eventBranch. The
+// usecase's total is len(candidates) after ranking, so collapsing here is also
+// what keeps the reported count and the pagination honest: the number the
+// client is told matches the set it can actually page through.
+//
 // $1 city, $2 the signed-in guest (NULL when anonymous — the prefs CTE is then
 // empty and every item scores a neutral 0 for the preference signal), $3 now,
 // $4 the candidate cap. Each parameter carries an explicit cast on first use:
@@ -108,10 +142,32 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		WHERE r.city = $1::varchar AND r.is_active AND NOT r.hidden_from_home
 		  AND i.status = 'published' AND i.feed_status = 'approved'
 		  AND i.starts_at <= $3::timestamptz AND i.ends_at > $3`
-	eventBranch := itemSelect(domain.FeedItemEvent) + `
-		WHERE r.city = $1 AND r.is_active AND NOT r.hidden_from_home
-		  AND i.status = 'published' AND i.feed_status = 'approved'
-		  AND i.ends_at > $3`
+	// A recurring series contributes exactly ONE card — its nearest upcoming
+	// occurrence — and it does so BEFORE the union, so the surviving card
+	// competes with promos on the very same ordering and ranking rules as any
+	// one-off item. Without this a daily rule buries the whole main screen
+	// under one venue (the «Живая музыка в ресторане INZHU» incident, 98
+	// cards), which is the same reason the public Афиша collapses in
+	// event.ListPublicUpcoming — this is that rule, applied to the feed.
+	//
+	// row_number() runs over the ALREADY-FILTERED set, so "nearest" means
+	// nearest among what the guest may actually see: an occurrence that has
+	// ended, was never published or was not approved for the feed is not a
+	// candidate for the one surviving card, and when today's date passes,
+	// tomorrow's automatically takes its place.
+	//
+	// The explicit `recurrence_id IS NULL` branch is not optional: every
+	// one-off event shares the NULL partition, so filtering on rn = 1 alone
+	// would drop all of them but one.
+	eventBranch := `SELECT ` + collapsedEventCols + ` FROM (
+			` + itemSelect(domain.FeedItemEvent,
+		"i.recurrence_id",
+		"row_number() OVER (PARTITION BY i.recurrence_id ORDER BY i.starts_at ASC, i.id ASC) AS rn") + `
+			WHERE r.city = $1 AND r.is_active AND NOT r.hidden_from_home
+			  AND i.status = 'published' AND i.feed_status = 'approved'
+			  AND i.ends_at > $3
+		) ev
+		WHERE ev.recurrence_id IS NULL OR ev.rn = 1`
 
 	sql := `WITH prefs AS (
 			SELECT category_id FROM user_cuisine_preferences WHERE user_id = $2::uuid
