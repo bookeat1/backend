@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -55,13 +56,29 @@ func (r *Repository) Remove(ctx context.Context, userID, restaurantID uuid.UUID)
 	return nil
 }
 
-// ListByUser joins through restaurant_favorites, reusing restaurant.Columns /
-// restaurant.ScanListItem so a favorited restaurant serializes identically to
-// one returned by the public catalog listing (including its primary image).
-// Deactivated restaurants are excluded, same visibility rule as the catalog.
+// ListByUser is ListRestaurantsByUser without the bookmark timestamps — the
+// shape the original GET /favorites answers with. Both go through the same
+// query so the two screens can never disagree about which venues are in there.
 func (r *Repository) ListByUser(ctx context.Context, userID uuid.UUID) ([]domain.RestaurantListItem, error) {
+	items, err := r.ListRestaurantsByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.RestaurantListItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Restaurant)
+	}
+	return out, nil
+}
+
+// ListRestaurantsByUser joins through restaurant_favorites, reusing
+// restaurant.Columns / restaurant.ScanListItem so a favorited restaurant
+// serializes identically to one returned by the public catalog listing
+// (including its primary image). Deactivated restaurants are excluded, same
+// visibility rule as the catalog.
+func (r *Repository) ListRestaurantsByUser(ctx context.Context, userID uuid.UUID) ([]domain.FavoriteRestaurantItem, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT `+prefixed(restaurant.Columns, "r")+`, `+restaurant.ListExtraColumns+`
+		`SELECT `+prefixed(restaurant.Columns, "r")+`, `+restaurant.ListExtraColumns+`, f.created_at
 		 FROM restaurant_favorites f
 		 JOIN restaurants r ON r.id = f.restaurant_id
 		 WHERE f.user_id = $1 AND r.is_active = true
@@ -71,18 +88,37 @@ func (r *Repository) ListByUser(ctx context.Context, userID uuid.UUID) ([]domain
 	}
 	defer rows.Close()
 
-	var items []domain.RestaurantListItem
+	var items []domain.FavoriteRestaurantItem
 	for rows.Next() {
-		base, primary, err := restaurant.ScanListItem(rows)
+		// The bookmark timestamp is the LAST column of the row, so it is peeled
+		// off with a wrapper scanner rather than by re-implementing
+		// restaurant.ScanListItem with one more destination.
+		var favoritedAt time.Time
+		base, primary, err := restaurant.ScanListItem(trailingScanner{row: rows, extra: []any{&favoritedAt}})
 		if err != nil {
 			return nil, fmt.Errorf("list favorites: %w", err)
 		}
-		items = append(items, domain.RestaurantListItem{Restaurant: *base, PrimaryImage: primary})
+		items = append(items, domain.FavoriteRestaurantItem{
+			Restaurant:  domain.RestaurantListItem{Restaurant: *base, PrimaryImage: primary},
+			FavoritedAt: favoritedAt,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list favorites: %w", err)
 	}
 	return items, nil
+}
+
+// trailingScanner appends extra destinations to whatever a shared scan helper
+// asks for, so a caller can select one more column after a borrowed column list
+// without forking the helper. The extras must be the LAST columns of the SELECT.
+type trailingScanner struct {
+	row   interface{ Scan(dest ...any) error }
+	extra []any
+}
+
+func (s trailingScanner) Scan(dest ...any) error {
+	return s.row.Scan(append(dest, s.extra...)...)
 }
 
 // FavoriteSet reports which of restaurantIDs are favorited by userID. Never

@@ -270,3 +270,31 @@ func (r *Repository) ImagesByPromo(ctx context.Context, promoIDs []uuid.UUID) (m
 	}
 	return out, rows.Err()
 }
+
+// ListColumns is the `p.`-qualified promo column list followed by the host
+// venue's identity (`r.name, r.name_i18n, r.city`) — exactly what ScanListItem
+// expects, in that order. Exported together with ScanListItem so a sibling
+// package that joins through `promos p JOIN restaurants r` (the favorites read)
+// selects the same shape rather than duplicating it. Mirrors event.ListColumns.
+const ListColumns = `p.id, p.restaurant_id, p.title, p.title_i18n, p.description, p.description_i18n,
+	p.starts_at, p.ends_at, p.terms, p.cover_image_url, p.discount_percent, p.status,
+	p.created_at, p.updated_at,
+	r.name, r.name_i18n, r.city`
+
+// ScanListItem scans one row shaped like ListColumns into a PromoListItem.
+func ScanListItem(row pgx.Row) (*domain.PromoListItem, error) {
+	var it domain.PromoListItem
+	p := &it.Promo
+	var titleI18n, descI18n, venueNameI18n []byte
+	if err := row.Scan(&p.ID, &p.RestaurantID, &p.Title, &titleI18n, &p.Description, &descI18n,
+		&p.StartsAt, &p.EndsAt, &p.Terms, &p.CoverImageURL, &p.DiscountPercent, &p.Status,
+		&p.CreatedAt, &p.UpdatedAt,
+		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
+		return nil, err
+	}
+	p.TitleI18n = i18nFromDB(titleI18n)
+	p.DescriptionI18n = i18nFromDB(descI18n)
+	it.Restaurant.ID = p.RestaurantID
+	it.Restaurant.NameI18n = i18nFromDB(venueNameI18n)
+	return &it, nil
+}

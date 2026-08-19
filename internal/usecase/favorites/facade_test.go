@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,6 +17,17 @@ type fakeFavoriteRepo struct {
 	addErr      error
 	listItems   []domain.RestaurantListItem
 	set         map[uuid.UUID]bool
+
+	restaurantItems []domain.FavoriteRestaurantItem
+	eventItems      []domain.FavoriteEventItem
+	promoItems      []domain.FavoritePromoItem
+	// listNow records the instant ListAll evaluated visibility windows at.
+	listNow      time.Time
+	addEvents    []uuid.UUID
+	removeEvents []uuid.UUID
+	addPromos    []uuid.UUID
+	removePromos []uuid.UUID
+	addEventErr  error
 }
 
 func (f *fakeFavoriteRepo) Add(_ context.Context, userID, restaurantID uuid.UUID) error {
@@ -37,6 +49,67 @@ func (f *fakeFavoriteRepo) ListByUser(_ context.Context, _ uuid.UUID) ([]domain.
 
 func (f *fakeFavoriteRepo) FavoriteSet(_ context.Context, _ uuid.UUID, _ []uuid.UUID) (map[uuid.UUID]bool, error) {
 	return f.set, nil
+}
+
+func (f *fakeFavoriteRepo) ListRestaurantsByUser(_ context.Context, _ uuid.UUID) ([]domain.FavoriteRestaurantItem, error) {
+	return f.restaurantItems, nil
+}
+
+func (f *fakeFavoriteRepo) AddEvent(_ context.Context, _, eventID uuid.UUID) error {
+	if f.addEventErr != nil {
+		return f.addEventErr
+	}
+	f.addEvents = append(f.addEvents, eventID)
+	return nil
+}
+
+func (f *fakeFavoriteRepo) RemoveEvent(_ context.Context, _, eventID uuid.UUID) error {
+	f.removeEvents = append(f.removeEvents, eventID)
+	return nil
+}
+
+func (f *fakeFavoriteRepo) ListEventsByUser(_ context.Context, _ uuid.UUID, now time.Time) ([]domain.FavoriteEventItem, error) {
+	f.listNow = now
+	return f.eventItems, nil
+}
+
+func (f *fakeFavoriteRepo) AddPromo(_ context.Context, _, promoID uuid.UUID) error {
+	f.addPromos = append(f.addPromos, promoID)
+	return nil
+}
+
+func (f *fakeFavoriteRepo) RemovePromo(_ context.Context, _, promoID uuid.UUID) error {
+	f.removePromos = append(f.removePromos, promoID)
+	return nil
+}
+
+func (f *fakeFavoriteRepo) ListPromosByUser(_ context.Context, _ uuid.UUID, _ time.Time) ([]domain.FavoritePromoItem, error) {
+	return f.promoItems, nil
+}
+
+// The facade must pass ITS clock down to the visibility windows, not
+// time.Now(): a test that pins the clock and a production caller that does not
+// must both read the same code path.
+func TestListAll_UsesTheInjectedClock(t *testing.T) {
+	pinned := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	repo := &fakeFavoriteRepo{}
+	f := NewFacade(repo, WithClock(func() time.Time { return pinned }))
+
+	if _, err := f.ListAll(context.Background(), uuid.New()); err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if !repo.listNow.Equal(pinned) {
+		t.Fatalf("events read at %s, want the pinned %s", repo.listNow, pinned)
+	}
+}
+
+func TestAddEvent_PropagatesNotFound(t *testing.T) {
+	repo := &fakeFavoriteRepo{addEventErr: domain.ErrNotFound}
+	f := NewFacade(repo)
+
+	if err := f.AddEvent(context.Background(), uuid.New(), uuid.New()); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("AddEvent error = %v, want ErrNotFound", err)
+	}
 }
 
 func TestAdd(t *testing.T) {

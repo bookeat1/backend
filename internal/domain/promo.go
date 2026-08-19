@@ -66,6 +66,16 @@ type Promo struct {
 	UpdatedAt       time.Time
 }
 
+// PromoListItem is one row of a cross-venue promo read: the promo plus the
+// venue that runs it, so a card needs no per-item follow-up query. It mirrors
+// EventListItem and reuses EventRestaurant — that type is the minimal venue
+// identity a content card carries, named after the listing it first served
+// rather than after events specifically.
+type PromoListItem struct {
+	Promo
+	Restaurant EventRestaurant
+}
+
 // PromoRepository persists restaurant promos. Get* return ErrNotFound when
 // absent.
 type PromoRepository interface {
