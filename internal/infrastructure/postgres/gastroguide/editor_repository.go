@@ -31,6 +31,7 @@ import (
 const (
 	uniqueViolation     = "23505"
 	foreignKeyViolation = "23503"
+	checkViolation      = "23514"
 )
 
 // EditorRepository implements domain.GastroguideEditorRepository.
