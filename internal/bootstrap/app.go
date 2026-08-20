@@ -258,6 +258,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// user lookup would only cost a query. Guest reads only; the editor cabinet
 	// that fills these collections is a separate task.
 	gastroguiderest.NewHandler(deps.GastroguideFacade).RegisterPublic(api)
+	// «Гастропрогулки» — the guide's ordered itineraries, on the same public
+	// group and for the same reason.
+	gastroguiderest.NewRouteHandler(deps.GastroRoutes).RegisterPublic(api)
 
 	contentrest.NewHandler(deps.ContentFacade).RegisterStaffRoutes(authed)
 
@@ -316,6 +319,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// worth eating at, and a restaurant owner who could reach it could put their
 	// own venue into "лучшие завтраки". The usecase re-checks the role.
 	gastroguiderest.NewEditorHandler(deps.GastroguideEditor).RegisterAdminRoutes(adminGlobal)
+	// Route editor: same gate, same argument — an itinerary is the platform's
+	// editorial opinion about how to spend a day, not a venue's own page.
+	gastroguiderest.NewRouteEditorHandler(deps.GastroRouteEditor).RegisterAdminRoutes(adminGlobal)
 
 	// Restaurant payouts (выплаты заведениям). The money-OUT routes (generate +
 	// send) are mounted on the superadmin group; the venue-scoped routes

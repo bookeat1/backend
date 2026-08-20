@@ -58,6 +58,14 @@ func (h *EditorHandler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 }
 
 func (h *EditorHandler) actor(c *gin.Context) (uc.EditorActor, bool) {
+	return editorActor(c)
+}
+
+// editorActor lifts the authenticated caller out of the request context and is
+// shared by both editor handlers of this package (collections and routes): the
+// actor is the same superadmin either way, and two copies of this would be two
+// places to forget the 401.
+func editorActor(c *gin.Context) (uc.EditorActor, bool) {
 	au, ok := middleware.GetAuthUser(c.Request.Context())
 	if !ok {
 		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")

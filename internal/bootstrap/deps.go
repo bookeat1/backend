@@ -108,6 +108,10 @@ type Deps struct {
 	PromosFacade      promos.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
+	// GastroRoutes / GastroRouteEditor — «Гастропрогулки» (migration 0078): the
+	// guide's ordered itineraries. Same two-halves posture as the collections.
+	GastroRoutes      gastroguide.RouteFacade
+	GastroRouteEditor gastroguide.RouteEditor
 	ContentFacade     content.Facade
 	FeedFacade        feed.Facade
 	MenuFacade        menu.Facade
@@ -284,6 +288,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// as a unit) and enforces the superadmin gate itself.
 	gastroguideFacade := gastroguide.NewFacade(gastroguiderepo.New(db), eventrepo.New(db), promorepo.New(db))
 	gastroguideEditor := gastroguide.NewEditor(gastroguiderepo.NewEditor(db, txm))
+	// Routes (migration 0078) reuse the same split: a read-only guest facade and
+	// an editor that needs the transaction manager (append/delete/reorder of the
+	// stops are only correct as a unit under a lock on the route).
+	gastroRoutes := gastroguide.NewRouteFacade(gastroguiderepo.NewRoutes(db))
+	gastroRouteEditor := gastroguide.NewRouteEditor(gastroguiderepo.NewRouteEditor(db, txm))
 	contentFacade := content.NewFacade(
 		contentdraftrepo.New(db), eventrepo.New(db), promorepo.New(db), restaurantManagers, txm)
 	bookingLinks := bookingrepo.NewTables(db)
@@ -442,6 +451,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PromosFacade:          promosFacade,
 		GastroguideFacade:     gastroguideFacade,
 		GastroguideEditor:     gastroguideEditor,
+		GastroRoutes:          gastroRoutes,
+		GastroRouteEditor:     gastroRouteEditor,
 		ContentFacade:         contentFacade,
 		FeedFacade:            feedFacade,
 		MenuFacade:            menuFacade,

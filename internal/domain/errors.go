@@ -290,6 +290,13 @@ const (
 	// key forbids is the same venue twice in one.
 	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
 
+	// CodeGuideRouteEmpty — publishing a route with no stops (migration 0078).
+	// Deliberately NOT the mirror of a collection, where the same guard was
+	// removed: a collection is an article whose venues are a bonus, so an empty
+	// one still reads; a route IS its sequence of stops, and an empty itinerary
+	// renders as a title, a cover and nothing to walk. Fixed by adding a stop.
+	CodeGuideRouteEmpty ErrorCode = "guide_route_empty"
+
 	// Phone change for a signed-in user (POST /users/me/phone/otp/request,
 	// POST /users/me/phone/otp/verify). Both narrow a status that on its own
 	// reads as something else on this authenticated, own-account flow.
