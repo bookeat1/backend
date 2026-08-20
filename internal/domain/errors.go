@@ -302,6 +302,73 @@ const (
 	// retryable until the number is freed.
 	CodePhoneInUse ErrorCode = "phone_in_use"
 
+	// --- split payments (internal/domain/payment_split.go) ---
+	//
+	// One guest charge divided between the venue and the platform at the
+	// acquirer. The first group is OUR pre-flight validation: nothing was sent
+	// anywhere, nothing was charged, and the caller's request is wrong. The
+	// second group is the acquirer's own refusal of a split, translated by the
+	// adapter — those mean the request never became money either, but the fix
+	// is configuration (usually a call to the acquirer's manager), not code.
+	//
+	// They are separate codes rather than one "split_failed" because the
+	// operator's next action differs completely: fix an amount, fill in a
+	// venue's sub-merchant id, or phone the acquirer.
+
+	// CodeSplitSumMismatch — the shares do not add up to the amount charged.
+	// The single most dangerous split mistake and the only one that a float
+	// percentage produces on its own. Nothing was charged.
+	CodeSplitSumMismatch ErrorCode = "split_sum_mismatch"
+
+	// CodeSplitShareInvalid — a share is zero, negative, in the wrong
+	// currency, or belongs to an unknown/repeated payee.
+	CodeSplitShareInvalid ErrorCode = "split_share_invalid"
+
+	// CodeSplitAccountMissing — a recipient has no acquirer sub-merchant
+	// account on file. For a venue this means it was never onboarded as a
+	// sub-merchant; for the platform it means this deployment has no
+	// PAYMENTS_PLATFORM_SPLIT_ACCOUNT set. Not retryable.
+	CodeSplitAccountMissing ErrorCode = "split_account_missing"
+
+	// CodeSplitAccountDuplicate — two shares address the same acquirer
+	// account. TipTop Pay answers "Duplicated PublicIds for splits".
+	CodeSplitAccountDuplicate ErrorCode = "split_account_duplicate"
+
+	// CodeSplitTooManyShares — more recipients than MaxPaymentSplits. Our own
+	// sanity bound, see that constant.
+	CodeSplitTooManyShares ErrorCode = "split_too_many_shares"
+
+	// CodeSplitAmountTooBig — a confirm/refund asks for more than the split
+	// itself is worth ("Amount is too big").
+	CodeSplitAmountTooBig ErrorCode = "split_amount_too_big"
+
+	// CodeSplitRequired — the acquirer refused an operation on a SPLIT payment
+	// that carried no Splits array ("Field \"Splits\" is required"). It means
+	// this build lost track of the original split; the payment is untouched.
+	CodeSplitRequired ErrorCode = "split_required"
+
+	// CodeSplitNotSupported — the acquirer terminal is not set up for split
+	// payments at all, or its gateway is not ("Split transaction is not
+	// supported", ErrorCode 6018). Configuration on the acquirer's side: no
+	// retry helps, somebody has to file the request with the manager.
+	CodeSplitNotSupported ErrorCode = "split_not_supported"
+
+	// CodeSplitSubMerchantUnknown — the acquirer does not recognise a
+	// sub-merchant id we sent ("SubMerchant not found"), or it is no longer
+	// working with the marketplace ("SubMerchants is disabled: ...").
+	CodeSplitSubMerchantUnknown ErrorCode = "split_submerchant_unknown"
+
+	// CodeSplitTerminalMismatch — the marketplace terminal and the
+	// sub-merchant terminal are in different modes ("Terminals modes not
+	// equal"), or the request was authenticated with a sub-merchant's own
+	// credentials instead of the marketplace's.
+	CodeSplitTerminalMismatch ErrorCode = "split_terminal_mismatch"
+
+	// CodeSplitFlowUnsupported — OUR configuration gap, not the acquirer's:
+	// the payment flow this build uses is not one the acquirer documents split
+	// support for. See docs/payments/tiptoppay-splits.md.
+	CodeSplitFlowUnsupported ErrorCode = "split_flow_unsupported"
+
 	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
 	// number. Nothing to verify and nothing to change; a plain validation_failed
 	// would make the app show a field error with no actionable reason. 422.

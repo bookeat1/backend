@@ -33,6 +33,11 @@ type recorded struct {
 	RequestID string
 	Auth      string
 	Body      map[string]any
+	// Raw is the request body byte for byte. Body is convenient but lossy:
+	// json.Unmarshal into `any` turns "10350.00" into a float64, so an
+	// assertion about the DECIMAL FORMAT an acquirer requires has to read this
+	// instead.
+	Raw []byte
 }
 
 // fakeAcquirer is an httptest server impersonating TipTopPay.
@@ -62,6 +67,7 @@ func newFakeAcquirer(t *testing.T, handler func(path string, attempt int, body m
 			RequestID: r.Header.Get("X-Request-ID"),
 			Auth:      r.Header.Get("Authorization"),
 			Body:      body,
+			Raw:       raw,
 		})
 		if f.counts[r.URL.Path] == nil {
 			var n int32

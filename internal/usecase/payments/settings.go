@@ -46,6 +46,25 @@ type Config struct {
 	// free_cancel_window_minutes. Owner-confirmed default 120 minutes (see
 	// withDefaults / migration 0034).
 	FreeCancelWindow time.Duration
+	// SplitEnabled turns split payments on for this deployment: the guest's one
+	// charge is divided at the acquirer between the venue's own sub-merchant
+	// account and the platform's, instead of landing whole on ours and being
+	// settled later by a payout.
+	//
+	// OFF by default, and it must stay off until venues actually have
+	// sub-merchant accounts: with it on, a venue that has none cannot take a
+	// payment at all (that is the point — see resolveSplitPlan).
+	SplitEnabled bool
+	// PlatformSplitAccountRef is the platform's OWN sub-merchant account at the
+	// acquirer, which its commission share is paid to. Required whenever
+	// SplitEnabled is on and the fee is non-zero: the acquirer requires the
+	// shares to add up to the whole charge, so the platform's cut must be
+	// addressed just like the venue's.
+	//
+	// It is an identifier, not a credential — it authorises nothing — which is
+	// why it lives here, next to the commission logic that decides the share,
+	// rather than in the adapter's secret configuration.
+	PlatformSplitAccountRef string
 }
 
 // Package-level fallbacks, applied to any zero-valued Config field — same

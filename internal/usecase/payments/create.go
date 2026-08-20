@@ -47,6 +47,23 @@ type createUseCase struct {
 	managers    managerChecker
 	tx          domain.TxManager
 	cfg         Config
+	// splitAccounts is optional (see CreateOption / WithSplitAccounts): nil
+	// means this deployment does not do split payments at all, which is the
+	// state every deployment is in until venues are onboarded as sub-merchants.
+	splitAccounts splitAccountReader
+}
+
+// CreateOption is an optional dependency of the payment-creation usecase. The
+// same shape as bookings.StatusOption: it keeps a capability that not every
+// deployment has out of the constructor's required arguments, so wiring it is a
+// deliberate act rather than a nil somebody passed to satisfy a signature.
+type CreateOption func(*createUseCase)
+
+// WithSplitAccounts wires the venue↔sub-merchant mapping that split payments
+// are addressed by. Without it (and without Config.SplitEnabled) payments are
+// created exactly as before, with no Splits array.
+func WithSplitAccounts(r splitAccountReader) CreateOption {
+	return func(u *createUseCase) { u.splitAccounts = r }
 }
 
 // NewCreateUseCase constructs the payment-creation usecase.
@@ -61,12 +78,17 @@ func NewCreateUseCase(
 	managers managerChecker,
 	tx domain.TxManager,
 	cfg Config,
+	opts ...CreateOption,
 ) CreateUseCase {
-	return &createUseCase{
+	u := &createUseCase{
 		payments: payments, outbox: outbox, bookings: bookings, items: items,
 		restaurants: restaurants, specialDays: specialDays, gateways: gateways,
 		managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // CreateForBooking computes the amount, resolves an acquirer, places a hold
@@ -158,6 +180,14 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	}
 	provider := gw.Name()
 
+	// Decided BEFORE the idempotency replay and before any acquirer call: a
+	// venue that cannot receive its share must not get as far as a hold that
+	// somebody then has to void.
+	splits, err := u.resolveSplitPlan(ctx, provider, booking.RestaurantID, base, fee, total)
+	if err != nil {
+		return nil, err
+	}
+
 	// Scoped to the booking AND the actor (report item, minor): scoping to
 	// the booking alone caught a collision across two different bookings,
 	// but not across two different ACTORS on the SAME booking (e.g. venue
@@ -193,6 +223,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		CallbackURL:    in.CallbackURL,
 		CustomerPhone:  booking.PhoneNormalized,
 		CustomerEmail:  booking.Email,
+		Splits:         splits,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("authorize with %s: %w", provider, err)

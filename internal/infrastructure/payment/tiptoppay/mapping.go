@@ -49,6 +49,10 @@ type transactionModel struct {
 	CardHolderMessage string      `json:"CardHolderMessage"`
 	Refunded          bool        `json:"Refunded"`
 	TestMode          bool        `json:"TestMode"`
+	// Splits is the split array echoed back verbatim for a split payment, and
+	// absent for an ordinary one. It is the ONLY place the original division
+	// can be read from before a confirm or a refund — see split.go.
+	Splits []splitEntry `json:"Splits"`
 }
 
 // refundModel is /payments/refund: it answers with the refund's own
