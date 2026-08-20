@@ -540,6 +540,16 @@ type AuthorizeRequest struct {
 	// Metadata is passed through to the acquirer and echoed back in webhooks.
 	// It must never contain card data or anything secret (spec §8).
 	Metadata map[string]string
+	// Splits divides this one charge between its recipients at the acquirer —
+	// the venue's share and the platform's commission — instead of landing the
+	// whole amount on our merchant account and settling it later by payout. It
+	// is optional and provider-neutral: an empty plan (PaymentSplitPlan.IsZero)
+	// means an ordinary single-recipient payment, and an adapter for an
+	// acquirer without split support must REFUSE a non-empty plan rather than
+	// drop it — silently ignoring it charges the guest correctly and pays the
+	// wrong account. The shares are validated against Amount before the call
+	// (see PaymentSplitPlan.Validate).
+	Splits PaymentSplitPlan
 }
 
 // GatewayPayment is the acquirer's view of a payment, already translated into

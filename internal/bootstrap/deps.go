@@ -324,8 +324,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	scheduleRepo := schedulerepo.New(db)
 	specialDays := specialDayAdapter{overrides: scheduleRepo, fallbackTZ: cfg.Booking.TimezoneFallback}
 
+	// Split payments: the venue↔sub-merchant mapping is always wired (the table
+	// is simply empty until venues are onboarded); whether it is CONSULTED is
+	// decided by PAYMENTS_SPLIT_ENABLED inside the usecase.
+	paymentSplitAccounts := paymentrepo.NewSplitAccounts(db)
 	paymentCreate := payments.NewCreateUseCase(paymentsRepo, paymentOutboxRepo, bookingRepo, bookingItems,
-		paymentSettings, specialDays, paymentGateways, restaurantManagers, txm, paymentsCfg)
+		paymentSettings, specialDays, paymentGateways, restaurantManagers, txm, paymentsCfg,
+		payments.WithSplitAccounts(paymentSplitAccounts))
 	paymentCapture := payments.NewCaptureUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, txm)
 	paymentVoid := payments.NewVoidUseCase(paymentsRepo, paymentOutboxRepo, paymentGateways, restaurantManagers, txm)
@@ -665,6 +670,8 @@ func newPaymentsConfig(cfg Config) payments.Config {
 		PreorderPaymentRequired:      cfg.Payments.PreorderPaymentRequired,
 		HoldTTL:                      cfg.Payments.HoldTTL,
 		FreeCancelWindow:             cfg.Payments.FreeCancelWindow,
+		SplitEnabled:                 cfg.Payments.SplitEnabled,
+		PlatformSplitAccountRef:      cfg.Payments.PlatformSplitAccountRef,
 	}
 }
 

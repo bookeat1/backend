@@ -359,6 +359,25 @@ type PaymentsConfig struct {
 	// practice this only ever has to be FreedomPay-shaped; it is still built
 	// from a single base URL rather than hardcoding the route twice.
 	PublicBaseURL string // env: PAYMENTS_PUBLIC_BASE_URL
+
+	// SplitEnabled turns SPLIT payments on: one guest charge divided at the
+	// acquirer between the venue's own sub-merchant account and the platform's,
+	// instead of landing whole on ours and being settled later by a payout.
+	//
+	// OFF by default and it must stay off until venues actually have
+	// sub-merchant identifiers (restaurant_split_accounts, migration 0077):
+	// with it on, a venue that has none cannot take a payment at all, which is
+	// deliberate — the alternative is paying the venue's share to the platform.
+	// env: PAYMENTS_SPLIT_ENABLED
+	SplitEnabled bool
+
+	// PlatformSplitAccountRef is the platform's own sub-merchant identifier at
+	// the acquirer — where our commission share of a split payment is credited.
+	// Required whenever SplitEnabled is on. It identifies, it does not
+	// authorise, so unlike an acquirer key it is ordinary configuration; it is
+	// still never written to a log.
+	// env: PAYMENTS_PLATFORM_SPLIT_ACCOUNT
+	PlatformSplitAccountRef string
 }
 
 // PaymentsReconcilerConfig configures the background payments reconciliation
@@ -631,6 +650,8 @@ func NewConfig() (Config, error) {
 			HoldTTL:                      getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
 			FreeCancelWindow:             getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
 			PublicBaseURL:                strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
+			SplitEnabled:                 getEnvBool("PAYMENTS_SPLIT_ENABLED", false),
+			PlatformSplitAccountRef:      strings.TrimSpace(getEnv("PAYMENTS_PLATFORM_SPLIT_ACCOUNT", "")),
 		},
 		PaymentsReconciler: PaymentsReconcilerConfig{
 			TickInterval:     getEnvDuration("PAYMENTS_RECONCILE_TICK_INTERVAL", 2*time.Minute),

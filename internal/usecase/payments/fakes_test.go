@@ -900,6 +900,10 @@ type fakeGateway struct {
 	authorizeErr  error
 	authorizeResp *domain.GatewayPayment
 	authorizeN    int
+	// lastAuthorize is the request the gateway last saw, so a test can assert
+	// what was actually handed to the acquirer (e.g. the split plan) and not
+	// merely that Authorize was reached.
+	lastAuthorize domain.AuthorizeRequest
 
 	// captureDelay forces concurrent CaptureOnSeating callers to actually
 	// overlap, same reasoning as authorizeDelay.
@@ -940,6 +944,7 @@ func (f *fakeGateway) Authorize(_ context.Context, req domain.AuthorizeRequest) 
 	}
 	f.mu.Lock()
 	f.authorizeN++
+	f.lastAuthorize = req
 	f.mu.Unlock()
 	if f.authorizeErr != nil {
 		return nil, f.authorizeErr
