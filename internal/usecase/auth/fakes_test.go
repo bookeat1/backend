@@ -129,7 +129,15 @@ type fakeOTP struct {
 }
 
 func newFakeOTP() *fakeOTP { return &fakeOTP{} }
-func (f *fakeOTP) Create(_ context.Context, c *domain.OTPCode) error {
+
+// Create УВАЖАЕТ контекст, как настоящий репозиторий: pgx отменяет запрос
+// вместе с ним, и без этой проверки подделка молча прощала бы ошибку, которую
+// живая база не прощает (24.08.2026: клиент отваливался по своему таймауту, и
+// уже отправленный код не сохранялся).
+func (f *fakeOTP) Create(ctx context.Context, c *domain.OTPCode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cp := *c
 	f.codes = append(f.codes, &cp)
 	return nil
@@ -251,10 +259,16 @@ type stubSender struct {
 	channel  string
 	err      error
 	calls    int
+	// onSend срабатывает В МОМЕНТ доставки: так тест может воспроизвести
+	// клиента, который отвалился уже после того, как код ушёл человеку.
+	onSend func()
 }
 
 func (s *stubSender) Send(_ context.Context, _, code string, hint domain.OTPSendHint) (string, error) {
 	s.calls++
+	if s.onSend != nil {
+		s.onSend()
+	}
 	s.lastHint = hint
 	s.lastCode = code
 	if s.err != nil {

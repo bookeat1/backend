@@ -188,3 +188,32 @@ func TestRequestOTPFailedDeliveryStillConsumesTheRateLimit(t *testing.T) {
 		t.Fatalf("an undelivered attempt was remembered as %q", last)
 	}
 }
+
+// Отправленный код обязан сохраниться, даже если клиент уже ушёл.
+//
+// 24.08.2026 доставка через Telegram Gateway заняла около восьми секунд,
+// приложение оборвало запрос по своему таймауту, и запись кода упала с
+// context canceled. Человек получал код на телефон, а войти по нему не мог:
+// в базе кода не было. Это худший из возможных исходов — деньги за доставку
+// списаны, гость держит код в руках, а система его не знает.
+func TestRequestOTPStoresTheCodeEvenIfTheClientLeaves(t *testing.T) {
+	sender := &stubSender{channel: domain.OTPChannelSMS}
+	uc, repo := newTestOTPWith(t, sender)
+
+	// Контекст отменяется ровно в момент доставки, как у живого клиента с
+	// коротким таймаутом.
+	ctx, cancel := context.WithCancel(context.Background())
+	sender.onSend = cancel
+
+	if _, err := uc.RequestOTP(ctx, "+77070000123"); err != nil {
+		t.Fatalf("уход клиента не должен ронять запрос кода: %v", err)
+	}
+
+	n, err := repo.CountSince(context.Background(), "+77070000123", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("код обязан быть сохранён после отмены запроса, строк: %d", n)
+	}
+}

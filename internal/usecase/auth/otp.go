@@ -82,6 +82,11 @@ func NewOTPUseCase(
 	}
 }
 
+// otpPersistTimeout bounds the write that stores an already-sent code. It is
+// deliberately short: the row is small and the only reason to wait is a
+// struggling database, not a slow caller.
+const otpPersistTimeout = 5 * time.Second
+
 // RequestOTP normalizes the phone, enforces rate limits, stores a hashed code,
 // and asks the sender to deliver it. Returns the code only when OTPDevExpose.
 //
@@ -161,7 +166,19 @@ func (o *otpUseCase) RequestOTP(ctx context.Context, rawPhone string) (string, e
 		ExpiresAt: now.Add(o.cfg.OTPTTL),
 		CreatedAt: now,
 	}
-	if err := o.otp.Create(ctx, rec); err != nil {
+	// СОХРАНЯЕМ ВНЕ КОНТЕКСТА ЗАПРОСА. Код уже ушёл человеку на телефон, и с
+	// этой секунды он существует в мире независимо от того, ждёт ли ещё
+	// приложение ответа. Если гость свернул экран или у клиента истёк свой
+	// таймаут, отмена запроса не должна отменять запись: иначе код придёт, а
+	// войти по нему будет нельзя — ровно это и случилось 24.08.2026, когда
+	// доставка через Telegram Gateway заняла около восьми секунд, приложение
+	// оборвало запрос, и `create otp` упал с context canceled.
+	//
+	// Отдельный короткий таймаут: писать бесконечно тоже нельзя, иначе
+	// зависшая база задержит горутину после ухода клиента.
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), otpPersistTimeout)
+	defer cancel()
+	if err := o.otp.Create(saveCtx, rec); err != nil {
 		return "", err
 	}
 	if o.cfg.OTPDevExpose {
@@ -205,6 +222,11 @@ func (o *otpUseCase) sendHint(ctx context.Context, p string) domain.OTPSendHint 
 func (o *otpUseCase) recordUndeliveredAttempt(ctx context.Context, p, code string) {
 	now := time.Now()
 	used := now
+	// Тоже вне контекста запроса: строка нужна счётчику ограничений, а он
+	// защищает от перебора и от трат на отправку. Клиент, отвалившийся в этот
+	// момент, не должен обнулять эту защиту.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), otpPersistTimeout)
+	defer cancel()
 	_ = o.otp.Create(ctx, &domain.OTPCode{
 		ID:        uuid.New(),
 		Phone:     p,
