@@ -23,6 +23,40 @@ var _ domain.BookingItemRepository = (*Items)(nil)
 const itemCols = `id, booking_id, menu_item_id, item_name, item_price_minor,
 	currency, quantity, status, comment, created_at, updated_at`
 
+// ListByBookings returns the pre-ordered lines for MANY bookings at once,
+// grouped by booking.
+//
+// The venue's booking list shows up to a hundred rows, and asking per booking
+// would mean a hundred round trips on the one screen a hostess keeps open all
+// evening. One query with ANY($1) keeps that screen cheap.
+//
+// A booking with no pre-order is simply absent from the map — the caller reads
+// it as "nothing ordered", which is the same thing an empty slice would say.
+func (r *Items) ListByBookings(ctx context.Context, bookingIDs []uuid.UUID) (map[uuid.UUID][]domain.BookingItem, error) {
+	out := make(map[uuid.UUID][]domain.BookingItem, len(bookingIDs))
+	if len(bookingIDs) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+itemCols+` FROM booking_items WHERE booking_id = ANY($1) ORDER BY created_at, id`,
+		bookingIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list booking items by bookings: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var i domain.BookingItem
+		var status string
+		if err := rows.Scan(&i.ID, &i.BookingID, &i.MenuItemID, &i.ItemName, &i.PriceMinor,
+			&i.Currency, &i.Quantity, &status, &i.Comment, &i.CreatedAt, &i.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("list booking items by bookings: %w", err)
+		}
+		i.Status = domain.BookingItemStatus(status)
+		out[i.BookingID] = append(out[i.BookingID], i)
+	}
+	return out, rows.Err()
+}
+
 func (r *Items) ListByBooking(ctx context.Context, bookingID uuid.UUID) ([]domain.BookingItem, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT `+itemCols+` FROM booking_items WHERE booking_id=$1 ORDER BY created_at, id`, bookingID)

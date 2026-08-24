@@ -516,9 +516,23 @@ func (h *Handler) listBookings(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	// Состав предзаказа берём ОДНИМ запросом на всю страницу: у хостес этот
+	// список открыт весь вечер, и сотня отдельных запросов на сотню броней
+	// превратила бы его в самый дорогой экран кабинета.
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, b := range items {
+		ids = append(ids, b.ID)
+	}
+	preorders, err := h.panel.ListBookingPreorders(c.Request.Context(), actor, rid, ids)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
 	out := make([]bookingResponse, 0, len(items))
 	for _, b := range items {
-		out = append(out, bookingToResponse(b))
+		r := bookingToResponse(b)
+		r.Preorder = preorderToResponse(preorders[b.ID])
+		out = append(out, r)
 	}
 	page, perPage := f.Page, f.PerPage
 	if page <= 0 {

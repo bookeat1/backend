@@ -158,6 +158,39 @@ type bookingResponse struct {
 	CancellationReason *string    `json:"cancellation_reason"`
 	ConfirmedAt        *time.Time `json:"confirmed_at"`
 	CreatedAt          time.Time  `json:"created_at"`
+	// Предзаказ гостя. Пустой массив, а не null: список блюд у брони без
+	// предзаказа существует, он просто пуст, и клиенту не нужно разбирать
+	// два разных «ничего».
+	Preorder []preorderItemResponse `json:"preorder"`
+}
+
+// preorderItemResponse — одна строка предзаказа так, как её видит заведение:
+// что готовить, сколько порций и почём. Цена уже зафиксирована в момент
+// заказа, поэтому берётся из самой строки, а не из текущего меню.
+type preorderItemResponse struct {
+	Name       string `json:"name"`
+	Quantity   int    `json:"quantity"`
+	PriceMinor int64  `json:"price_minor"`
+	TotalMinor int64  `json:"total_minor"`
+	Comment    string `json:"comment,omitempty"`
+}
+
+func preorderToResponse(items []domain.BookingItem) []preorderItemResponse {
+	out := make([]preorderItemResponse, 0, len(items))
+	for _, i := range items {
+		comment := ""
+		if i.Comment != nil {
+			comment = *i.Comment
+		}
+		out = append(out, preorderItemResponse{
+			Name:       i.ItemName,
+			Quantity:   i.Quantity,
+			PriceMinor: i.PriceMinor,
+			TotalMinor: i.PriceMinor * int64(i.Quantity),
+			Comment:    comment,
+		})
+	}
+	return out
 }
 
 func bookingToResponse(b domain.Booking) bookingResponse {
