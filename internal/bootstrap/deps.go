@@ -409,7 +409,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		scheduleRepo, guestrepo.New(db), bookingsFacade, bookingStatus,
 		restRepo,                         // paymentSettingsWriter: edits free_cancel_window_minutes
 		notificationrepo.NewSettings(db), // telegramSettings: connects/clears the venue's Telegram alert chat
-	)
+	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
 	// for the global superadmin only. Pure reads over a dedicated read-model

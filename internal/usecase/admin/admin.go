@@ -41,6 +41,7 @@ type UseCase struct {
 	bookingTx    bookingTransitioner
 	paySettings  paymentSettingsWriter
 	telegram     telegramSettings
+	preorder     preorderLister
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -511,6 +512,42 @@ func (u *UseCase) ListBookings(ctx context.Context, actor Actor, restaurantID uu
 		return nil, 0, err
 	}
 	return u.bookingList.ListByRestaurant(ctx, actor.bookingActor(), restaurantID, f)
+}
+
+// preorderLister reads the pre-ordered dishes for a batch of bookings.
+// Satisfied by *booking.Items (postgres). Optional on purpose: the panel works
+// without it, just without the dish list.
+type preorderLister interface {
+	ListByBookings(ctx context.Context, bookingIDs []uuid.UUID) (map[uuid.UUID][]domain.BookingItem, error)
+}
+
+// WithPreorder wires the pre-order reader in. A setter rather than a
+// constructor argument so the existing call sites and their tests keep
+// compiling: the panel degrades to "no dish list" when it is absent, which is
+// exactly how it behaved before this existed.
+func (u *UseCase) WithPreorder(p preorderLister) *UseCase {
+	u.preorder = p
+	return u
+}
+
+// ListBookingPreorders returns the dishes ordered for the given bookings,
+// grouped by booking id.
+//
+// WHY THE VENUE NEEDS IT. Until now the cabinet showed only a count on the
+// dashboard, so a guest could pre-order four dishes and the kitchen would never
+// learn what to cook — the feature existed for the guest and stopped at the
+// door of the venue.
+//
+// Same permission as the booking list itself: whoever may see the bookings may
+// see what was ordered for them.
+func (u *UseCase) ListBookingPreorders(ctx context.Context, actor Actor, restaurantID uuid.UUID, bookingIDs []uuid.UUID) (map[uuid.UUID][]domain.BookingItem, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermBookingManage); err != nil {
+		return nil, err
+	}
+	if u.preorder == nil || len(bookingIDs) == 0 {
+		return map[uuid.UUID][]domain.BookingItem{}, nil
+	}
+	return u.preorder.ListByBookings(ctx, bookingIDs)
 }
 
 // ConfirmBooking accepts/confirms a pending booking. Any staff role.
