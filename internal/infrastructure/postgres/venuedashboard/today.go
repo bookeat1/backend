@@ -52,7 +52,67 @@ func (r *TodayRepository) Today(ctx context.Context, restaurantID uuid.UUID, now
 	if err := r.today(ctx, &out, restaurantID, now, todayLimit); err != nil {
 		return domain.VenueToday{}, err
 	}
+	if err := r.attachPreorders(ctx, &out); err != nil {
+		return domain.VenueToday{}, err
+	}
 	return out, nil
+}
+
+// attachPreorders fills in the pre-ordered dishes for every row on the screen.
+//
+// ONE query for both lists, not one per row: this screen refreshes on a timer
+// while the venue works, and the two lists overlap (a pending request for today
+// appears in both), so a per-row read would also fetch the same booking twice.
+//
+// A booking without a pre-order keeps its nil slice: the panel reads that as
+// "nothing ordered", which is what it is.
+func (r *TodayRepository) attachPreorders(ctx context.Context, out *domain.VenueToday) error {
+	ids := make([]uuid.UUID, 0, len(out.Awaiting)+len(out.Today))
+	seen := make(map[uuid.UUID]struct{}, cap(ids))
+	for _, list := range [][]domain.VenueTodayBooking{out.Awaiting, out.Today} {
+		for _, b := range list {
+			if _, ok := seen[b.ID]; ok {
+				continue
+			}
+			seen[b.ID] = struct{}{}
+			ids = append(ids, b.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT booking_id, item_name, item_price_minor, quantity
+		   FROM booking_items
+		  WHERE booking_id = ANY($1)
+		  ORDER BY created_at, id`, ids)
+	if err != nil {
+		return fmt.Errorf("venue today preorders: %w", err)
+	}
+	defer rows.Close()
+
+	byBooking := make(map[uuid.UUID][]domain.BookingItem, len(ids))
+	for rows.Next() {
+		var bookingID uuid.UUID
+		var item domain.BookingItem
+		if err := rows.Scan(&bookingID, &item.ItemName, &item.PriceMinor, &item.Quantity); err != nil {
+			return fmt.Errorf("scan venue today preorder: %w", err)
+		}
+		item.BookingID = bookingID
+		byBooking[bookingID] = append(byBooking[bookingID], item)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate venue today preorders: %w", err)
+	}
+
+	for i := range out.Awaiting {
+		out.Awaiting[i].Preorder = byBooking[out.Awaiting[i].ID]
+	}
+	for i := range out.Today {
+		out.Today[i].Preorder = byBooking[out.Today[i].ID]
+	}
+	return nil
 }
 
 // awaiting lists the requests the venue has not answered, OLDEST FIRST.
