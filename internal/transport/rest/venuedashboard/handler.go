@@ -139,6 +139,25 @@ func todayRows(in []domain.VenueTodayBooking) []gin.H {
 			"status":          string(b.Status),
 			"created_at":      b.CreatedAt.Format(time.RFC3339),
 			"waiting_minutes": b.WaitingMinutes,
+			// Состав предзаказа: что готовить и сколько порций. Пустой массив,
+			// а не null — панели не нужно разбирать два разных «ничего».
+			"preorder": preorderJSON(b.Preorder),
+		})
+	}
+	return out
+}
+
+// preorderJSON renders the dishes a guest ordered ahead. Price comes from the
+// stored line, not from today's menu: the guest was quoted that price when
+// ordering, and the kitchen sheet must match what he will be charged.
+func preorderJSON(items []domain.BookingItem) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, i := range items {
+		out = append(out, map[string]any{
+			"name":        i.ItemName,
+			"quantity":    i.Quantity,
+			"price_minor": i.PriceMinor,
+			"total_minor": i.PriceMinor * int64(i.Quantity),
 		})
 	}
 	return out

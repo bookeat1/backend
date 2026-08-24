@@ -112,6 +112,13 @@ type VenueTodayBooking struct {
 	// age of the record. Never negative: a created_at in the future (clock skew
 	// on an import) reads as 0, not as a negative wait.
 	WaitingMinutes int
+	// Preorder is what the guest ordered ahead, if anything.
+	//
+	// It lives on THIS row, and not only in the bookings list, because the
+	// hostess decides whether to accept a request from this screen: four
+	// pre-ordered dishes are an argument for saying yes, and the kitchen needs
+	// them before the guest arrives, not after someone opens another tab.
+	Preorder []BookingItem
 }
 
 // VenueTodayRepository reads the panel's operational view.
