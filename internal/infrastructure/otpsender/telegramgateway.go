@@ -198,7 +198,7 @@ func (t *TelegramGateway) call(ctx context.Context, method string, payload map[s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+trimmed(t.cfg.Token))
 
-	status, body, err := t.http.do(req)
+	status, body, err := t.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("telegram gateway: %s: %w", method, err)
 	}

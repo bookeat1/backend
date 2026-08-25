@@ -25,9 +25,10 @@ func (f *fakeManagers) ListByUser(_ context.Context, uid uuid.UUID) ([]domain.Re
 func (f *fakeManagers) GetByID(context.Context, uuid.UUID) (*domain.RestaurantManager, error) {
 	return nil, domain.ErrNotFound
 }
-func (f *fakeManagers) Create(context.Context, *domain.RestaurantManager) error       { return nil }
-func (f *fakeManagers) UpdateRole(context.Context, uuid.UUID, domain.StaffRole) error { return nil }
-func (f *fakeManagers) Delete(context.Context, uuid.UUID) error                       { return nil }
+func (f *fakeManagers) Create(context.Context, *domain.RestaurantManager) error        { return nil }
+func (f *fakeManagers) UpdateRole(context.Context, uuid.UUID, domain.StaffRole) error  { return nil }
+func (f *fakeManagers) UpdateWhatsApp(context.Context, uuid.UUID, bool, *string) error { return nil }
+func (f *fakeManagers) Delete(context.Context, uuid.UUID) error                        { return nil }
 
 func validRegister(rest uuid.UUID) RegisterInput {
 	return RegisterInput{RestaurantID: rest, Endpoint: "https://push/abc", P256dh: "p256", Auth: "auth"}

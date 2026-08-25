@@ -59,6 +59,7 @@ import (
 	"backend-core/internal/infrastructure/telegramnotify"
 	"backend-core/internal/infrastructure/token"
 	"backend-core/internal/infrastructure/webpush"
+	"backend-core/internal/infrastructure/whatsapp"
 	"backend-core/internal/transport/rest/telegramhook"
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/analytics"
@@ -1161,12 +1162,65 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		log,
 	)
 
+	// WhatsApp channel: a FIFTH notifier on the same dispatcher — the venue's
+	// staff get the approved «новая бронь» template on their own numbers. It is
+	// the channel Kazakh venues actually live in, and it rides the same outbox
+	// and delivery ledger as everything else, so a new booking still triggers
+	// exactly one send per opted-in staff row.
+	//
+	// Two independent ways to silence it, both no-ops rather than failures:
+	// absent credentials (like VAPID keys for web push) and the explicit
+	// WHATSAPP_NOTIFY_ENABLED kill switch, which exists because the credentials
+	// are shared with the login-code channel and must not have to be removed.
+	waCfg := whatsapp.SenderConfig{
+		Config: whatsapp.Config{
+			AccessToken:   cfg.Push.WhatsAppNotifyAccessToken,
+			PhoneNumberID: cfg.Push.WhatsAppNotifyPhoneNumberID,
+			APIVersion:    cfg.Push.WhatsAppNotifyAPIVersion,
+			Timeout:       cfg.Push.WhatsAppNotifyTimeout,
+			BaseURL:       cfg.Push.WhatsAppNotifyAPIURL,
+		},
+		TemplateName: cfg.Push.WhatsAppNotifyTemplateName,
+		TemplateLang: cfg.Push.WhatsAppNotifyTemplateLang,
+	}
+	waOn := cfg.Push.WhatsAppNotifyEnabled && waCfg.Configured()
+	var waSender notifications.WhatsAppSender
+	switch {
+	case !cfg.Push.WhatsAppNotifyEnabled:
+		log.Warn("whatsapp venue alerts switched off by WHATSAPP_NOTIFY_ENABLED — the channel will no-op")
+	case !waCfg.Configured():
+		log.Warn("whatsapp venue alerts not configured (no access token / phone number id) — the channel will no-op")
+	default:
+		waSender = whatsapp.NewSender(waCfg).Send
+	}
+	// The platform zone a venue's booking time is rendered in when the venue
+	// stores none of its own — the SAME fallback bookings and payouts use, so a
+	// venue's day means one thing across the system. An unusable platform value
+	// degrades to UTC here rather than crashing the worker: this is the wording
+	// of a message, not a payout boundary.
+	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("platform timezone fallback is unusable, whatsapp alerts will render times in UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		waFallbackZone = time.UTC
+	}
+	whatsAppNotifier := notifications.NewWhatsAppNotifier(
+		restrepo.NewManagers(db),
+		notificationrepo.NewSettings(db),
+		notificationrepo.NewDeliveries(db),
+		notificationrepo.NewVenues(db),
+		waSender,
+		waFallbackZone,
+		waOn,
+		log,
+	)
+
 	return notifications.NewDispatcher(
 		bookingrepo.NewOutbox(db), txm,
 		notifications.DispatcherConfig{
 			TickInterval: cfg.Push.DispatchTick,
 			BatchSize:    cfg.Push.DispatchBatch,
-		}, log, webPush, telegram, guestPush, feedNotifier)
+		}, log, webPush, telegram, guestPush, feedNotifier, whatsAppNotifier)
 }
 
 // newOTPSender builds the login-code delivery sender.

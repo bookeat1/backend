@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"backend-core/internal/infrastructure/whatsapp"
 	"backend-core/internal/transport/rest/middleware"
 )
 
@@ -516,6 +517,35 @@ type PushConfig struct {
 	ExpoAccessToken string // env: EXPO_ACCESS_TOKEN
 	// ExpoEndpoint overrides Expo's push URL (tests / a future relay).
 	ExpoEndpoint string // env: EXPO_PUSH_ENDPOINT
+
+	// --- venue WhatsApp booking alerts (Meta Cloud API) ---
+
+	// WhatsAppNotifyEnabled is the KILL SWITCH. It is a separate variable from
+	// the credentials on purpose: the credentials are shared with the login-code
+	// channel, so "stop the venue alerts right now" must be possible without
+	// taking WhatsApp logins down with them. Default true — a channel nobody
+	// asked to silence is on.
+	WhatsAppNotifyEnabled bool // env: WHATSAPP_NOTIFY_ENABLED
+	// WhatsAppNotifyAccessToken / WhatsAppNotifyPhoneNumberID are the sending
+	// credentials. Empty falls back to the OTP channel's OTP_WHATSAPP_* pair,
+	// because today it is the SAME business number — the split exists so a
+	// second number (or a rotated token) is a config change, not a deploy.
+	// Credentials: env only, NEVER logged.
+	WhatsAppNotifyAccessToken   string // env: WHATSAPP_NOTIFY_ACCESS_TOKEN
+	WhatsAppNotifyPhoneNumberID string // env: WHATSAPP_NOTIFY_PHONE_NUMBER_ID
+	// WhatsAppNotifyTemplateName / …Lang name the APPROVED template. Meta
+	// requires a NEW template for any wording change, so being able to point at
+	// the successor without a deploy is the point of these two.
+	WhatsAppNotifyTemplateName string // env: WHATSAPP_NOTIFY_TEMPLATE_NAME
+	WhatsAppNotifyTemplateLang string // env: WHATSAPP_NOTIFY_TEMPLATE_LANG
+	// WhatsAppNotifyAPIVersion pins the Graph version; empty falls back to the
+	// OTP channel's value, then to the adapter default.
+	WhatsAppNotifyAPIVersion string // env: WHATSAPP_NOTIFY_API_VERSION
+	// WhatsAppNotifyAPIURL overrides the Graph host (tests / staging).
+	WhatsAppNotifyAPIURL string // env: WHATSAPP_NOTIFY_API_URL
+	// WhatsAppNotifyTimeout caps ONE send. The dispatcher fans out to several
+	// recipients per event, so an unbounded call would stall the whole tick.
+	WhatsAppNotifyTimeout time.Duration // env: WHATSAPP_NOTIFY_TIMEOUT
 }
 
 // StaticMapConfig configures the restaurant map-preview proxy.
@@ -714,6 +744,21 @@ func NewConfig() (Config, error) {
 			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
 			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),
 			ExpoEndpoint:      getEnv("EXPO_PUSH_ENDPOINT", ""),
+
+			WhatsAppNotifyEnabled: getEnvBool("WHATSAPP_NOTIFY_ENABLED", true),
+			// Fall back to the login-code channel's credentials: same business
+			// number today, and requiring the operator to paste the same token
+			// under a second name is how a channel ends up silently unconfigured.
+			WhatsAppNotifyAccessToken:   getEnv("WHATSAPP_NOTIFY_ACCESS_TOKEN", getEnv("OTP_WHATSAPP_ACCESS_TOKEN", "")),
+			WhatsAppNotifyPhoneNumberID: getEnv("WHATSAPP_NOTIFY_PHONE_NUMBER_ID", getEnv("OTP_WHATSAPP_PHONE_NUMBER_ID", "")),
+			// The APPROVED venue template (Meta id 1046784127953752, ru, UTILITY).
+			// NOT the OTP template: that one is an AUTHENTICATION template with a
+			// single parameter and would be rejected with four.
+			WhatsAppNotifyTemplateName: getEnv("WHATSAPP_NOTIFY_TEMPLATE_NAME", whatsapp.DefaultBookingTemplateName),
+			WhatsAppNotifyTemplateLang: getEnv("WHATSAPP_NOTIFY_TEMPLATE_LANG", whatsapp.DefaultBookingTemplateLang),
+			WhatsAppNotifyAPIVersion:   getEnv("WHATSAPP_NOTIFY_API_VERSION", getEnv("OTP_WHATSAPP_API_VERSION", whatsapp.DefaultAPIVersion)),
+			WhatsAppNotifyAPIURL:       getEnv("WHATSAPP_NOTIFY_API_URL", ""),
+			WhatsAppNotifyTimeout:      getEnvDuration("WHATSAPP_NOTIFY_TIMEOUT", 10*time.Second),
 		},
 		StaticMap: StaticMapConfig{
 			Provider:      getEnv("STATIC_MAP_PROVIDER", ""),

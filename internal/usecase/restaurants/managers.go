@@ -3,9 +3,11 @@ package restaurants
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
+	"backend-core/internal/auth/phone"
 	"backend-core/internal/domain"
 )
 
@@ -30,6 +32,7 @@ type ManagerUseCase interface {
 	List(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.RestaurantManager, error)
 	Assign(ctx context.Context, actor Actor, in AssignManagerInput) (*domain.RestaurantManager, error)
 	SetRole(ctx context.Context, actor Actor, id uuid.UUID, role domain.StaffRole) (*domain.RestaurantManager, error)
+	SetWhatsApp(ctx context.Context, actor Actor, id uuid.UUID, in SetWhatsAppInput) (*domain.RestaurantManager, error)
 	Remove(ctx context.Context, actor Actor, id uuid.UUID) error
 	Manages(ctx context.Context, userID, restaurantID uuid.UUID) (bool, error)
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
@@ -170,11 +173,26 @@ func (u *managerUseCase) Assign(ctx context.Context, actor Actor, in AssignManag
 	if _, err := u.users.GetByID(ctx, in.UserID); err != nil {
 		return nil, err // ErrNotFound when the assignee doesn't exist
 	}
+	// The WhatsApp number is normalized to E.164 here as well as in SetWhatsApp:
+	// "8 701…" stored on one row and "+7701…" on another is two targets for one
+	// person, and the notifier would then message the same handset twice.
+	//
+	// The "consent needs a number" rule is deliberately NOT applied on this
+	// path. Assign is an existing endpoint the venue cabinet already calls, and
+	// tightening it would start rejecting requests that work today; a row with
+	// consent and no number is merely SILENT (the notifier skips it), never
+	// wrong. The rule is enforced where the cabinet's toggle actually lives —
+	// SetWhatsApp.
+	waPhone, err := normalizeWhatsAppPhone(in.WhatsappPhone)
+	if err != nil {
+		return nil, err
+	}
+	optIn := in.WhatsappOptIn
 	m := &domain.RestaurantManager{
 		RestaurantID: in.RestaurantID, UserID: in.UserID, Role: in.Role, CreatedBy: in.CreatedBy,
-		WhatsappOptIn: in.WhatsappOptIn, WhatsappPhone: in.WhatsappPhone,
+		WhatsappOptIn: optIn, WhatsappPhone: waPhone,
 	}
-	err := u.tx.WithinTx(ctx, func(ctx context.Context) error {
+	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.managers.Create(ctx, m); err != nil {
 			return err
 		}
@@ -248,6 +266,109 @@ func (u *managerUseCase) SetRole(ctx context.Context, actor Actor, id uuid.UUID,
 	}
 	m.Role = role
 	return m, nil
+}
+
+// normalizeWhatsApp validates the consent pair for SetWhatsApp. Consent that
+// survives with no number is REFUSED: opt_in = true with an empty phone reads as
+// "switched on" in the cabinet and delivers nothing, which is the exact failure
+// the WhatsApp channel exists to fix.
+func normalizeWhatsApp(optIn bool, raw *string) (bool, *string, error) {
+	stored, err := normalizeWhatsAppPhone(raw)
+	if err != nil {
+		return false, nil, err
+	}
+	if optIn && stored == nil {
+		return false, nil, fmt.Errorf("%w: whatsapp_opt_in needs a whatsapp_phone to send to", domain.ErrValidation)
+	}
+	return optIn, stored, nil
+}
+
+// normalizeWhatsAppPhone turns a typed number into the stored E.164 form, or
+// nil for "no number". Empty / whitespace-only is absence, not a value.
+func normalizeWhatsAppPhone(raw *string) (*string, error) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, nil
+	}
+	// The same normalization the venue-level number goes through:
+	// "+77010000001" and "8 701 000 00 01" must not be two numbers.
+	normalized := phone.Normalize(*raw)
+	// 11 digits + "+" is the shortest number this market has. A shape check, not
+	// an existence one — whether the number is actually on WhatsApp only the
+	// first send can tell.
+	if len(normalized) < 12 || !strings.HasPrefix(normalized, "+") {
+		return nil, fmt.Errorf("%w: whatsapp_phone must be a phone number in international format", domain.ErrValidation)
+	}
+	return &normalized, nil
+}
+
+// SetWhatsAppInput changes a staff member's WhatsApp booking-alert settings.
+// Both fields are OPTIONAL and nil means "leave as it is", so a caller can flip
+// the consent without re-sending the number.
+type SetWhatsAppInput struct {
+	// OptIn is the consent to be messaged on WhatsApp about new bookings.
+	OptIn *bool
+	// Phone is the number to message. An EMPTY string clears it (and therefore
+	// silences the channel for this person); nil leaves the stored number alone.
+	Phone *string
+}
+
+// SetWhatsApp writes a staff member's WhatsApp alert consent and number.
+//
+// Why it exists: until now both columns could only be written by Assign, i.e.
+// at the moment the staff row was CREATED. Every venue whose staff predate the
+// WhatsApp channel — which was all nine live ones — had no way to switch it on
+// at all. PATCH accepted only a role.
+//
+// AUTHORIZATION differs deliberately from SetRole. Consent to be messaged on
+// what may be a private number is PERSONAL, so the row's own user may always
+// set it for themselves; anybody else must hold staff.manage at that venue AND
+// strictly outrank the row (the same lateral-takeover guard as SetRole — an
+// owner must not be able to redirect a co-owner's alerts to their own phone).
+// A superadmin passes as everywhere else.
+//
+// VALIDATION: consent that ends up ON must end up with a usable number. The
+// alternative — storing opt_in=true with no number — looks switched on in the
+// cabinet and delivers nothing, which is the exact failure this whole feature
+// exists to fix.
+func (u *managerUseCase) SetWhatsApp(ctx context.Context, actor Actor, id uuid.UUID, in SetWhatsAppInput) (*domain.RestaurantManager, error) {
+	m, err := u.managers.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := u.authorizeWhatsApp(ctx, actor, *m); err != nil {
+		return nil, err
+	}
+
+	optIn := m.WhatsappOptIn
+	if in.OptIn != nil {
+		optIn = *in.OptIn
+	}
+	stored := m.WhatsappPhone
+	if in.Phone != nil {
+		stored = in.Phone
+	}
+	optIn, stored, err = normalizeWhatsApp(optIn, stored)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := u.managers.UpdateWhatsApp(ctx, id, optIn, stored); err != nil {
+		return nil, err
+	}
+	m.WhatsappOptIn, m.WhatsappPhone = optIn, stored
+	return m, nil
+}
+
+// authorizeWhatsApp gates SetWhatsApp: superadmin, or the row's own user, or a
+// staff.manage holder at that venue who strictly outranks the row.
+func (u *managerUseCase) authorizeWhatsApp(ctx context.Context, actor Actor, target domain.RestaurantManager) error {
+	if actor.Role == domain.RoleAdmin || actor.UserID == target.UserID {
+		return nil
+	}
+	if err := u.authorizeStaffManage(ctx, actor, target.RestaurantID); err != nil {
+		return err
+	}
+	return u.requireOutranksTarget(ctx, actor, target)
 }
 
 // Remove deletes a staff row. The target is resolved by id FIRST (same
