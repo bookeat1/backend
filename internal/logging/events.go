@@ -41,6 +41,18 @@ const (
 	// way to see the rule doing its work.
 	EventGuestBookingsLinked = "guest.bookings_linked"
 
+	// App Store review test account (AUTH_TEST_ACCOUNT_PHONE / _CODE, see
+	// internal/usecase/auth/test_account.go). One number logs in with a fixed
+	// code and no message is ever sent, so these lines are the ONLY trace such a
+	// request leaves — nothing is written to otp_codes. All three are logged at
+	// WARN, including the successful login: on a healthy contour this number
+	// should see a handful of events per app submission and nothing in between,
+	// so a stream of them (especially login_attempt with accepted=false) is
+	// somebody probing and is worth an alert.
+	EventTestAccountOTPRequested       = "auth.test_account_otp_requested"
+	EventTestAccountLoginAttempt       = "auth.test_account_login_attempt" // field: accepted=true|false
+	EventTestAccountPhoneChangeRefused = "auth.test_account_phone_change_refused"
+
 	// Payments, wired from internal/usecase/payments.
 	EventPaymentCreated         = "payment.created"
 	EventPaymentAuthorized      = "payment.authorized" // two-stage hold placed

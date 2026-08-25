@@ -57,6 +57,9 @@ type otpUseCase struct {
 	tokens   TokenIssuer
 	sender   OTPSender
 	cfg      Config
+	// testAcc is the App Store review account, resolved once at construction.
+	// Zero value = disabled; see test_account.go.
+	testAcc testAccount
 }
 
 // NewOTPUseCase constructs the phone-OTP authentication usecase.
@@ -79,6 +82,7 @@ func NewOTPUseCase(
 		tokens:   tokens,
 		sender:   sender,
 		cfg:      cfg,
+		testAcc:  newTestAccount(cfg),
 	}
 }
 
@@ -113,6 +117,28 @@ func (o *otpUseCase) RequestOTP(ctx context.Context, rawPhone string) (string, e
 	if p == "" {
 		return "", domain.WithCode(domain.CodeOTPInvalidPhone,
 			fmt.Errorf("%w: phone required", domain.ErrValidation))
+	}
+
+	// The App Store review account answers success without sending anything and
+	// without writing an otp_codes row. Placed BEFORE the rate-limit counters on
+	// purpose — see the block comment in test_account.go and the note below on
+	// why the per-phone budget does not apply to this one number.
+	//
+	// The per-phone limits (1/min, 5/hour) exist to protect two things: the SMS
+	// bill and a real person's phone from being used as a doorbell. Neither can
+	// happen here — nothing is sent, nothing is billed, and the number belongs
+	// to nobody. What they WOULD do is break the review: a reviewer who taps
+	// "resend" twice, or a second reviewer on the same submission, would be
+	// locked out for a minute with an error the app shows as a failure. The
+	// endpoint is still not open: the per-IP strict limiter in front of it
+	// (RATE_LIMIT_STRICT_LIMIT, 5/min per IP per route) is untouched and applies
+	// to this number exactly as it does to every other.
+	if o.testAcc.matches(p) {
+		o.testAcc.logRequest(ctx)
+		if o.cfg.OTPDevExpose {
+			return o.testAcc.code, nil
+		}
+		return "", nil
 	}
 
 	// Both limits keep their 422 and their message; only the code and the
@@ -308,6 +334,21 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
 	}
 
+	// App Store review account: the fixed code, and only it, opens this number.
+	// There is no otp_codes row to read, no attempt counter to bump and no
+	// lockout — every wrong guess answers with the same errOTPInvalid() any
+	// other number gets, and every attempt (right or wrong) leaves a WARN line.
+	if o.testAcc.matches(p) {
+		if !o.testAcc.codeAccepted(code) {
+			o.testAcc.logVerify(ctx, false)
+			return nil, errOTPInvalid()
+		}
+		o.testAcc.logVerify(ctx, true)
+		// From here on it is an ordinary login: the account is created on first
+		// use and behaves like any other guest afterwards.
+		return o.completeLogin(ctx, p, nil)
+	}
+
 	// Read + attempt accounting happen OUTSIDE the transaction: a failed guess
 	// must durably increment attempts (if it were inside the tx that returns the
 	// auth error, the rollback would discard it and the lockout would never fire).
@@ -342,12 +383,27 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 
 	// Correct code: mark used + find-or-create the user + attach the bookings
 	// made for this number before the account existed + issue tokens, atomically.
+	return o.completeLogin(ctx, p, rec)
+}
+
+// completeLogin turns a proven ownership of phone p into a session, in ONE
+// transaction: burn the code, find-or-create the user, attach the bookings made
+// for that number before the account existed, issue the token pair.
+//
+// rec is the code that was just accepted, and may be nil — that is the App
+// Store review account, which has no otp_codes row to mark used. Everything
+// after that point is deliberately identical for both callers: the review
+// account must exercise the same login the real one does, otherwise the review
+// proves nothing about the app the guests use.
+func (o *otpUseCase) completeLogin(ctx context.Context, p string, rec *domain.OTPCode) (*TokenPair, error) {
 	var pair *TokenPair
 	var attached int64
 	var userID uuid.UUID
-	err = o.tx.WithinTx(ctx, func(ctx context.Context) error {
-		if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
-			return err
+	err := o.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if rec != nil {
+			if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
+				return err
+			}
 		}
 
 		u, err := o.users.GetByPhone(ctx, p)
@@ -406,6 +462,16 @@ func (o *otpUseCase) RequestPhoneChangeOTP(ctx context.Context, userID uuid.UUID
 			fmt.Errorf("%w: phone required", domain.ErrValidation))
 	}
 
+	// The App Store review number is reserved: it is not a destination a
+	// signed-in account may move onto. Allowing it would let anybody with a
+	// session take over the reviewer's account (or strand the next review on an
+	// account they can no longer reach). Answered with the same 409 an occupied
+	// number gets — which is exactly what this is.
+	if o.testAcc.matches(p) {
+		o.testAcc.logPhoneChangeRefused(ctx, userID)
+		return "", errPhoneInUse()
+	}
+
 	caller, err := o.users.GetByID(ctx, userID)
 	if err != nil {
 		return "", err
@@ -454,6 +520,16 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 	if code == "" {
 		return nil, domain.WithCode(domain.CodeOTPCodeRequired,
 			fmt.Errorf("%w: phone and code required", domain.ErrValidation))
+	}
+
+	// The App Store review number is reserved: it is not a destination a
+	// signed-in account may move onto. Allowing it would let anybody with a
+	// session take over the reviewer's account (or strand the next review on an
+	// account they can no longer reach). Answered with the same 409 an occupied
+	// number gets — which is exactly what this is.
+	if o.testAcc.matches(p) {
+		o.testAcc.logPhoneChangeRefused(ctx, userID)
+		return nil, errPhoneInUse()
 	}
 
 	caller, err := o.users.GetByID(ctx, userID)
