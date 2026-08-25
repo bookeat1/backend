@@ -52,10 +52,20 @@ type venueStaffReader interface {
 // later from the worker. A dead Meta endpoint can therefore never fail, slow or
 // roll back a booking.
 //
-// Consent is per PERSON, not per venue: a manager's WhatsApp number may be
-// their personal one, so an alert goes only to a staff row with
-// whatsapp_opt_in = true AND a number. No opted-in staff = nothing to do and
-// NOT an error — the event drains.
+// There are TWO sources of recipients, and the alert goes to their UNION:
+//
+//  1. the venue's own number — restaurant_notification_settings.whatsapp_phone,
+//     the field the owner fills in the admin panel's «Уведомления в WhatsApp»
+//     card and next to which the panel shows «Подключено». Before this it was
+//     read only for the kill switch and never used as an address, so the card
+//     was a control that lied: a number was saved, a green badge appeared, and
+//     nothing was ever sent to it.
+//  2. every staff row that gave PERSONAL consent — restaurant_managers with
+//     whatsapp_opt_in = true AND a number. A manager's WhatsApp is their own
+//     handset, so this consent cannot be inherited from the venue.
+//
+// Neither source is required. No number anywhere = nothing to do and NOT an
+// error — the event drains.
 type WhatsAppNotifier struct {
 	staff      venueStaffReader
 	settings   domain.RestaurantNotificationSettingsRepository
@@ -134,14 +144,15 @@ func (w *WhatsAppNotifier) Notify(ctx context.Context, e Event) error {
 		return nil
 	}
 
-	recipients, err := w.recipients(ctx, e.RestaurantID)
+	recipients, err := w.recipients(ctx, e.RestaurantID, cfg.Phone)
 	if err != nil {
 		return fmt.Errorf("whatsapp: read venue staff: %w", err)
 	}
 	if len(recipients) == 0 {
-		// Nobody consented, or nobody left a number. Not a failure — the venue
-		// simply has this channel unused, and the event must still drain.
-		w.log.Info("whatsapp skipped: no opted-in staff with a number",
+		// The venue set no number of its own and nobody on the roster consented.
+		// Not a failure — the venue simply has this channel unused, and the
+		// event must still drain.
+		w.log.Info("whatsapp skipped: venue has no number and no opted-in staff",
 			slog.String("booking_id", e.BookingID.String()),
 			slog.String("restaurant_id", e.RestaurantID.String()))
 		return nil
@@ -151,9 +162,11 @@ func (w *WhatsAppNotifier) Notify(ctx context.Context, e Event) error {
 
 	var retryable error
 	for _, r := range recipients {
-		// The dedupe target is the STAFF ROW: two managers of one venue must
-		// both be alerted, and a redelivery must re-alert neither.
-		already, err := w.deliveries.AlreadyDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp, r.managerID)
+		// The dedupe target is the NUMBER (see whatsAppDedupeTarget), not the
+		// staff row: the same handset must get one message even when it is
+		// reachable through two different rows, and a redelivery must re-alert
+		// nobody who already received this booking.
+		already, err := w.deliveries.AlreadyDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp, r.targetID)
 		if err != nil {
 			return fmt.Errorf("whatsapp: check delivery: %w", err)
 		}
@@ -166,14 +179,14 @@ func (w *WhatsAppNotifier) Notify(ctx context.Context, e Event) error {
 		case sendErr == nil:
 			// Record AFTER success (at-least-once): a crash here re-sends on the
 			// next tick, it never drops the alert.
-			if err := w.deliveries.RecordDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp, r.managerID); err != nil {
+			if err := w.deliveries.RecordDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp, r.targetID); err != nil {
 				return fmt.Errorf("whatsapp: record delivery: %w", err)
 			}
 			w.log.Info("whatsapp: booking alert sent",
 				slog.String("booking_id", e.BookingID.String()),
 				slog.String("restaurant_id", e.RestaurantID.String()),
-				slog.String("manager_id", r.managerID.String()),
 				slog.String("phone", logging.MaskPhone(r.phone)),
+				r.logSource(),
 				slog.Int("status", status))
 		case permanentWhatsAppFailure(status):
 			// Meta will reject this identically on every retry: a number with no
@@ -182,16 +195,16 @@ func (w *WhatsAppNotifier) Notify(ctx context.Context, e Event) error {
 			w.log.Error("whatsapp: send permanently rejected, giving up on this recipient",
 				slog.String("booking_id", e.BookingID.String()),
 				slog.String("restaurant_id", e.RestaurantID.String()),
-				slog.String("manager_id", r.managerID.String()),
 				slog.String("phone", logging.MaskPhone(r.phone)),
+				r.logSource(),
 				slog.Int("status", status),
 				slog.String("error", sendErr.Error()))
 		default:
 			w.log.Warn("whatsapp: send failed, event left for retry",
 				slog.String("booking_id", e.BookingID.String()),
 				slog.String("restaurant_id", e.RestaurantID.String()),
-				slog.String("manager_id", r.managerID.String()),
 				slog.String("phone", logging.MaskPhone(r.phone)),
+				r.logSource(),
 				slog.Int("status", status),
 				slog.String("error", sendErr.Error()))
 			retryable = fmt.Errorf("whatsapp: send to restaurant %s: %w", e.RestaurantID, sendErr)
@@ -200,46 +213,128 @@ func (w *WhatsAppNotifier) Notify(ctx context.Context, e Event) error {
 	return retryable
 }
 
-// recipient is one resolved target: which staff row consented, and to which
-// number. The staff row id is the dedupe key; the number is E.164.
+// whatsAppRecipientSource says where a number came from. It is log-only: the
+// two sources are equal citizens once the number is resolved.
+type whatsAppRecipientSource string
+
+const (
+	// sourceVenue is restaurant_notification_settings.whatsapp_phone — the
+	// number the owner typed into the admin panel.
+	sourceVenue whatsAppRecipientSource = "venue"
+	// sourceStaff is a restaurant_managers row with personal consent.
+	sourceStaff whatsAppRecipientSource = "staff"
+)
+
+// recipient is one resolved target: an E.164 number, the dedupe identity
+// derived from it, and — for a staff row — which row it came from, so support
+// can tell whose consent produced a message.
 type recipient struct {
-	managerID uuid.UUID
+	targetID  uuid.UUID
 	phone     string
+	source    whatsAppRecipientSource
+	managerID uuid.UUID // uuid.Nil for the venue's own number
 }
 
-// recipients resolves the venue's opted-in staff. Numbers are normalized to
-// E.164 and DEDUPED by number: a venue where the owner is also listed as a
-// manager (or where two rows carry the same phone written differently) must get
-// one message, not two identical ones on the same handset.
-func (w *WhatsAppNotifier) recipients(ctx context.Context, restaurantID uuid.UUID) ([]recipient, error) {
+// logSource renders the origin of a recipient for a log line: "venue", or the
+// staff row id that consented.
+func (r recipient) logSource() slog.Attr {
+	if r.source == sourceStaff {
+		return slog.String("manager_id", r.managerID.String())
+	}
+	return slog.String("source", string(r.source))
+}
+
+// whatsAppDedupeNamespace seeds the derived delivery targets below. A fixed,
+// arbitrary constant — it only has to stay the same forever, which is why it is
+// written out here rather than generated.
+var whatsAppDedupeNamespace = uuid.MustParse("2b7d2a24-9e2b-4d5f-9a3f-6a3a1a5f7c11")
+
+// whatsAppDedupeTarget maps an E.164 number to the uuid this channel writes
+// into notification_deliveries.target_id.
+//
+// Why the NUMBER and not the row it came from. The ledger's unique key is
+// (outbox_event_id, channel, target_id), so target_id decides what "the same
+// recipient" means. For WhatsApp that is a handset, not a database row: the
+// owner's personal number is very often BOTH the venue's number and their own
+// staff row, and two rows keyed separately would ring the same phone twice for
+// one booking. Keying by number also survives the roster changing between two
+// attempts at the same event — a staff row deleted, or a number moved to a
+// different person, would otherwise look like a brand-new recipient on the
+// retry and re-send.
+//
+// Stability: this is a pure function of the number, so attempt #2 of an event
+// computes exactly the same target as attempt #1 and the ledger's pre-check
+// (and its unique index) still stop the duplicate.
+//
+// Collision with a real staff row id is impossible, not merely unlikely: this
+// is a version-5 (name-based) uuid, while every id in this database is version
+// 4 (uuid.New() in Go, gen_random_uuid() in Postgres). The version nibble
+// differs, so the two spaces cannot intersect.
+func whatsAppDedupeTarget(e164 string) uuid.UUID {
+	return uuid.NewSHA1(whatsAppDedupeNamespace, []byte("whatsapp:"+e164))
+}
+
+// recipients resolves everyone this venue's booking alert must reach: the
+// venue's own number first, then every staff row with personal consent.
+//
+// Numbers are normalized to E.164 and deduped by the normalized value, so the
+// owner who appears in both places — or two staff rows carrying the same number
+// written differently — produces exactly ONE message.
+func (w *WhatsAppNotifier) recipients(ctx context.Context, restaurantID uuid.UUID, venuePhone string) ([]recipient, error) {
 	staff, err := w.staff.ListByRestaurant(ctx, restaurantID)
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]struct{}, len(staff))
-	out := make([]recipient, 0, len(staff))
+
+	seen := make(map[string]struct{}, len(staff)+1)
+	out := make([]recipient, 0, len(staff)+1)
+
+	add := func(raw string, source whatsAppRecipientSource, managerID uuid.UUID) {
+		normalized, ok := w.normalizeRecipientPhone(raw)
+		if !ok {
+			w.log.Warn("whatsapp: unusable number, skipped",
+				slog.String("restaurant_id", restaurantID.String()),
+				slog.String("source", string(source)),
+				slog.String("manager_id", managerID.String()),
+				slog.String("phone", logging.MaskPhone(normalized)))
+			return
+		}
+		if _, dup := seen[normalized]; dup {
+			return
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, recipient{
+			targetID:  whatsAppDedupeTarget(normalized),
+			phone:     normalized,
+			source:    source,
+			managerID: managerID,
+		})
+	}
+
+	// The venue's own number goes first: it is the address the owner sees as
+	// «Подключено» in the panel, so when it collides with a staff number it is
+	// the one that wins the single message.
+	if strings.TrimSpace(venuePhone) != "" {
+		add(venuePhone, sourceVenue, uuid.Nil)
+	}
 	for _, m := range staff {
 		if !m.WhatsappOptIn || m.WhatsappPhone == nil {
 			continue
 		}
-		normalized := phone.Normalize(strings.TrimSpace(*m.WhatsappPhone))
-		// "+" plus 11 digits is the shortest number this market has; anything
-		// shorter is a half-typed value, and sending to it can only produce a
-		// permanent rejection.
-		if len(normalized) < 12 || !strings.HasPrefix(normalized, "+") {
-			w.log.Warn("whatsapp: staff row has an unusable number, skipped",
-				slog.String("restaurant_id", restaurantID.String()),
-				slog.String("manager_id", m.ID.String()),
-				slog.String("phone", logging.MaskPhone(normalized)))
-			continue
-		}
-		if _, dup := seen[normalized]; dup {
-			continue
-		}
-		seen[normalized] = struct{}{}
-		out = append(out, recipient{managerID: m.ID, phone: normalized})
+		add(*m.WhatsappPhone, sourceStaff, m.ID)
 	}
 	return out, nil
+}
+
+// normalizeRecipientPhone converts a stored number to E.164 and rejects a
+// half-typed one. "+" plus 11 digits is the shortest number this market has;
+// anything shorter can only ever earn a permanent rejection from Meta.
+func (w *WhatsAppNotifier) normalizeRecipientPhone(raw string) (string, bool) {
+	normalized := phone.Normalize(strings.TrimSpace(raw))
+	if len(normalized) < 12 || !strings.HasPrefix(normalized, "+") {
+		return normalized, false
+	}
+	return normalized, true
 }
 
 // templateParams fills the approved template's four placeholders, in order:
