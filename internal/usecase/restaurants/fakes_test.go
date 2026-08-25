@@ -147,12 +147,13 @@ func (f *fakePartners) Create(_ context.Context, p *domain.PartnershipRequest) e
 // ManagerUseCase's authorization logic (List/Assign/SetRole/Remove all
 // resolve a row by id or filter by user/restaurant, same as Postgres would).
 type fakeManagers struct {
-	rows       []domain.RestaurantManager
-	created    *domain.RestaurantManager
-	getErr     error
-	createErr  error
-	updRoleErr error
-	delErr     error
+	rows           []domain.RestaurantManager
+	created        *domain.RestaurantManager
+	getErr         error
+	createErr      error
+	updRoleErr     error
+	updWhatsAppErr error
+	delErr         error
 }
 
 func (f *fakeManagers) ListByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.RestaurantManager, error) {
@@ -207,6 +208,19 @@ func (f *fakeManagers) UpdateRole(_ context.Context, id uuid.UUID, role domain.S
 	for i := range f.rows {
 		if f.rows[i].ID == id {
 			f.rows[i].Role = role
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+func (f *fakeManagers) UpdateWhatsApp(_ context.Context, id uuid.UUID, optIn bool, phone *string) error {
+	if f.updWhatsAppErr != nil {
+		return f.updWhatsAppErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			f.rows[i].WhatsappOptIn, f.rows[i].WhatsappPhone = optIn, phone
 			return nil
 		}
 	}

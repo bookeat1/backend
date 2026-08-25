@@ -173,6 +173,13 @@ type RestaurantManagerRepository interface {
 	// UpdateRole changes an existing staff member's role in place. Returns
 	// ErrNotFound when id is absent.
 	UpdateRole(ctx context.Context, id uuid.UUID, role StaffRole) error
+	// UpdateWhatsApp sets a staff member's WhatsApp alert consent and number in
+	// place. Both are written together because they are one decision: a
+	// consent without a number silences the channel just as surely as no
+	// consent, and storing half of it is how a venue ends up believing it
+	// switched alerts on. phone == nil clears the number. Returns ErrNotFound
+	// when id is absent.
+	UpdateWhatsApp(ctx context.Context, id uuid.UUID, optIn bool, phone *string) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

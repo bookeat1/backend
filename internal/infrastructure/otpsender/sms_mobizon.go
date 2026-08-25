@@ -95,7 +95,7 @@ func (m *Mobizon) SendSMS(ctx context.Context, phone, text string) (string, erro
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	status, body, err := m.http.do(req)
+	status, body, err := m.http.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("mobizon: send: %w", err)
 	}

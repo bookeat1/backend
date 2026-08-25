@@ -433,6 +433,24 @@ func (m *Managers) Create(ctx context.Context, mn *domain.RestaurantManager) err
 	return nil
 }
 
+// UpdateWhatsApp writes the consent flag and the number in ONE statement. Until
+// this existed the two columns could only ever be set by INSERT, so every staff
+// row created before a venue cared about WhatsApp was stuck at
+// (false, NULL) forever — which is exactly the state all nine live venues were
+// found in.
+func (m *Managers) UpdateWhatsApp(ctx context.Context, id uuid.UUID, optIn bool, phone *string) error {
+	tag, err := sqltx.From(ctx, m.pool).Exec(ctx,
+		`UPDATE restaurant_managers SET whatsapp_opt_in=$2, whatsapp_phone=$3 WHERE id=$1`,
+		id, optIn, phone)
+	if err != nil {
+		return mapWrite(err, "update manager whatsapp")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 func (m *Managers) UpdateRole(ctx context.Context, id uuid.UUID, role domain.StaffRole) error {
 	tag, err := sqltx.From(ctx, m.pool).Exec(ctx,
 		`UPDATE restaurant_managers SET role=$2 WHERE id=$1`, id, string(role))

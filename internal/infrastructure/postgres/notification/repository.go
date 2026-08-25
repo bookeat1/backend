@@ -321,6 +321,31 @@ func (r *Venues) Name(ctx context.Context, restaurantID uuid.UUID) (string, erro
 	return name, nil
 }
 
+// Timezone returns the IANA zone stored on the venue, or "" when it has none of
+// its own (the platform default then applies — resolving that is the caller's
+// job, exactly as in usecase/bookings and usecase/payouts). A missing venue
+// yields domain.ErrNotFound.
+//
+// The column is NULLABLE, so NULL and "" are read as the same thing: "no zone
+// of its own". They are NOT read as UTC — time.LoadLocation("") silently
+// returns UTC, which is how a Kazakh venue ends up being told about a booking
+// five hours off.
+func (r *Venues) Timezone(ctx context.Context, restaurantID uuid.UUID) (string, error) {
+	var tz *string
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT timezone FROM restaurants WHERE id=$1`, restaurantID).Scan(&tz)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read venue timezone: %w", err)
+	}
+	if tz == nil {
+		return "", nil
+	}
+	return *tz, nil
+}
+
 // WhatsAppSettings returns the venue's WhatsApp target + toggle. A missing row
 // is WhatsAppSettings{Phone: "", Enabled: true}: like Telegram, the channel
 // defaults enabled but stays silent until a number is set.

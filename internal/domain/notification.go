@@ -27,6 +27,12 @@ const (
 	// its idempotency is the notifications table's own (outbox_event_id, user_id)
 	// unique key.
 	ChannelInApp NotificationChannel = "in_app"
+	// ChannelWhatsApp is the VENUE-facing WhatsApp Cloud API channel: an
+	// approved template sent to the staff who opted in on their own
+	// restaurant_managers row. Its delivery ledger target is that staff row's
+	// id — a venue can have several people on the alert, unlike Telegram where
+	// the target is the venue's single chat.
+	ChannelWhatsApp NotificationChannel = "whatsapp"
 )
 
 // PushSubscription is a staff member's browser Web Push subscription, as handed

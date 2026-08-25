@@ -1,15 +1,12 @@
 package otpsender
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 	"time"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/whatsapp"
 )
 
 // WhatsAppConfig configures the Meta WhatsApp Cloud API channel.
@@ -50,22 +47,26 @@ type WhatsAppConfig struct {
 // id and a template name are all required — two out of three is a
 // misconfiguration that would fail on every send, so it counts as absent.
 func (c WhatsAppConfig) Configured() bool {
-	return trimmed(c.AccessToken) != "" && trimmed(c.PhoneNumberID) != "" && trimmed(c.TemplateName) != ""
+	return c.transport().Configured() && trimmed(c.TemplateName) != ""
 }
 
-const (
-	whatsAppBaseURL = "https://graph.facebook.com"
-	// The Graph version the live send was verified on (2026-07-25).
-	whatsAppDefaultVersion = "v22.0"
-	// "en" is the approved language of bookeat_otp_en, confirmed by a real
-	// delivery rather than by inspection.
-	whatsAppDefaultLang = "en"
-	// whatsAppNotOnWhatsApp is Meta's error code for "this recipient cannot
-	// receive the message" — in practice, no WhatsApp account on that number.
-	whatsAppNotOnWhatsApp = 131026
-)
+func (c WhatsAppConfig) transport() whatsapp.Config {
+	return whatsapp.Config{
+		AccessToken:   c.AccessToken,
+		PhoneNumberID: c.PhoneNumberID,
+		APIVersion:    c.APIVersion,
+		Timeout:       c.Timeout,
+		BaseURL:       c.BaseURL,
+	}
+}
 
-// WhatsApp is the Meta Cloud API channel.
+// whatsAppDefaultLang is the approved language of bookeat_otp_en, confirmed by
+// a real delivery rather than by inspection.
+const whatsAppDefaultLang = "en"
+
+// WhatsApp is the Meta Cloud API login-code channel. The HTTP call itself lives
+// in internal/infrastructure/whatsapp, shared with the venue booking-alert
+// channel; what stays here is everything specific to a LOGIN CODE.
 //
 // # Optimistic by nature
 //
@@ -85,107 +86,49 @@ const (
 // send an SMS anyway": no background scheduler, no second charge for guests who
 // simply took their time typing.
 type WhatsApp struct {
-	cfg  WhatsAppConfig
-	base string
-	http *httpClient
+	cfg    WhatsAppConfig
+	client *whatsapp.Client
 }
 
 // NewWhatsApp builds the channel. Build it only when cfg.Configured().
 func NewWhatsApp(cfg WhatsAppConfig) *WhatsApp {
-	base := trimmed(cfg.BaseURL)
-	if base == "" {
-		base = whatsAppBaseURL
-	}
-	if trimmed(cfg.APIVersion) == "" {
-		cfg.APIVersion = whatsAppDefaultVersion
-	}
 	if trimmed(cfg.TemplateLang) == "" {
 		cfg.TemplateLang = whatsAppDefaultLang
 	}
-	return &WhatsApp{cfg: cfg, base: base, http: newHTTPClient(cfg.Timeout, cfg.AccessToken)}
+	return &WhatsApp{cfg: cfg, client: whatsapp.NewClient(cfg.transport())}
 }
 
 var _ Channel = (*WhatsApp)(nil)
 
 func (w *WhatsApp) Name() string { return domain.OTPChannelWhatsApp }
 
-type whatsAppResponse struct {
-	Messages []struct {
-		ID string `json:"id"`
-	} `json:"messages"`
-	// Only the numeric codes are decoded. Meta's prose "message" is deliberately
-	// NOT parsed: it would be free text from a third party landing in our logs,
-	// and everything we act on is expressible as a code.
-	Error struct {
-		Code    int `json:"code"`
-		Subcode int `json:"error_subcode"`
-	} `json:"error"`
-}
-
 // Send posts the authentication template. A nil error means Meta ACCEPTED it and
 // the returned string is the wamid — see the type comment for why acceptance is
 // not delivery, and why the wamid is worth logging anyway (it is what a delivery
 // webhook and Meta's own dashboard key on).
 func (w *WhatsApp) Send(ctx context.Context, phone, code string) (string, error) {
-	// Meta wants the number WITHOUT the leading "+", digits only.
-	to := strings.TrimPrefix(phone, "+")
-
-	components := []map[string]any{{
-		"type":       "body",
-		"parameters": []map[string]any{{"type": "text", "text": code}},
-	}}
+	tpl := whatsapp.Template{
+		To:         phone,
+		Name:       trimmed(w.cfg.TemplateName),
+		Lang:       trimmed(w.cfg.TemplateLang),
+		BodyParams: []string{code},
+	}
 	if w.cfg.CopyCodeButton {
 		// The button's URL embeds {{1}}; the parameter is what WhatsApp copies
 		// to the clipboard when the guest taps "Copy code". It is never rendered
 		// as text, but it is required whenever the template has the button.
-		components = append(components, map[string]any{
-			"type":       "button",
-			"sub_type":   "url",
-			"index":      0,
-			"parameters": []map[string]any{{"type": "text", "text": code}},
-		})
+		tpl.ButtonURLParam = code
 	}
 
-	payload := map[string]any{
-		"messaging_product": "whatsapp",
-		"to":                to,
-		"type":              "template",
-		"template": map[string]any{
-			"name":       trimmed(w.cfg.TemplateName),
-			"language":   map[string]any{"code": trimmed(w.cfg.TemplateLang)},
-			"components": components,
-		},
-	}
-
-	raw, err := json.Marshal(payload)
+	res, err := w.client.Send(ctx, tpl)
 	if err != nil {
-		return "", fmt.Errorf("whatsapp: marshal request: %w", err)
+		// "No WhatsApp account on that number" is not a fault of ours: it means
+		// this channel cannot serve this guest, and the waterfall must fall
+		// through to the next one instead of reporting a failure.
+		if res.ErrorCode == whatsapp.ErrCodeNotOnWhatsApp {
+			return "", fmt.Errorf("%w: recipient has no whatsapp (131026)", ErrChannelUnavailable)
+		}
+		return "", err
 	}
-	url := fmt.Sprintf("%s/%s/%s/messages", w.base, trimmed(w.cfg.APIVersion), trimmed(w.cfg.PhoneNumberID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return "", fmt.Errorf("whatsapp: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+trimmed(w.cfg.AccessToken))
-
-	status, body, err := w.http.do(req)
-	if err != nil {
-		return "", fmt.Errorf("whatsapp: send: %w", err)
-	}
-
-	var parsed whatsAppResponse
-	if jsonErr := json.Unmarshal(body, &parsed); jsonErr != nil {
-		return "", fmt.Errorf("whatsapp: unreadable response (http %d)", status)
-	}
-	if status >= 200 && status <= 299 && len(parsed.Messages) > 0 && parsed.Messages[0].ID != "" {
-		return parsed.Messages[0].ID, nil
-	}
-	if parsed.Error.Code == whatsAppNotOnWhatsApp {
-		return "", fmt.Errorf("%w: recipient has no whatsapp (131026)", ErrChannelUnavailable)
-	}
-	// The error is reported by CODE, not by Meta's prose message: the prose is
-	// attacker-influenced free text that ends up in our logs, and (unlike the
-	// code) it is not a stable thing to alert on.
-	return "", fmt.Errorf("whatsapp: rejected (http %d, code %d, subcode %d)", status, parsed.Error.Code, parsed.Error.Subcode)
+	return res.MessageID, nil
 }

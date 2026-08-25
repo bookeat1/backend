@@ -93,7 +93,7 @@ func (t *Twilio) SendSMS(ctx context.Context, phone, text string) (string, error
 	// has to clean up.
 	req.SetBasicAuth(trimmed(t.cfg.AccountSID), trimmed(t.cfg.AuthToken))
 
-	status, body, err := t.http.do(req)
+	status, body, err := t.http.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("twilio: send: %w", err)
 	}

@@ -552,20 +552,51 @@ func (h *Handler) setManagerRole(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid manager id")
 		return
 	}
-	var req setManagerRoleRequest
+	var req setManagerRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	role := domain.StaffRole(req.Role)
-	if !role.Valid() {
-		response.Error(c.Writer, http.StatusUnprocessableEntity, "role must be one of: owner, manager, hostess")
+	if req.Role == nil && !req.touchesWhatsApp() {
+		response.Error(c.Writer, http.StatusUnprocessableEntity,
+			"nothing to change: send role and/or whatsapp_opt_in / whatsapp_phone")
 		return
 	}
-	m, err := h.managers.SetRole(c.Request.Context(), actor, mid, role)
-	if err != nil {
-		response.HandleError(c.Writer, err)
-		return
+
+	// The role is validated BEFORE anything is written, so a body carrying both
+	// a bad role and a good number cannot half-apply. The two writes are still
+	// two statements (they are authorized differently and there is no shared
+	// transaction here): WhatsApp goes first because it is the lower-privilege
+	// change and is safely repeatable, so a failing role change leaves the
+	// caller with a retryable, harmless partial rather than a silently
+	// redirected alert.
+	var role domain.StaffRole
+	if req.Role != nil {
+		role = domain.StaffRole(*req.Role)
+		if !role.Valid() {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, "role must be one of: owner, manager, hostess")
+			return
+		}
+	}
+
+	var m *domain.RestaurantManager
+	if req.touchesWhatsApp() {
+		updated, err := h.managers.SetWhatsApp(c.Request.Context(), actor, mid, uc.SetWhatsAppInput{
+			OptIn: req.WhatsappOptIn, Phone: req.WhatsappPhone,
+		})
+		if err != nil {
+			response.HandleError(c.Writer, err)
+			return
+		}
+		m = updated
+	}
+	if req.Role != nil {
+		updated, err := h.managers.SetRole(c.Request.Context(), actor, mid, role)
+		if err != nil {
+			response.HandleError(c.Writer, err)
+			return
+		}
+		m = updated
 	}
 	response.OK(c.Writer, managerToResponse(*m))
 }

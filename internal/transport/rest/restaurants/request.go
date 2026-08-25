@@ -140,6 +140,28 @@ type assignManagerRequest struct {
 	WhatsappPhone *string `json:"whatsapp_phone"`
 }
 
-type setManagerRoleRequest struct {
-	Role string `json:"role"` // one of: owner, manager, hostess
+// setManagerRequest is the PATCH body for one staff row. Every field is
+// OPTIONAL and absent means "leave it alone" — the route used to take a role
+// and nothing else, so a venue could never switch a staff member's WhatsApp
+// alerts on after the row was created.
+//
+// The two groups are authorized differently in the usecase (a role change is an
+// owner's prerogative; consent to be messaged on a personal number is the
+// person's own), which is why they are applied by two separate calls rather
+// than one blanket update.
+type setManagerRequest struct {
+	// Role is one of: owner, manager, hostess. Absent = unchanged.
+	Role *string `json:"role"`
+	// WhatsappOptIn is the consent to receive booking alerts on WhatsApp.
+	// Absent = unchanged.
+	WhatsappOptIn *bool `json:"whatsapp_opt_in"`
+	// WhatsappPhone is the number those alerts go to, in any writing (it is
+	// normalized to E.164 server-side). An EMPTY STRING clears it; absent =
+	// unchanged.
+	WhatsappPhone *string `json:"whatsapp_phone"`
+}
+
+// touchesWhatsApp reports whether the body asks for a WhatsApp change at all.
+func (r setManagerRequest) touchesWhatsApp() bool {
+	return r.WhatsappOptIn != nil || r.WhatsappPhone != nil
 }
