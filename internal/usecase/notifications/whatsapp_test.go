@@ -488,6 +488,10 @@ func TestWhatsAppFailureCannotAffectTheBooking(t *testing.T) {
 		sender.send, time.UTC, true, slog.Default())
 
 	d := NewDispatcher(outbox, noopTx{}, DispatcherConfig{}, slog.Default(), telegram, whatsApp)
+	// A failed event is now retried on its own schedule (backoff), not on the
+	// very next tick, so the clock is driven by hand here.
+	now := time.Now()
+	d.now = func() time.Time { return now }
 	res, err := d.Tick(context.Background())
 	if err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -502,7 +506,9 @@ func TestWhatsAppFailureCannotAffectTheBooking(t *testing.T) {
 	if n := len(tgSender.sends()); n != 1 {
 		t.Fatalf("telegram sends = %d, want 1 — a WhatsApp failure must not silence other channels", n)
 	}
-	// And on the next tick telegram is NOT re-sent (ledger), while WhatsApp is.
+	// And when the backoff has elapsed telegram is NOT re-sent (ledger), while
+	// WhatsApp is.
+	now = now.Add(defaultRetryBaseDelay)
 	if _, err := d.Tick(context.Background()); err != nil {
 		t.Fatalf("second Tick: %v", err)
 	}
