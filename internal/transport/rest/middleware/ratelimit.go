@@ -236,8 +236,11 @@ var routeTiers = map[string]RateLimitTier{
 	// The map proxy costs a paid provider request on a cache miss, so it sits
 	// in the browsing tier rather than being unlimited — the cache absorbs the
 	// repeats, the tier bounds a caller trying to walk the catalog.
-	"GET /api/v1/restaurants/:id/map":          TierSoft,
-	"GET /api/v1/restaurant-categories":        TierSoft,
+	"GET /api/v1/restaurants/:id/map":   TierSoft,
+	"GET /api/v1/restaurant-categories": TierSoft,
+	// The cuisine dictionary is fetched once per app launch and is tiny;
+	// browsing tier, same as the other public reference reads.
+	"GET /api/v1/cuisines":                     TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,

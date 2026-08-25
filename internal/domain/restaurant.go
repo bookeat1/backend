@@ -127,6 +127,13 @@ type RestaurantAggregate struct {
 	Features    []Feature
 	Tags        []Tag
 	SocialLinks []SocialLink
+	// Cuisines is the venue's cuisine set from the dictionary (migration
+	// 0079), in the venue's own order — the first entry is its main cuisine.
+	// The legacy scalar Restaurant.CuisineType is the comma-joined rendering
+	// of exactly this set and stays in the payload for store builds.
+	// Empty for a venue whose historical cuisine string has not been mapped
+	// to the dictionary yet; CuisineType is then still populated.
+	Cuisines []Cuisine
 	// VenueState carries the server-computed schedule / open-now / bookability
 	// facts for the public payload. Nil means "not computed" (the enrichment is
 	// optional, see usecase/restaurants.WithVenueState) — the transport layer
@@ -235,6 +242,9 @@ type RestaurantRepository interface {
 type RestaurantListItem struct {
 	Restaurant
 	PrimaryImage *string
+	// Cuisines — see RestaurantAggregate.Cuisines. Loaded for the listing too,
+	// because the app builds its cuisine chips from a catalog page.
+	Cuisines []Cuisine
 	// VenueState — see RestaurantAggregate.VenueState. Nil = not computed.
 	VenueState *PublicVenueState
 }

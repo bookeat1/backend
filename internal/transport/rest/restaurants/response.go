@@ -7,12 +7,23 @@ import (
 )
 
 type restaurantResponse struct {
-	ID            string            `json:"id"`
-	CategoryID    *string           `json:"category_id"`
-	Name          string            `json:"name"`
-	NameI18n      map[string]string `json:"name_i18n,omitempty"`
-	Description   string            `json:"description"`
-	CuisineType   string            `json:"cuisine_type"`
+	ID          string            `json:"id"`
+	CategoryID  *string           `json:"category_id"`
+	Name        string            `json:"name"`
+	NameI18n    map[string]string `json:"name_i18n,omitempty"`
+	Description string            `json:"description"`
+	// CuisineType is the LEGACY single-string cuisine field: the venue's
+	// cuisines joined with ", ". It is NOT removed and never will be silently:
+	// the store builds (1.4 live, 1.5 in review) read exactly this string and
+	// send it back as a filter value. `cuisines` below is the structured form
+	// new clients should read.
+	CuisineType string `json:"cuisine_type"`
+	// Cuisines is the venue's cuisine set from the platform dictionary, in the
+	// venue's own order (first = main). Omitted entirely when the venue has no
+	// dictionary links yet — a venue whose historical value is still awaiting a
+	// manual split has cuisine_type and nothing here, and an empty array would
+	// read as "this venue declared no cuisine", which is a different statement.
+	Cuisines      []cuisineResponse `json:"cuisines,omitempty"`
 	Address       string            `json:"address"`
 	OpeningHours  string            `json:"opening_hours"`
 	City          string            `json:"city"`
@@ -176,6 +187,36 @@ type socialResponse struct {
 	Type string `json:"type"`
 	URL  string `json:"url"`
 }
+
+// cuisineResponse is one dictionary entry as every client reads it — the same
+// shape in the venue payload and in GET /cuisines, so a client has one mapper.
+type cuisineResponse struct {
+	ID       string            `json:"id"`
+	Code     string            `json:"code"`
+	Name     string            `json:"name"`
+	NameI18n map[string]string `json:"name_i18n,omitempty"`
+	ImageURL *string           `json:"image_url,omitempty"`
+}
+
+func cuisineToResponse(c domain.Cuisine, lang string) cuisineResponse {
+	return cuisineResponse{
+		ID: c.ID.String(), Code: c.Code,
+		Name:     c.NameI18n.Resolve(lang, c.Name),
+		NameI18n: c.NameI18n, ImageURL: c.ImageURL,
+	}
+}
+
+func cuisinesToResponse(cs []domain.Cuisine, lang string) []cuisineResponse {
+	if len(cs) == 0 {
+		return nil
+	}
+	out := make([]cuisineResponse, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, cuisineToResponse(c, lang))
+	}
+	return out
+}
+
 type categoryResponse struct {
 	ID       string            `json:"id"`
 	Name     string            `json:"name"`
@@ -226,6 +267,8 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantResponse {
 	resp := baseFromDomain(it.Restaurant, lang)
 	resp.PrimaryImage = it.PrimaryImage
+	resp.Cuisines = cuisinesToResponse(it.Cuisines, lang)
+	applyDerivedCuisineType(&resp, it.Cuisines, lang)
 	applyVenueState(&resp, it.VenueState)
 	return resp
 }
@@ -243,6 +286,8 @@ func PublicListItem(it domain.RestaurantListItem, lang string) any {
 
 func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantResponse {
 	resp := baseFromDomain(a.Restaurant, lang)
+	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
+	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
 		resp.Images = append(resp.Images, imageResponse{ID: i.ID.String(), ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
 		if i.IsPrimary && resp.PrimaryImage == nil {
@@ -261,6 +306,23 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 	}
 	applyVenueState(&resp, a.VenueState)
 	return resp
+}
+
+// applyDerivedCuisineType keeps the legacy string in sync with the set INSIDE
+// the response, not only in the database.
+//
+// The stored cuisine_type is rewritten whenever a venue changes its set, but it
+// can still drift: a cuisine renamed in the dictionary does not touch 45 venue
+// rows. Rendering it from the set right here means an old store build always
+// sees names that actually exist, and — unlike the stored column, which is
+// Russian — sees them in the language it asked for. A venue with no dictionary
+// links keeps its stored string untouched, which is the whole reason the
+// unresolved composite values are safe to leave alone.
+func applyDerivedCuisineType(resp *restaurantResponse, cs []domain.Cuisine, lang string) {
+	if len(cs) == 0 {
+		return
+	}
+	resp.CuisineType = domain.JoinCuisineNames(cs, lang)
 }
 
 func categoryToResponse(c domain.RestaurantCategory) categoryResponse {

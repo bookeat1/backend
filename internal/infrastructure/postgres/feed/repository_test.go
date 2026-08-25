@@ -25,6 +25,7 @@ var feedNow = time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 // The tables these tests own. Truncated before each case so one leftover row
 // cannot make another test pass.
 var feedTables = []string{"promos", "events", "reviews", "user_cuisine_preferences",
+	"restaurant_cuisines", "cuisine_aliases", "cuisines",
 	"restaurant_categories", "restaurants", "users"}
 
 func seedUser(ctx context.Context, t *testing.T, pool sqltx.Querier, name string) uuid.UUID {
@@ -44,6 +45,29 @@ func seedCategory(ctx context.Context, t *testing.T, pool sqltx.Querier, name st
 		t.Fatalf("seed category: %v", err)
 	}
 	return id
+}
+
+// seedCuisine inserts a dictionary entry (migration 0079) and returns its id.
+func seedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code, name string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO cuisines (id, code, name) VALUES ($1,$2,$3)`, id, code, name); err != nil {
+		t.Fatalf("seed cuisine: %v", err)
+	}
+	return id
+}
+
+// linkCuisine ties a venue to a dictionary cuisine — the link the feed's
+// cuisine_match signal now reads (it used to compare restaurants.category_id,
+// the VENUE TYPE, which no venue ever had; see migration 0079).
+func linkCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, venue, cuisine uuid.UUID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_cuisines (restaurant_id, cuisine_id, position) VALUES ($1,$2,0)`,
+		venue, cuisine); err != nil {
+		t.Fatalf("link cuisine: %v", err)
+	}
 }
 
 type venueOpts struct {
@@ -194,10 +218,12 @@ func TestListCandidates_CarriesRatingAndPreferences(t *testing.T) {
 	testdb.Truncate(t, pool, feedTables...)
 	ctx := context.Background()
 
-	italian := seedCategory(ctx, t, pool, "Italian")
-	sushi := seedCategory(ctx, t, pool, "Sushi")
-	matching := seedVenue(ctx, t, pool, "Trattoria", venueOpts{city: domain.CityAlmaty, isActive: true, categoryID: &italian})
-	other := seedVenue(ctx, t, pool, "Sushi bar", venueOpts{city: domain.CityAlmaty, isActive: true, categoryID: &sushi})
+	italian := seedCuisine(ctx, t, pool, "italian", "Итальянская")
+	sushi := seedCuisine(ctx, t, pool, "japanese", "Японская")
+	matching := seedVenue(ctx, t, pool, "Trattoria", venueOpts{city: domain.CityAlmaty, isActive: true})
+	other := seedVenue(ctx, t, pool, "Sushi bar", venueOpts{city: domain.CityAlmaty, isActive: true})
+	linkCuisine(ctx, t, pool, matching, italian)
+	linkCuisine(ctx, t, pool, other, sushi)
 
 	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
 	seedPromo(ctx, t, pool, matching, "pasta week", domain.PromoPublished, open, close, domain.FeedApproved, 0)
@@ -224,7 +250,7 @@ func TestListCandidates_CarriesRatingAndPreferences(t *testing.T) {
 
 	guest := seedUser(ctx, t, pool, "Foodie")
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO user_cuisine_preferences (user_id, category_id) VALUES ($1, $2)`, guest, italian); err != nil {
+		`INSERT INTO user_cuisine_preferences (user_id, cuisine_id) VALUES ($1, $2)`, guest, italian); err != nil {
 		t.Fatalf("seed preference: %v", err)
 	}
 

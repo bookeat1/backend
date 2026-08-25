@@ -74,19 +74,25 @@ type UserRepository interface {
 }
 
 // UserCuisinePreferenceRepository stores a user's foodie-profile cuisine
-// preferences: a many-to-many link to the existing restaurant_categories
-// dictionary (the same reference list restaurants themselves are tagged
-// with — no separate cuisine dictionary is invented).
+// preferences: a many-to-many link to the cuisine dictionary (Cuisine,
+// migration 0079).
+//
+// Until 0079 this pointed at restaurant_categories — the dictionary of venue
+// TYPES (ресторан / кафе / кофейня), not cuisines — which was empty and which
+// no restaurant referenced. The consequence was not a cosmetic one: the feed's
+// strongest organic ranking signal, FeedSignalCuisineMatch (400 points), could
+// never fire, because neither side of the comparison existed. See the header of
+// migration 0079.
 type UserCuisinePreferenceRepository interface {
-	// ListCategoryIDs returns the category ids the user picked, in no
+	// ListCuisineIDs returns the cuisine ids the user picked, in no
 	// particular order. Empty slice, never an error, when the user picked none.
-	ListCategoryIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
-	// Replace deletes the user's existing preferences and inserts categoryIDs.
-	// An unknown category id fails the whole call with ErrValidation (FK
+	ListCuisineIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+	// Replace deletes the user's existing preferences and inserts cuisineIDs.
+	// An unknown cuisine id fails the whole call with ErrValidation (FK
 	// violation). Replace itself is NOT atomic against a partial failure — the
 	// delete and each insert are separate statements — so callers MUST run it
 	// inside a domain.TxManager.WithinTx (as usecase/users.UpdateMe does) so a
 	// rejected id rolls the delete back too, leaving the previous preferences
 	// intact rather than silently clearing them.
-	Replace(ctx context.Context, userID uuid.UUID, categoryIDs []uuid.UUID) error
+	Replace(ctx context.Context, userID uuid.UUID, cuisineIDs []uuid.UUID) error
 }

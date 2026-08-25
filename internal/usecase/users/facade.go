@@ -22,7 +22,8 @@ const maxAgeYears = 120
 type Facade interface {
 	Me(ctx context.Context, id uuid.UUID) (*domain.User, error)
 	UpdateMe(ctx context.Context, id uuid.UUID, in UpdateInput) (*domain.User, error)
-	// CuisinePreferences returns the category ids of the user's foodie profile.
+	// CuisinePreferences returns the cuisine-dictionary ids of the user's
+	// foodie profile (domain.Cuisine, migration 0079).
 	CuisinePreferences(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
 	// DeleteMe soft-deletes and anonymizes the caller's own account, revokes
 	// every refresh token and outstanding OTP code tied to it. Idempotent: a
@@ -57,17 +58,21 @@ func NewFacade(
 }
 
 // UpdateInput carries the mutable profile fields. A nil pointer leaves the
-// existing value unchanged. CuisineCategoryIDs is a *[]uuid.UUID (not a plain
+// existing value unchanged. CuisineIDs is a *[]uuid.UUID (not a plain
 // slice) so a nil pointer ("field omitted") is distinguishable from a
 // non-nil-but-empty slice ("clear all my preferences").
+//
+// Since migration 0079 these are ids from the CUISINE dictionary; they used to
+// be ids from restaurant_categories (venue types), which is why the wire field
+// is still called cuisine_category_ids — see transport/rest/users.
 type UpdateInput struct {
-	FullName           *string
-	AvatarURL          *string
-	PreferredLanguage  *string
-	City               *string
-	CountryCode        *string
-	BirthDate          *time.Time
-	CuisineCategoryIDs *[]uuid.UUID
+	FullName          *string
+	AvatarURL         *string
+	PreferredLanguage *string
+	City              *string
+	CountryCode       *string
+	BirthDate         *time.Time
+	CuisineIDs        *[]uuid.UUID
 }
 
 // Me returns the user by id, or ErrNotFound.
@@ -75,9 +80,9 @@ func (f *facade) Me(ctx context.Context, id uuid.UUID) (*domain.User, error) {
 	return f.users.GetByID(ctx, id)
 }
 
-// CuisinePreferences returns the user's picked cuisine category ids.
+// CuisinePreferences returns the user's picked cuisine ids.
 func (f *facade) CuisinePreferences(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
-	return f.cuisines.ListCategoryIDs(ctx, id)
+	return f.cuisines.ListCuisineIDs(ctx, id)
 }
 
 // SetAvatarURL stores the avatar URL on the user's profile.
@@ -125,8 +130,8 @@ func (f *facade) UpdateMe(ctx context.Context, id uuid.UUID, in UpdateInput) (*d
 		if err := f.users.Update(ctx, u); err != nil {
 			return err
 		}
-		if in.CuisineCategoryIDs != nil {
-			if err := f.cuisines.Replace(ctx, id, *in.CuisineCategoryIDs); err != nil {
+		if in.CuisineIDs != nil {
+			if err := f.cuisines.Replace(ctx, id, *in.CuisineIDs); err != nil {
 				return err
 			}
 		}

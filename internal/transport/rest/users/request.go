@@ -26,7 +26,15 @@ type updateMeRequest struct {
 	// CuisineCategoryIDs replaces the foodie profile's picked cuisines when
 	// present (including an empty array, which clears all picks). Omit the
 	// field entirely to leave existing picks unchanged.
+	//
+	// The values are ids from the CUISINE dictionary (GET /cuisines) since
+	// migration 0079; before that they were ids from restaurant_categories.
+	// The wire name is kept for the store builds already installed — renaming
+	// it would silently stop their profile writes from taking effect. New
+	// clients may send `cuisine_ids` instead; when both are present,
+	// `cuisine_ids` wins.
 	CuisineCategoryIDs *[]string `json:"cuisine_category_ids"`
+	CuisineIDs         *[]string `json:"cuisine_ids"`
 }
 
 // phoneChangeRequestRequest asks for an OTP to be sent to a NEW number the
@@ -56,16 +64,19 @@ func (r updateMeRequest) toInput() (uc.UpdateInput, error) {
 		}
 		in.BirthDate = &bd
 	}
-	if r.CuisineCategoryIDs != nil {
-		ids := make([]uuid.UUID, 0, len(*r.CuisineCategoryIDs))
-		for _, s := range *r.CuisineCategoryIDs {
+	if raw, field := r.CuisineCategoryIDs, "cuisine_category_ids"; raw != nil || r.CuisineIDs != nil {
+		if r.CuisineIDs != nil {
+			raw, field = r.CuisineIDs, "cuisine_ids"
+		}
+		ids := make([]uuid.UUID, 0, len(*raw))
+		for _, s := range *raw {
 			id, err := uuid.Parse(s)
 			if err != nil {
-				return uc.UpdateInput{}, fmt.Errorf("%w: invalid cuisine_category_ids entry %q", domain.ErrValidation, s)
+				return uc.UpdateInput{}, fmt.Errorf("%w: invalid %s entry %q", domain.ErrValidation, field, s)
 			}
 			ids = append(ids, id)
 		}
-		in.CuisineCategoryIDs = &ids
+		in.CuisineIDs = &ids
 	}
 	return in, nil
 }
