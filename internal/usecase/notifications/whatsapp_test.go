@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -150,7 +152,7 @@ func waEvent(rid uuid.UUID) Event {
 func TestWhatsAppSendsOnBookingCreated(t *testing.T) {
 	rid := uuid.New()
 	h := newWAHarness(t, true, "Asia/Almaty")
-	mgr := h.staff.add(rid, true, "+77010000001")
+	h.staff.add(rid, true, "+77010000001")
 
 	e := waEvent(rid)
 	if err := h.notifier.Notify(context.Background(), e); err != nil {
@@ -174,14 +176,16 @@ func TestWhatsAppSendsOnBookingCreated(t *testing.T) {
 			t.Errorf("param %d = %q, want %q", i+1, sends[0].params[i], want[i])
 		}
 	}
-	// Delivery is recorded against the STAFF ROW (not the venue): a venue can
-	// have several people on the alert, and each must be deduped separately.
-	done, err := h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp, mgr)
+	// Delivery is recorded against the NUMBER, not the staff row: a venue can
+	// reach the same handset through several rows (and through its own settings
+	// number), and all of them must count as one recipient.
+	done, err := h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp,
+		whatsAppDedupeTarget("+77010000001"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !done {
-		t.Fatal("the send was not recorded against the staff row")
+		t.Fatal("the send was not recorded against the recipient number")
 	}
 }
 
@@ -251,14 +255,15 @@ func TestWhatsAppSendFailureClassification(t *testing.T) {
 func TestWhatsAppFailedSendIsNotRecordedAsDelivered(t *testing.T) {
 	rid := uuid.New()
 	h := newWAHarness(t, true, "Asia/Almaty")
-	mgr := h.staff.add(rid, true, "+77010000001")
+	h.staff.add(rid, true, "+77010000001")
 	h.sender.status["+77010000001"] = 500
 
 	e := waEvent(rid)
 	if err := h.notifier.Notify(context.Background(), e); err == nil {
 		t.Fatal("want an error on a 5xx")
 	}
-	already, err := h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp, mgr)
+	already, err := h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp,
+		whatsAppDedupeTarget("+77010000001"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +276,8 @@ func TestWhatsAppFailedSendIsNotRecordedAsDelivered(t *testing.T) {
 	if err := h.notifier.Notify(context.Background(), e); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	already, _ = h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp, mgr)
+	already, _ = h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp,
+		whatsAppDedupeTarget("+77010000001"))
 	if !already {
 		t.Fatal("a successful send was not recorded")
 	}
@@ -517,5 +523,237 @@ func TestWhatsAppFailureCannotAffectTheBooking(t *testing.T) {
 	}
 	if n := len(sender.sends()); n != 2 {
 		t.Fatalf("whatsapp attempts = %d, want a retry", n)
+	}
+}
+
+// --- the venue's own number as a real recipient ------------------------
+
+// phonesOf lists, sorted, the numbers a sender was asked to write to.
+func phonesOf(sends []whatsAppSend) []string {
+	out := make([]string, 0, len(sends))
+	for _, s := range sends {
+		out = append(out, s.phone)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// THE bug this change exists for: the owner fills «Уведомления в WhatsApp» in
+// the admin panel, the panel shows «Подключено» — and before this change the
+// notifier read that row only for the kill switch and sent to nobody, because
+// there was no staff row with personal opt-in. A control that lies.
+func TestWhatsAppSendsToTheVenueNumberAlone(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+77010000001" // saved from the admin panel
+	// Deliberately no staff at all: the roster is empty, exactly as it is for a
+	// venue whose owner only ever used the panel's WhatsApp card.
+
+	e := waEvent(rid)
+	if err := h.notifier.Notify(context.Background(), e); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	sends := h.sender.sends()
+	if len(sends) != 1 {
+		t.Fatalf("sends = %d, want 1 — the number the panel calls «Подключено» must actually receive", len(sends))
+	}
+	if sends[0].phone != "+77010000001" {
+		t.Errorf("phone = %q, want the venue's own number", sends[0].phone)
+	}
+	// And it is recorded, so the redelivery of this event does not ring twice.
+	done, err := h.deliv.AlreadyDelivered(context.Background(), e.OutboxEventID, domain.ChannelWhatsApp,
+		whatsAppDedupeTarget("+77010000001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done {
+		t.Fatal("the venue number's delivery was not recorded")
+	}
+}
+
+// A venue number stored in the local form must still be recognised as the same
+// handset the guest-facing normalizer produces — the settings usecase writes
+// E.164, but a row predating that (or written by a script) must not be dropped.
+func TestWhatsAppNormalisesTheVenueNumber(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "8 701 000 00 01"
+
+	if err := h.notifier.Notify(context.Background(), waEvent(rid)); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	sends := h.sender.sends()
+	if len(sends) != 1 || sends[0].phone != "+77010000001" {
+		t.Fatalf("sends = %+v, want one message to the E.164 form", sends)
+	}
+}
+
+// The union: the venue's own number AND a consenting manager are two different
+// handsets, and both must learn about the booking.
+func TestWhatsAppSendsToVenueNumberAndStaff(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+77010000001" // the owner, from the panel
+	h.staff.add(rid, true, "+77010000002")   // the hostess, personal opt-in
+
+	if err := h.notifier.Notify(context.Background(), waEvent(rid)); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	got := phonesOf(h.sender.sends())
+	want := []string{"+77010000001", "+77010000002"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sent to %v, want %v", got, want)
+	}
+}
+
+// The common real case: the owner is the only person at the venue, so their
+// personal number sits BOTH in the panel's WhatsApp card and on their own staff
+// row. One booking must ring that phone once.
+func TestWhatsAppSameNumberInBothPlacesSendsOnce(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+77010000001"
+	staffRow := h.staff.add(rid, true, "8 701 000 00 01") // the same handset, written locally
+
+	e := waEvent(rid)
+	if err := h.notifier.Notify(context.Background(), e); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	sends := h.sender.sends()
+	if len(sends) != 1 {
+		t.Fatalf("sends = %d, want 1 — the same handset must not be rung twice: %+v", len(sends), sends)
+	}
+
+	// One message is not enough on its own: it must be deduped by the NUMBER.
+	// A ledger row keyed by the staff row id would collapse the moment the
+	// roster changes (row deleted, number moved to another person) and the
+	// redelivery would ring the owner a second time.
+	ctx := context.Background()
+	byNumber, err := h.deliv.AlreadyDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp,
+		whatsAppDedupeTarget("+77010000001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !byNumber {
+		t.Fatal("the single message was not recorded against the number — the dedupe is not number-scoped")
+	}
+	byRow, err := h.deliv.AlreadyDelivered(ctx, e.OutboxEventID, domain.ChannelWhatsApp, staffRow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byRow {
+		t.Fatal("the delivery is still keyed by the staff row id")
+	}
+
+	// And the roster changing between two attempts at the same event must not
+	// produce a second message: the owner deletes their own staff row, only the
+	// venue number remains, and the redelivery has to stay silent.
+	delete(h.staff.rows, rid)
+	if err := h.notifier.Notify(ctx, e); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if n := len(h.sender.sends()); n != 1 {
+		t.Fatalf("after the roster changed the handset was rung %d times, want 1", n)
+	}
+}
+
+// The venue's kill switch has to silence BOTH kinds of recipient, not just the
+// staff fan-out it used to gate.
+func TestWhatsAppVenueToggleOffSilencesTheVenueNumberToo(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+77010000001"
+	h.staff.add(rid, true, "+77010000002")
+	h.settings.waDisabled[rid] = true
+
+	if err := h.notifier.Notify(context.Background(), waEvent(rid)); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if n := len(h.sender.sends()); n != 0 {
+		t.Fatalf("a venue that switched WhatsApp off got %d messages", n)
+	}
+}
+
+// A half-typed venue number is skipped like a half-typed staff one — and it
+// must not take the rest of the recipients down with it.
+func TestWhatsAppUnusableVenueNumberIsSkipped(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+7701"
+	h.staff.add(rid, true, "+77010000002")
+
+	if err := h.notifier.Notify(context.Background(), waEvent(rid)); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	got := phonesOf(h.sender.sends())
+	if !reflect.DeepEqual(got, []string{"+77010000002"}) {
+		t.Fatalf("sent to %v, want only the usable staff number", got)
+	}
+}
+
+// A venue with an empty settings number and nobody opted in is still a drain,
+// not a failure.
+func TestWhatsAppNoVenueNumberAndNoStaffIsNotAnError(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+
+	if err := h.notifier.Notify(context.Background(), waEvent(rid)); err != nil {
+		t.Fatalf("Notify must not fail when there is nothing to send to: %v", err)
+	}
+	if n := len(h.sender.sends()); n != 0 {
+		t.Fatalf("sent %d messages, want 0", n)
+	}
+}
+
+// A partial failure: one of the two recipients is temporarily unreachable, so
+// the event is retried — and the retry must reach ONLY the one that missed out.
+// This is the property that makes the derived, number-keyed dedupe target worth
+// having: it has to be identical on attempt #2.
+func TestWhatsAppRetryAfterPartialFailureDoesNotResend(t *testing.T) {
+	rid := uuid.New()
+	h := newWAHarness(t, true, "Asia/Almaty")
+	h.settings.waPhone[rid] = "+77010000001" // the venue number: succeeds
+	h.staff.add(rid, true, "+77010000002")   // the manager: Meta is down for them
+	h.sender.status["+77010000002"] = 503
+
+	e := waEvent(rid)
+	if err := h.notifier.Notify(context.Background(), e); err == nil {
+		t.Fatal("a 5xx must leave the event for another tick")
+	}
+	if got := phonesOf(h.sender.sends()); !reflect.DeepEqual(got, []string{"+77010000001", "+77010000002"}) {
+		t.Fatalf("first attempt wrote to %v, want both", got)
+	}
+
+	// Second tick: Meta recovered.
+	delete(h.sender.status, "+77010000002")
+	if err := h.notifier.Notify(context.Background(), e); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	got := phonesOf(h.sender.sends())
+	want := []string{"+77010000001", "+77010000002", "+77010000002"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after the retry the sender saw %v, want %v — the venue number must not be written to twice", got, want)
+	}
+}
+
+// The dedupe identity may never be mistaken for a real row id. It is a
+// version-5 uuid while every id in this database is version 4, so the two
+// spaces cannot intersect — and it must be a pure function of the number, or
+// a retry would look like a new recipient.
+func TestWhatsAppDedupeTargetIsStableAndCannotCollideWithARowID(t *testing.T) {
+	a := whatsAppDedupeTarget("+77010000001")
+	if a != whatsAppDedupeTarget("+77010000001") {
+		t.Fatal("the dedupe target is not stable across calls — every retry would re-send")
+	}
+	if a == whatsAppDedupeTarget("+77010000002") {
+		t.Fatal("two different numbers share a dedupe target — one of them would never be notified")
+	}
+	if a.Version() != 5 {
+		t.Fatalf("dedupe target version = %d, want 5 (name-based)", a.Version())
+	}
+	// uuid.New() is version 4, as is Postgres' gen_random_uuid(); a version-5
+	// value can therefore never equal a staff row id.
+	if uuid.New().Version() != 4 {
+		t.Fatal("row ids are no longer version 4 — the no-collision argument needs re-checking")
 	}
 }
