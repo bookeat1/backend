@@ -25,6 +25,7 @@ import (
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
+	cuisinerepo "backend-core/internal/infrastructure/postgres/cuisine"
 	dashboardrepo "backend-core/internal/infrastructure/postgres/dashboard"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
 	eventrecurrencerepo "backend-core/internal/infrastructure/postgres/eventrecurrence"
@@ -63,6 +64,7 @@ import (
 	"backend-core/internal/usecase/bookings"
 	"backend-core/internal/usecase/consent"
 	"backend-core/internal/usecase/content"
+	cuisinesuc "backend-core/internal/usecase/cuisines"
 	"backend-core/internal/usecase/dashboard"
 	"backend-core/internal/usecase/eventrecurrence"
 	"backend-core/internal/usecase/events"
@@ -95,6 +97,7 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
+	Cuisines           cuisinesuc.UseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
 	DeviceTokens       *notifications.DeviceTokenUseCase
 	NotificationFeed   *notifications.NotificationFeedUseCase
@@ -386,6 +389,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// batched by venue id. Wiring a second implementation here is how the
 	// catalog would start promising tables the booking screen then refuses.
 	availabilitySearch := bookings.NewAvailabilitySearch(restRelated, bookingLinks, bookingCapacity, bookingCfg)
+	// The cuisine dictionary. restRepo doubles as the writer of the derived
+	// cuisine_type string (UpdateCuisineTypeString) and restaurantManagers as
+	// the venue permission check, so the usecase depends on neither package.
+	cuisinesUC := cuisinesuc.NewUseCase(cuisinerepo.New(db), restRepo, restaurantManagers, txm)
+
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
 		restaurants.WithVenueState(venueState),
 		restaurants.WithAvailabilityFilter(availabilitySearch))
@@ -440,6 +448,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantsFacade:     restaurantsFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
+		Cuisines:              cuisinesUC,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,
 		NotificationFeed:      notificationFeed,

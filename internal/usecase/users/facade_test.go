@@ -54,7 +54,7 @@ func (f *memUsers) Delete(_ context.Context, id uuid.UUID) error {
 type memCuisines struct{ m map[uuid.UUID][]uuid.UUID }
 
 func newMemCuisines() *memCuisines { return &memCuisines{m: map[uuid.UUID][]uuid.UUID{}} }
-func (f *memCuisines) ListCategoryIDs(_ context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+func (f *memCuisines) ListCuisineIDs(_ context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
 	out := make([]uuid.UUID, len(f.m[userID]))
 	copy(out, f.m[userID])
 	return out, nil
@@ -200,7 +200,7 @@ func TestCuisinePreferencesRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	catA, catB := uuid.New(), uuid.New()
-	if _, err := f.UpdateMe(ctx, id, UpdateInput{CuisineCategoryIDs: &[]uuid.UUID{catA, catB}}); err != nil {
+	if _, err := f.UpdateMe(ctx, id, UpdateInput{CuisineIDs: &[]uuid.UUID{catA, catB}}); err != nil {
 		t.Fatalf("UpdateMe: %v", err)
 	}
 	got, err := f.CuisinePreferences(ctx, id)
@@ -222,7 +222,7 @@ func TestCuisinePreferencesRoundTrip(t *testing.T) {
 
 	// An empty (non-nil) slice clears all preferences.
 	empty := []uuid.UUID{}
-	if _, err := f.UpdateMe(ctx, id, UpdateInput{CuisineCategoryIDs: &empty}); err != nil {
+	if _, err := f.UpdateMe(ctx, id, UpdateInput{CuisineIDs: &empty}); err != nil {
 		t.Fatalf("UpdateMe: %v", err)
 	}
 	got, _ = f.CuisinePreferences(ctx, id)

@@ -19,6 +19,7 @@ import (
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	consentrest "backend-core/internal/transport/rest/consent"
 	contentrest "backend-core/internal/transport/rest/content"
+	cuisinesrest "backend-core/internal/transport/rest/cuisines"
 	dashboardrest "backend-core/internal/transport/rest/dashboard"
 	devicetokensrest "backend-core/internal/transport/rest/devicetokens"
 	eventsrest "backend-core/internal/transport/rest/events"
@@ -128,6 +129,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic := api.Group("")
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
+
+	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and
+	// the venue panel's checkbox list read the same route, so they can never
+	// disagree about the list or its order); it needs no auth at all, hence the
+	// plain api group rather than restPublic.
+	cuisinesHandler := cuisinesrest.NewHandler(deps.Cuisines)
+	cuisinesHandler.RegisterPublic(api)
 
 	// Server-side static map preview. Fully public and NOT on the OptionalAuth
 	// group: the picture is identical for every caller, so parsing a token
@@ -292,6 +300,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
+	// The cuisine dictionary is the PLATFORM's, not a venue's: only the
+	// superadmin creates, edits or hides an entry (ADR-022). A venue that
+	// could add its own would recreate «Кафе, европейская» in a new table.
+	cuisinesHandler.RegisterAdminGlobal(adminGlobal)
 
 	// Global role management. This is the endpoint that hands out the rights to
 	// every other admin endpoint, so the usecase checks the caller's role again
@@ -348,6 +360,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restScoped := authed.Group("")
 	restScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))
 	restHandler.RegisterRestaurantScoped(restScoped)
+	// A venue PICKS its cuisines from the dictionary — same venue-scoped gate
+	// as the rest of its profile.
+	cuisinesHandler.RegisterRestaurantScoped(restScoped)
 
 	menuScoped := authed.Group("")
 	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))

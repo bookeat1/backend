@@ -134,7 +134,7 @@ func TestUpdateMePatchesOwnProfile(t *testing.T) {
 	if f.lastUpdateIn.BirthDate == nil {
 		t.Fatalf("birth_date not forwarded: %+v", f.lastUpdateIn)
 	}
-	if f.lastUpdateIn.CuisineCategoryIDs == nil || len(*f.lastUpdateIn.CuisineCategoryIDs) != 1 {
+	if f.lastUpdateIn.CuisineIDs == nil || len(*f.lastUpdateIn.CuisineIDs) != 1 {
 		t.Errorf("cuisine_category_ids not forwarded: %+v", f.lastUpdateIn)
 	}
 }

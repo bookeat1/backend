@@ -169,8 +169,14 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		) ev
 		WHERE ev.recurrence_id IS NULL OR ev.rn = 1`
 
+	// prefs: the guest's picked cuisines. Until migration 0079 this read
+	// user_cuisine_preferences.category_id and compared it to
+	// restaurants.category_id — the VENUE TYPE dictionary, which was empty and
+	// which no restaurant referenced. matches_pref was therefore false for
+	// every card ever served, and the 400-point cuisine signal below has never
+	// once fired in production. It compares dictionary cuisines now.
 	sql := `WITH prefs AS (
-			SELECT category_id FROM user_cuisine_preferences WHERE user_id = $2::uuid
+			SELECT cuisine_id FROM user_cuisine_preferences WHERE user_id = $2::uuid
 		),
 		candidates AS (
 			` + promoBranch + `
@@ -180,7 +186,9 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		SELECT c.*,
 			COALESCE(rt.avg_rating, 0)::float8 AS venue_rating,
 			COALESCE(rt.review_count, 0)::int  AS venue_review_count,
-			(c.category_id IS NOT NULL AND EXISTS (SELECT 1 FROM prefs p WHERE p.category_id = c.category_id)) AS matches_pref,
+			EXISTS (SELECT 1 FROM restaurant_cuisines rc
+			         JOIN prefs p ON p.cuisine_id = rc.cuisine_id
+			        WHERE rc.restaurant_id = c.restaurant_id) AS matches_pref,
 			EXISTS (SELECT 1 FROM prefs) AS has_prefs
 		FROM candidates c
 		-- LATERAL, not a platform-wide GROUP BY: the aggregate is computed for

@@ -120,6 +120,47 @@ SET last_synced_at = EXCLUDED.last_synced_at,
 // category_id points at old restaurant_categories, which increment 1 does not
 // sync, so writing it would violate the new FK. The booking-policy columns are
 // left at their NULL defaults (they mean "use the global env default").
+// legacyRestaurantUpdateSet is the assignment list of UpsertRestaurant's
+// ON CONFLICT DO UPDATE. It is a named constant, not an inline tail of the
+// query, for one reason: the columns that are NOT here matter as much as the
+// ones that are, and an omission inside a 12-line SQL literal is invisible.
+//
+// cuisine_type / cuisine_type_i18n are absent BY DESIGN — see the note in the
+// middle of the list. Adding them back reverts every venue's cuisine to the
+// legacy free text on the next sync run.
+const legacyRestaurantUpdateSet = `
+ name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n, description=EXCLUDED.description,
+ description_i18n=EXCLUDED.description_i18n,
+ -- cuisine_type / cuisine_type_i18n: НЕ ПРИСВАИВАЮТСЯ. Кухня — наша (ADR-023):
+ -- источник истины с миграции 0079 это restaurant_cuisines, а строка —
+ -- производная от него. Старая система кухню больше не трогает.
+ address=EXCLUDED.address,
+ address_i18n=EXCLUDED.address_i18n, opening_hours=EXCLUDED.opening_hours,
+ opening_hours_i18n=EXCLUDED.opening_hours_i18n, city=EXCLUDED.city,
+ price_category=EXCLUDED.price_category, email=EXCLUDED.email, phone=EXCLUDED.phone,
+ latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
+ kwaaka_restaurant_id=EXCLUDED.kwaaka_restaurant_id, is_active=EXCLUDED.is_active,
+ is_new=EXCLUDED.is_new, is_popular=EXCLUDED.is_popular, is_premium=EXCLUDED.is_premium,
+ hidden_from_home=EXCLUDED.hidden_from_home, display_order=EXCLUDED.display_order,
+ updated_at=EXCLUDED.updated_at`
+
+// UpsertRestaurant writes one venue from the LEGACY system.
+//
+// CUISINE IS OURS, NOT THEIRS (ADR-023). `cuisine_type` / `cuisine_type_i18n`
+// are deliberately ABSENT from the ON CONFLICT DO UPDATE list, which lives in
+// legacyRestaurantUpdateSet right above and spells the omission out in place
+// instead of leaving it to be noticed. Since migration 0079 the source of truth for a venue's cuisine is
+// the dictionary link `restaurant_cuisines`, filled in OUR panel; the scalar
+// column is its derived rendering. A sync run that kept writing the legacy free
+// text would silently revert the mapping and leave the string disagreeing with
+// the links — the single most likely way to lose this whole migration.
+//
+// The columns are still written on INSERT: a venue that appears in the legacy
+// system for the first time and has no dictionary links yet is better off with
+// its legacy string than with an empty cuisine.
+//
+// City is NOT part of this change: it stays under legacy control until the
+// owner decides where cities are edited.
 func (s *Sink) UpsertRestaurant(ctx context.Context, r legacysync.Restaurant) (legacysync.Outcome, error) {
 	return exec(ctx, s.pool, `
 INSERT INTO restaurants
@@ -128,18 +169,7 @@ INSERT INTO restaurants
   email, phone, latitude, longitude, kwaaka_restaurant_id, is_active, is_new,
   is_popular, is_premium, hidden_from_home, display_order, created_at, updated_at)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
-ON CONFLICT (id) DO UPDATE SET
- name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n, description=EXCLUDED.description,
- description_i18n=EXCLUDED.description_i18n, cuisine_type=EXCLUDED.cuisine_type,
- cuisine_type_i18n=EXCLUDED.cuisine_type_i18n, address=EXCLUDED.address,
- address_i18n=EXCLUDED.address_i18n, opening_hours=EXCLUDED.opening_hours,
- opening_hours_i18n=EXCLUDED.opening_hours_i18n, city=EXCLUDED.city,
- price_category=EXCLUDED.price_category, email=EXCLUDED.email, phone=EXCLUDED.phone,
- latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
- kwaaka_restaurant_id=EXCLUDED.kwaaka_restaurant_id, is_active=EXCLUDED.is_active,
- is_new=EXCLUDED.is_new, is_popular=EXCLUDED.is_popular, is_premium=EXCLUDED.is_premium,
- hidden_from_home=EXCLUDED.hidden_from_home, display_order=EXCLUDED.display_order,
- updated_at=EXCLUDED.updated_at`,
+ON CONFLICT (id) DO UPDATE SET`+legacyRestaurantUpdateSet,
 		r.ID, r.Name, jsonb(r.NameI18n), r.Description, jsonb(r.DescriptionI18n),
 		r.CuisineType, jsonb(r.CuisineTypeI18n), r.Address, jsonb(r.AddressI18n),
 		r.OpeningHours, jsonb(r.OpeningHoursI18n), r.City, r.PriceCategory, r.Email,

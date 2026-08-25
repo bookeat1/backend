@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/infrastructure/postgres/cuisine"
 	"backend-core/internal/infrastructure/sqltx"
 )
 
@@ -106,6 +107,29 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
 		return mapWrite(err, "update restaurant")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCuisineTypeString rewrites ONLY the two derived backward-compatibility
+// columns after a venue's cuisine set changed (see usecase/cuisines).
+//
+// `cuisine_type` used to be the source of truth typed by hand; since migration
+// 0079 the source of truth is `restaurant_cuisines`, and this column is its
+// comma-joined rendering, kept alive for the store builds (1.4 / 1.5) that read
+// one string. Writing it through a narrow UPDATE — instead of the full Update
+// above — is deliberate: a read-modify-write of the whole row from a caller
+// that only knows about cuisines is how a concurrent edit of the venue profile
+// gets silently reverted.
+func (r *Repository) UpdateCuisineTypeString(ctx context.Context, id uuid.UUID, cuisineType string, i18n domain.I18n) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants SET cuisine_type=$2, cuisine_type_i18n=$3, updated_at=now()
+		 WHERE id=$1`, id, cuisineType, i18nToDB(i18n))
+	if err != nil {
+		return fmt.Errorf("update derived cuisine_type: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound
@@ -231,6 +255,11 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Restaur
 	if agg.SocialLinks, err = rel.ListSocialLinks(ctx, id); err != nil {
 		return nil, err
 	}
+	byVenue, err := cuisine.New(r.pool).ListByRestaurants(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	agg.Cuisines = byVenue[id]
 	return agg, nil
 }
 
@@ -297,7 +326,33 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("list restaurants: %w", err)
 	}
+	if err := r.attachCuisines(ctx, items); err != nil {
+		return nil, 0, err
+	}
 	return items, total, nil
+}
+
+// attachCuisines fills the cuisine set of a whole page in ONE extra query, so
+// a 20-item catalog page costs two round trips rather than twenty-one. Loading
+// it here — rather than in a usecase — is what keeps EVERY consumer of
+// RestaurantListItem consistent: the catalog listing, the search and the
+// favorites screen all render the same venue with the same cuisines.
+func (r *Repository) attachCuisines(ctx context.Context, items []domain.RestaurantListItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	for i := range items {
+		ids = append(ids, items[i].Restaurant.ID)
+	}
+	byVenue, err := cuisine.New(r.pool).ListByRestaurants(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		items[i].Cuisines = byVenue[items[i].Restaurant.ID]
+	}
+	return nil
 }
 
 // searchTextExpr is the exact SQL expression the FTS and trigram indexes in
@@ -307,6 +362,41 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 // alias resolves to the same columns the unqualified index expression names,
 // which is why the index still matches. See the migration's comment for the
 // all-locale rationale.
+// cuisineMatchExpr matches a venue against an OR-set of NORMALIZED cuisine
+// keys (domain.NormalizeCuisineKeys: trimmed, lower-cased, spaces collapsed).
+// $%d is a text[], cast explicitly on both uses: the same bound parameter
+// feeding two differently-typed comparisons is exactly the shape that trips
+// SQLSTATE 42P08 under the extended protocol (see
+// bugs/bookeat-backend-cas-sql-type-inference.md).
+//
+// Two branches, and both are required:
+//
+//  1. the dictionary link — the venue has a cuisine whose alias (or code, which
+//     is seeded as an alias) is one of the requested keys. This is what makes a
+//     venue with SEVERAL cuisines findable by each of them;
+//  2. the legacy string — the venue's own `cuisine_type`, normalized the same
+//     way, matched BOTH whole and comma-part by comma-part. This is not a
+//     leftover: venues whose composite value is still awaiting a manual split
+//     have no links yet, and dropping this branch would make them disappear
+//     from the very filter they answer today. The per-part comparison is what
+//     keeps an already-installed app working: it scrapes its chips out of the
+//     catalog, so its chip literally reads «Кафе, европейская», the transport
+//     splits that on commas, and neither half would equal the whole string.
+//     Splitting HERE decides nothing and writes nothing — the raw value stays
+//     exactly as it is until a human rules on it.
+//
+// Case-insensitivity is itself a fix: before this, «Европейская» and
+// «европейская» were two different filters, and the app sent whichever spelling
+// it had scraped out of the catalog.
+const cuisineMatchExpr = `(
+	EXISTS (SELECT 1 FROM restaurant_cuisines rc
+	          JOIN cuisine_aliases ca ON ca.cuisine_id = rc.cuisine_id
+	         WHERE rc.restaurant_id = r.id AND ca.alias = ANY($%d::text[]))
+	OR lower(btrim(r.cuisine_type)) = ANY($%d::text[])
+	OR EXISTS (SELECT 1 FROM unnest(string_to_array(r.cuisine_type, ',')) AS part
+	            WHERE lower(btrim(part)) = ANY($%d::text[]))
+)`
+
 const searchTextExpr = `restaurant_search_text(r.name, r.description, r.name_i18n, r.description_i18n)`
 
 // Search implements domain.RestaurantRepository.Search: a full-text +
@@ -322,8 +412,11 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 	if f.City != nil {
 		add("r.city = $%d", string(*f.City))
 	}
-	if len(f.Cuisines) > 0 {
-		add("r.cuisine_type = ANY($%d)", f.Cuisines)
+	if keys := domain.NormalizeCuisineKeys(f.Cuisines); len(keys) > 0 {
+		// Bound once, referenced three times — hence not add(), which assumes
+		// a single placeholder.
+		args = append(args, keys)
+		where = append(where, fmt.Sprintf(cuisineMatchExpr, len(args), len(args), len(args)))
 	}
 	if f.Price != nil {
 		add("r.price_category = $%d", string(*f.Price))
@@ -391,6 +484,9 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("search restaurants: %w", err)
+	}
+	if err := r.attachCuisines(ctx, items); err != nil {
+		return nil, 0, err
 	}
 	return items, total, nil
 }
