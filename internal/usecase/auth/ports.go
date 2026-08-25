@@ -60,4 +60,12 @@ type Config struct {
 	OTPPerMin    int
 	OTPPerHour   int
 	OTPDevExpose bool
+
+	// TestAccountPhone / TestAccountCode enable the App Store review account:
+	// one number that logs in with a fixed code and no message sent. Both empty
+	// = the feature does not exist and every number takes the ordinary path.
+	// Any human phone format is accepted, it is normalized once at construction.
+	// See test_account.go for the full rationale and rules.
+	TestAccountPhone string
+	TestAccountCode  string
 }

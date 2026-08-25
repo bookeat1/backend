@@ -219,6 +219,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		OTPPerMin:    cfg.Auth.OTPRateLimitPerMin,
 		OTPPerHour:   cfg.Auth.OTPRateLimitPerHour,
 		OTPDevExpose: cfg.Auth.OTPDevExpose,
+
+		// Empty unless this contour runs an App Store review account; see
+		// internal/usecase/auth/test_account.go.
+		TestAccountPhone: cfg.Auth.TestAccountPhone,
+		TestAccountCode:  cfg.Auth.TestAccountCode,
 	}
 	authFacade := auth.NewFacade(usersRepo, credsRepo, refreshRepo, txm, issuer, authCfg)
 	authOTP := auth.NewOTPUseCase(

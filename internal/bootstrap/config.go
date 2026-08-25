@@ -229,6 +229,15 @@ type AuthConfig struct {
 	OTPRateLimitPerMin  int           // env: AUTH_OTP_RATE_PER_MIN
 	OTPRateLimitPerHour int           // env: AUTH_OTP_RATE_PER_HOUR
 	OTPDevExpose        bool          // env: AUTH_OTP_DEV_EXPOSE — echo code in response (dev only)
+
+	// The App Store review account: ONE phone number that logs in with a fixed
+	// code and no message sent (an App Review reviewer can receive neither a
+	// Telegram code nor an SMS). Both empty = the feature does not exist; a half
+	// configured pair is a startup error, never a silent "off". Any human phone
+	// format is accepted — it is normalized the same way a login request is.
+	// Rationale and rules: internal/usecase/auth/test_account.go.
+	TestAccountPhone string // env: AUTH_TEST_ACCOUNT_PHONE
+	TestAccountCode  string // env: AUTH_TEST_ACCOUNT_CODE
 }
 
 // BookingConfig holds the global (level-1) booking policy. A restaurant may
@@ -611,6 +620,8 @@ func NewConfig() (Config, error) {
 			OTPRateLimitPerMin:  getEnvInt("AUTH_OTP_RATE_PER_MIN", 1),
 			OTPRateLimitPerHour: getEnvInt("AUTH_OTP_RATE_PER_HOUR", 5),
 			OTPDevExpose:        getEnvBool("AUTH_OTP_DEV_EXPOSE", false),
+			TestAccountPhone:    strings.TrimSpace(getEnv("AUTH_TEST_ACCOUNT_PHONE", "")),
+			TestAccountCode:     strings.TrimSpace(getEnv("AUTH_TEST_ACCOUNT_CODE", "")),
 		},
 		Booking: BookingConfig{
 			DefaultDuration:       getEnvMinutes("BOOKING_DEFAULT_DURATION_MINUTES", 90),
@@ -802,6 +813,16 @@ func NewConfig() (Config, error) {
 			MobizonSender: getEnv("OTP_SMS_MOBIZON_SENDER", ""),
 			MobizonAPIURL: getEnv("OTP_SMS_MOBIZON_API_URL", ""),
 		},
+	}
+
+	// A half-configured review account is refused at startup rather than
+	// silently ignored. Both empty is the normal, intended state (the feature
+	// does not exist); one of the two set means somebody meant to enable it and
+	// mistyped a variable name — and the failure mode of "silently off" is a
+	// rejected App Store submission nobody can explain.
+	if (cfg.Auth.TestAccountPhone == "") != (cfg.Auth.TestAccountCode == "") {
+		return Config{}, fmt.Errorf(
+			"AUTH_TEST_ACCOUNT_PHONE and AUTH_TEST_ACCOUNT_CODE must be set together (or both left empty)")
 	}
 
 	return cfg, nil
