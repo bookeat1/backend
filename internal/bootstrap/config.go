@@ -493,6 +493,15 @@ type PushConfig struct {
 	TTL             time.Duration // env: PUSH_TTL — push-service message retention
 	DispatchTick    time.Duration // env: NOTIFY_DISPATCH_TICK_INTERVAL
 	DispatchBatch   int           // env: NOTIFY_DISPATCH_BATCH_SIZE
+	// RetryBaseDelay / RetryMaxDelay / RetryMaxAttempts are the dispatcher's
+	// failure schedule (migration 0083): a failed event waits BaseDelay, then
+	// double each time up to MaxDelay, and after MaxAttempts it is abandoned
+	// into the dead letter instead of retried forever. They are tunable so an
+	// outage can be ridden out longer without a redeploy, not because the
+	// defaults are guesses.
+	RetryBaseDelay   time.Duration // env: NOTIFY_RETRY_BASE_DELAY
+	RetryMaxDelay    time.Duration // env: NOTIFY_RETRY_MAX_DELAY
+	RetryMaxAttempts int           // env: NOTIFY_RETRY_MAX_ATTEMPTS
 	// TelegramBotToken is the BookEat notifications bot token. Read from env
 	// only and never logged (a bot credential). Absent → the telegram channel
 	// no-ops cleanly, exactly like absent VAPID keys for web push.
@@ -738,6 +747,9 @@ func NewConfig() (Config, error) {
 			TTL:                   getEnvDuration("PUSH_TTL", 24*time.Hour),
 			DispatchTick:          getEnvDuration("NOTIFY_DISPATCH_TICK_INTERVAL", 15*time.Second),
 			DispatchBatch:         getEnvInt("NOTIFY_DISPATCH_BATCH_SIZE", 100),
+			RetryBaseDelay:        getEnvDuration("NOTIFY_RETRY_BASE_DELAY", time.Minute),
+			RetryMaxDelay:         getEnvDuration("NOTIFY_RETRY_MAX_DELAY", time.Hour),
+			RetryMaxAttempts:      getEnvInt("NOTIFY_RETRY_MAX_ATTEMPTS", 12),
 			TelegramBotToken:      getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
 			TelegramWebhookSecret: getEnv("TELEGRAM_NOTIFY_WEBHOOK_SECRET", ""),
 

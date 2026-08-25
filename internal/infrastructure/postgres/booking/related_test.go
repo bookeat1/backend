@@ -368,7 +368,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 	var claimed []domain.BookingOutboxEvent
 	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
 		var err error
-		claimed, err = outbox.ClaimUnpublished(ctx, 10)
+		claimed, err = outbox.ClaimDue(ctx, 10, time.Now())
 		if err != nil {
 			return err
 		}
@@ -385,7 +385,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 			t.Errorf("claimed event mismatch: %+v", claimed[0])
 		}
 		// A parallel worker must skip the locked row.
-		parallel, err := outbox.ClaimUnpublished(context.Background(), 10)
+		parallel, err := outbox.ClaimDue(context.Background(), 10, time.Now())
 		if err != nil {
 			return err
 		}
@@ -398,7 +398,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 	}
 
 	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
-		left, err := outbox.ClaimUnpublished(ctx, 10)
+		left, err := outbox.ClaimDue(ctx, 10, time.Now())
 		if err != nil {
 			return err
 		}

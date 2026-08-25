@@ -308,10 +308,14 @@ func (f *fakeOutbox) Create(_ context.Context, e *domain.BookingOutboxEvent) err
 	f.created = append(f.created, *e)
 	return nil
 }
-func (f *fakeOutbox) ClaimUnpublished(context.Context, int) ([]domain.BookingOutboxEvent, error) {
+func (f *fakeOutbox) ClaimDue(context.Context, int, time.Time) ([]domain.BookingOutboxEvent, error) {
 	return nil, nil
 }
-func (f *fakeOutbox) MarkPublished(context.Context, []uuid.UUID, time.Time) error { return nil }
+func (f *fakeOutbox) MarkPublished(context.Context, []uuid.UUID, time.Time) error     { return nil }
+func (f *fakeOutbox) Reschedule(context.Context, []domain.BookingOutboxFailure) error { return nil }
+func (f *fakeOutbox) Abandon(context.Context, []domain.BookingOutboxFailure, time.Time) error {
+	return nil
+}
 
 func (f *fakeOutbox) ExistsForBooking(_ context.Context, bookingID uuid.UUID, t domain.BookingEventType) (bool, error) {
 	for _, e := range f.created {

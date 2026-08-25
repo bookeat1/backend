@@ -1218,8 +1218,11 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	return notifications.NewDispatcher(
 		bookingrepo.NewOutbox(db), txm,
 		notifications.DispatcherConfig{
-			TickInterval: cfg.Push.DispatchTick,
-			BatchSize:    cfg.Push.DispatchBatch,
+			TickInterval:   cfg.Push.DispatchTick,
+			BatchSize:      cfg.Push.DispatchBatch,
+			RetryBaseDelay: cfg.Push.RetryBaseDelay,
+			RetryMaxDelay:  cfg.Push.RetryMaxDelay,
+			MaxAttempts:    cfg.Push.RetryMaxAttempts,
 		}, log, webPush, telegram, guestPush, feedNotifier, whatsAppNotifier)
 }
 

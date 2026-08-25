@@ -3,6 +3,7 @@ package notifications
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,34 +20,76 @@ func (noopTx) WithinTx(ctx context.Context, fn func(context.Context) error) erro
 func (noopTx) Detach(ctx context.Context) context.Context                         { return ctx }
 
 // fakeOutbox is an in-memory booking outbox implementing the drain surface the
-// dispatcher uses (ClaimUnpublished / MarkPublished). It records how many times
-// each event was claimed so a test can prove a re-claim (redelivery) happens.
+// dispatcher uses (ClaimDue / MarkPublished / Reschedule / Abandon). It mirrors
+// the SQL of migration 0083 deliberately closely — the due filter AND the
+// fresh-events-before-retries ordering — because the fairness the dispatcher
+// relies on lives in that ORDER BY, and a fake that ignored it would let a
+// starvation bug pass the test suite. It also records how many times each event
+// was claimed so a test can prove a re-claim (redelivery) happens.
 type fakeOutbox struct {
 	mu        sync.Mutex
 	events    []domain.BookingOutboxEvent
 	published map[uuid.UUID]bool
 	claims    map[uuid.UUID]int
+	// retry state, keyed by event id, exactly the three 0083 columns
+	attempts  map[uuid.UUID]int
+	nextAt    map[uuid.UUID]time.Time
+	lastErr   map[uuid.UUID]string
+	abandoned map[uuid.UUID]time.Time
 }
 
 func newFakeOutbox(evs ...domain.BookingOutboxEvent) *fakeOutbox {
-	return &fakeOutbox{events: evs, published: map[uuid.UUID]bool{}, claims: map[uuid.UUID]int{}}
+	return &fakeOutbox{
+		events: evs, published: map[uuid.UUID]bool{}, claims: map[uuid.UUID]int{},
+		attempts: map[uuid.UUID]int{}, nextAt: map[uuid.UUID]time.Time{},
+		lastErr: map[uuid.UUID]string{}, abandoned: map[uuid.UUID]time.Time{},
+	}
 }
 
 func (f *fakeOutbox) Create(context.Context, *domain.BookingOutboxEvent) error { return nil }
 
-func (f *fakeOutbox) ClaimUnpublished(_ context.Context, limit int) ([]domain.BookingOutboxEvent, error) {
+func (f *fakeOutbox) ClaimDue(_ context.Context, limit int, now time.Time) ([]domain.BookingOutboxEvent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []domain.BookingOutboxEvent
+
+	type candidate struct {
+		ev    domain.BookingOutboxEvent
+		due   time.Time // COALESCE(next_attempt_at, created_at)
+		retry bool      // attempts > 0
+	}
+	var cands []candidate
 	for _, e := range f.events {
 		if f.published[e.ID] {
 			continue
 		}
+		if _, dead := f.abandoned[e.ID]; dead {
+			continue
+		}
+		due := e.CreatedAt
+		if n, ok := f.nextAt[e.ID]; ok {
+			if n.After(now) {
+				continue
+			}
+			due = n
+		}
+		e.Attempts = f.attempts[e.ID]
+		e.LastError = f.lastErr[e.ID]
+		cands = append(cands, candidate{ev: e, due: due, retry: e.Attempts > 0})
+	}
+	// ORDER BY (attempts > 0), COALESCE(next_attempt_at, created_at)
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].retry != cands[j].retry {
+			return !cands[i].retry
+		}
+		return cands[i].due.Before(cands[j].due)
+	})
+	var out []domain.BookingOutboxEvent
+	for _, c := range cands {
 		if len(out) >= limit {
 			break
 		}
-		f.claims[e.ID]++
-		out = append(out, e)
+		f.claims[c.ev.ID]++
+		out = append(out, c.ev)
 	}
 	return out, nil
 }
@@ -64,10 +107,98 @@ func (f *fakeOutbox) MarkPublished(_ context.Context, ids []uuid.UUID, _ time.Ti
 	return nil
 }
 
+func (f *fakeOutbox) Reschedule(_ context.Context, failures []domain.BookingOutboxFailure) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, fl := range failures {
+		f.attempts[fl.ID]++
+		f.nextAt[fl.ID] = fl.NextAttemptAt
+		f.lastErr[fl.ID] = fl.LastError
+	}
+	return nil
+}
+
+func (f *fakeOutbox) Abandon(_ context.Context, failures []domain.BookingOutboxFailure, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, fl := range failures {
+		f.attempts[fl.ID]++
+		f.lastErr[fl.ID] = fl.LastError
+		f.abandoned[fl.ID] = at
+		delete(f.nextAt, fl.ID)
+	}
+	return nil
+}
+
 func (f *fakeOutbox) isPublished(id uuid.UUID) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.published[id]
+}
+
+func (f *fakeOutbox) isAbandoned(id uuid.UUID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.abandoned[id]
+	return ok
+}
+
+func (f *fakeOutbox) attemptsOf(id uuid.UUID) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempts[id]
+}
+
+func (f *fakeOutbox) lastErrorOf(id uuid.UUID) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastErr[id]
+}
+
+func (f *fakeOutbox) dueAt(id uuid.UUID) (time.Time, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, ok := f.nextAt[id]
+	return n, ok
+}
+
+// stubNotifier is a dispatcher-level channel double: it answers Interested for
+// the event types it was given and either records the event or fails with a
+// fixed error. It exists so the dispatcher's fan-out and retry behaviour can be
+// tested without dragging a real channel's settings/ledger/consent along.
+type stubNotifier struct {
+	mu      sync.Mutex
+	channel domain.NotificationChannel
+	types   map[domain.BookingEventType]bool
+	err     error
+	got     []uuid.UUID
+}
+
+func newStubNotifier(ch domain.NotificationChannel, err error, types ...domain.BookingEventType) *stubNotifier {
+	m := map[domain.BookingEventType]bool{}
+	for _, t := range types {
+		m[t] = true
+	}
+	return &stubNotifier{channel: ch, types: m, err: err}
+}
+
+func (s *stubNotifier) Channel() domain.NotificationChannel { return s.channel }
+
+func (s *stubNotifier) Interested(t domain.BookingEventType) bool { return s.types[t] }
+
+func (s *stubNotifier) Notify(_ context.Context, e Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.got = append(s.got, e.OutboxEventID)
+	return s.err
+}
+
+func (s *stubNotifier) delivered() []uuid.UUID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]uuid.UUID, len(s.got))
+	copy(out, s.got)
+	return out
 }
 
 // fakeSubs is an in-memory push-subscription repository.
