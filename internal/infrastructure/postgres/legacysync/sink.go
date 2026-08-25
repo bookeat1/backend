@@ -125,9 +125,9 @@ SET last_synced_at = EXCLUDED.last_synced_at,
 // query, for one reason: the columns that are NOT here matter as much as the
 // ones that are, and an omission inside a 12-line SQL literal is invisible.
 //
-// cuisine_type / cuisine_type_i18n are absent BY DESIGN — see the note in the
-// middle of the list. Adding them back reverts every venue's cuisine to the
-// legacy free text on the next sync run.
+// cuisine_type / cuisine_type_i18n and city are absent BY DESIGN — see the
+// notes in the middle of the list. Adding them back reverts every venue's
+// cuisine and city to the legacy value on the next sync run.
 const legacyRestaurantUpdateSet = `
  name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n, description=EXCLUDED.description,
  description_i18n=EXCLUDED.description_i18n,
@@ -136,7 +136,10 @@ const legacyRestaurantUpdateSet = `
  -- производная от него. Старая система кухню больше не трогает.
  address=EXCLUDED.address,
  address_i18n=EXCLUDED.address_i18n, opening_hours=EXCLUDED.opening_hours,
- opening_hours_i18n=EXCLUDED.opening_hours_i18n, city=EXCLUDED.city,
+ opening_hours_i18n=EXCLUDED.opening_hours_i18n,
+ -- city: НЕ ПРИСВАИВАЕТСЯ. Город — наш (ADR-023): его редактируют в нашем
+ -- кабинете, старая система им больше не владеет. Верните строку обратно —
+ -- и ближайший прогон синхронизации молча откатит правку кабинета.
  price_category=EXCLUDED.price_category, email=EXCLUDED.email, phone=EXCLUDED.phone,
  latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
  kwaaka_restaurant_id=EXCLUDED.kwaaka_restaurant_id, is_active=EXCLUDED.is_active,
@@ -155,12 +158,17 @@ const legacyRestaurantUpdateSet = `
 // text would silently revert the mapping and leave the string disagreeing with
 // the links — the single most likely way to lose this whole migration.
 //
-// The columns are still written on INSERT: a venue that appears in the legacy
-// system for the first time and has no dictionary links yet is better off with
-// its legacy string than with an empty cuisine.
+// CITY IS OURS TOO (ADR-023, decided 2026-08-25). `city` is absent from the
+// same list for the same reason: the venue's city is now edited in OUR panel
+// (PATCH /restaurants/:id, validated by usecase/restaurants against
+// domain.City.Valid()), while the legacy row keeps whatever was typed into the
+// old admin. Assigning it on update would let the next sync run silently undo
+// an edit made in the panel.
 //
-// City is NOT part of this change: it stays under legacy control until the
-// owner decides where cities are edited.
+// All three columns are still written on INSERT: a venue that appears in the
+// legacy system for the first time has no cuisine links and no city of ours
+// yet, and is better off with the legacy values than with an empty cuisine and
+// an empty city (city is NOT NULL — see migration 0002).
 func (s *Sink) UpsertRestaurant(ctx context.Context, r legacysync.Restaurant) (legacysync.Outcome, error) {
 	return exec(ctx, s.pool, `
 INSERT INTO restaurants
