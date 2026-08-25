@@ -23,6 +23,7 @@ import (
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	cityrepo "backend-core/internal/infrastructure/postgres/city"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
 	cuisinerepo "backend-core/internal/infrastructure/postgres/cuisine"
@@ -62,6 +63,7 @@ import (
 	"backend-core/internal/usecase/analytics"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	citiesuc "backend-core/internal/usecase/cities"
 	"backend-core/internal/usecase/consent"
 	"backend-core/internal/usecase/content"
 	cuisinesuc "backend-core/internal/usecase/cuisines"
@@ -97,6 +99,7 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
+	Cities             citiesuc.UseCase
 	Cuisines           cuisinesuc.UseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
 	DeviceTokens       *notifications.DeviceTokenUseCase
@@ -398,10 +401,18 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// cuisine_type string (UpdateCuisineTypeString) and restaurantManagers as
 	// the venue permission check, so the usecase depends on neither package.
 	cuisinesUC := cuisinesuc.NewUseCase(cuisinerepo.New(db), restRepo, restaurantManagers, txm)
+	// The city dictionary (migration 0081). restRepo doubles as the writer of
+	// the derived `city` string (RenameCityString), exactly as it does for
+	// cuisine_type — a rename has to reach the venues in the same transaction
+	// or the catalog and the venue disagree about where the venue is.
+	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm)
 
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
 		restaurants.WithVenueState(venueState),
-		restaurants.WithAvailabilityFilter(availabilitySearch))
+		restaurants.WithAvailabilityFilter(availabilitySearch),
+		// Teaches ?city= the dictionary: a code, a historical spelling and the
+		// Russian name all resolve to the one spelling stored on the venue.
+		restaurants.WithCityResolver(citiesUC))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
@@ -453,6 +464,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		RestaurantsFacade:     restaurantsFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
+		Cities:                citiesUC,
 		Cuisines:              cuisinesUC,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,

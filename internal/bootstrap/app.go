@@ -17,6 +17,7 @@ import (
 	adminrest "backend-core/internal/transport/rest/admin"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	citiesrest "backend-core/internal/transport/rest/cities"
 	consentrest "backend-core/internal/transport/rest/consent"
 	contentrest "backend-core/internal/transport/rest/content"
 	cuisinesrest "backend-core/internal/transport/rest/cuisines"
@@ -136,6 +137,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// plain api group rather than restPublic.
 	cuisinesHandler := cuisinesrest.NewHandler(deps.Cuisines)
 	cuisinesHandler.RegisterPublic(api)
+
+	// The city dictionary, on the SAME public path the catalog handler used to
+	// serve GET /cities from. Anonymous, like the cuisine list: the app asks
+	// for the city chips before anyone has signed in.
+	citiesHandler := citiesrest.NewHandler(deps.Cities)
+	citiesHandler.RegisterPublic(api)
 
 	// Server-side static map preview. Fully public and NOT on the OptionalAuth
 	// group: the picture is identical for every caller, so parsing a token
@@ -304,6 +311,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that
 	// could add its own would recreate «Кафе, европейская» in a new table.
 	cuisinesHandler.RegisterAdminGlobal(adminGlobal)
+	// Same rule for cities (ADR-023): the dictionary is the platform's, a
+	// venue only points at an entry.
+	citiesHandler.RegisterAdminGlobal(adminGlobal)
 
 	// Global role management. This is the endpoint that hands out the rights to
 	// every other admin endpoint, so the usecase checks the caller's role again

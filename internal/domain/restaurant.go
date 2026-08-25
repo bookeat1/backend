@@ -7,8 +7,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// City is a restaurant's city, stored as VARCHAR. Values are the raw Supabase
-// enum labels (Cyrillic).
+// City is a restaurant's city as STORED: the free-text VARCHAR column
+// restaurants.city, whose values are the raw Supabase labels (Cyrillic).
+//
+// Since migration 0081 it is no longer the source of truth — CityEntry (table
+// `cities`) is. This type stays because it is the backward-compatibility
+// contract: a store build reads the city as a string and sends the same string
+// back as ?city=, the catalog filter still compares that column, and the legacy
+// importers write it on insert. Treat it as "the rendering", not "the list".
 type City string
 
 const (
@@ -16,13 +22,18 @@ const (
 	CityAlmaty City = "Алматы"
 )
 
-// Valid reports whether c is a known city.
+// Valid reports whether c is one of the two cities that predate the
+// dictionary. It is a FALLBACK only: the authoritative check is "does this
+// spelling resolve in `cities`/`city_aliases`" (CityRepository.ResolveAlias),
+// which is what usecase/restaurants uses when a resolver is wired. Keeping the
+// constants means a service started without the dictionary still refuses
+// garbage instead of accepting anything.
 func (c City) Valid() bool { return c == CityAstana || c == CityAlmaty }
 
-// Cities lists every known city enum value, in a stable display order. There
-// is no separate cities table (spec: reuse the existing city column/enum
-// values, do not reinvent) — this is the single source of truth for a
-// "which cities are available" endpoint.
+// Cities lists the two cities the platform launched with, in the order the
+// clients have always received them. This is the SEED of migration 0081 (same
+// values, same display order) and the fallback for Valid above — the live list
+// comes from CityRepository.List.
 func Cities() []City { return []City{CityAstana, CityAlmaty} }
 
 // PriceCategory is a restaurant's price tier, stored as VARCHAR.
