@@ -47,7 +47,7 @@ func TestRelatedReplaceAndRead(t *testing.T) {
 		if err := rel.ReplaceImages(ctx, rid, []domain.Image{{ImageURL: "a.png", IsPrimary: true}}); err != nil {
 			return err
 		}
-		return rel.ReplaceFeatures(ctx, rid, []domain.Feature{{Name: "wifi", NameI18n: domain.I18n{"ru": "вайфай"}}})
+		return rel.ReplaceTags(ctx, rid, []domain.Tag{{TagName: "wifi", TagNameI18n: domain.I18n{"ru": "вайфай"}}})
 	})
 	if err != nil {
 		t.Fatalf("replace: %v", err)
@@ -60,9 +60,13 @@ func TestRelatedReplaceAndRead(t *testing.T) {
 	if len(agg.Images) != 1 || agg.Images[0].ImageURL != "a.png" {
 		t.Errorf("images = %+v", agg.Images)
 	}
-	if len(agg.Features) != 1 || agg.Features[0].NameI18n["ru"] != "вайфай" {
-		t.Errorf("features = %+v", agg.Features)
+	if len(agg.Tags) != 1 || agg.Tags[0].TagNameI18n["ru"] != "вайфай" {
+		t.Errorf("tags = %+v", agg.Tags)
 	}
+	// Features are deliberately NOT exercised here any more: since migration
+	// 0082 they are not an inline free-text collection this repository writes,
+	// they are links into the platform dictionary. Their read path is covered
+	// by TestGetByIDLoadsDictionaryFeatures in repository_features_test.go.
 }
 
 func TestUpsertFloorPlan(t *testing.T) {

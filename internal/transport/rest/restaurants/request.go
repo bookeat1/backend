@@ -35,9 +35,16 @@ type saveRestaurantRequest struct {
 	IsPremium     *bool             `json:"is_premium"`
 	DisplayOrder  *int              `json:"display_order"`
 	Images        []imageInput      `json:"images"`
-	Features      []featureInput    `json:"features"`
-	Tags          []tagInput        `json:"tags"`
-	SocialLinks   []socialInput     `json:"social_links"`
+	// Features is still PARSED, but only so that a client which still sends the
+	// old free-text array gets a clear 422 instead of a silent no-op. The
+	// free-text table behind it was dropped in migration 0082; a venue's
+	// features are now set through PUT /restaurants/:id/features by dictionary
+	// id. Nothing in this repo has ever sent this field (the admin panel does
+	// not), so refusing it breaks no known caller — and refusing beats
+	// accepting a write that would go nowhere.
+	Features    []featureInput `json:"features"`
+	Tags        []tagInput     `json:"tags"`
+	SocialLinks []socialInput  `json:"social_links"`
 }
 
 type imageInput struct {
@@ -85,12 +92,10 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 		}
 		in.Images = &imgs
 	}
-	if r.Features != nil {
-		feats := make([]domain.Feature, 0, len(r.Features))
-		for _, f := range r.Features {
-			feats = append(feats, domain.Feature{Name: f.Name, NameI18n: f.NameI18n})
-		}
-		in.Features = &feats
+	if len(r.Features) > 0 {
+		return uc.SaveInput{}, fmt.Errorf(
+			"%w: free-text `features` is no longer accepted; set them with PUT /restaurants/{id}/features using venue feature ids",
+			domain.ErrValidation)
 	}
 	if r.Tags != nil {
 		tags := make([]domain.Tag, 0, len(r.Tags))

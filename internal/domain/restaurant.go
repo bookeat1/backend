@@ -134,8 +134,12 @@ type Restaurant struct {
 // nested read the app performs on the detail screen.
 type RestaurantAggregate struct {
 	Restaurant
-	Images      []Image
-	Features    []Feature
+	Images []Image
+	// Features is the venue's feature set from the dictionary (migration
+	// 0082), in the venue's own order. Before 0082 this was a slice of
+	// free-text rows the venue typed itself; the JSON field it feeds
+	// (`features[]`) keeps the same shape.
+	Features    []VenueFeature
 	Tags        []Tag
 	SocialLinks []SocialLink
 	// Cuisines is the venue's cuisine set from the dictionary (migration
@@ -193,8 +197,12 @@ type RestaurantFilter struct {
 	IsPopular *bool
 	IsNew     *bool
 	Search    string // case-insensitive substring match on name
-	Page      int    // 1-based; <=0 means 1
-	PerPage   int    // <=0 means default (20), capped at 100
+	// Features is an AND-set of feature keys (code, name or any approved
+	// alias): a venue must carry EVERY one of them. See
+	// RestaurantSearchFilter.Features for why AND and not OR.
+	Features []string
+	Page     int // 1-based; <=0 means 1
+	PerPage  int // <=0 means default (20), capped at 100
 	// Unpaginated asks for the WHOLE matching set (up to CatalogScanLimit)
 	// instead of one page, ignoring Page/PerPage. Set only by
 	// usecase/restaurants when a VenueStateFilter is in play: that filter is
@@ -221,6 +229,15 @@ type RestaurantSearchFilter struct {
 	// an OR-set (cuisine_type IN (...)); an empty/nil slice means "any cuisine".
 	City     *City
 	Cuisines []string
+	// Features is an AND-set of feature keys (code, name or any approved
+	// alias, normalized by NormalizeFeatureKeys). A venue matches only when it
+	// carries EVERY requested feature.
+	//
+	// AND, unlike Cuisines' OR, is deliberate and product-driven: a guest who
+	// ticks «Намазхана» and «Парковка» wants both — a venue with only parking
+	// is not an answer to that question. Cuisine is the opposite: «итальянская
+	// или японская» is a choice, not a requirement (decision 2026-08-25).
+	Features []string
 	Price    *PriceCategory
 	Page     int // 1-based; <=0 means 1
 	PerPage  int // <=0 means default (20), capped at 100
@@ -256,6 +273,10 @@ type RestaurantListItem struct {
 	// Cuisines — see RestaurantAggregate.Cuisines. Loaded for the listing too,
 	// because the app builds its cuisine chips from a catalog page.
 	Cuisines []Cuisine
+	// Features — see RestaurantAggregate.Features. Loaded for the listing too:
+	// a card that offers a «Wi-Fi» filter has to be able to show why a venue
+	// matched it.
+	Features []VenueFeature
 	// VenueState — see RestaurantAggregate.VenueState. Nil = not computed.
 	VenueState *PublicVenueState
 }

@@ -8,13 +8,9 @@ import (
 	"github.com/google/uuid"
 )
 
-type Feature struct {
-	ID           uuid.UUID
-	RestaurantID uuid.UUID
-	Name         string
-	NameI18n     I18n
-	CreatedAt    time.Time
-}
+// NOTE: the free-text `Feature` type and the `restaurant_features` table it
+// mapped were removed by migration 0082. A venue's features now come from the
+// platform dictionary — see VenueFeature in venue_feature.go.
 
 type Image struct {
 	ID           uuid.UUID
@@ -142,7 +138,6 @@ type PartnershipRequest struct {
 // given set (call inside a TxManager for the parent mutation).
 type RestaurantRelatedRepository interface {
 	ListImages(ctx context.Context, restaurantID uuid.UUID) ([]Image, error)
-	ListFeatures(ctx context.Context, restaurantID uuid.UUID) ([]Feature, error)
 	ListTags(ctx context.Context, restaurantID uuid.UUID) ([]Tag, error)
 	ListSocialLinks(ctx context.Context, restaurantID uuid.UUID) ([]SocialLink, error)
 	ListWorkingHours(ctx context.Context, restaurantID uuid.UUID) ([]WorkingHours, error)
@@ -151,7 +146,6 @@ type RestaurantRelatedRepository interface {
 	GetFloorPlan(ctx context.Context, restaurantID uuid.UUID) (*FloorPlan, error)
 
 	ReplaceImages(ctx context.Context, restaurantID uuid.UUID, items []Image) error
-	ReplaceFeatures(ctx context.Context, restaurantID uuid.UUID, items []Feature) error
 	ReplaceTags(ctx context.Context, restaurantID uuid.UUID, items []Tag) error
 	ReplaceSocialLinks(ctx context.Context, restaurantID uuid.UUID, items []SocialLink) error
 	ReplaceWorkingHours(ctx context.Context, restaurantID uuid.UUID, items []WorkingHours) error

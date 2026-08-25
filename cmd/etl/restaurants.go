@@ -45,7 +45,8 @@ const etlRestaurantUpdateSet = `
 // runRestaurants upserts the restaurant catalog from raw_supabase into the clean
 // schema. Idempotent (upsert by id); FK order: categories → restaurants → children.
 //
-// A venue's cuisine and city are written on INSERT (a venue seen for the first
+// A venue's features are NOT imported at all (see the note where that step
+// used to be). A venue's cuisine and city are written on INSERT (a venue seen for the first
 // time is better off with the legacy values than with an empty cuisine, and
 // `city` is NOT NULL since migration 0002) and left alone on UPDATE — see
 // etlRestaurantUpdateSet.
@@ -74,11 +75,18 @@ func runRestaurants(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 			  display_order, COALESCE(created_at, now()), COALESCE(updated_at, now())
 			FROM raw_supabase.restaurants
 			ON CONFLICT (id) DO UPDATE SET` + etlRestaurantUpdateSet},
-		{"features", `
-			INSERT INTO restaurant_features (id, restaurant_id, name, name_i18n, created_at)
-			SELECT id, restaurant_id, name, name_i18n, COALESCE(created_at, now())
-			FROM raw_supabase.restaurant_features
-			ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n`},
+		// "features": УДАЛЁН. Особенности заведения больше не свободный текст:
+		// с миграции 0082 это справочник venue_features + связи
+		// restaurant_venue_features, а таблицы restaurant_features, в которую
+		// писал этот шаг, попросту нет.
+		//
+		// Это ТА ЖЕ дверь, что и с кухней с городом (ADR-023): импортёр
+		// запускается руками и о нём вспоминают раз в несколько месяцев.
+		// Оставленный здесь шаг либо уронил бы прогон на несуществующей
+		// таблице, либо — если бы кто-то её воссоздал — тихо вернул бы
+		// «Восточную кухню» и «Коктобе» в поле удобств.
+		// Раскладка старых формулировок сделана ОДИН РАЗ, явным списком
+		// в миграции 0082; автоматического импорта особенностей больше нет.
 		{"images", `
 			INSERT INTO restaurant_images (id, restaurant_id, image_url, is_primary, created_at)
 			SELECT id, restaurant_id, image_url, COALESCE(is_primary,false), COALESCE(created_at, now())

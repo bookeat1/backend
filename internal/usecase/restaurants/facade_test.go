@@ -40,11 +40,14 @@ func TestCreateValidatesAndSavesCollections(t *testing.T) {
 	if !repo.created.IsActive {
 		t.Error("expected new restaurant to default to active when IsActive is nil")
 	}
-	if rel.replaced != 4 { // images, features, tags, social
-		t.Errorf("replaced collections = %d, want 4", rel.replaced)
+	// Three, not four: features stopped being an inline free-text collection in
+	// migration 0082 and became links into the platform dictionary, written
+	// through usecase/venuefeatures.
+	if rel.replaced != 3 { // images, tags, social
+		t.Errorf("replaced collections = %d, want 3", rel.replaced)
 	}
-	if !rel.imagesReplaced || !rel.featuresReplaced || !rel.tagsReplaced || !rel.socialLinksReplaced {
-		t.Error("expected Create to replace all four collections, including empty ones")
+	if !rel.imagesReplaced || !rel.tagsReplaced || !rel.socialLinksReplaced {
+		t.Error("expected Create to replace all three collections, including empty ones")
 	}
 }
 
@@ -174,7 +177,7 @@ func TestUpdateOnlyReplacesProvidedCollections(t *testing.T) {
 	if !rel.imagesReplaced {
 		t.Error("expected ReplaceImages to be called since Images was provided")
 	}
-	if rel.featuresReplaced || rel.tagsReplaced || rel.socialLinksReplaced {
+	if rel.tagsReplaced || rel.socialLinksReplaced {
 		t.Error("expected features/tags/social_links to be left untouched when omitted from the request")
 	}
 	if rel.replaced != 1 {

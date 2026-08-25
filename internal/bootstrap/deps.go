@@ -53,6 +53,7 @@ import (
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
 	userrolerepo "backend-core/internal/infrastructure/postgres/userrole"
 	venuedashboardrepo "backend-core/internal/infrastructure/postgres/venuedashboard"
+	venuefeaturerepo "backend-core/internal/infrastructure/postgres/venuefeature"
 	"backend-core/internal/infrastructure/sqltx"
 	"backend-core/internal/infrastructure/staticmap/twogis"
 	"backend-core/internal/infrastructure/telegramnotify"
@@ -88,6 +89,7 @@ import (
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
+	venuefeaturesuc "backend-core/internal/usecase/venuefeatures"
 )
 
 // Deps holds the constructed usecases and shared infrastructure.
@@ -101,6 +103,7 @@ type Deps struct {
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	Cities             citiesuc.UseCase
 	Cuisines           cuisinesuc.UseCase
+	VenueFeatures      venuefeaturesuc.UseCase
 	PushSubscriptions  *notifications.SubscriptionUseCase
 	DeviceTokens       *notifications.DeviceTokenUseCase
 	NotificationFeed   *notifications.NotificationFeedUseCase
@@ -406,6 +409,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// cuisine_type — a rename has to reach the venues in the same transaction
 	// or the catalog and the venue disagree about where the venue is.
 	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm)
+	// The venue-feature dictionary (migration 0082). Unlike cuisines it has NO
+	// derived scalar column to keep in step — the free-text restaurant_features
+	// table it replaces was dropped, not kept as a rendering — so it needs no
+	// writer port, only the venue permission check.
+	venueFeaturesUC := venuefeaturesuc.NewUseCase(venuefeaturerepo.New(db), restaurantManagers, txm)
 
 	restaurantsFacade := restaurants.NewFacade(restRepo, restRelated, restCategories, restPartners, txm,
 		restaurants.WithVenueState(venueState),
@@ -466,6 +474,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		MyRestaurants:         myRestaurants,
 		Cities:                citiesUC,
 		Cuisines:              cuisinesUC,
+		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,
 		NotificationFeed:      notificationFeed,

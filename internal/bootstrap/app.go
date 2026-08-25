@@ -47,6 +47,7 @@ import (
 	ticketsrest "backend-core/internal/transport/rest/tickets"
 	usersrest "backend-core/internal/transport/rest/users"
 	venuedashboardrest "backend-core/internal/transport/rest/venuedashboard"
+	venuefeaturesrest "backend-core/internal/transport/rest/venuefeatures"
 )
 
 // HTTP server timeouts. httpWriteTimeout is a named constant rather than a
@@ -137,6 +138,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// plain api group rather than restPublic.
 	cuisinesHandler := cuisinesrest.NewHandler(deps.Cuisines)
 	cuisinesHandler.RegisterPublic(api)
+
+	// The venue-feature dictionary («Удобства»). Same anonymous public read as
+	// the cuisines: the app's filter sheet must build its list from the SERVER
+	// instead of the seven hardcoded ids it used to draw — that hardcoded list
+	// is exactly why the filter changed nothing at all.
+	venueFeaturesHandler := venuefeaturesrest.NewHandler(deps.VenueFeatures)
+	venueFeaturesHandler.RegisterPublic(api)
 
 	// The city dictionary, on the SAME public path the catalog handler used to
 	// serve GET /cities from. Anonymous, like the cuisine list: the app asks
@@ -311,6 +319,8 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that
 	// could add its own would recreate «Кафе, европейская» in a new table.
 	cuisinesHandler.RegisterAdminGlobal(adminGlobal)
+	// Same rule for the feature dictionary: the platform owns the list.
+	venueFeaturesHandler.RegisterAdminGlobal(adminGlobal)
 	// Same rule for cities (ADR-023): the dictionary is the platform's, a
 	// venue only points at an entry.
 	citiesHandler.RegisterAdminGlobal(adminGlobal)
@@ -373,6 +383,8 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// A venue PICKS its cuisines from the dictionary — same venue-scoped gate
 	// as the rest of its profile.
 	cuisinesHandler.RegisterRestaurantScoped(restScoped)
+	// ...and its features, from the same dictionary, behind the same gate.
+	venueFeaturesHandler.RegisterRestaurantScoped(restScoped)
 
 	menuScoped := authed.Group("")
 	menuScoped.Use(middleware.RequireRestaurantManager(deps.RestaurantManagers, "id"))

@@ -21,11 +21,14 @@ import (
 // 78 would fail every other package in the suite.
 const cuisinesMigrationVersion = 80
 
-// cuisineMigrationSteps is how many migrations the cuisine feature spans (0079
+// cuisineMigrationFloor is the version JUST BELOW the cuisine feature (0079
 // structure + transfer, 0080 the owner-approved layout of the disputed
-// spellings). A round trip has to revert BOTH, or the "down" half only ever
-// exercises the last one.
-const cuisineMigrationSteps = 2
+// spellings). The round trip reverts down TO this version rather than counting
+// a fixed number of steps: counting steps silently stops reverting the cuisine
+// migrations the moment anything is stacked on top of them, and the test then
+// keeps passing while exercising nothing — which is exactly what happened when
+// 0081 and 0082 landed.
+const cuisineMigrationFloor = 78
 
 // gooseDB opens goose's database/sql handle onto the same TEST_DATABASE_URL the
 // pgx pool uses. goose needs *sql.DB; the repositories need a pgx pool. Both
@@ -50,10 +53,8 @@ func gooseDB(t *testing.T) *sql.DB {
 func downThenUp(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
-	for i := 0; i < cuisineMigrationSteps; i++ {
-		if err := goose.DownContext(ctx, db, "."); err != nil {
-			t.Fatalf("goose down (step %d): %v", i+1, err)
-		}
+	if err := goose.DownToContext(ctx, db, ".", cuisineMigrationFloor); err != nil {
+		t.Fatalf("goose down to %d: %v", cuisineMigrationFloor, err)
 	}
 	if err := goose.UpContext(ctx, db, "."); err != nil {
 		t.Fatalf("goose up: %v", err)

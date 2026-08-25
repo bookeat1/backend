@@ -177,3 +177,75 @@ VALUES ($1,'Rest One','d','italian','addr','10-22','Алматы','₸₸','r@x.
 		t.Errorf("city = %q, want OUR value untouched by the importer", city)
 	}
 }
+
+// TestETLDoesNotImportFreeTextFeatures guards the THIRD thing this importer used
+// to own. Until migration 0082 it copied raw_supabase.restaurant_features
+// verbatim — the table where the old system kept a cuisine («Восточная кухня»),
+// a district («Коктобе») and a sound-engineering spec under the same column as
+// «Wi-Fi».
+//
+// Two failures are possible and both are covered by one run: the step could
+// still exist and blow up on the table that no longer exists (the importer must
+// finish cleanly), or someone could recreate the table and have the step
+// quietly re-import the mess on top of the approved dictionary links (the
+// venue's feature set must be exactly what we assigned).
+func TestETLDoesNotImportFreeTextFeatures(t *testing.T) {
+	db := etlDB(t)
+	ctx := context.Background()
+	log := logger.New("error", "text")
+
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO raw_supabase.restaurants
+ (id, name, description, cuisine_type, address, opening_hours, city, price_category,
+  email, phone, is_active, created_at, updated_at)
+VALUES ($1,'Rest Two','d','italian','addr','10-22','Алматы','₸₸','r@x.kz','+7700',true, now(), now())`,
+		etlVenue); err != nil {
+		t.Fatalf("seed staging venue: %v", err)
+	}
+	// The dump still carries its free-text "features" — that is the point.
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO raw_supabase.restaurant_features (id, restaurant_id, name, created_at)
+VALUES (gen_random_uuid(), $1, 'Восточная кухня', now()),
+       (gen_random_uuid(), $1, 'Коктобе', now())`, etlVenue); err != nil {
+		t.Fatalf("seed staging features: %v", err)
+	}
+
+	if err := runRestaurants(ctx, db, log); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+
+	// WE assign a feature, the way the panel will.
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO restaurant_venue_features (restaurant_id, feature_id, position)
+SELECT $1, id, 0 FROM venue_features WHERE code = 'wifi'`, etlVenue); err != nil {
+		t.Fatalf("assign our feature: %v", err)
+	}
+
+	// Someone runs the importer again by hand, months later.
+	if err := runRestaurants(ctx, db, log); err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+SELECT f.code FROM restaurant_venue_features rvf
+  JOIN venue_features f ON f.id = rvf.feature_id
+ WHERE rvf.restaurant_id = $1 ORDER BY rvf.position`, etlVenue)
+	if err != nil {
+		t.Fatalf("read features: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, code)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read features: %v", err)
+	}
+	if len(got) != 1 || got[0] != "wifi" {
+		t.Errorf("features after the importer ran = %v, want exactly [wifi] — ours, untouched", got)
+	}
+}

@@ -172,11 +172,37 @@ type imageResponse struct {
 	ImageURL  string `json:"image_url"`
 	IsPrimary bool   `json:"is_primary"`
 }
+
+// featureResponse is one of the venue's features. The shape is unchanged from
+// when these rows were free text (migration 0082 dropped that table): same
+// three fields, so a client mapper written against the old payload still
+// parses. `code` is additive — it is the stable, language-independent key the
+// filter travels by, and the app keys its icon off it.
 type featureResponse struct {
 	ID       string            `json:"id"`
+	Code     string            `json:"code,omitempty"`
 	Name     string            `json:"name"`
 	NameI18n map[string]string `json:"name_i18n,omitempty"`
 }
+
+// featuresToResponse renders a venue's feature set, resolving each name into
+// the requested locale (falling back to the Russian base, never to a blank).
+func featuresToResponse(items []domain.VenueFeature, lang string) []featureResponse {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]featureResponse, 0, len(items))
+	for _, f := range items {
+		out = append(out, featureResponse{
+			ID:       f.ID.String(),
+			Code:     f.Code,
+			Name:     f.NameI18n.Resolve(lang, f.Name),
+			NameI18n: f.NameI18n,
+		})
+	}
+	return out
+}
+
 type tagResponse struct {
 	ID          string            `json:"id"`
 	TagName     string            `json:"tag_name"`
@@ -269,6 +295,9 @@ func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantRes
 	resp.PrimaryImage = it.PrimaryImage
 	resp.Cuisines = cuisinesToResponse(it.Cuisines, lang)
 	applyDerivedCuisineType(&resp, it.Cuisines, lang)
+	// Features travel with the LISTING too, not just the detail read: a card
+	// shown under a «Wi-Fi» filter has to be able to say why it matched.
+	resp.Features = featuresToResponse(it.Features, lang)
 	applyVenueState(&resp, it.VenueState)
 	return resp
 }
@@ -295,9 +324,7 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 			resp.PrimaryImage = &u
 		}
 	}
-	for _, f := range a.Features {
-		resp.Features = append(resp.Features, featureResponse{ID: f.ID.String(), Name: f.Name, NameI18n: f.NameI18n})
-	}
+	resp.Features = featuresToResponse(a.Features, lang)
 	for _, t := range a.Tags {
 		resp.Tags = append(resp.Tags, tagResponse{ID: t.ID.String(), TagName: t.TagName, TagNameI18n: t.TagNameI18n})
 	}

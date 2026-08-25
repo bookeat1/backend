@@ -152,8 +152,12 @@ type SaveInput struct {
 	IsPremium    *bool
 	DisplayOrder *int
 
-	Images      *[]domain.Image // nil = collection not provided (preserve on Update)
-	Features    *[]domain.Feature
+	Images *[]domain.Image // nil = collection not provided (preserve on Update)
+	// NOTE: there is no Features field. A venue's features stopped being a
+	// free-text inline collection in migration 0082 and became links into the
+	// platform dictionary; they are written through usecase/venuefeatures
+	// (PUT /restaurants/:id/features), which is also where the "may this user
+	// edit this venue" check for them lives.
 	Tags        *[]domain.Tag
 	SocialLinks *[]domain.SocialLink
 }
@@ -410,14 +414,11 @@ func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domai
 	return f.repo.GetByID(ctx, id)
 }
 
-// saveAllCollections replaces all four inline collections, treating a nil
+// saveAllCollections replaces the inline collections, treating a nil
 // pointer as an explicitly empty collection. Used by Create, where a
 // brand-new restaurant has no prior rows to preserve.
 func (f *facade) saveAllCollections(ctx context.Context, in SaveInput, rid uuid.UUID) error {
 	if err := f.related.ReplaceImages(ctx, rid, deref(in.Images)); err != nil {
-		return err
-	}
-	if err := f.related.ReplaceFeatures(ctx, rid, deref(in.Features)); err != nil {
 		return err
 	}
 	if err := f.related.ReplaceTags(ctx, rid, deref(in.Tags)); err != nil {
@@ -432,11 +433,6 @@ func (f *facade) saveAllCollections(ctx context.Context, in SaveInput, rid uuid.
 func (f *facade) saveProvidedCollections(ctx context.Context, in SaveInput, rid uuid.UUID) error {
 	if in.Images != nil {
 		if err := f.related.ReplaceImages(ctx, rid, *in.Images); err != nil {
-			return err
-		}
-	}
-	if in.Features != nil {
-		if err := f.related.ReplaceFeatures(ctx, rid, *in.Features); err != nil {
 			return err
 		}
 	}
