@@ -81,16 +81,12 @@ type fakeRelated struct {
 	replaced int
 
 	imagesReplaced      bool
-	featuresReplaced    bool
 	tagsReplaced        bool
 	socialLinksReplaced bool
 }
 
 func (f *fakeRelated) ListImages(context.Context, uuid.UUID) ([]domain.Image, error) { return nil, nil }
-func (f *fakeRelated) ListFeatures(context.Context, uuid.UUID) ([]domain.Feature, error) {
-	return nil, nil
-}
-func (f *fakeRelated) ListTags(context.Context, uuid.UUID) ([]domain.Tag, error) { return nil, nil }
+func (f *fakeRelated) ListTags(context.Context, uuid.UUID) ([]domain.Tag, error)     { return nil, nil }
 func (f *fakeRelated) ListSocialLinks(context.Context, uuid.UUID) ([]domain.SocialLink, error) {
 	return nil, nil
 }
@@ -109,11 +105,6 @@ func (f *fakeRelated) GetFloorPlan(context.Context, uuid.UUID) (*domain.FloorPla
 func (f *fakeRelated) ReplaceImages(context.Context, uuid.UUID, []domain.Image) error {
 	f.replaced++
 	f.imagesReplaced = true
-	return nil
-}
-func (f *fakeRelated) ReplaceFeatures(context.Context, uuid.UUID, []domain.Feature) error {
-	f.replaced++
-	f.featuresReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceTags(context.Context, uuid.UUID, []domain.Tag) error {

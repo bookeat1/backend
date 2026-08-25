@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/logging"
 	"backend-core/internal/transport/rest/middleware"
 	"backend-core/internal/transport/rest/response"
 	uc "backend-core/internal/usecase/restaurants"
@@ -140,6 +141,7 @@ func (h *Handler) list(c *gin.Context) {
 			f.IsNew = &b
 		}
 	}
+	f.Features = featureKeys(c)
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
 
@@ -158,6 +160,32 @@ func (h *Handler) list(c *gin.Context) {
 	h.attachFavorites(c.Request.Context(), out, ids)
 	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// featureKeys reads the «Удобства» filter off the query string.
+//
+// Accepts both shapes, exactly like ?cuisine=: repeated
+// (?features=wifi&features=parking) or one comma-separated value
+// (?features=wifi,parking). Blank entries are dropped; the repository
+// normalizes and de-duplicates what is left.
+//
+// The values are feature CODES (`wifi`), but a name or any approved alias works
+// too — migration 0082 seeds both as aliases. Codes are what a client should
+// send: they do not change when the Russian label is edited, and they do not
+// depend on the guest's language.
+//
+// The set is AND-combined downstream: ?features=prayer_room,parking means "both",
+// not "either". See appendFeatureConds in the restaurant repository.
+func featureKeys(c *gin.Context) []string {
+	var out []string
+	for _, raw := range c.QueryArray("features") {
+		for _, part := range strings.Split(raw, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // venueStateFilter reads the two server-computed catalog filters off the query
@@ -257,6 +285,7 @@ func (h *Handler) search(c *gin.Context) {
 			}
 		}
 	}
+	f.Features = featureKeys(c)
 	if v := c.Query("price"); v != "" {
 		price := domain.PriceCategory(v)
 		f.Price = &price
@@ -277,8 +306,34 @@ func (h *Handler) search(c *gin.Context) {
 		ids = append(ids, it.Restaurant.ID)
 	}
 	h.attachFavorites(c.Request.Context(), out, ids)
+	logFeatureDemand(c, f.Features, total)
 	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// logFeatureDemand writes ONE structured line per search that actually used the
+// «Удобства» filter, so "how often did anyone filter by Винная карта" can be
+// answered from the logs already shipped to Grafana (ADR-004) instead of a new
+// analytics pipeline. The owner asked to measure demand for that one feature
+// specifically before deciding whether it stays in the filter.
+//
+// This is NOT the product-analytics path. internal/usecase/analytics ships to
+// Amplitude by re-reading the transactional booking/payment outboxes; a search
+// is a read with no state transition and has no outbox to hang off, so forcing
+// it in would mean inventing a write. The guest-side counterpart belongs in the
+// app's own trackEvent (apps/mobile/src/lib/analytics.ts), which already fires
+// a `search` event — that is a frontend change, not this one.
+//
+// Contents are feature CODES and a result count: no query text, no user id, no
+// ip. Nothing here identifies a guest.
+func logFeatureDemand(c *gin.Context, keys []string, total int) {
+	if len(keys) == 0 {
+		return
+	}
+	logging.FromContext(c.Request.Context()).Info("catalog.feature_filter",
+		slog.Any("features", keys),
+		slog.Int("results", total),
+	)
 }
 
 func (h *Handler) get(c *gin.Context) {

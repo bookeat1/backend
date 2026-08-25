@@ -16,6 +16,7 @@ import (
 
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/postgres/cuisine"
+	"backend-core/internal/infrastructure/postgres/venuefeature"
 	"backend-core/internal/infrastructure/sqltx"
 )
 
@@ -269,9 +270,6 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Restaur
 	if agg.Images, err = rel.ListImages(ctx, id); err != nil {
 		return nil, err
 	}
-	if agg.Features, err = rel.ListFeatures(ctx, id); err != nil {
-		return nil, err
-	}
 	if agg.Tags, err = rel.ListTags(ctx, id); err != nil {
 		return nil, err
 	}
@@ -283,6 +281,13 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Restaur
 		return nil, err
 	}
 	agg.Cuisines = byVenue[id]
+	// Features come from the platform dictionary since migration 0082 — the
+	// free-text restaurant_features table this used to read was dropped there.
+	featByVenue, err := venuefeature.New(r.pool).ListByRestaurants(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	agg.Features = featByVenue[id]
 	return agg, nil
 }
 
@@ -311,6 +316,9 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	}
 	if f.IsNew != nil {
 		add("r.is_new = $%d", *f.IsNew)
+	}
+	if keys := domain.NormalizeFeatureKeys(f.Features); len(keys) > 0 {
+		where, args = appendFeatureConds(where, args, keys)
 	}
 	if s := strings.TrimSpace(f.Search); s != "" {
 		// Escape LIKE wildcards so a term containing % or _ matches literally
@@ -352,6 +360,9 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	if err := r.attachCuisines(ctx, items); err != nil {
 		return nil, 0, err
 	}
+	if err := r.attachFeatures(ctx, items); err != nil {
+		return nil, 0, err
+	}
 	return items, total, nil
 }
 
@@ -374,6 +385,28 @@ func (r *Repository) attachCuisines(ctx context.Context, items []domain.Restaura
 	}
 	for i := range items {
 		items[i].Cuisines = byVenue[items[i].Restaurant.ID]
+	}
+	return nil
+}
+
+// attachFeatures does for the feature set what attachCuisines does for
+// cuisines: one extra query per page, loaded in the repository so the catalog,
+// the search and the favorites screen all render the same venue with the same
+// features.
+func (r *Repository) attachFeatures(ctx context.Context, items []domain.RestaurantListItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	for i := range items {
+		ids = append(ids, items[i].Restaurant.ID)
+	}
+	byVenue, err := venuefeature.New(r.pool).ListByRestaurants(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		items[i].Features = byVenue[items[i].Restaurant.ID]
 	}
 	return nil
 }
@@ -420,6 +453,41 @@ const cuisineMatchExpr = `(
 	            WHERE lower(btrim(part)) = ANY($%d::text[]))
 )`
 
+// featureVenueMatchExpr matches a venue that carries ONE feature, identified by
+// any approved spelling: the feature's own name, its code, or a row in
+// venue_feature_aliases (both name and code are seeded as aliases by migration
+// 0082, so this single lookup covers all three).
+//
+// $%d is a single text key, cast explicitly — same 42P08 discipline as the
+// cuisine expression next door.
+const featureVenueMatchExpr = `EXISTS (
+	SELECT 1 FROM restaurant_venue_features rvf
+	  JOIN venue_feature_aliases fa ON fa.feature_id = rvf.feature_id
+	 WHERE rvf.restaurant_id = r.id AND fa.alias = $%d::text)`
+
+// appendFeatureConds AND-combines one EXISTS per requested feature.
+//
+// AND, not OR, and that is the whole point (decision 2026-08-25): a guest who
+// ticked «Намазхана» and «Парковка» is asking for a place with both, and a
+// venue with only one of them is not an answer. Cuisine is the opposite — see
+// cuisineMatchExpr, which is a single OR-set.
+//
+// One subquery per key rather than a `GROUP BY ... HAVING count(*) = n` because
+// the planner can drive each EXISTS off idx_restaurant_venue_features_feature
+// and stop at the first hit, and because it degrades honestly: an unknown key
+// (a typo, or a feature no venue carries) simply matches nothing, which is the
+// truthful answer to "show me venues with X" — never a silently dropped filter.
+//
+// It returns the grown args/where slices, in the same shape the callers' local
+// `add` helper uses.
+func appendFeatureConds(where []string, args []any, keys []string) ([]string, []any) {
+	for _, k := range keys {
+		args = append(args, k)
+		where = append(where, fmt.Sprintf(featureVenueMatchExpr, len(args)))
+	}
+	return where, args
+}
+
 const searchTextExpr = `restaurant_search_text(r.name, r.description, r.name_i18n, r.description_i18n)`
 
 // Search implements domain.RestaurantRepository.Search: a full-text +
@@ -440,6 +508,9 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 		// a single placeholder.
 		args = append(args, keys)
 		where = append(where, fmt.Sprintf(cuisineMatchExpr, len(args), len(args), len(args)))
+	}
+	if keys := domain.NormalizeFeatureKeys(f.Features); len(keys) > 0 {
+		where, args = appendFeatureConds(where, args, keys)
 	}
 	if f.Price != nil {
 		add("r.price_category = $%d", string(*f.Price))
@@ -509,6 +580,9 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 		return nil, 0, fmt.Errorf("search restaurants: %w", err)
 	}
 	if err := r.attachCuisines(ctx, items); err != nil {
+		return nil, 0, err
+	}
+	if err := r.attachFeatures(ctx, items); err != nil {
 		return nil, 0, err
 	}
 	return items, total, nil

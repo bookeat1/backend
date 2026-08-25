@@ -40,27 +40,6 @@ func (r *Related) ListImages(ctx context.Context, rid uuid.UUID) ([]domain.Image
 	return out, rows.Err()
 }
 
-func (r *Related) ListFeatures(ctx context.Context, rid uuid.UUID) ([]domain.Feature, error) {
-	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT id, restaurant_id, name, name_i18n, created_at
-		 FROM restaurant_features WHERE restaurant_id=$1 ORDER BY created_at`, rid)
-	if err != nil {
-		return nil, fmt.Errorf("list features: %w", err)
-	}
-	defer rows.Close()
-	var out []domain.Feature
-	for rows.Next() {
-		var f domain.Feature
-		var i18n []byte
-		if err := rows.Scan(&f.ID, &f.RestaurantID, &f.Name, &i18n, &f.CreatedAt); err != nil {
-			return nil, err
-		}
-		f.NameI18n = i18nFromDB(i18n)
-		out = append(out, f)
-	}
-	return out, rows.Err()
-}
-
 func (r *Related) ListTags(ctx context.Context, rid uuid.UUID) ([]domain.Tag, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT id, restaurant_id, tag_name, tag_name_i18n, created_at
@@ -192,23 +171,6 @@ func (r *Related) ReplaceImages(ctx context.Context, rid uuid.UUID, items []doma
 			`INSERT INTO restaurant_images (id, restaurant_id, image_url, is_primary, created_at)
 			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].ImageURL, items[i].IsPrimary); err != nil {
 			return fmt.Errorf("replace images: %w", err)
-		}
-	}
-	return nil
-}
-
-func (r *Related) ReplaceFeatures(ctx context.Context, rid uuid.UUID, items []domain.Feature) error {
-	if err := r.del(ctx, "restaurant_features", rid); err != nil {
-		return fmt.Errorf("replace features: %w", err)
-	}
-	for i := range items {
-		if items[i].ID == uuid.Nil {
-			items[i].ID = uuid.New()
-		}
-		if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
-			`INSERT INTO restaurant_features (id, restaurant_id, name, name_i18n, created_at)
-			 VALUES ($1,$2,$3,$4,now())`, items[i].ID, rid, items[i].Name, i18nToDB(items[i].NameI18n)); err != nil {
-			return fmt.Errorf("replace features: %w", err)
 		}
 	}
 	return nil

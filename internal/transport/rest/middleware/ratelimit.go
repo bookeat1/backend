@@ -240,7 +240,10 @@ var routeTiers = map[string]RateLimitTier{
 	"GET /api/v1/restaurant-categories": TierSoft,
 	// The cuisine dictionary is fetched once per app launch and is tiny;
 	// browsing tier, same as the other public reference reads.
-	"GET /api/v1/cuisines":                     TierSoft,
+	"GET /api/v1/cuisines": TierSoft,
+	// Same for the venue-feature dictionary: the app's filter sheet fetches it
+	// once when the sheet opens, and it is a handful of rows.
+	"GET /api/v1/venue-features":               TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,
