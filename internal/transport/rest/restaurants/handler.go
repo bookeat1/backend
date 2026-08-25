@@ -42,7 +42,6 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/restaurants/search", h.search)
 	rg.GET("/restaurants/:id", h.get)
 	rg.GET("/restaurant-categories", h.categories)
-	rg.GET("/cities", h.cities)
 	rg.POST("/partnership-requests", h.submitPartnership)
 }
 
@@ -331,16 +330,9 @@ func (h *Handler) attachFavorites(ctx context.Context, out []restaurantResponse,
 	}
 }
 
-// cities lists the catalog's known cities (spec: reuse the existing city
-// enum values, don't reinvent a cities table).
-func (h *Handler) cities(c *gin.Context) {
-	cities := domain.Cities()
-	out := make([]string, 0, len(cities))
-	for _, ct := range cities {
-		out = append(out, string(ct))
-	}
-	response.OK(c.Writer, out)
-}
+// GET /cities used to live here, backed by the two constants in
+// internal/domain. Since migration 0081 the cities are a dictionary table and
+// the route belongs to transport/rest/cities — same path, same default body.
 
 func (h *Handler) categories(c *gin.Context) {
 	cats, err := h.facade.Categories(c.Request.Context())

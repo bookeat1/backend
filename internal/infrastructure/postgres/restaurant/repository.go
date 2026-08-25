@@ -137,6 +137,29 @@ func (r *Repository) UpdateCuisineTypeString(ctx context.Context, id uuid.UUID, 
 	return nil
 }
 
+// RenameCityString rewrites ONLY the derived city string of every venue linked
+// to a city, after the dictionary entry was renamed (see usecase/cities).
+//
+// `restaurants.city` is the backward-compatibility rendering of `city_id`
+// exactly the way `cuisine_type` renders `restaurant_cuisines`: a store build
+// reads that one string and sends it back as ?city=. Leaving it at the old
+// spelling after a rename would make the venue's own screen and the catalog
+// filter disagree about where the venue is.
+//
+// Scoped by city_id (not by the old string): a venue whose string was already
+// out of sync still gets fixed, and a venue in another city can never be
+// touched. Returns the number of venues rewritten — the caller logs it, and a
+// surprising number is the first sign a rename hit more than intended.
+func (r *Repository) RenameCityString(ctx context.Context, cityID uuid.UUID, name string) (int64, error) {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants SET city=$2, updated_at=now()
+		 WHERE city_id=$1 AND city IS DISTINCT FROM $2`, cityID, name)
+	if err != nil {
+		return 0, fmt.Errorf("rename venue city string: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *Repository) SetActive(ctx context.Context, id uuid.UUID, active bool) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE restaurants SET is_active=$2, updated_at=now() WHERE id=$1`, id, active)

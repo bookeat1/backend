@@ -47,6 +47,31 @@ type facade struct {
 	// it is refused (see filterByAvailability) rather than answered with the
 	// unfiltered catalog.
 	availability availabilityFilter
+
+	// cities is the optional city-dictionary resolver (see WithCityResolver).
+	// Nil unless wired; the catalog then behaves exactly as it did before
+	// migration 0081 — the raw ?city= string is compared to the stored column
+	// and a venue's city is validated against the two legacy constants.
+	cities cityResolver
+}
+
+// cityResolver is the minimal slice of usecase/cities this package needs:
+// "which dictionary entry does this written spelling mean". Declared here and
+// bound in bootstrap/deps.go, so the catalog never depends on the dictionary
+// package itself.
+//
+// A nil *domain.CityEntry with a nil error means "no such city" — that is a
+// normal answer for a filter value typed by a client, not a failure.
+type cityResolver interface {
+	Resolve(ctx context.Context, raw string) (*domain.CityEntry, error)
+}
+
+// WithCityResolver teaches the catalog the city dictionary: ?city= starts
+// accepting a city CODE (?city=almaty) and any registered spelling next to the
+// Russian name it has always accepted, and a venue's city is validated against
+// the dictionary instead of two constants in the code.
+func WithCityResolver(r cityResolver) FacadeOption {
+	return func(f *facade) { f.cities = r }
 }
 
 // availabilityFilter is the minimal slice of the booking engine this package
@@ -146,6 +171,7 @@ type PartnershipInput struct {
 }
 
 func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
+	flt.City = f.canonicalCity(ctx, flt.City)
 	if !vs.Active() {
 		items, total, err := f.repo.ListActive(ctx, flt)
 		if err != nil {
@@ -165,6 +191,7 @@ func (f *facade) List(ctx context.Context, flt domain.RestaurantFilter, vs domai
 }
 
 func (f *facade) Search(ctx context.Context, flt domain.RestaurantSearchFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
+	flt.City = f.canonicalCity(ctx, flt.City)
 	if !vs.Active() {
 		items, total, err := f.repo.Search(ctx, flt)
 		if err != nil {
@@ -327,6 +354,9 @@ func (f *facade) Create(ctx context.Context, in SaveInput) (*domain.RestaurantAg
 	if err := validateProvided(in); err != nil {
 		return nil, err
 	}
+	if err := f.validateCity(ctx, in); err != nil {
+		return nil, err
+	}
 	rest := domain.Restaurant{ID: uuid.New(), IsActive: true}
 	applyRestaurant(&rest, in)
 	if err := validateRestaurant(rest); err != nil {
@@ -349,6 +379,9 @@ func (f *facade) Create(ctx context.Context, in SaveInput) (*domain.RestaurantAg
 
 func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domain.RestaurantAggregate, error) {
 	if err := validateProvided(in); err != nil {
+		return nil, err
+	}
+	if err := f.validateCity(ctx, in); err != nil {
 		return nil, err
 	}
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
@@ -517,12 +550,79 @@ func validateProvided(in SaveInput) error {
 	if in.Name != nil && strings.TrimSpace(*in.Name) == "" {
 		return domain.ErrValidation
 	}
-	if in.City != nil && !domain.City(*in.City).Valid() {
-		return domain.ErrValidation
-	}
+	// The city is NOT checked here: since migration 0081 the answer lives in
+	// the dictionary and needs a context and a query — see facade.validateCity.
 	if in.PriceCategory != nil && !domain.PriceCategory(*in.PriceCategory).Valid() {
 		return domain.ErrValidation
 	}
+	return nil
+}
+
+// canonicalCity turns whatever a client put in ?city= into the spelling that
+// is actually stored in restaurants.city — the only thing the catalog query
+// compares against.
+//
+// This is what lets one server answer three generations of client at once: the
+// store build sends «Алматы», a new build may send «almaty», and a stale one
+// may still send a city's previous name (kept as an alias on rename). All three
+// resolve to the same stored spelling.
+//
+// It never fails the request. An unknown value is passed through untouched, so
+// the behaviour is exactly what it was before the dictionary existed: the
+// filter matches nothing. A resolver ERROR is logged and also passed through —
+// a dictionary outage must not turn a browsable catalog into a 500.
+func (f *facade) canonicalCity(ctx context.Context, in *domain.City) *domain.City {
+	if in == nil || f.cities == nil || strings.TrimSpace(string(*in)) == "" {
+		return in
+	}
+	entry, err := f.cities.Resolve(ctx, string(*in))
+	if err != nil {
+		slog.Warn("city dictionary lookup failed, filtering by the raw value",
+			"city", string(*in), "error", err)
+		return in
+	}
+	if entry == nil {
+		return in
+	}
+	v := domain.City(entry.Name)
+	return &v
+}
+
+// validateCity checks a venue's city against the DICTIONARY, which is the whole
+// point of having one: before it, `city` was a free varchar and the only guard
+// was two constants compiled into the binary, so a third city could not be
+// added without a release.
+//
+// Two rules beyond "it must exist":
+//   - a HIDDEN city cannot be newly assigned. Hiding has to actually stop a
+//     city spreading, or «скрыть» means nothing.
+//   - the stored value is the dictionary's own spelling, not the caller's.
+//     The database trigger would normalize it anyway; doing it here means the
+//     response echoes what was really saved.
+//
+// Without a resolver wired the old constant check stands — a service started
+// without the dictionary still refuses garbage rather than accepting anything.
+func (f *facade) validateCity(ctx context.Context, in SaveInput) error {
+	if in.City == nil {
+		return nil
+	}
+	if f.cities == nil {
+		if !domain.City(*in.City).Valid() {
+			return fmt.Errorf("%w: unknown city %q", domain.ErrValidation, *in.City)
+		}
+		return nil
+	}
+	entry, err := f.cities.Resolve(ctx, *in.City)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return fmt.Errorf("%w: unknown city %q", domain.ErrValidation, *in.City)
+	}
+	if !entry.IsActive {
+		return fmt.Errorf("%w: city %q is hidden", domain.ErrValidation, entry.Code)
+	}
+	*in.City = entry.Name
 	return nil
 }
 
