@@ -374,3 +374,230 @@ func TestReplace_AccountlessBookingStaffOnly(t *testing.T) {
 		[]Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrNotFound)
 }
+
+// ---- the confirmed-booking lock -------------------------------------------
+
+// mustCode asserts the error carries a specific machine-readable code — the
+// contract the mobile app branches on. The message text is not a contract.
+func mustCode(t *testing.T, err error, want domain.ErrorCode) {
+	t.Helper()
+	got, ok := domain.CodeOf(err)
+	if !ok {
+		t.Fatalf("err = %v carries no error code, want %q", err, want)
+	}
+	if got != want {
+		t.Fatalf("error code = %q, want %q", got, want)
+	}
+}
+
+// Once the booking is CONFIRMED the guest may no longer change the pre-order:
+// the venue has accepted the order and plans the kitchen around it. The refusal
+// is a distinguishable code, not a generic validation string.
+func TestReplace_GuestBlockedOnConfirmedBooking(t *testing.T) {
+	owner := uuid.New()
+	h := newHarness(t, &owner, domain.BookingConfirmed, nil)
+	actor := Actor{UserID: owner, Role: domain.RoleUser}
+
+	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+	mustErr(t, err, domain.ErrValidation)
+	mustCode(t, err, domain.CodePreorderLocked)
+	if h.items.replaceCalls != 0 {
+		t.Errorf("replace was called by the guest on a confirmed booking")
+	}
+
+	// Clearing the pre-order is a change too — the guest cannot empty it either.
+	_, err = h.uc.Replace(context.Background(), actor, h.booking.ID, nil)
+	mustCode(t, err, domain.CodePreorderLocked)
+	if h.items.replaceCalls != 0 {
+		t.Errorf("guest cleared the pre-order of a confirmed booking")
+	}
+}
+
+// The lock is scoped to `confirmed` only: pending and waitlist bookings stay
+// fully editable by the guest, which is the normal pre-order flow.
+func TestReplace_GuestStillAllowedOnPendingAndWaitlist(t *testing.T) {
+	for _, st := range []domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist} {
+		t.Run(string(st), func(t *testing.T) {
+			owner := uuid.New()
+			h := newHarness(t, &owner, st, nil)
+			actor := Actor{UserID: owner, Role: domain.RoleUser}
+
+			p, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+			if err != nil {
+				t.Fatalf("guest replace on %s: %v", st, err)
+			}
+			if p.TotalMinor != 450000 {
+				t.Errorf("total = %d, want 450000", p.TotalMinor)
+			}
+			if h.items.replaceCalls != 1 {
+				t.Errorf("replace calls = %d, want 1", h.items.replaceCalls)
+			}
+		})
+	}
+}
+
+// The venue KEEPS the ability after confirmation: it is the party that cooks
+// the order and takes the phone call when a dish runs out. Same for an admin.
+func TestReplace_VenueStaffAllowedOnConfirmedBooking(t *testing.T) {
+	owner := uuid.New()
+	staff := uuid.New()
+	h := newHarness(t, &owner, domain.BookingConfirmed,
+		map[string]bool{staff.String() + "|" + restA.String(): true})
+
+	if _, err := h.uc.Replace(context.Background(), Actor{UserID: staff, Role: domain.RoleRestaurant},
+		h.booking.ID, []Line{{MenuItemID: h.dishB.ID, Quantity: 3}}); err != nil {
+		t.Fatalf("venue staff replace on confirmed booking: %v", err)
+	}
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace calls = %d, want 1", h.items.replaceCalls)
+	}
+
+	h = newHarness(t, &owner, domain.BookingConfirmed, nil)
+	if _, err := h.uc.Replace(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleAdmin},
+		h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}}); err != nil {
+		t.Fatalf("admin replace on confirmed booking: %v", err)
+	}
+}
+
+// A staff member who booked a table at their OWN venue is resolved as staff, so
+// the guest lock does not apply to them — they are the venue.
+func TestReplace_StaffOwningTheirOwnBookingIsStaff(t *testing.T) {
+	staff := uuid.New()
+	h := newHarness(t, &staff, domain.BookingConfirmed,
+		map[string]bool{staff.String() + "|" + restA.String(): true})
+
+	if _, err := h.uc.Replace(context.Background(), Actor{UserID: staff, Role: domain.RoleRestaurant},
+		h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}}); err != nil {
+		t.Fatalf("staff replace on own confirmed booking at own venue: %v", err)
+	}
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace calls = %d, want 1", h.items.replaceCalls)
+	}
+}
+
+// A restaurant-role user who booked at SOMEBODY ELSE's venue is an ordinary
+// guest there: they pass authorization as the owner (not ErrForbidden) and the
+// confirmed lock applies to them.
+func TestReplace_RestaurantRoleGuestAtAnotherVenue(t *testing.T) {
+	owner := uuid.New() // has RoleRestaurant, but manages nothing at restA
+	actor := Actor{UserID: owner, Role: domain.RoleRestaurant}
+
+	h := newHarness(t, &owner, domain.BookingPending, nil)
+	if _, err := h.uc.Replace(context.Background(), actor, h.booking.ID,
+		[]Line{{MenuItemID: h.dishA.ID, Quantity: 1}}); err != nil {
+		t.Fatalf("restaurant-role owner on a pending booking at another venue: %v", err)
+	}
+
+	h = newHarness(t, &owner, domain.BookingConfirmed, nil)
+	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+	mustCode(t, err, domain.CodePreorderLocked)
+	if h.items.replaceCalls != 0 {
+		t.Errorf("replace was called on a confirmed booking by a guest-at-another-venue")
+	}
+}
+
+// The payment freeze is NOT weakened by the confirmed lock and stays a distinct
+// code: it applies to venue staff and admins too (they must not move the amount
+// out from under a payment that is already snapshotted), and it is temporary —
+// unlike the lock, it lifts when the payment goes terminal.
+func TestReplace_PaymentFreezeAppliesToStaffAndAdminToo(t *testing.T) {
+	owner := uuid.New()
+	staff := uuid.New()
+	manages := map[string]bool{staff.String() + "|" + restA.String(): true}
+
+	for _, tc := range []struct {
+		name  string
+		actor Actor
+	}{
+		{"guest", Actor{UserID: owner, Role: domain.RoleUser}},
+		{"staff", Actor{UserID: staff, Role: domain.RoleRestaurant}},
+		{"admin", Actor{UserID: uuid.New(), Role: domain.RoleAdmin}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Pending, so the confirmed lock cannot be what refuses the guest.
+			h := newHarness(t, &owner, domain.BookingPending, manages)
+			h.payments.inFlight = true
+
+			_, err := h.uc.Replace(context.Background(), tc.actor, h.booking.ID,
+				[]Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+			mustErr(t, err, domain.ErrValidation)
+			mustCode(t, err, domain.CodePreorderPaymentInFlight)
+			if h.items.replaceCalls != 0 {
+				t.Errorf("replace was called while a payment was in flight")
+			}
+		})
+	}
+}
+
+// A confirmed booking with a payment in flight reports the PAYMENT code to the
+// venue (the freeze is the reason it cannot be touched by anyone) and the LOCK
+// code to the guest — the guest's answer must not depend on the payment state,
+// otherwise the app would tell them to wait for a payment that will never
+// unlock anything for them.
+func TestReplace_ConfirmedAndPaymentInFlightCodes(t *testing.T) {
+	owner := uuid.New()
+	staff := uuid.New()
+	manages := map[string]bool{staff.String() + "|" + restA.String(): true}
+
+	h := newHarness(t, &owner, domain.BookingConfirmed, manages)
+	h.payments.inFlight = true
+
+	_, err := h.uc.Replace(context.Background(), Actor{UserID: owner, Role: domain.RoleUser},
+		h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+	mustCode(t, err, domain.CodePreorderLocked)
+
+	_, err = h.uc.Replace(context.Background(), Actor{UserID: staff, Role: domain.RoleRestaurant},
+		h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+	mustCode(t, err, domain.CodePreorderPaymentInFlight)
+	if h.items.replaceCalls != 0 {
+		t.Errorf("replace was called on a frozen booking")
+	}
+}
+
+// A booking that is over is closed to EVERYONE, staff and admin included, and
+// says so with its own code.
+func TestReplace_ClosedBookingCodeAndAppliesToStaff(t *testing.T) {
+	owner := uuid.New()
+	staff := uuid.New()
+	manages := map[string]bool{staff.String() + "|" + restA.String(): true}
+
+	for _, st := range []domain.BookingStatus{domain.BookingArrived, domain.BookingCompleted,
+		domain.BookingCancelled, domain.BookingNoShow} {
+		t.Run(string(st), func(t *testing.T) {
+			h := newHarness(t, &owner, st, manages)
+			for _, actor := range []Actor{
+				{UserID: owner, Role: domain.RoleUser},
+				{UserID: staff, Role: domain.RoleRestaurant},
+				{UserID: uuid.New(), Role: domain.RoleAdmin},
+			} {
+				_, err := h.uc.Replace(context.Background(), actor, h.booking.ID,
+					[]Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+				mustErr(t, err, domain.ErrValidation)
+				mustCode(t, err, domain.CodePreorderBookingClosed)
+			}
+			if h.items.replaceCalls != 0 {
+				t.Errorf("replace was called on a %s booking", st)
+			}
+		})
+	}
+}
+
+// Reading a confirmed booking's pre-order is untouched — the lock is on
+// writing, and the guest must still be able to see what they ordered.
+func TestGet_GuestStillReadsConfirmedPreorder(t *testing.T) {
+	owner := uuid.New()
+	h := newHarness(t, &owner, domain.BookingConfirmed, nil)
+	menuID := h.dishA.ID
+	h.items.byBooking[h.booking.ID] = []domain.BookingItem{
+		{ID: uuid.New(), BookingID: h.booking.ID, MenuItemID: &menuID, ItemName: "Beshbarmak",
+			PriceMinor: 450000, Currency: "KZT", Quantity: 1, Status: domain.BookingItemPending},
+	}
+
+	p, err := h.uc.Get(context.Background(), Actor{UserID: owner, Role: domain.RoleUser}, h.booking.ID)
+	if err != nil {
+		t.Fatalf("get on a confirmed booking: %v", err)
+	}
+	if p.TotalMinor != 450000 {
+		t.Errorf("total = %d, want 450000", p.TotalMinor)
+	}
+}
