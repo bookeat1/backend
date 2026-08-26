@@ -31,7 +31,7 @@ var _ domain.EventRepository = (*Repository)(nil)
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
 	starts_at, ends_at, venue, cover_image_url, status, ticketed,
 	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
-	recurrence_id, created_at, updated_at`
+	recurrence_id, created_at, updated_at, city`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as reviews/favorites.
@@ -42,13 +42,13 @@ func (r *Repository) Create(ctx context.Context, e *domain.Event) error {
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
 			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor, capacity,
-			tags, tickets_refundable, ticket_refund_cutoff_minutes)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-		 RETURNING created_at, updated_at`,
+			tags, tickets_refundable, ticket_refund_cutoff_minutes, city)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		 RETURNING created_at, updated_at, city`,
 		e.ID, e.RestaurantID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes).
-		Scan(&e.CreatedAt, &e.UpdatedAt)
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City).
+		Scan(&e.CreatedAt, &e.UpdatedAt, &e.City)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
@@ -73,11 +73,11 @@ func (r *Repository) Update(ctx context.Context, e *domain.Event) error {
 		`UPDATE events SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
 			starts_at = $6, ends_at = $7, venue = $8, cover_image_url = $9, status = $10,
 			ticketed = $11, ticket_price_minor = $12, capacity = $13, tags = $14,
-			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, updated_at = now()
+			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, city = $17, updated_at = now()
 		 WHERE id = $1`,
 		e.ID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes)
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City)
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
@@ -168,16 +168,20 @@ func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uui
 const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e.description_i18n,
 	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
 	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
-	e.recurrence_id, e.created_at, e.updated_at,
+	e.recurrence_id, e.created_at, e.updated_at, e.city AS event_city,
 	r.name, r.name_i18n, r.city`
 
 // collapsedCols reads listCols back out of the derived table the collapse
 // builds (the `e.`/`r.` prefixes are gone there, and `rn` must not reach the
 // scanner). Same columns, same order — scanListItemRow depends on it.
+//
+// The event's own city arrives as `event_city`, not `city`: inside the derived
+// table it would otherwise collide with the venue's `city` and every reference
+// to it would be ambiguous. That is why listCols aliases it at the source.
 const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.description, c.description_i18n,
 	c.starts_at, c.ends_at, c.venue, c.cover_image_url, c.status, c.ticketed,
 	c.ticket_price_minor, c.capacity, c.tags, c.tickets_refundable, c.ticket_refund_cutoff_minutes,
-	c.recurrence_id, c.created_at, c.updated_at,
+	c.recurrence_id, c.created_at, c.updated_at, c.event_city,
 	c.name, c.name_i18n, c.city`
 
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
@@ -209,7 +213,16 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 		where = append(where, fmt.Sprintf(cond, len(args)))
 	}
 	if f.City != nil {
-		add("r.city = $%d", string(*f.City))
+		// The EFFECTIVE city of an event: its own override when it has one,
+		// otherwise the host venue's. Same predicate shape as the gastroguide
+		// collections (migration 0061): a row with no effective city at all is
+		// shown for EVERY city rather than for none.
+		//
+		// Today the venue is joined with an inner JOIN and restaurants.city is
+		// NOT NULL, so the COALESCE can only be NULL once events without a
+		// venue exist — which is exactly the branch that card will need, and it
+		// is already here so the read does not have to change again.
+		add("(COALESCE(e.city, r.city) IS NULL OR COALESCE(e.city, r.city) = $%d)", string(*f.City))
 	}
 	if f.RestaurantID != nil {
 		add("e.restaurant_id = $%d", *f.RestaurantID)
@@ -310,7 +323,7 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt); err != nil {
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
@@ -326,7 +339,7 @@ func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt,
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City,
 		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
 		return nil, err
 	}
@@ -454,3 +467,24 @@ const ListColumns = listCols
 // ScanListItem scans one row shaped like ListColumns into an EventListItem.
 // Exported for the same reason as ListColumns.
 func ScanListItem(row pgx.Row) (*domain.EventListItem, error) { return scanListItemRow(row) }
+
+// RenameCityString rewrites ONLY the city-override string of every event linked
+// to a city, after the dictionary entry was renamed (see usecase/cities). It is
+// the events-side twin of restaurant.Repository.RenameCityString and exists for
+// the same reason: the listing compares cities as exact strings, so an override
+// left at the previous spelling would keep pointing at a city that no longer
+// answers to that name — the event would silently vanish from every filter.
+//
+// Scoped by city_id, not by the old string: an override whose string was
+// already out of step still gets fixed, and an event in another city can never
+// be touched. updated_at is deliberately NOT bumped — nothing about the event
+// changed for a guest, only the platform's spelling of a city, and touching it
+// would make every event in a renamed city look freshly edited to the cabinet.
+func (r *Repository) RenameCityString(ctx context.Context, cityID uuid.UUID, name string) (int64, error) {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE events SET city=$2 WHERE city_id=$1 AND city IS DISTINCT FROM $2`, cityID, name)
+	if err != nil {
+		return 0, fmt.Errorf("rename event city string: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}

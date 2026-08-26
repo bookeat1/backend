@@ -290,8 +290,21 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// removed — so the recurrence repository is injected into the events facade
 	// as `occurrenceSkipRecorder`, the same one-effect-port shape as feedRepo.
 	recurrenceRepo := eventrecurrencerepo.New(db)
-	eventsFacade := events.NewFacade(eventrepo.New(db), restaurantManagers, feedRepo,
-		events.WithOccurrenceSkips(recurrenceRepo))
+	eventRepo := eventrepo.New(db)
+	// The city dictionary (migration 0081) is constructed HERE, ahead of the
+	// catalog that also uses it, because the events facade needs it too and the
+	// dependency runs both ways: the dictionary rewrites the city string stored
+	// on venues AND on events when a city is renamed (or the rename would leave
+	// event overrides pointing at a name that no longer exists), while the
+	// events facade resolves ?city= through it. restRepo and eventRepo are the
+	// two one-column writers; neither usecase depends on the other's package.
+	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm,
+		citiesuc.WithEventCityWriter(eventRepo))
+	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
+		events.WithOccurrenceSkips(recurrenceRepo),
+		// Same seam as the catalog: ?city=almaty, a historical spelling or a
+		// renamed city resolve to the one spelling the listing compares.
+		events.WithCityResolver(citiesUC))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
@@ -405,11 +418,6 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// cuisine_type string (UpdateCuisineTypeString) and restaurantManagers as
 	// the venue permission check, so the usecase depends on neither package.
 	cuisinesUC := cuisinesuc.NewUseCase(cuisinerepo.New(db), restRepo, restaurantManagers, txm)
-	// The city dictionary (migration 0081). restRepo doubles as the writer of
-	// the derived `city` string (RenameCityString), exactly as it does for
-	// cuisine_type — a rename has to reach the venues in the same transaction
-	// or the catalog and the venue disagree about where the venue is.
-	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm)
 	// The venue-feature dictionary (migration 0082). Unlike cuisines it has NO
 	// derived scalar column to keep in step — the free-text restaurant_features
 	// table it replaces was dropped, not kept as a rendering — so it needs no

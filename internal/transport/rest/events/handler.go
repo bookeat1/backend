@@ -136,6 +136,7 @@ func (h *Handler) create(c *gin.Context) {
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
 		Ticketed:         req.Ticketed,
@@ -184,6 +185,7 @@ func (h *Handler) update(c *gin.Context) {
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
 		Ticketed:         req.Ticketed,
@@ -385,18 +387,25 @@ func parseEventStatuses(raw string) []domain.EventStatus {
 // --- DTOs ---
 
 type eventRequest struct {
-	Title            string            `json:"title"`
-	TitleI18n        map[string]string `json:"title_i18n"`
-	Description      string            `json:"description"`
-	DescriptionI18n  map[string]string `json:"description_i18n"`
-	StartsAt         string            `json:"starts_at"`
-	EndsAt           string            `json:"ends_at"`
-	Venue            string            `json:"venue"`
-	CoverImageURL    *string           `json:"cover_image_url"`
-	Status           string            `json:"status"`
-	Ticketed         bool              `json:"ticketed"`
-	TicketPriceMinor *int64            `json:"ticket_price_minor"`
-	Capacity         *int              `json:"capacity"`
+	Title           string            `json:"title"`
+	TitleI18n       map[string]string `json:"title_i18n"`
+	Description     string            `json:"description"`
+	DescriptionI18n map[string]string `json:"description_i18n"`
+	StartsAt        string            `json:"starts_at"`
+	EndsAt          string            `json:"ends_at"`
+	Venue           string            `json:"venue"`
+	CoverImageURL   *string           `json:"cover_image_url"`
+	Status          string            `json:"status"`
+	// City переопределяет город, в котором показывается событие. Пусто или
+	// отсутствует — обычный случай: событие живёт в городе своего заведения, и
+	// переезжает вместе с ним. Значение резолвится по справочнику городов
+	// (принимается код «almaty», историческое написание, любой регистр);
+	// неизвестный или скрытый город — 422, а не молча несуществующий фильтр.
+	// Поле, как и всё в этой структуре, — полная замена: не прислали — сняли.
+	City             *string `json:"city"`
+	Ticketed         bool    `json:"ticketed"`
+	TicketPriceMinor *int64  `json:"ticket_price_minor"`
+	Capacity         *int    `json:"capacity"`
 	// The «Афиша» chips ("Бранч", "Живая музыка", ...). The usecase trims blanks
 	// and caps the count; absent/empty means the card draws no chips.
 	Tags []string `json:"tags"`
@@ -468,20 +477,23 @@ func (r eventRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, o
 }
 
 type eventResponse struct {
-	ID               string            `json:"id"`
-	RestaurantID     string            `json:"restaurant_id"`
-	Title            string            `json:"title"`
-	TitleI18n        map[string]string `json:"title_i18n,omitempty"`
-	Description      string            `json:"description"`
-	DescriptionI18n  map[string]string `json:"description_i18n,omitempty"`
-	StartsAt         string            `json:"starts_at"`
-	EndsAt           string            `json:"ends_at"`
-	Venue            string            `json:"venue,omitempty"`
-	CoverImageURL    *string           `json:"cover_image_url,omitempty"`
-	Status           string            `json:"status"`
-	Ticketed         bool              `json:"ticketed"`
-	TicketPriceMinor *int64            `json:"ticket_price_minor,omitempty"`
-	Capacity         *int              `json:"capacity,omitempty"`
+	ID              string            `json:"id"`
+	RestaurantID    string            `json:"restaurant_id"`
+	Title           string            `json:"title"`
+	TitleI18n       map[string]string `json:"title_i18n,omitempty"`
+	Description     string            `json:"description"`
+	DescriptionI18n map[string]string `json:"description_i18n,omitempty"`
+	StartsAt        string            `json:"starts_at"`
+	EndsAt          string            `json:"ends_at"`
+	Venue           string            `json:"venue,omitempty"`
+	CoverImageURL   *string           `json:"cover_image_url,omitempty"`
+	Status          string            `json:"status"`
+	// City — переопределение города. Отсутствует, когда его нет: событие тогда
+	// показывается в городе заведения-хозяина (см. restaurant.city рядом).
+	City             *string `json:"city,omitempty"`
+	Ticketed         bool    `json:"ticketed"`
+	TicketPriceMinor *int64  `json:"ticket_price_minor,omitempty"`
+	Capacity         *int    `json:"capacity,omitempty"`
 	// The «Афиша» chips. Always present and serialized as [] when empty (never
 	// null, never omitted): the app renders a chip row and an absent field would
 	// read as "unknown".
@@ -501,6 +513,17 @@ type eventResponse struct {
 	RecurrenceID *string `json:"recurrence_id,omitempty"`
 	CreatedAt    string  `json:"created_at"`
 	UpdatedAt    string  `json:"updated_at"`
+}
+
+// cityOrNil renders the optional city override as a plain optional string. nil
+// stays nil, which the response then omits entirely: "this event has no city of
+// its own", not "its city is empty".
+func cityOrNil(c *domain.City) *string {
+	if c == nil {
+		return nil
+	}
+	s := string(*c)
+	return &s
 }
 
 // tagsOrEmpty guarantees the JSON tags field serializes as [] rather than null:
@@ -532,6 +555,7 @@ func adminResponse(e domain.Event) eventResponse {
 		StartsAt:         e.StartsAt.Format(time.RFC3339),
 		EndsAt:           e.EndsAt.Format(time.RFC3339),
 		Venue:            e.Venue,
+		City:             cityOrNil(e.City),
 		CoverImageURL:    e.CoverImageURL,
 		Status:           string(e.Status),
 		Ticketed:         e.Ticketed,

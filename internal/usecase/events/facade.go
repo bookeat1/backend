@@ -10,6 +10,7 @@ package events
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -88,6 +89,13 @@ type CreateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// City overrides the city the event is shown in. nil (or blank) is the
+	// normal case and means "wherever the host venue is" — resolved on every
+	// read, so it follows the venue if the venue ever moves. A value is
+	// resolved through the city dictionary and stored in the dictionary's own
+	// spelling; an unknown or hidden city is ErrValidation, because this one is
+	// typed by an editor, not imported from the old system.
+	City *string
 	// Tags are the «Афиша» chips ("Бранч", "Живая музыка", ...). Blank entries
 	// are dropped and the list is capped (see normalizeTags); empty means the
 	// card draws no chips.
@@ -117,6 +125,14 @@ type UpdateInput struct {
 	Ticketed         bool
 	TicketPriceMinor *int64
 	Capacity         *int
+	// City replaces the event's city override, full replace like the rest of
+	// this struct: nil or blank CLEARS it, and the event goes back to following
+	// its venue. That is safe for an older cabinet build that does not send the
+	// field — clearing the override restores the venue-derived city, which is
+	// exactly what every event did before migration 0084. (Contrast
+	// RefundPolicy below, which is optional precisely because its default is
+	// NOT the previous behaviour.)
+	City *string
 	// Tags replaces the event's «Афиша» chips (full replace, like the rest of
 	// this struct). Blank entries are dropped and the list is capped; an empty
 	// or absent list clears the chips.
@@ -143,12 +159,29 @@ type occurrenceSkipRecorder interface {
 	RecordSkip(ctx context.Context, recurrenceID uuid.UUID, slot time.Time) error
 }
 
+// cityResolver is the minimal slice of usecase/cities this package needs:
+// "which dictionary entry does this written spelling mean". Declared here and
+// bound in bootstrap/deps.go, so the events usecase never depends on the
+// dictionary package itself — the same seam usecase/restaurants uses.
+//
+// A nil *domain.CityEntry with a nil error means "no such city". On the READ
+// path that is a normal answer for a filter value typed by a client; on the
+// WRITE path it is a validation error.
+type cityResolver interface {
+	Resolve(ctx context.Context, raw string) (*domain.CityEntry, error)
+}
+
 type facade struct {
 	repo  domain.EventRepository
 	perms permissionChecker
 	feed  feedModerator
 	skips occurrenceSkipRecorder
-	clock func() time.Time
+	// cities is the optional city-dictionary resolver (see WithCityResolver).
+	// Nil unless wired; ?city= then behaves exactly as it did before migration
+	// 0084 — the raw string is compared to the stored spelling, and an event's
+	// own city override is validated against the two legacy constants.
+	cities cityResolver
+	clock  func() time.Time
 }
 
 // Option tunes the facade. Variadic options keep every existing positional
@@ -163,6 +196,15 @@ type Option func(*facade)
 // touch a generated event.
 func WithOccurrenceSkips(r occurrenceSkipRecorder) Option {
 	return func(f *facade) { f.skips = r }
+}
+
+// WithCityResolver teaches the events usecase the city dictionary (migration
+// 0081): ?city= starts accepting a city CODE (?city=almaty) and any registered
+// spelling — a historical name, another case — next to the Russian name it has
+// always accepted, and an event's own city override is validated against the
+// dictionary instead of two constants compiled into the binary.
+func WithCityResolver(r cityResolver) Option {
+	return func(f *facade) { f.cities = r }
 }
 
 // NewFacade constructs the events Facade.
@@ -200,6 +242,10 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if status == "" {
 		status = domain.EventDraft
 	}
+	city, err := f.cityOverride(ctx, in.City)
+	if err != nil {
+		return nil, err
+	}
 	e := &domain.Event{
 		RestaurantID:     in.RestaurantID,
 		Title:            strings.TrimSpace(in.Title),
@@ -209,6 +255,7 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		StartsAt:         in.StartsAt,
 		EndsAt:           in.EndsAt,
 		Venue:            in.Venue,
+		City:             city,
 		CoverImageURL:    in.CoverImageURL,
 		Status:           status,
 		Ticketed:         in.Ticketed,
@@ -248,7 +295,16 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	// actually read counts as an edit. Publishing or hiding an event travels
 	// through this same method, and re-queueing a venue for that would punish
 	// them for using their own visibility switch. Same rule as usecase/promos.
-	contentChanged := eventContentChanged(*e, in)
+	city, err := f.cityOverride(ctx, in.City)
+	if err != nil {
+		return nil, err
+	}
+	// A city override is moderated content too: it decides WHICH city's main
+	// screen the card can reach, so changing it hands the same approved words to
+	// a different audience than the platform said yes to. Compared on the
+	// RESOLVED value, not the raw input — otherwise re-saving «almaty» over a
+	// stored «Алматы» would read as an edit and cost the venue a re-review.
+	contentChanged := eventContentChanged(*e, in) || !cityPtrEqual(city, e.City)
 	// Moving a generated occurrence to another time frees its ORIGINAL slot, so
 	// that slot needs the same tombstone a delete leaves — otherwise the next
 	// pass fills the old date back in and the venue ends up with both.
@@ -265,6 +321,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.StartsAt = in.StartsAt
 	e.EndsAt = in.EndsAt
 	e.Venue = in.Venue
+	e.City = city
 	e.CoverImageURL = in.CoverImageURL
 	e.Status = in.Status
 	e.Ticketed = in.Ticketed
@@ -374,6 +431,7 @@ func (f *facade) ListPublicUpcoming(ctx context.Context, flt domain.PublicEventF
 	if flt.From != nil && flt.To != nil && flt.To.Before(*flt.From) {
 		return nil, 0, fmt.Errorf("%w: to must not be before from", domain.ErrValidation)
 	}
+	flt.City = f.canonicalCity(ctx, flt.City)
 	return f.repo.ListPublicUpcoming(ctx, flt, f.clock())
 }
 
@@ -481,6 +539,15 @@ func validateRefundPolicy(p domain.TicketRefundPolicy) error {
 // feed card or reviewed by a moderator: the words, the dates, the venue line,
 // the cover, or the ticketing terms a guest sees before paying. Status,
 // deliberately, is not one of them.
+// cityPtrEqual compares two optional city overrides, nil (no override) equal
+// only to nil.
+func cityPtrEqual(a, b *domain.City) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 func eventContentChanged(cur domain.Event, in UpdateInput) bool {
 	switch {
 	case strings.TrimSpace(in.Title) != cur.Title,
@@ -570,4 +637,77 @@ func intPtrEqual(a, b *int) bool {
 		return a == b
 	}
 	return *a == *b
+}
+
+// canonicalCity turns whatever a client put in ?city= into the spelling the
+// listing actually compares against — the dictionary's own name, which is what
+// both restaurants.city and an event's own override are normalized to.
+//
+// This is what lets one server answer three generations of client at once: the
+// store build sends «Алматы», a new build may send «almaty», and a stale one
+// may still send a city's previous name (kept as an alias on rename). All three
+// resolve to the same stored spelling. Copied deliberately from
+// usecase/restaurants.canonicalCity: two endpoints that disagree about what
+// ?city=almaty means are worse than a duplicated ten lines.
+//
+// It never fails the request. An unknown value is passed through untouched, so
+// the behaviour is exactly what it was before the dictionary existed: the
+// filter matches nothing. A resolver ERROR is logged and also passed through —
+// a dictionary outage must not turn a browsable Афиша into a 500.
+func (f *facade) canonicalCity(ctx context.Context, in *domain.City) *domain.City {
+	if in == nil || f.cities == nil || strings.TrimSpace(string(*in)) == "" {
+		return in
+	}
+	entry, err := f.cities.Resolve(ctx, string(*in))
+	if err != nil {
+		slog.Warn("city dictionary lookup failed, filtering events by the raw value",
+			"city", string(*in), "error", err)
+		return in
+	}
+	if entry == nil {
+		return in
+	}
+	v := domain.City(entry.Name)
+	return &v
+}
+
+// cityOverride validates and canonicalizes the city an EDITOR typed on the
+// event itself. Unlike the read filter this one is strict: nothing writes here
+// except our own cabinet, so an unrecognized city is a mistake to report, not a
+// value to store and quietly never match.
+//
+//   - nil or blank → nil: "no override", the event follows its venue.
+//   - a HIDDEN city cannot be assigned, mirroring restaurants.validateCity —
+//     hiding a city has to actually stop it spreading.
+//   - the stored value is the dictionary's spelling, not the caller's. The
+//     database trigger would normalize it anyway; doing it here means the
+//     response echoes what was really saved.
+//
+// Without a resolver wired the legacy constant check stands, so a service
+// started without the dictionary still refuses garbage rather than storing an
+// override that can never match.
+func (f *facade) cityOverride(ctx context.Context, raw *string) (*domain.City, error) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, nil
+	}
+	v := strings.TrimSpace(*raw)
+	if f.cities == nil {
+		c := domain.City(v)
+		if !c.Valid() {
+			return nil, fmt.Errorf("%w: unknown city %q", domain.ErrValidation, v)
+		}
+		return &c, nil
+	}
+	entry, err := f.cities.Resolve(ctx, v)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("%w: unknown city %q", domain.ErrValidation, v)
+	}
+	if !entry.IsActive {
+		return nil, fmt.Errorf("%w: city %q is hidden", domain.ErrValidation, entry.Code)
+	}
+	c := domain.City(entry.Name)
+	return &c, nil
 }
