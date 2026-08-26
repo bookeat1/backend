@@ -128,3 +128,30 @@ var staffPermissions = map[StaffRole]map[Permission]bool{
 func (s StaffRole) HasPermission(perm Permission) bool {
 	return staffPermissions[s][perm]
 }
+
+// PlatformContentRoles is the ENTIRE list of global roles allowed to create and
+// edit content that belongs to the platform itself rather than to a venue —
+// «акции и афиши без привязки к ресторану» (migration 0085). Venue-bound
+// content is unaffected: it keeps going through PermRestaurantManage AT its own
+// restaurant, which a platform item has none of.
+//
+// It is a separate, tiny list on purpose. The RBAC matrix above is
+// restaurant-SCOPED (StaffRole lives on a roster row for one venue), and there
+// is no venue here to scope anything to, so a permission in that matrix could
+// not have expressed this without inventing a fake restaurant to hang it on.
+//
+// TODAY: superadmin only, per the owner's interim decision. Granting it to a
+// marketer role later is meant to be an edit to THIS map plus a User.Role that
+// exists — every call site already asks CanManagePlatformContent and nothing
+// else, so no usecase, handler or route has to change. What a marketer role
+// additionally needs is a global Role value of its own (User.Role today is
+// user / restaurant / admin) and a login that carries it; the platform-content
+// gate itself is one line here.
+var PlatformContentRoles = map[Role]bool{
+	RoleAdmin: true,
+}
+
+// CanManagePlatformContent reports whether a global role may manage the
+// platform's own promos and events. Unknown/empty roles may not — there is no
+// implicit allow, same posture as StaffRole.HasPermission.
+func CanManagePlatformContent(role Role) bool { return PlatformContentRoles[role] }

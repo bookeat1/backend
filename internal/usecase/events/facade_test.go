@@ -28,6 +28,9 @@ type fakeEventRepo struct {
 	publicNow    time.Time
 	publicCalls  int
 	publicErr    error
+	// venue is the host-venue block GetPublicByID hands back; nil = a platform
+	// event, which is the default here.
+	venue *domain.EventRestaurant
 }
 
 func newFakeRepo() *fakeEventRepo { return &fakeEventRepo{byID: map[uuid.UUID]*domain.Event{}} }
@@ -79,6 +82,43 @@ func (f *fakeEventRepo) ListPublishedUpcoming(_ context.Context, _ uuid.UUID, _ 
 	return f.published, len(f.published), nil
 }
 
+// ListPlatform answers from the same store Create writes to, filtered to the
+// events that have no host venue — so a "create a platform event, then list the
+// platform's events" test exercises the real predicate, not a canned slice.
+func (f *fakeEventRepo) ListPlatform(_ context.Context, statuses []domain.EventStatus, _, _ int) ([]domain.Event, int, error) {
+	var out []domain.Event
+	for _, e := range f.byID {
+		if e.RestaurantID != nil {
+			continue
+		}
+		if len(statuses) > 0 {
+			match := false
+			for _, s := range statuses {
+				if e.Status == s {
+					match = true
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		out = append(out, *e)
+	}
+	return out, len(out), nil
+}
+
+// GetPublicByID applies the same visibility rule the SQL does: published, not
+// yet ended. The venue block comes from f.venue, nil by default — which is
+// exactly the platform-event shape.
+func (f *fakeEventRepo) GetPublicByID(_ context.Context, id uuid.UUID, now time.Time) (*domain.EventListItem, error) {
+	e, ok := f.byID[id]
+	if !ok || e.Status != domain.EventPublished || !e.EndsAt.After(now) {
+		return nil, domain.ErrNotFound
+	}
+	cp := *e
+	return &domain.EventListItem{Event: cp, Restaurant: f.venue}, nil
+}
+
 func (f *fakeEventRepo) ListPublicUpcoming(_ context.Context, flt domain.PublicEventFilter, now time.Time) ([]domain.EventListItem, int, error) {
 	f.publicCalls++
 	f.publicFilter = flt
@@ -120,7 +160,7 @@ func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
 
 func validCreate(rid uuid.UUID) CreateInput {
 	return CreateInput{
-		RestaurantID: rid,
+		RestaurantID: &rid,
 		Title:        "Wine Dinner",
 		StartsAt:     time.Now().Add(24 * time.Hour),
 		EndsAt:       time.Now().Add(27 * time.Hour),
@@ -168,7 +208,7 @@ func TestUpdate_CrossTenantForbidden(t *testing.T) {
 	actorID := uuid.New()
 	repo := newFakeRepo()
 	// Event belongs to rid; actor is a manager of a DIFFERENT restaurant.
-	ev := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft}
+	ev := &domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.EventDraft}
 	repo.byID[ev.ID] = ev
 	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleManager), &fakeFeed{})
 
@@ -191,7 +231,7 @@ func TestUpdate_AbsentRefundPolicyKeepsTheVenuesRules(t *testing.T) {
 	actorID := uuid.New()
 	repo := newFakeRepo()
 	ev := &domain.Event{
-		ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft,
+		ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.EventDraft,
 		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
 	}
 	repo.byID[ev.ID] = ev
@@ -218,7 +258,7 @@ func TestUpdate_PresentRefundPolicyReplacesTheRules(t *testing.T) {
 	actorID := uuid.New()
 	repo := newFakeRepo()
 	ev := &domain.Event{
-		ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft,
+		ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.EventDraft,
 		TicketsRefundable: true, TicketRefundCutoffMinutes: 1440,
 	}
 	repo.byID[ev.ID] = ev
@@ -241,7 +281,7 @@ func TestUpdate_PresentRefundPolicyReplacesTheRules(t *testing.T) {
 func TestDelete_AdminBypassesPermLookup(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()
-	ev := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.EventDraft}
+	ev := &domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.EventDraft}
 	repo.byID[ev.ID] = ev
 	// perms would error if consulted — a superadmin must not need it.
 	f := NewFacade(repo, &fakePerms{err: errors.New("must not be called")}, &fakeFeed{})
@@ -292,8 +332,8 @@ func TestCreate_EmptyTitleRejected(t *testing.T) {
 func TestGetPublic_HidesDraftAndCrossTenant(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()
-	draft := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "d", Status: domain.EventDraft}
-	pub := &domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "p", Status: domain.EventPublished}
+	draft := &domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "d", Status: domain.EventDraft}
+	pub := &domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "p", Status: domain.EventPublished}
 	repo.byID[draft.ID] = draft
 	repo.byID[pub.ID] = pub
 	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
@@ -389,8 +429,8 @@ func TestListPublicUpcoming_ItemsCarryTheirVenue(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()
 	repo.publicItems = []domain.EventListItem{{
-		Event:      domain.Event{ID: uuid.New(), RestaurantID: rid, Title: "Wine Dinner", Status: domain.EventPublished},
-		Restaurant: domain.EventRestaurant{ID: rid, Name: "Bistro", City: domain.CityAlmaty},
+		Event:      domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "Wine Dinner", Status: domain.EventPublished},
+		Restaurant: &domain.EventRestaurant{ID: rid, Name: "Bistro", City: domain.CityAlmaty},
 	}}
 	f := NewFacade(repo, &fakePerms{}, &fakeFeed{})
 

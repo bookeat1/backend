@@ -147,7 +147,7 @@ func (h *contentHarness) seedEvent(title string, startsAt time.Time, status doma
 	h.t.Helper()
 	cover := "https://cdn.example.com/" + title + ".jpg"
 	e := &domain.Event{
-		ID: uuid.New(), RestaurantID: h.rid, Title: title,
+		ID: uuid.New(), RestaurantID: &h.rid, Title: title,
 		StartsAt: startsAt, EndsAt: startsAt.Add(2 * time.Hour),
 		Venue: "Терраса", CoverImageURL: &cover, Status: status,
 		Tags: []string{"Живая музыка"},
@@ -163,7 +163,7 @@ func (h *contentHarness) seedPromo(title string, startsAt, endsAt time.Time, sta
 	cover := "https://cdn.example.com/" + title + ".jpg"
 	pct := 30
 	p := &domain.Promo{
-		ID: uuid.New(), RestaurantID: h.rid, Title: title,
+		ID: uuid.New(), RestaurantID: &h.rid, Title: title,
 		StartsAt: startsAt, EndsAt: endsAt, Terms: "Только зал",
 		CoverImageURL: &cover, DiscountPercent: &pct, Status: status,
 	}

@@ -60,7 +60,14 @@ func (u *adminUseCase) authorize(ctx context.Context, actor Actor, eventID uuid.
 	if actor.UserID == nil {
 		return fmt.Errorf("%w: no authenticated staff actor", domain.ErrUnauthorized)
 	}
-	ok, err := u.perms.HasPermission(ctx, *actor.UserID, event.RestaurantID, domain.PermRestaurantManage)
+	// A PLATFORM event has no venue whose staff could be entitled to its sales.
+	// It also cannot have any (it may not be ticketed at all), so this is a
+	// closed door rather than a case to model: only the superadmin path above
+	// gets past it.
+	if event.RestaurantID == nil {
+		return fmt.Errorf("%w: a platform event has no venue ticket sales", domain.ErrForbidden)
+	}
+	ok, err := u.perms.HasPermission(ctx, *actor.UserID, *event.RestaurantID, domain.PermRestaurantManage)
 	if err != nil {
 		return err
 	}

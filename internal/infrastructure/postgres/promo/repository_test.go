@@ -26,7 +26,7 @@ func seedRestaurant(ctx context.Context, t *testing.T, pool sqltx.Querier, name 
 func mkPromo(rid uuid.UUID, status domain.PromoStatus, startsIn, dur time.Duration) *domain.Promo {
 	start := time.Now().Add(startsIn).UTC().Truncate(time.Second)
 	return &domain.Promo{
-		RestaurantID: rid,
+		RestaurantID: &rid,
 		Title:        "P",
 		StartsAt:     start,
 		EndsAt:       start.Add(dur),

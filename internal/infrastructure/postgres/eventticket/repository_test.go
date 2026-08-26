@@ -30,7 +30,7 @@ func seed(ctx context.Context, t *testing.T, pool sqltx.Querier, capacity int) (
 	cap := capacity
 	start := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
 	e := &domain.Event{
-		ID: uuid.New(), RestaurantID: r.ID, Title: "E", StartsAt: start, EndsAt: start.Add(2 * time.Hour),
+		ID: uuid.New(), RestaurantID: &r.ID, Title: "E", StartsAt: start, EndsAt: start.Add(2 * time.Hour),
 		Status: domain.EventPublished, Ticketed: true, TicketPriceMinor: &price, Capacity: &cap,
 	}
 	if err := erepo.Create(ctx, e); err != nil {

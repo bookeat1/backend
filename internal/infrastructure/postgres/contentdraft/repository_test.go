@@ -91,7 +91,7 @@ func TestMarkApproved_CASOnPending(t *testing.T) {
 
 	// A real event must exist for the approved-kind CHECK + FK.
 	start := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
-	ev := &domain.Event{RestaurantID: rid, Title: "Parsed Event", StartsAt: start, EndsAt: start.Add(2 * time.Hour), Status: domain.EventPublished}
+	ev := &domain.Event{RestaurantID: &rid, Title: "Parsed Event", StartsAt: start, EndsAt: start.Add(2 * time.Hour), Status: domain.EventPublished}
 	if err := eventrepo.New(pool).Create(ctx, ev); err != nil {
 		t.Fatalf("seed event: %v", err)
 	}

@@ -16,6 +16,12 @@ type fakePromoRepo struct {
 	created *domain.Promo
 	updated *domain.Promo
 	active  []domain.Promo
+	// The cross-venue listing's canned answer plus what the facade asked for.
+	publicItems  []domain.PromoListItem
+	publicFilter domain.PublicPromoFilter
+	publicNow    time.Time
+	// venue is the block GetPublic hands back; nil = a platform promo.
+	venue *domain.EventRestaurant
 }
 
 func newFakeRepo() *fakePromoRepo { return &fakePromoRepo{byID: map[uuid.UUID]*domain.Promo{}} }
@@ -63,6 +69,45 @@ func (f *fakePromoRepo) ListActive(_ context.Context, _ uuid.UUID, _ time.Time, 
 	return f.active, len(f.active), nil
 }
 
+// ListPlatform answers from the same store Create writes to, filtered to the
+// promos with no venue — the real predicate, not a canned slice.
+func (f *fakePromoRepo) ListPlatform(_ context.Context, statuses []domain.PromoStatus, _, _ int) ([]domain.Promo, int, error) {
+	var out []domain.Promo
+	for _, p := range f.byID {
+		if p.RestaurantID != nil {
+			continue
+		}
+		if len(statuses) > 0 {
+			match := false
+			for _, s := range statuses {
+				if p.Status == s {
+					match = true
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		out = append(out, *p)
+	}
+	return out, len(out), nil
+}
+
+func (f *fakePromoRepo) ListPublicActive(_ context.Context, flt domain.PublicPromoFilter, now time.Time) ([]domain.PromoListItem, int, error) {
+	f.publicFilter = flt
+	f.publicNow = now
+	return f.publicItems, len(f.publicItems), nil
+}
+
+func (f *fakePromoRepo) GetPublic(_ context.Context, id uuid.UUID, now time.Time) (*domain.PromoListItem, error) {
+	p, ok := f.byID[id]
+	if !ok || p.Status != domain.PromoPublished || !p.StartsAt.Before(now) || !p.EndsAt.After(now) {
+		return nil, domain.ErrNotFound
+	}
+	cp := *p
+	return &domain.PromoListItem{Promo: cp, Restaurant: f.venue}, nil
+}
+
 type fakePerms struct {
 	roles map[[2]uuid.UUID]domain.StaffRole
 	err   error
@@ -103,7 +148,7 @@ func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
 
 func validCreate(rid uuid.UUID) CreateInput {
 	return CreateInput{
-		RestaurantID: rid,
+		RestaurantID: &rid,
 		Title:        "Happy Hour",
 		StartsAt:     time.Now().Add(-time.Hour),
 		EndsAt:       time.Now().Add(time.Hour),
@@ -145,7 +190,7 @@ func TestUpdate_CrossTenantForbidden(t *testing.T) {
 	other := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoDraft}
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.PromoDraft}
 	repo.byID[pr.ID] = pr
 	f := NewFacade(repo, permsWith(actorID, other, domain.StaffRoleOwner), &fakeFeed{})
 
@@ -180,7 +225,7 @@ func TestUpdate_DemotesFeedApprovalBeforeWriting(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoPublished}
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.PromoPublished}
 	repo.byID[pr.ID] = pr
 	fd := &fakeFeed{}
 	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), fd)
@@ -200,7 +245,7 @@ func TestUpdate_AbortsWhenTheDemotionFails(t *testing.T) {
 	rid := uuid.New()
 	actorID := uuid.New()
 	repo := newFakeRepo()
-	pr := &domain.Promo{ID: uuid.New(), RestaurantID: rid, Title: "x", Status: domain.PromoPublished}
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: &rid, Title: "x", Status: domain.PromoPublished}
 	repo.byID[pr.ID] = pr
 	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{err: errors.New("db down")})
 
@@ -221,7 +266,7 @@ func TestUpdate_StatusOnlyChangeKeepsTheApproval(t *testing.T) {
 	repo := newFakeRepo()
 	now := time.Now()
 	pr := &domain.Promo{
-		ID: uuid.New(), RestaurantID: rid, Title: "Кофе за полцены",
+		ID: uuid.New(), RestaurantID: &rid, Title: "Кофе за полцены",
 		Description: "до конца недели", Terms: "только в зале",
 		StartsAt: now, EndsAt: now.Add(48 * time.Hour), Status: domain.PromoPublished,
 	}

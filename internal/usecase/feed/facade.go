@@ -229,7 +229,7 @@ func (f *facade) GetState(ctx context.Context, actor Actor, kind domain.FeedItem
 }
 
 func (f *facade) ListVenue(ctx context.Context, actor Actor, restaurantID uuid.UUID, page, perPage int) ([]ItemState, int, error) {
-	if err := f.authorizeVenue(ctx, actor, restaurantID); err != nil {
+	if err := f.authorizeVenue(ctx, actor, &restaurantID); err != nil {
 		return nil, 0, err
 	}
 	page, perPage = normalizePage(page, perPage)
@@ -338,11 +338,24 @@ func (f *facade) resolveAndAuthorize(ctx context.Context, actor Actor, kind doma
 	return item, nil
 }
 
-func (f *facade) authorizeVenue(ctx context.Context, actor Actor, restaurantID uuid.UUID) error {
+// authorizeVenue gates an action on ONE item. restaurantID nil is a PLATFORM
+// item (migration 0085): it has no venue whose staff could submit or withdraw
+// it, so the global platform-content policy decides — today the superadmin,
+// who would have passed the RoleAdmin bypass below anyway. Stating it
+// explicitly is what keeps the seam in one place: when a marketer role is
+// granted domain.PlatformContentRoles, it gains the feed submission of the
+// platform's own cards with it, and not a single venue's.
+func (f *facade) authorizeVenue(ctx context.Context, actor Actor, restaurantID *uuid.UUID) error {
+	if restaurantID == nil {
+		if !domain.CanManagePlatformContent(actor.Role) {
+			return fmt.Errorf("%w: only the platform may manage feed placement of content that belongs to no venue", domain.ErrForbidden)
+		}
+		return nil
+	}
 	if actor.Role == domain.RoleAdmin {
 		return nil
 	}
-	ok, err := f.perms.HasPermission(ctx, actor.UserID, restaurantID, domain.PermRestaurantManage)
+	ok, err := f.perms.HasPermission(ctx, actor.UserID, *restaurantID, domain.PermRestaurantManage)
 	if err != nil {
 		return err
 	}

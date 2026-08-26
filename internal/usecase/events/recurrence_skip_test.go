@@ -35,7 +35,7 @@ func (f *fakeSkips) RecordSkip(_ context.Context, recurrenceID uuid.UUID, slot t
 func seedOccurrence(repo *fakeEventRepo, rid uuid.UUID, recurrenceID *uuid.UUID, startsAt time.Time) *domain.Event {
 	e := &domain.Event{
 		ID:           uuid.New(),
-		RestaurantID: rid,
+		RestaurantID: &rid,
 		Title:        "Караоке-битва",
 		StartsAt:     startsAt,
 		EndsAt:       startsAt.Add(3 * time.Hour),

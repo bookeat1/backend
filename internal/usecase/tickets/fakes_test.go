@@ -272,8 +272,12 @@ func nowPlus() time.Time { return time.Now().Add(24 * time.Hour) }
 
 func ticketedEvent(capacity *int, price int64) *domain.Event {
 	return &domain.Event{
-		ID: uuid.New(), RestaurantID: uuid.New(),
+		ID: uuid.New(), RestaurantID: ptrUUID(uuid.New()),
 		Status: domain.EventPublished, Ticketed: true, TicketPriceMinor: &price, Capacity: capacity,
 		StartsAt: time.Now().Add(24 * time.Hour), EndsAt: time.Now().Add(48 * time.Hour),
 	}
 }
+
+// ptrUUID is the fixture helper for Event.RestaurantID, optional since
+// migration 0085 (nil = a platform event, which may never sell tickets).
+func ptrUUID(id uuid.UUID) *uuid.UUID { return &id }

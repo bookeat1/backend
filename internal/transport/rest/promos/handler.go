@@ -35,6 +35,11 @@ func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 // RegisterPublic mounts the unauthenticated read route.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/restaurants/:id/promos", h.listPublic)
+	// The cross-venue listing and one promo's own page, addressed without a
+	// restaurant — the only public reads that can show a PLATFORM promo.
+	// Mirrors GET /events and GET /events/:eventId.
+	rg.GET("/promos", h.listPublicActive)
+	rg.GET("/promos/:promoId", h.getPublicDetail)
 }
 
 // RegisterAdminRoutes mounts the admin CRUD routes. Mount on a group running
@@ -42,6 +47,11 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.POST("/admin/restaurants/:id/promos", h.create)
 	rg.GET("/admin/restaurants/:id/promos", h.listAdmin)
+	// The PLATFORM's own акции: same payload, no restaurant in the path. Edit,
+	// read and delete keep using /admin/promos/:promoId — those resolve the
+	// promo first and authorize against whoever owns it.
+	rg.POST("/admin/platform/promos", h.createPlatform)
+	rg.GET("/admin/platform/promos", h.listPlatformAdmin)
 	rg.GET("/admin/promos/:promoId", h.getAdmin)
 	rg.PUT("/admin/promos/:promoId", h.update)
 	rg.DELETE("/admin/promos/:promoId", h.delete)
@@ -67,11 +77,20 @@ func (h *Handler) listPublic(c *gin.Context) {
 }
 
 func (h *Handler) create(c *gin.Context) {
-	actor, ok := actorFrom(c)
+	rid, ok := pathUUID(c, "id", "invalid restaurant id")
 	if !ok {
 		return
 	}
-	rid, ok := pathUUID(c, "id", "invalid restaurant id")
+	h.createWithHost(c, &rid)
+}
+
+// createPlatform creates a promo with NO venue. The route carries no restaurant
+// id, so there is nothing a caller could send to claim one; the platform-content
+// policy is applied in the usecase, from the nil owner.
+func (h *Handler) createPlatform(c *gin.Context) { h.createWithHost(c, nil) }
+
+func (h *Handler) createWithHost(c *gin.Context, rid *uuid.UUID) {
+	actor, ok := actorFrom(c)
 	if !ok {
 		return
 	}
@@ -86,6 +105,7 @@ func (h *Handler) create(c *gin.Context) {
 	}
 	p, err := h.facade.Create(c.Request.Context(), actor, uc.CreateInput{
 		RestaurantID:    rid,
+		City:            req.City,
 		Title:           req.Title,
 		TitleI18n:       domain.I18n(req.TitleI18n),
 		Description:     req.Description,
@@ -135,12 +155,90 @@ func (h *Handler) update(c *gin.Context) {
 		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
 		Images:          req.Images,
+		City:            req.City,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
 	response.OK(c.Writer, adminResponse(*p))
+}
+
+// listPublicActive serves the cross-venue guest listing:
+// GET /promos?city=&restaurant_id=&page=&per_page=&lang=.
+func (h *Handler) listPublicActive(c *gin.Context) {
+	flt, ok := publicListFilter(c)
+	if !ok {
+		return
+	}
+	items, total, err := h.facade.ListPublicActive(c.Request.Context(), flt)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	lang := reqlocale.Resolve(c)
+	out := make([]promoListItemResponse, 0, len(items))
+	for _, it := range items {
+		out = append(out, publicListItemResponse(it, lang))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, flt.Page, flt.PerPage))
+}
+
+// getPublicDetail serves one promo's own page: GET /promos/{promoId}, venue
+// block included only when the promo has a venue.
+func (h *Handler) getPublicDetail(c *gin.Context) {
+	pid, ok := pathUUID(c, "promoId", "invalid promo id")
+	if !ok {
+		return
+	}
+	it, err := h.facade.GetPublicDetail(c.Request.Context(), pid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, publicListItemResponse(*it, reqlocale.Resolve(c)))
+}
+
+// publicListFilter parses the cross-venue listing's query parameters. A
+// malformed restaurant_id is 422 rather than ignored — silently dropping it
+// would hand the caller the WHOLE platform's promos under one venue's name.
+// An unknown city is left as it is and simply matches nothing, same as the
+// events listing.
+func publicListFilter(c *gin.Context) (domain.PublicPromoFilter, bool) {
+	var f domain.PublicPromoFilter
+	if v := strings.TrimSpace(c.Query("city")); v != "" {
+		city := domain.City(v)
+		f.City = &city
+	}
+	if v := strings.TrimSpace(c.Query("restaurant_id")); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, "restaurant_id must be a uuid")
+			return f, false
+		}
+		f.RestaurantID = &id
+	}
+	f.Page, f.PerPage = pagination(c)
+	return f, true
+}
+
+func (h *Handler) listPlatformAdmin(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	page, perPage := pagination(c)
+	statuses := parsePromoStatuses(c.Query("status"))
+	items, total, err := h.facade.ListPlatformAdmin(c.Request.Context(), actor, statuses, page, perPage)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	out := make([]promoResponse, 0, len(items))
+	for _, p := range items {
+		out = append(out, adminResponse(p))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -267,6 +365,11 @@ type promoRequest struct {
 	Status          string `json:"status"`
 	// Images — галерея акции БЕЗ обложки; полная замена, пустой список очищает.
 	Images []string `json:"images"`
+	// City переопределяет город показа акции. Пусто или отсутствует — обычный
+	// случай: акция живёт в городе своего заведения (а акция платформы — во
+	// всех городах). Значение резолвится по справочнику городов; неизвестный
+	// или скрытый город — 422. Поле, как и всё здесь, — полная замена.
+	City *string `json:"city"`
 }
 
 func (r promoRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, ok bool) {
@@ -284,8 +387,10 @@ func (r promoRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, o
 }
 
 type promoResponse struct {
-	ID              string            `json:"id"`
-	RestaurantID    string            `json:"restaurant_id"`
+	ID string `json:"id"`
+	// RestaurantID — заведение. ОТСУТСТВУЕТ у акции платформы: заведения нет,
+	// и слать сюда нули значило бы предложить клиенту открыть пустую карточку.
+	RestaurantID    *string           `json:"restaurant_id,omitempty"`
 	Title           string            `json:"title"`
 	TitleI18n       map[string]string `json:"title_i18n,omitempty"`
 	Description     string            `json:"description"`
@@ -301,15 +406,65 @@ type promoResponse struct {
 	DiscountPercent *int   `json:"discount_percent,omitempty"`
 	Status          string `json:"status"`
 	// Images — дополнительные фотографии акции, без обложки. Всегда массив.
-	Images    []string `json:"images"`
-	CreatedAt string   `json:"created_at"`
-	UpdatedAt string   `json:"updated_at"`
+	Images []string `json:"images"`
+	// City — переопределение города. Отсутствует, когда его нет: акция тогда
+	// показывается в городе заведения, а у акции платформы — во всех городах.
+	City      *string `json:"city,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	UpdatedAt string  `json:"updated_at"`
+}
+
+// promoListItemResponse is the cross-venue listing's item: the same guest-facing
+// promo shape plus the venue that runs it. Restaurant is ABSENT for a platform
+// promo — a client must treat that as a real, drawable state.
+type promoListItemResponse struct {
+	promoResponse
+	Restaurant *promoRestaurantResponse `json:"restaurant,omitempty"`
+}
+
+// promoRestaurantResponse is the minimal venue identity on a promo card, the
+// same shape the events listing uses.
+type promoRestaurantResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	City string `json:"city"`
+}
+
+func publicListItemResponse(it domain.PromoListItem, lang string) promoListItemResponse {
+	out := promoListItemResponse{promoResponse: publicResponse(it.Promo, lang)}
+	if it.Restaurant != nil {
+		out.Restaurant = &promoRestaurantResponse{
+			ID:   it.Restaurant.ID.String(),
+			Name: it.Restaurant.NameI18n.Resolve(lang, it.Restaurant.Name),
+			City: string(it.Restaurant.City),
+		}
+	}
+	return out
+}
+
+// cityOrNil renders the optional city override as an optional string: nil stays
+// nil and the field is omitted — "this promo has no city of its own".
+func cityOrNil(c *domain.City) *string {
+	if c == nil {
+		return nil
+	}
+	s := string(*c)
+	return &s
+}
+
+// idOrNil renders an optional uuid as an optional string.
+func idOrNil(id *uuid.UUID) *string {
+	if id == nil {
+		return nil
+	}
+	s := id.String()
+	return &s
 }
 
 func adminResponse(p domain.Promo) promoResponse {
 	return promoResponse{
 		ID:              p.ID.String(),
-		RestaurantID:    p.RestaurantID.String(),
+		RestaurantID:    idOrNil(p.RestaurantID),
 		Title:           p.Title,
 		TitleI18n:       p.TitleI18n,
 		Description:     p.Description,
@@ -321,6 +476,7 @@ func adminResponse(p domain.Promo) promoResponse {
 		DiscountPercent: p.DiscountPercent,
 		Status:          string(p.Status),
 		Images:          imagesOrEmpty(p.Images),
+		City:            cityOrNil(p.City),
 		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),
 	}

@@ -101,7 +101,7 @@ func (f *fakeFeedRepo) GetItem(_ context.Context, kind domain.FeedItemKind, id u
 func (f *fakeFeedRepo) ListByRestaurant(_ context.Context, restaurantID uuid.UUID, _, _ int) ([]domain.FeedItem, int, error) {
 	var out []domain.FeedItem
 	for _, k := range f.order {
-		if it := f.items[k]; it.RestaurantID == restaurantID {
+		if it := f.items[k]; it.RestaurantID != nil && *it.RestaurantID == restaurantID {
 			out = append(out, *it)
 		}
 	}
@@ -196,8 +196,8 @@ func livePromo(rid uuid.UUID) domain.FeedItem {
 	return domain.FeedItem{
 		Kind:          domain.FeedItemPromo,
 		ID:            uuid.New(),
-		RestaurantID:  rid,
-		City:          domain.CityAlmaty,
+		RestaurantID:  &rid,
+		City:          ptrCity(domain.CityAlmaty),
 		VenueIsActive: true,
 		ItemStatus:    string(domain.PromoPublished),
 		StartsAt:      testNow.Add(-time.Hour),
@@ -237,7 +237,7 @@ func TestMain_OnlyApprovedItemsReachTheScreen(t *testing.T) {
 	repo.put(expired)
 
 	otherCity := livePromo(rid)
-	otherCity.City = domain.CityAstana
+	otherCity.City = ptrCity(domain.CityAstana)
 	repo.put(otherCity)
 
 	f := newFacadeAt(repo, &fakePerms{})
@@ -659,5 +659,73 @@ func TestDemoteAfterContentEdit_PullsAnApprovedCardOffTheScreen(t *testing.T) {
 	}
 	if res.Total != 0 {
 		t.Fatalf("an edited card must leave the main screen until it is reviewed again, got %d", res.Total)
+	}
+}
+
+// ptrCity is the fixture helper for FeedItem.City, which is optional since
+// migration 0085 (nil = a platform card that runs in every city).
+func ptrCity(c domain.City) *domain.City { return &c }
+
+// --- platform content: an item with no venue (migration 0085) ---
+
+// platformPromo is livePromo without a venue: the platform's own card.
+func platformPromo() domain.FeedItem {
+	it := livePromo(uuid.New())
+	it.RestaurantID = nil
+	it.City = nil
+	it.VenueIsActive = false // meaningless without a venue; must not hide it
+	return it
+}
+
+// The platform's own card reaches every city's main screen and does not need a
+// venue to be scored or ordered.
+func TestMain_PlatformCardReachesEveryCity(t *testing.T) {
+	rid := uuid.New()
+	repo := newFakeRepo()
+	repo.put(livePromo(rid))
+	repo.put(platformPromo())
+
+	f := newFacadeAt(repo, &fakePerms{})
+	for _, city := range []domain.City{domain.CityAlmaty, domain.CityAstana} {
+		res, err := f.Main(context.Background(), MainInput{City: city})
+		if err != nil {
+			t.Fatalf("Main(%s): %v", city, err)
+		}
+		found := false
+		for _, r := range res.Items {
+			if r.Item.RestaurantID == nil {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s: the platform card is missing from %d ranked items", city, len(res.Items))
+		}
+	}
+}
+
+// Submitting the platform's own card to the queue is gated by the global
+// platform-content policy, not by a per-venue permission — there is no venue to
+// hold one at. A venue role must not be able to push the platform's card.
+func TestSubmit_PlatformItemIsPlatformOnly(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	it := platformPromo()
+	it.Placement.Status = domain.FeedNotSubmitted
+	item := repo.put(it)
+
+	f := newFacadeAt(repo, permsWith(actorID, rid, domain.StaffRoleOwner))
+
+	_, err := f.Submit(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, domain.FeedItemPromo, item.ID)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("a venue role submitting the platform's card: err = %v, want ErrForbidden", err)
+	}
+
+	got, err := f.Submit(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleAdmin}, domain.FeedItemPromo, item.ID)
+	if err != nil {
+		t.Fatalf("the platform must be able to submit its own card: %v", err)
+	}
+	if got.Placement.Status != domain.FeedPendingReview {
+		t.Fatalf("status = %s, want pending_review", got.Placement.Status)
 	}
 }

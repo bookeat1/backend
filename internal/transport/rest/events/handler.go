@@ -36,6 +36,10 @@ func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 // RegisterPublic mounts the unauthenticated read routes.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/events", h.listUpcoming)
+	// The event's OWN page, addressed by the event id alone. It is what an
+	// action button with no external link points at, and the only way to open a
+	// PLATFORM event at all — that one hangs under no restaurant's path.
+	rg.GET("/events/:eventId", h.getPublicDetail)
 	rg.GET("/restaurants/:id/events", h.listPublic)
 	rg.GET("/restaurants/:id/events/:eventId", h.getPublic)
 }
@@ -45,6 +49,13 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.POST("/admin/restaurants/:id/events", h.create)
 	rg.GET("/admin/restaurants/:id/events", h.listAdmin)
+	// The PLATFORM's own «афиша»: same payload, no restaurant in the path,
+	// which is precisely what makes the created event venue-less. Editing,
+	// reading and deleting go through the existing /admin/events/:eventId
+	// routes — they resolve the event first and authorize against whoever owns
+	// it, so they already handle "nobody" without a second set of routes.
+	rg.POST("/admin/platform/events", h.createPlatform)
+	rg.GET("/admin/platform/events", h.listPlatformAdmin)
 	rg.GET("/admin/events/:eventId", h.getAdmin)
 	rg.PUT("/admin/events/:eventId", h.update)
 	rg.DELETE("/admin/events/:eventId", h.delete)
@@ -110,11 +121,21 @@ func (h *Handler) getPublic(c *gin.Context) {
 }
 
 func (h *Handler) create(c *gin.Context) {
-	actor, ok := actorFrom(c)
+	rid, ok := pathUUID(c, "id", "invalid restaurant id")
 	if !ok {
 		return
 	}
-	rid, ok := pathUUID(c, "id", "invalid restaurant id")
+	h.createWithHost(c, &rid)
+}
+
+// createPlatform creates an event with NO host venue. The route carries no
+// restaurant id, so there is nothing a caller could pass to claim one — the
+// authorization (platform-content policy) is decided in the usecase from the
+// nil owner, not from this handler.
+func (h *Handler) createPlatform(c *gin.Context) { h.createWithHost(c, nil) }
+
+func (h *Handler) createWithHost(c *gin.Context, rid *uuid.UUID) {
+	actor, ok := actorFrom(c)
 	if !ok {
 		return
 	}
@@ -129,6 +150,7 @@ func (h *Handler) create(c *gin.Context) {
 	}
 	e, err := h.facade.Create(c.Request.Context(), actor, uc.CreateInput{
 		RestaurantID:     rid,
+		Action:           req.Action.toDomain(),
 		Title:            req.Title,
 		TitleI18n:        domain.I18n(req.TitleI18n),
 		Description:      req.Description,
@@ -194,6 +216,7 @@ func (h *Handler) update(c *gin.Context) {
 		Tags:             req.Tags,
 		Images:           req.Images,
 		RefundPolicy:     refundPolicy,
+		Action:           req.Action.toDomain(),
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -285,6 +308,41 @@ func (h *Handler) listAdmin(c *gin.Context) {
 		out = append(out, adminResponse(e))
 	}
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+func (h *Handler) listPlatformAdmin(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	page, perPage := pagination(c)
+	statuses := parseEventStatuses(c.Query("status"))
+	items, total, err := h.facade.ListPlatformAdmin(c.Request.Context(), actor, statuses, page, perPage)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	out := make([]eventResponse, 0, len(items))
+	for _, e := range items {
+		out = append(out, adminResponse(e))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
+}
+
+// getPublicDetail serves the event's own page: GET /events/{eventId}. It
+// answers for a venue-bound and a platform event alike, and carries the venue
+// block only when there is one.
+func (h *Handler) getPublicDetail(c *gin.Context) {
+	eid, ok := pathUUID(c, "eventId", "invalid event id")
+	if !ok {
+		return
+	}
+	it, err := h.facade.GetPublicDetail(c.Request.Context(), eid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, publicListItemResponse(*it, reqlocale.Resolve(c)))
 }
 
 // --- helpers ---
@@ -413,6 +471,10 @@ type eventRequest struct {
 	// или пустой список очищает галерею (запись — полная замена, как и всё
 	// остальное в этой структуре).
 	Images []string `json:"images"`
+	// Action — кнопка на карточке: подпись плюс цель. Отсутствует — кнопки нет
+	// (на обновлении это ЗНАЧИТ «убрать кнопку»: поле, как и все прочие здесь,
+	// заменяется целиком).
+	Action *eventActionRequest `json:"action"`
 	// The venue's own refund rules for this event. POINTERS on purpose: this is a
 	// full-replace payload, and a cabinet build that predates the feature sends
 	// the event without these fields. On create, absent means the conservative
@@ -421,6 +483,28 @@ type eventRequest struct {
 	// refunds off for everyone who buys next.
 	TicketsRefundable         *bool `json:"tickets_refundable"`
 	TicketRefundCutoffMinutes *int  `json:"ticket_refund_cutoff_minutes"`
+}
+
+// eventActionRequest is the call-to-action button an editor typed.
+//
+// There is deliberately NO "target" field: the target is derived from whether
+// url is present. Sending both would let a payload say target=event with an
+// external url, and someone would eventually have to guess which half is a lie.
+type eventActionRequest struct {
+	Label string `json:"label"`
+	// URL — внешняя ссылка. Отсутствует или null → кнопка ведёт на страницу
+	// самого события. Значение проверяется в домене: только http/https, с
+	// хостом, без учётных данных и управляющих символов; javascript:, data: и
+	// прочие схемы отклоняются с 422.
+	URL *string `json:"url"`
+}
+
+// toDomain maps the optional button, nil staying nil ("no button").
+func (r *eventActionRequest) toDomain() *domain.EventAction {
+	if r == nil {
+		return nil
+	}
+	return &domain.EventAction{Label: r.Label, URL: r.URL}
 }
 
 // refundPolicyRequest is the narrow "just the refund rules" admin payload.
@@ -477,8 +561,11 @@ func (r eventRequest) parseWindow(c *gin.Context) (startsAt, endsAt time.Time, o
 }
 
 type eventResponse struct {
-	ID              string            `json:"id"`
-	RestaurantID    string            `json:"restaurant_id"`
+	ID string `json:"id"`
+	// RestaurantID — заведение-хозяин. ОТСУТСТВУЕТ у события платформы: у него
+	// заведения нет, и прислать сюда нули значило бы предложить клиенту
+	// открыть несуществующую карточку.
+	RestaurantID    *string           `json:"restaurant_id,omitempty"`
 	Title           string            `json:"title"`
 	TitleI18n       map[string]string `json:"title_i18n,omitempty"`
 	Description     string            `json:"description"`
@@ -511,8 +598,36 @@ type eventResponse struct {
 	// for an ordinary one-off event. The cabinet uses it to tell the venue "this
 	// date comes from a series" before they edit or delete it.
 	RecurrenceID *string `json:"recurrence_id,omitempty"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	// Action — кнопка карточки. Отсутствует, когда кнопки нет.
+	Action    *eventActionResponse `json:"action,omitempty"`
+	CreatedAt string               `json:"created_at"`
+	UpdatedAt string               `json:"updated_at"`
+}
+
+// eventActionResponse is the button as a client draws it. Target is DERIVED
+// (see domain.EventAction.Target) and is what the client branches on: "event"
+// → open GET /events/{id} in-app, "external" → open url in a browser.
+type eventActionResponse struct {
+	Label  string  `json:"label"`
+	Target string  `json:"target"`
+	URL    *string `json:"url,omitempty"`
+}
+
+func actionResponse(a *domain.EventAction) *eventActionResponse {
+	if a == nil {
+		return nil
+	}
+	return &eventActionResponse{Label: a.Label, Target: string(a.Target()), URL: a.URL}
+}
+
+// idOrNil renders an optional uuid as an optional string, so an absent owner
+// stays absent in JSON instead of becoming an all-zeros id.
+func idOrNil(id *uuid.UUID) *string {
+	if id == nil {
+		return nil
+	}
+	s := id.String()
+	return &s
 }
 
 // cityOrNil renders the optional city override as a plain optional string. nil
@@ -547,7 +662,7 @@ func adminResponse(e domain.Event) eventResponse {
 	}
 	return eventResponse{
 		ID:               e.ID.String(),
-		RestaurantID:     e.RestaurantID.String(),
+		RestaurantID:     idOrNil(e.RestaurantID),
 		Title:            e.Title,
 		TitleI18n:        e.TitleI18n,
 		Description:      e.Description,
@@ -567,6 +682,7 @@ func adminResponse(e domain.Event) eventResponse {
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
 		RecurrenceID:              recurrenceID,
+		Action:                    actionResponse(e.Action),
 		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
 	}
@@ -575,9 +691,12 @@ func adminResponse(e domain.Event) eventResponse {
 // eventListItemResponse is the cross-venue listing's item: the same guest-facing
 // event shape as the per-restaurant listing (embedded, so its fields stay inline
 // and identical) plus the venue that hosts it, which the Explore card needs.
+// Restaurant is ABSENT for a platform event. It used to be unconditional, and
+// a client that reads it must treat "no restaurant" as a real, drawable state:
+// the card is the platform's own and simply has no venue line.
 type eventListItemResponse struct {
 	eventResponse
-	Restaurant eventRestaurantResponse `json:"restaurant"`
+	Restaurant *eventRestaurantResponse `json:"restaurant,omitempty"`
 }
 
 // eventRestaurantResponse is the minimal venue identity on an Explore card.
@@ -588,14 +707,15 @@ type eventRestaurantResponse struct {
 }
 
 func publicListItemResponse(it domain.EventListItem, lang string) eventListItemResponse {
-	return eventListItemResponse{
-		eventResponse: publicResponse(it.Event, lang),
-		Restaurant: eventRestaurantResponse{
+	out := eventListItemResponse{eventResponse: publicResponse(it.Event, lang)}
+	if it.Restaurant != nil {
+		out.Restaurant = &eventRestaurantResponse{
 			ID:   it.Restaurant.ID.String(),
 			Name: it.Restaurant.NameI18n.Resolve(lang, it.Restaurant.Name),
 			City: string(it.Restaurant.City),
-		},
+		}
 	}
+	return out
 }
 
 // publicResponse localizes title/description into lang and omits the raw i18n

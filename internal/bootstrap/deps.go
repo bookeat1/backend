@@ -306,7 +306,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// renamed city resolve to the one spelling the listing compares.
 		events.WithCityResolver(citiesUC))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
-	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo)
+	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
+		// The same dictionary the events listing uses: a promo's own city
+		// override (migration 0085) and ?city= must mean the same thing in both
+		// listings, or the two halves of one screen would disagree.
+		promos.WithCityResolver(citiesUC))
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
 
 	// Gastroguide (migration 0061): editorial collections of venues. Two halves

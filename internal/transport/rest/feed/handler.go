@@ -303,10 +303,14 @@ type placementWeightRequest struct {
 // on purpose: the ranking is a product promise ("we show you what is relevant"),
 // and a promise that cannot be inspected cannot be checked.
 type cardResponse struct {
-	Kind           string  `json:"kind"`
-	ID             string  `json:"id"`
-	RestaurantID   string  `json:"restaurant_id"`
-	RestaurantName string  `json:"restaurant_name"`
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	// RestaurantID / RestaurantName are ABSENT for a PLATFORM card — content
+	// the platform itself supplied, with no venue behind it (migration 0085).
+	// They were unconditional before; a client must draw such a card without a
+	// venue line rather than treat it as malformed.
+	RestaurantID   *string `json:"restaurant_id,omitempty"`
+	RestaurantName string  `json:"restaurant_name,omitempty"`
 	Title          string  `json:"title"`
 	Description    string  `json:"description"`
 	StartsAt       string  `json:"starts_at"`
@@ -325,6 +329,27 @@ type cardResponse struct {
 	ScoreReasons []scoreReasonResponse `json:"score_reasons"`
 }
 
+// idOrNil renders an optional owner id as an optional string: a platform card
+// has no venue, and an all-zeros uuid would invite the client to open one.
+func idOrNil(id *uuid.UUID) *string {
+	if id == nil {
+		return nil
+	}
+	s := id.String()
+	return &s
+}
+
+// venueName localizes the venue's name, or returns "" when there is no venue.
+// A platform card's name field is simply absent — the alternative, resolving an
+// i18n map over an empty base string, would produce an empty label the client
+// still has to special-case.
+func venueName(it domain.FeedItem, lang string) string {
+	if it.RestaurantID == nil {
+		return ""
+	}
+	return it.RestaurantNameI18n.Resolve(lang, it.RestaurantName)
+}
+
 type scoreReasonResponse struct {
 	Code   string `json:"code"`
 	Points int    `json:"points"`
@@ -341,8 +366,8 @@ func newCardResponse(r domain.RankedFeedItem, lang string) cardResponse {
 	return cardResponse{
 		Kind:            string(r.Item.Kind),
 		ID:              r.Item.ID.String(),
-		RestaurantID:    r.Item.RestaurantID.String(),
-		RestaurantName:  r.Item.RestaurantNameI18n.Resolve(lang, r.Item.RestaurantName),
+		RestaurantID:    idOrNil(r.Item.RestaurantID),
+		RestaurantName:  venueName(r.Item, lang),
 		Title:           r.Item.TitleI18n.Resolve(lang, r.Item.Title),
 		Description:     r.Item.DescriptionI18n.Resolve(lang, r.Item.Description),
 		StartsAt:        r.Item.StartsAt.Format(time.RFC3339),
@@ -359,10 +384,11 @@ func newCardResponse(r domain.RankedFeedItem, lang string) cardResponse {
 // stateResponse is the venue/platform view of one item: the content, the
 // moderation record and the derived lifecycle the cabinet renders as a badge.
 type stateResponse struct {
-	Kind            string  `json:"kind"`
-	ID              string  `json:"id"`
-	RestaurantID    string  `json:"restaurant_id"`
-	RestaurantName  string  `json:"restaurant_name"`
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	// Absent for a platform item — see cardResponse.
+	RestaurantID    *string `json:"restaurant_id,omitempty"`
+	RestaurantName  string  `json:"restaurant_name,omitempty"`
 	Title           string  `json:"title"`
 	StartsAt        string  `json:"starts_at"`
 	EndsAt          string  `json:"ends_at"`
@@ -380,7 +406,7 @@ func newStateResponse(st uc.ItemState) stateResponse {
 	out := stateResponse{
 		Kind:            string(st.Item.Kind),
 		ID:              st.Item.ID.String(),
-		RestaurantID:    st.Item.RestaurantID.String(),
+		RestaurantID:    idOrNil(st.Item.RestaurantID),
 		RestaurantName:  st.Item.RestaurantName,
 		Title:           st.Item.Title,
 		StartsAt:        st.Item.StartsAt.Format(time.RFC3339),

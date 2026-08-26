@@ -28,7 +28,7 @@ func seedRestaurant(ctx context.Context, t *testing.T, pool sqltx.Querier, name 
 func mkEvent(rid uuid.UUID, status domain.EventStatus, startsIn, dur time.Duration) *domain.Event {
 	start := time.Now().Add(startsIn).UTC().Truncate(time.Second)
 	return &domain.Event{
-		RestaurantID: rid,
+		RestaurantID: &rid,
 		Title:        "E",
 		StartsAt:     start,
 		EndsAt:       start.Add(dur),
@@ -348,11 +348,14 @@ func TestListPublicUpcoming_CarriesTheHostVenue(t *testing.T) {
 		t.Fatalf("items = %d, want 1", len(items))
 	}
 	v := items[0].Restaurant
+	if v == nil {
+		t.Fatalf("venue-bound event lost its venue block")
+	}
 	if v.ID != fx.astana || v.Name != "Astana Grill" || v.City != domain.CityAstana {
 		t.Fatalf("venue = %+v, want the Astana venue", v)
 	}
-	if v.ID != items[0].RestaurantID {
-		t.Fatalf("venue id %s does not match the event's restaurant_id %s", v.ID, items[0].RestaurantID)
+	if items[0].RestaurantID == nil || v.ID != *items[0].RestaurantID {
+		t.Fatalf("venue id %s does not match the event's restaurant_id %v", v.ID, items[0].RestaurantID)
 	}
 }
 
