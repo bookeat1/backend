@@ -30,7 +30,8 @@ var _ domain.MenuItemRepository = (*Repository)(nil)
 // selCols lists menu_items columns for reads; price is rendered as text so the
 // domain can carry it as a decimal string without a float round-trip.
 const selCols = `id, restaurant_id, name, name_i18n, description, description_i18n,
-	price::text, image_url, is_available, is_featured, category, category_i18n, subcategory,
+	price::text, image_url, is_available, is_featured, top_pick_position::int,
+	category, category_i18n, subcategory,
 	subcategory_i18n, portion_size, portion_size_i18n, language, display_order,
 	created_at, updated_at`
 
@@ -211,7 +212,8 @@ func (r *Repository) ListFeatured(ctx context.Context, f domain.FeaturedMenuFilt
 		var venueName string
 		if err := rows.Scan(
 			&m.ID, &m.RestaurantID, &m.Name, &name, &m.Description, &desc, &m.Price,
-			&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.Category, &cat, &m.Subcategory, &subcat,
+			&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.TopPickPosition,
+			&m.Category, &cat, &m.Subcategory, &subcat,
 			&m.PortionSize, &portion, &m.Language, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
 			&venueName, &venueI18n,
 		); err != nil {
@@ -249,6 +251,71 @@ func (r *Repository) SetFeatured(ctx context.Context, restaurantID, id uuid.UUID
 		return domain.ErrNotFound
 	}
 	return nil
+}
+
+// ListTopPicks reads the dishes a venue has marked as «Лучшие позиции», in the
+// venue's own order. Availability is NOT filtered here on purpose: the panel
+// has to show a marked dish that is currently stopped (otherwise it silently
+// disappears from the editor while still holding a slot), and the usecase needs
+// every occupied slot to allocate a free one. The guest-facing read drops
+// unavailable dishes itself.
+func (r *Repository) ListTopPicks(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+selCols+` FROM menu_items
+		 WHERE restaurant_id=$1 AND top_pick_position IS NOT NULL
+		 ORDER BY top_pick_position ASC`, restaurantID)
+	if err != nil {
+		return nil, fmt.Errorf("list top picks: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.MenuItem{}
+	for rows.Next() {
+		m, err := scanItem(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list top picks: %w", err)
+		}
+		out = append(out, *m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list top picks: %w", err)
+	}
+	return out, nil
+}
+
+// SetTopPickPosition marks (position != nil) or unmarks (nil) one dish of
+// restaurantID. The restaurant_id predicate is the tenant guard: an id owned by
+// another venue matches zero rows and comes back as ErrNotFound, so a manager
+// cannot arrange somebody else's shop window by guessing ids.
+//
+// The slot collision is left to the partial UNIQUE index rather than to a
+// SELECT-then-UPDATE: two managers marking a dish at the same moment compute
+// the same free slot, and exactly one of them wins. mapWrite turns 23505 into
+// ErrAlreadyExists and the usecase retries with the next free slot.
+func (r *Repository) SetTopPickPosition(ctx context.Context, restaurantID, id uuid.UUID, position *int) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE menu_items SET top_pick_position=$3::smallint, updated_at=now()
+		 WHERE restaurant_id=$1 AND id=$2`, restaurantID, id, position)
+	if err != nil {
+		return mapWrite(err, "set top pick position")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// ClearTopPicks unmarks every dish of restaurantID in one statement. Used as
+// the first half of a clear-then-set re-ordering inside a single transaction:
+// doing it dish by dish would make an intermediate state where a new slot
+// collides with an old one, and the whole re-order would fail on a legal input.
+func (r *Repository) ClearTopPicks(ctx context.Context, restaurantID uuid.UUID) (int, error) {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE menu_items SET top_pick_position=NULL, updated_at=now()
+		 WHERE restaurant_id=$1 AND top_pick_position IS NOT NULL`, restaurantID)
+	if err != nil {
+		return 0, fmt.Errorf("clear top picks: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // prefixed qualifies every bare column of a select list with a table alias, so
@@ -320,7 +387,8 @@ func scanItem(row scanner) (*domain.MenuItem, error) {
 	var name, desc, cat, subcat, portion []byte
 	if err := row.Scan(
 		&m.ID, &m.RestaurantID, &m.Name, &name, &m.Description, &desc, &m.Price,
-		&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.Category, &cat, &m.Subcategory, &subcat,
+		&m.ImageURL, &m.IsAvailable, &m.IsFeatured, &m.TopPickPosition,
+		&m.Category, &cat, &m.Subcategory, &subcat,
 		&m.PortionSize, &portion, &m.Language, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err
