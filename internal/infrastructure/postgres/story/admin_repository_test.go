@@ -226,3 +226,91 @@ func sortOrderOf(t *testing.T, ctx context.Context, repo *Repository, id uuid.UU
 	}
 	return s.SortOrder
 }
+
+// TestActionURLRoundTrips: the external link a tap on the story follows survives
+// Create → GetByID → Update, and it is a DIFFERENT column from image_url (the
+// picture's address). Both lists read it back too, so the public and admin
+// surfaces see the same link.
+func TestActionURLRoundTrips(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_stories", "restaurants")
+	ctx := context.Background()
+	repo := New(pool)
+
+	rid := mkRestaurant(t, ctx, pool, "A")
+	link := "https://book-eat.com/promo"
+	s := &domain.Story{RestaurantID: rid, ImageURL: "https://cdn/a.jpg", ActionURL: &link, IsActive: true}
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ActionURL == nil || *got.ActionURL != link {
+		t.Fatalf("action_url must round-trip, got %v", got.ActionURL)
+	}
+	if got.ImageURL != "https://cdn/a.jpg" {
+		t.Fatalf("image_url must stay the picture's address, got %q", got.ImageURL)
+	}
+
+	list, err := repo.ListActiveByRestaurant(ctx, rid)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].ActionURL == nil || *list[0].ActionURL != link {
+		t.Fatalf("the public read must carry the link: %+v", list)
+	}
+
+	// Clearing the link (nil) is a reachable state, and it must not disturb the
+	// picture.
+	got.ActionURL = nil
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after, err := repo.GetByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if after.ActionURL != nil {
+		t.Fatalf("the link must be clearable, got %v", *after.ActionURL)
+	}
+	if after.ImageURL != "https://cdn/a.jpg" {
+		t.Fatalf("clearing the link must not touch image_url, got %q", after.ImageURL)
+	}
+}
+
+// TestActionURLCheckConstraintRefusesDangerousLink: the CHECK added in 0086 is
+// the SECOND line of defence — the first is domain.ValidateExternalActionURL.
+// This test writes straight past the application (a manual UPDATE, a future
+// import) and asserts the database itself refuses a javascript: link, a
+// credentials-bearing URL and one carrying a smuggled newline.
+func TestActionURLCheckConstraintRefusesDangerousLink(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_stories", "restaurants")
+	ctx := context.Background()
+	rid := mkRestaurant(t, ctx, pool, "A")
+
+	for _, raw := range []string{
+		"javascript:alert(1)",
+		"java\nscript:alert(1)",
+		"https://user:pass@book-eat.com/promo",
+		"https://book-eat.com/ promo",
+	} {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO restaurant_stories (restaurant_id, image_url, action_url) VALUES ($1,'https://cdn/a.jpg',$2)`,
+			rid, raw)
+		if err == nil {
+			t.Fatalf("the CHECK constraint must refuse %q", raw)
+		}
+	}
+
+	// The same insert with a sane link succeeds — the constraint is not simply
+	// rejecting everything.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_stories (restaurant_id, image_url, action_url) VALUES ($1,'https://cdn/a.jpg','https://book-eat.com/promo')`,
+		rid); err != nil {
+		t.Fatalf("a valid link must be accepted: %v", err)
+	}
+}

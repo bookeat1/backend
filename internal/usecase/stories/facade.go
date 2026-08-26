@@ -62,8 +62,13 @@ type CreateInput struct {
 	RestaurantID uuid.UUID
 	ImageURL     string
 	Caption      *string
-	SortOrder    *int
-	IsActive     *bool
+	// ActionURL is the EXTERNAL link a tap on the card follows — NOT the
+	// picture's address, which is ImageURL. nil or an empty string means "the
+	// card leads nowhere"; anything else must pass
+	// domain.ValidateExternalActionURL.
+	ActionURL *string
+	SortOrder *int
+	IsActive  *bool
 }
 
 // UpdateInput carries a story's mutable fields for a PARTIAL update: a nil field
@@ -71,8 +76,13 @@ type CreateInput struct {
 // unchanged, and an explicit empty/whitespace string clears it (empty→nil), so
 // the "no caption" state is reachable through the edit form.
 type UpdateInput struct {
-	ImageURL  *string
-	Caption   *string
+	ImageURL *string
+	Caption  *string
+	// ActionURL follows the same three-state rule as Caption: nil leaves the
+	// stored link untouched, an empty/whitespace string clears it (so the
+	// operator can un-link a story through the edit form), and anything else is
+	// validated and stored.
+	ActionURL *string
 	SortOrder *int
 	IsActive  *bool
 }
@@ -107,6 +117,10 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 	if err := validateImageURL(imageURL); err != nil {
 		return nil, err
 	}
+	actionURL, err := normalizeActionURL(in.ActionURL)
+	if err != nil {
+		return nil, err
+	}
 	sortOrder, err := f.resolveSortOrder(ctx, in.RestaurantID, in.SortOrder)
 	if err != nil {
 		return nil, err
@@ -119,6 +133,7 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 		RestaurantID: in.RestaurantID,
 		ImageURL:     imageURL,
 		Caption:      normalizeCaption(in.Caption),
+		ActionURL:    actionURL,
 		SortOrder:    sortOrder,
 		IsActive:     isActive,
 	}
@@ -145,6 +160,13 @@ func (f *facade) UpdateStory(ctx context.Context, actor Actor, storyID uuid.UUID
 	}
 	if in.Caption != nil {
 		s.Caption = normalizeCaption(in.Caption)
+	}
+	if in.ActionURL != nil {
+		actionURL, err := normalizeActionURL(in.ActionURL)
+		if err != nil {
+			return nil, err
+		}
+		s.ActionURL = actionURL
 	}
 	if in.SortOrder != nil {
 		s.SortOrder = *in.SortOrder
@@ -221,6 +243,28 @@ func normalizeCaption(c *string) *string {
 		return nil
 	}
 	return &trimmed
+}
+
+// normalizeActionURL turns the operator's input into what gets stored: nil (or
+// a blank string) means "no link", and anything else must survive
+// domain.ValidateExternalActionURL — the SAME validator the event action button
+// uses, deliberately not a second, softer copy of it. It refuses javascript:/
+// data: and friends, credentials in the URL, control characters smuggled into
+// the scheme ("java\nscript:") and anything over 2048 characters, all as
+// ErrValidation → 422.
+//
+// Note this is stricter than validateImageURL below, and that is on purpose:
+// the image URL is fetched by an <img>, while this one is OPENED in the guest's
+// browser on tap, which is what makes a hostile scheme dangerous.
+func normalizeActionURL(raw *string) (*string, error) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, nil
+	}
+	v, err := domain.ValidateExternalActionURL(*raw)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // validateImageURL turns what would otherwise be a NOT NULL / bad-data write

@@ -440,3 +440,137 @@ func TestListForAdmin_Forbidden(t *testing.T) {
 		t.Fatalf("a non-managing caller must be denied the admin list, got %v", err)
 	}
 }
+
+// --- action_url: the EXTERNAL link a tap on the story follows ---
+//
+// These guard the field that is NOT image_url. image_url is where the picture
+// lives; action_url is where the guest goes. Confusing the two is the whole
+// hazard this feature carries, so every test below names the distinction.
+
+func TestCreateStory_StoresActionURL(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.CreateStory(context.Background(), managerActor(actorID), CreateInput{
+		RestaurantID: rid,
+		ImageURL:     "https://cdn.book-eat.com/stories/a.jpg",
+		ActionURL:    strptr("  https://book-eat.com/promo  "),
+	})
+	if err != nil {
+		t.Fatalf("a manager must be able to attach an external link: %v", err)
+	}
+	if s.ActionURL == nil || *s.ActionURL != "https://book-eat.com/promo" {
+		t.Fatalf("action_url must be trimmed and stored, got %v", s.ActionURL)
+	}
+	if s.ImageURL != "https://cdn.book-eat.com/stories/a.jpg" {
+		t.Fatalf("the link must not touch image_url, got %q", s.ImageURL)
+	}
+	if repo.created == nil || repo.created.ActionURL == nil {
+		t.Fatal("the link must reach the repository, not just the returned struct")
+	}
+}
+
+func TestCreateStory_NoActionURLIsNil(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.CreateStory(context.Background(), managerActor(actorID), CreateInput{
+		RestaurantID: rid, ImageURL: "https://cdn/a.jpg", ActionURL: strptr("   "),
+	})
+	if err != nil {
+		t.Fatalf("a story without a link is valid: %v", err)
+	}
+	if s.ActionURL != nil {
+		t.Fatalf("a blank link must be stored as NULL, got %v", *s.ActionURL)
+	}
+}
+
+// TestCreateStory_DangerousActionURLRejected: the link is OPENED on the guest's
+// phone, so a hostile scheme is code execution in a webview. Control characters
+// must be stripped BEFORE the URL is parsed — "java\nscript:" is the classic
+// way past a naive check — which is exactly what domain.ValidateExternalActionURL
+// does, and why stories reuse it instead of growing a second, softer validator.
+func TestCreateStory_DangerousActionURLRejected(t *testing.T) {
+	for _, raw := range []string{
+		"javascript:alert(1)",
+		"java\nscript:alert(1)",
+		"data:text/html;base64,PHNjcmlwdD4=",
+		"book-eat.com/promo",
+		"https://user:pass@book-eat.com/promo",
+		"https:///promo",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			rid, actorID := uuid.New(), uuid.New()
+			repo := newFakeRepo()
+			f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+			_, err := f.CreateStory(context.Background(), managerActor(actorID), CreateInput{
+				RestaurantID: rid, ImageURL: "https://cdn/a.jpg", ActionURL: strptr(raw),
+			})
+			if !errors.Is(err, domain.ErrValidation) {
+				t.Fatalf("%q must be refused as ErrValidation, got %v", raw, err)
+			}
+			if repo.created != nil {
+				t.Fatal("nothing must be written when the link is refused")
+			}
+		})
+	}
+}
+
+func TestUpdateStory_ActionURLLeftAloneWhenOmitted(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.ActionURL = strptr("https://book-eat.com/promo")
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		ImageURL: strptr("https://cdn/new.jpg"),
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if s.ActionURL == nil || *s.ActionURL != "https://book-eat.com/promo" {
+		t.Fatalf("changing the picture must not drop the link, got %v", s.ActionURL)
+	}
+	if s.ImageURL != "https://cdn/new.jpg" {
+		t.Fatalf("image_url must be the field that changed, got %q", s.ImageURL)
+	}
+}
+
+func TestUpdateStory_EmptyActionURLClearsIt(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.ActionURL = strptr("https://book-eat.com/promo")
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		ActionURL: strptr(""),
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if s.ActionURL != nil {
+		t.Fatalf("an empty link must un-link the story, got %v", *s.ActionURL)
+	}
+}
+
+func TestUpdateStory_DangerousActionURLRejected(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	_, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		ActionURL: strptr("java\nscript:alert(1)"),
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("a smuggled javascript: link must be ErrValidation, got %v", err)
+	}
+	if repo.updated != nil {
+		t.Fatal("nothing must be written when the link is refused")
+	}
+}

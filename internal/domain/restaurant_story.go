@@ -13,11 +13,21 @@ import (
 // (a wordless highlight card is valid); nil means "no caption", not an empty
 // string. SortOrder governs left-to-right display order; IsActive lets a venue
 // retire a card without deleting it.
+//
+// ActionURL is the EXTERNAL link the guest is sent to when they tap the card —
+// a different thing from ImageURL, which is where the card's PICTURE lives. It
+// is optional (nil = tapping the card leads nowhere) and, when set, has passed
+// ValidateExternalActionURL, the same validator the event action button uses.
+//
+// Unlike EventAction there is no companion label: an event draws a BUTTON, and
+// a button needs a caption, whereas a story's whole card is the tap target and
+// there is nothing to caption.
 type Story struct {
 	ID           uuid.UUID
 	RestaurantID uuid.UUID
 	ImageURL     string
 	Caption      *string
+	ActionURL    *string
 	SortOrder    int
 	IsActive     bool
 	CreatedAt    time.Time
@@ -47,8 +57,8 @@ type StoryRepository interface {
 	// ErrNotFound. CreatedAt is populated on the passed struct.
 	Create(ctx context.Context, s *Story) error
 
-	// Update overwrites the mutable fields (image_url, caption, sort_order,
-	// is_active) of s.ID, scoped to s.RestaurantID so an id from another tenant
+	// Update overwrites the mutable fields (image_url, caption, action_url,
+	// sort_order, is_active) of s.ID, scoped to s.RestaurantID so an id from another tenant
 	// can never be updated. A zero-rows update maps to ErrNotFound.
 	Update(ctx context.Context, s *Story) error
 

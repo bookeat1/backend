@@ -234,3 +234,58 @@ func TestDeleteReturnsStatus(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
 	}
 }
+
+// TestCreatePassesActionURL: the body's action_url reaches the facade as the
+// LINK, untouched, and comes back in the admin response — and it is carried
+// independently of image_url, which stays the picture's address.
+func TestCreatePassesActionURL(t *testing.T) {
+	story := sampleStory()
+	link := "https://book-eat.com/promo"
+	story.ActionURL = &link
+	f := &fakeFacade{story: story}
+	r := adminRouter(f, domain.RoleRestaurant)
+	token := uuid.New()
+
+	body := gin.H{"image_url": story.ImageURL, "action_url": link}
+	w := doAdmin(r, http.MethodPost, "/api/v1/admin/restaurants/"+story.RestaurantID.String()+"/stories", body, nil, &token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	if f.created == nil || f.created.ActionURL == nil || *f.created.ActionURL != link {
+		t.Fatalf("facade did not receive action_url: %+v", f.created)
+	}
+	if f.created.ImageURL != story.ImageURL {
+		t.Fatalf("image_url must be unaffected, got %q", f.created.ImageURL)
+	}
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Data["action_url"] != link {
+		t.Errorf("admin response action_url = %v, want %q", env.Data["action_url"], link)
+	}
+}
+
+// TestUpdatePassesActionURL: an explicit empty action_url in the PATCH body must
+// reach the facade as a set-but-empty pointer — that is how the operator clears
+// the link — and must not be confused with an omitted field.
+func TestUpdatePassesActionURL(t *testing.T) {
+	story := sampleStory()
+	f := &fakeFacade{story: story}
+	r := adminRouter(f, domain.RoleRestaurant)
+	token := uuid.New()
+
+	body := gin.H{"action_url": ""}
+	w := doAdmin(r, http.MethodPut, "/api/v1/admin/stories/"+story.ID.String(), body, nil, &token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	if f.updated == nil || f.updated.ActionURL == nil || *f.updated.ActionURL != "" {
+		t.Fatalf("an explicit empty action_url must reach the facade: %+v", f.updated)
+	}
+	if f.updated.ImageURL != nil {
+		t.Fatalf("image_url must stay omitted, got %v", *f.updated.ImageURL)
+	}
+}

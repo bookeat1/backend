@@ -95,6 +95,7 @@ func (h *Handler) create(c *gin.Context) {
 		RestaurantID: rid,
 		ImageURL:     req.ImageURL,
 		Caption:      req.Caption,
+		ActionURL:    req.ActionURL,
 		SortOrder:    req.SortOrder,
 		IsActive:     req.IsActive,
 	})
@@ -122,6 +123,7 @@ func (h *Handler) update(c *gin.Context) {
 	s, err := h.facade.UpdateStory(c.Request.Context(), actor, sid, uc.UpdateInput{
 		ImageURL:  req.ImageURL,
 		Caption:   req.Caption,
+		ActionURL: req.ActionURL,
 		SortOrder: req.SortOrder,
 		IsActive:  req.IsActive,
 	})
@@ -204,8 +206,13 @@ func pathUUID(c *gin.Context, param, msg string) (uuid.UUID, bool) {
 // usecase; caption/sort_order/is_active are optional (nil ⇒ the usecase default:
 // no caption, end-of-list, active).
 type createStoryRequest struct {
-	ImageURL  string  `json:"image_url"`
-	Caption   *string `json:"caption"`
+	ImageURL string  `json:"image_url"`
+	Caption  *string `json:"caption"`
+	// action_url is where a TAP on the story sends the guest. Not to be
+	// confused with image_url, which is where the picture itself lives.
+	// Optional; when present it must be an http(s) link (validated in the
+	// usecase by domain.ValidateExternalActionURL).
+	ActionURL *string `json:"action_url"`
 	SortOrder *int    `json:"sort_order"`
 	IsActive  *bool   `json:"is_active"`
 }
@@ -213,8 +220,11 @@ type createStoryRequest struct {
 // updateStoryRequest is a partial edit: an omitted field is left unchanged. An
 // empty/whitespace caption clears it (empty ⇒ null).
 type updateStoryRequest struct {
-	ImageURL  *string `json:"image_url"`
-	Caption   *string `json:"caption"`
+	ImageURL *string `json:"image_url"`
+	Caption  *string `json:"caption"`
+	// Same three states as caption: omitted ⇒ unchanged, empty ⇒ the link is
+	// removed, otherwise validated and stored.
+	ActionURL *string `json:"action_url"`
 	SortOrder *int    `json:"sort_order"`
 	IsActive  *bool   `json:"is_active"`
 }

@@ -26,7 +26,7 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.StoryRepository = (*Repository)(nil)
 
 // selCols lists restaurant_stories columns for reads.
-const selCols = `id, restaurant_id, image_url, caption, sort_order, is_active, created_at`
+const selCols = `id, restaurant_id, image_url, caption, action_url, sort_order, is_active, created_at`
 
 func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
 	// id is the final tie-break: now() is constant within a transaction, so a
@@ -103,10 +103,10 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 		s.ID = uuid.New()
 	}
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, sort_order, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, action_url, sort_order, is_active)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING created_at`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.SortOrder, s.IsActive).
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.ActionURL, s.SortOrder, s.IsActive).
 		Scan(&s.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -124,9 +124,9 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 func (r *Repository) Update(ctx context.Context, s *domain.Story) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE restaurant_stories
-		 SET image_url=$3, caption=$4, sort_order=$5, is_active=$6
+		 SET image_url=$3, caption=$4, action_url=$5, sort_order=$6, is_active=$7
 		 WHERE id=$1 AND restaurant_id=$2`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.SortOrder, s.IsActive)
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.ActionURL, s.SortOrder, s.IsActive)
 	if err != nil {
 		return fmt.Errorf("update restaurant story: %w", err)
 	}
@@ -180,7 +180,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanStory(row scanner) (*domain.Story, error) {
 	var s domain.Story
 	if err := row.Scan(
-		&s.ID, &s.RestaurantID, &s.ImageURL, &s.Caption, &s.SortOrder, &s.IsActive, &s.CreatedAt,
+		&s.ID, &s.RestaurantID, &s.ImageURL, &s.Caption, &s.ActionURL, &s.SortOrder, &s.IsActive, &s.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
