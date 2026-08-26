@@ -170,6 +170,12 @@ ALTER TABLE events
 --     учётных данных в URL и управляющих символов), а этот CHECK — второй
 --     рубеж: он ловит запись мимо приложения (ручной UPDATE, будущий импорт) и
 --     стоит ноль на INSERT.
+--
+--     Рубежи НЕ совпадают дословно и не должны: CHECK проверяет форму строки,
+--     Go разбирает URL целиком (IDN, доля процент-кодирования, схема после
+--     нормализации). Здесь закрыто то, что дёшево выразить регуляркой и дорого
+--     потерять: схема, длина, пробелы, управляющие байты и «@» — учётные данные
+--     в адресе. Всё, что строже, живёт в domain.ValidateExternalActionURL.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE events
@@ -180,7 +186,18 @@ ALTER TABLE events
     ADD CONSTRAINT events_action_url_needs_label
         CHECK (action_url IS NULL OR action_label IS NOT NULL),
     ADD CONSTRAINT events_action_url_scheme
-        CHECK (action_url IS NULL OR action_url ~* '^https?://[^[:space:]]+$');
+        CHECK (
+            action_url IS NULL
+            OR (
+                -- Схема, длина, отсутствие пробелов и управляющих байтов.
+                action_url ~* '^https?://[^[:space:][:cntrl:]]+$'
+                AND length(action_url) <= 2048
+                -- Учётные данные в URL (https://user:pass@host) — классическая
+                -- фишинговая форма; Go-валидатор их режет, CHECK обязан тоже,
+                -- иначе «второй рубеж» пропускает то, что запрещает первый.
+                AND position('@' in action_url) = 0
+            )
+        );
 
 COMMENT ON COLUMN events.action_label IS
     'Подпись кнопки действия. NULL = кнопки нет.';
