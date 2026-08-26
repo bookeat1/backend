@@ -31,17 +31,32 @@ func (s EventStatus) Valid() bool {
 	return false
 }
 
-// Event is a one-off happening a restaurant hosts (a wine dinner, a live-music
-// night). Title/Description are localized the same way the catalog is: a base
-// scalar column (ru) plus an optional *_i18n jsonb map — see I18n.Resolve.
+// Event is a one-off happening (a wine dinner, a live-music night). It is
+// hosted EITHER by a restaurant or by the platform itself — see RestaurantID.
+// Title/Description are localized the same way the catalog is: a base scalar
+// column (ru) plus an optional *_i18n jsonb map — see I18n.Resolve.
 //
 // Ticketed/TicketPriceMinor/Capacity are carried as FIELDS ONLY in this
 // increment: the ticket purchase / payment flow is a deliberately deferred
 // follow-up (see the PR). TicketPriceMinor is integer minor units (tiyin/
 // cents), never a float, consistent with every money value in this codebase.
 type Event struct {
-	ID              uuid.UUID
-	RestaurantID    uuid.UUID
+	ID uuid.UUID
+	// RestaurantID is the HOST venue, and nil means the PLATFORM itself hosts
+	// this event — «афиша без привязки к ресторану» (migration 0085). The two
+	// cases differ everywhere it matters and nowhere else:
+	//
+	//   set → today's event in every respect: the venue's staff manage it
+	//         (PermRestaurantManage at this id), the card carries the venue,
+	//         and the city is the venue's unless City overrides it.
+	//   nil → only the platform may create or edit it (see usecase/events
+	//         authorize), the card carries NO venue, and the city is whatever
+	//         City says — nil there meaning "every city".
+	//
+	// A platform event can never be Ticketed: selling a ticket means a payment
+	// with a payee, and the platform has no venue account to settle into (a DB
+	// CHECK in 0085 enforces the same rule).
+	RestaurantID    *uuid.UUID
 	Title           string
 	TitleI18n       I18n
 	Description     string
@@ -57,9 +72,8 @@ type Event struct {
 	//   nil + a host venue  → the event lives in the VENUE's city, resolved on
 	//                         every read (COALESCE(e.city, r.city)), so it can
 	//                         never go stale when the venue moves.
-	//   nil + no host venue → shown in EVERY city. Unreachable today
-	//                         (RestaurantID is required) and the seam the
-	//                         platform-wide-event card will use.
+	//   nil + no host venue → shown in EVERY city. This is the platform
+	//                         event's "везде" state, reachable since 0085.
 	//   set                 → shown in that city regardless of the venue.
 	//
 	// The stored value is the dictionary's own spelling of the city name (the
@@ -99,9 +113,17 @@ type Event struct {
 	// deleting the occurrence — an event that already happened, with tickets
 	// sold against it, must survive its rule.
 	RecurrenceID *uuid.UUID
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// Action is the optional call-to-action button on the card (migration
+	// 0085): a caption plus a destination that is either this event's own page
+	// or an external partner link. nil = no button, which is what every event
+	// created before 0085 has.
+	Action    *EventAction
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
+
+// IsPlatform reports whether the platform itself hosts this event (no venue).
+func (e Event) IsPlatform() bool { return e.RestaurantID == nil }
 
 // EventRestaurant is the minimal venue identity carried next to an event in the
 // cross-venue public listing: enough for the guest app's Explore card (who
@@ -118,9 +140,14 @@ type EventRestaurant struct {
 // itself plus the venue that hosts it. The venue is named Restaurant, not
 // Venue, because Event.Venue already means something else (the free-text room
 // inside the restaurant).
+//
+// Restaurant is nil for a PLATFORM event (Event.RestaurantID nil): there is no
+// venue to name, and a zero-valued EventRestaurant would put an all-zeros uuid
+// and an empty name on a guest's card. A pointer makes the compiler ask every
+// consumer what it draws in that case.
 type EventListItem struct {
 	Event
-	Restaurant EventRestaurant
+	Restaurant *EventRestaurant
 }
 
 // PublicEventFilter narrows the cross-venue public events listing. Every filter
@@ -130,7 +157,8 @@ type EventListItem struct {
 type PublicEventFilter struct {
 	// City filters by the event's EFFECTIVE city: its own override when set,
 	// otherwise the host venue's city (migration 0084). An event with no
-	// effective city at all is shown for every value of this filter. The value
+	// effective city at all — a platform event with no override — is shown for
+	// every value of this filter. The value
 	// is resolved through the city dictionary before it reaches the store (see
 	// usecase/events canonicalCity), so a code, an alias or a city's previous
 	// name all work; a value the dictionary does not know is passed through and
@@ -152,7 +180,7 @@ type PublicEventFilter struct {
 // absent.
 type EventRepository interface {
 	// Create inserts a new event. An unknown restaurant_id (FK violation) maps
-	// to ErrNotFound.
+	// to ErrNotFound. A nil Event.RestaurantID stores a platform event.
 	Create(ctx context.Context, e *Event) error
 	// GetByID returns an event by its id regardless of status (staff resolve the
 	// target and its restaurant before authorizing).
@@ -172,6 +200,12 @@ type EventRepository interface {
 	// optionally filtered to the given statuses (empty = all), newest-start
 	// first with id as a stable tie-breaker, paginated, plus the total count.
 	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, statuses []EventStatus, page, perPage int) ([]Event, int, error)
+	// ListPlatform is ListByRestaurant for the events NOBODY hosts — the
+	// platform's own «афиша» (restaurant_id IS NULL). Same ordering, same
+	// status filter, same pagination contract; a separate method rather than a
+	// nullable argument because "all events of no venue" and "all events of
+	// some venue" are two different questions with two different authorizations.
+	ListPlatform(ctx context.Context, statuses []EventStatus, page, perPage int) ([]Event, int, error)
 	// ListPublishedUpcoming returns a restaurant's PUBLISHED events that have
 	// not yet ended (ends_at > now), soonest first with id as a stable
 	// tie-breaker, paginated, plus the total count. This is the public listing.
@@ -190,4 +224,12 @@ type EventRepository interface {
 	// and bookings address a single occurrence, and the cabinet listing
 	// (ListByRestaurant) still shows every date.
 	ListPublicUpcoming(ctx context.Context, f PublicEventFilter, now time.Time) ([]EventListItem, int, error)
+	// GetPublicByID returns ONE published, not-yet-ended event addressed by its
+	// own id — whoever hosts it — together with its venue when it has one
+	// (nil for a platform event). It is what the event's OWN page reads, and
+	// therefore what an action button targeting that page can point at; the
+	// older GetByID + "does it belong to this restaurant" pair cannot express a
+	// venue-less event at all. ErrNotFound for a draft/hidden/finished event:
+	// to a guest it does not exist.
+	GetPublicByID(ctx context.Context, id uuid.UUID, now time.Time) (*EventListItem, error)
 }

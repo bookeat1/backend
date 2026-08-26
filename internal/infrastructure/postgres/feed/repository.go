@@ -35,6 +35,15 @@ var _ domain.FeedRepository = (*Repository)(nil)
 // NEVER caller input: it comes from tableFor, a closed switch over the two
 // known kinds, so no string here can carry an injection.
 //
+// The venue is LEFT-joined since migration 0085: a PLATFORM promo or event has
+// no venue at all, and an inner join would have silently deleted the whole
+// feature from the main screen. Everything the ranking reads off the venue is
+// therefore COALESCEd to a neutral value — is_active true, hidden_from_home
+// false, so the eligibility rule that exists to hide a DEACTIVATED venue does
+// not also hide a card that never had one. The card's city becomes
+// COALESCE(i.city, r.city): the item's own override first, its venue second,
+// NULL (= every city) only when it has neither.
+//
 // The two branches now differ only in `terms` and `discount_percent`, which
 // events do not have: terms is projected as an empty string and discount as
 // NULL so the column list stays identical. Both tables carry cover_image_url
@@ -70,8 +79,14 @@ func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 	}
 	return `SELECT '` + string(kind) + `'::text AS kind,
 		` + alias + `.id, ` + alias + `.restaurant_id,
-		r.name AS restaurant_name, r.name_i18n AS restaurant_name_i18n,
-		r.city, r.category_id, r.is_active AS venue_is_active, r.hidden_from_home AS venue_hidden_from_home,
+		-- COALESCE, because the venue is LEFT-joined: a platform card has no
+		-- venue row, and a NULL here does not scan into a Go string — it fails
+		-- the WHOLE main-screen query, not just its own row.
+		COALESCE(r.name, '') AS restaurant_name, r.name_i18n AS restaurant_name_i18n,
+		COALESCE(` + alias + `.city, r.city) AS city,
+		r.category_id,
+		COALESCE(r.is_active, true) AS venue_is_active,
+		COALESCE(r.hidden_from_home, false) AS venue_hidden_from_home,
 		` + alias + `.title, ` + alias + `.title_i18n, ` + alias + `.description, ` + alias + `.description_i18n,
 		` + alias + `.starts_at, ` + alias + `.ends_at,
 		` + cover + ` AS cover_image_url, ` + images + ` AS images,
@@ -81,7 +96,7 @@ func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 		` + alias + `.feed_reviewed_at, ` + alias + `.feed_rejection_reason, ` + alias + `.feed_placement_weight,
 		` + alias + `.created_at` + tail + `
 	FROM ` + table + ` ` + alias + `
-	JOIN restaurants r ON r.id = ` + alias + `.restaurant_id`
+	LEFT JOIN restaurants r ON r.id = ` + alias + `.restaurant_id`
 }
 
 // collapsedEventCols reads the shared column list back out of the derived table
@@ -100,6 +115,16 @@ const collapsedEventCols = `ev.kind, ev.id, ev.restaurant_id,
 	ev.feed_status, ev.feed_submitted_at, ev.feed_reviewed_by,
 	ev.feed_reviewed_at, ev.feed_rejection_reason, ev.feed_placement_weight,
 	ev.created_at`
+
+// feedVisibleSQL is domain.FeedEligible's venue-and-city half, in SQL. It is
+// written ONCE and pasted into both union branches, because the one thing worse
+// than this rule being in two languages is it being in two languages twice.
+//
+// $1 is the requested city. Read it as: the card belongs to this city (its own
+// override, or its venue's) or to no city at all, AND — only if it has a venue —
+// that venue is visible.
+const feedVisibleSQL = `(COALESCE(i.city, r.city) IS NULL OR COALESCE(i.city, r.city) = $1::varchar)
+		  AND (i.restaurant_id IS NULL OR (r.is_active AND NOT r.hidden_from_home))`
 
 // tableFor maps a kind to its table. The default panics rather than returning
 // an empty name: an unknown kind here is a programming error, and silently
@@ -138,8 +163,13 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		limit = 100
 	}
 	// Promos must have STARTED; an upcoming event is promoted before it starts.
+	// The city, the venue flags and the "no venue at all" case are all folded
+	// into feedVisibleSQL so the two union branches state the rule once. A NULL
+	// effective city passes for EVERY city — that is the platform card meant to
+	// run everywhere, and no venue-bound row can reach it (restaurants.city is
+	// NOT NULL).
 	promoBranch := itemSelect(domain.FeedItemPromo) + `
-		WHERE r.city = $1::varchar AND r.is_active AND NOT r.hidden_from_home
+		WHERE ` + feedVisibleSQL + `
 		  AND i.status = 'published' AND i.feed_status = 'approved'
 		  AND i.starts_at <= $3::timestamptz AND i.ends_at > $3`
 	// A recurring series contributes exactly ONE card — its nearest upcoming
@@ -163,7 +193,7 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 			` + itemSelect(domain.FeedItemEvent,
 		"i.recurrence_id",
 		"row_number() OVER (PARTITION BY i.recurrence_id ORDER BY i.starts_at ASC, i.id ASC) AS rn") + `
-			WHERE r.city = $1 AND r.is_active AND NOT r.hidden_from_home
+			WHERE ` + feedVisibleSQL + `
 			  AND i.status = 'published' AND i.feed_status = 'approved'
 			  AND i.ends_at > $3
 		) ev

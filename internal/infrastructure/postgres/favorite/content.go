@@ -92,8 +92,14 @@ func (r *Repository) ListEventsByUser(ctx context.Context, userID uuid.UUID, now
 		     ORDER BY ev.starts_at ASC, ev.id ASC
 		     LIMIT 1
 		 ) e ON true
-		 JOIN restaurants r ON r.id = e.restaurant_id AND r.is_active = true
+		 -- LEFT JOIN since migration 0085: a PLATFORM event has no venue, and
+		 -- an inner join would drop it from the guest's own saved list — the
+		 -- one screen where the guest already decided they want it. The active
+		 -- check moves into COALESCE for the same reason: "no venue" is not
+		 -- "an inactive venue".
+		 LEFT JOIN restaurants r ON r.id = e.restaurant_id
 		 WHERE f.user_id = $1
+		   AND COALESCE(r.is_active, true) = true
 		 ORDER BY f.created_at DESC`, userID, now)
 	if err != nil {
 		return nil, fmt.Errorf("list event favorites: %w", err)
@@ -161,8 +167,11 @@ func (r *Repository) ListPromosByUser(ctx context.Context, userID uuid.UUID, now
 		`SELECT `+promo.ListColumns+`, f.created_at
 		 FROM promo_favorites f
 		 JOIN promos p ON p.id = f.promo_id
-		 JOIN restaurants r ON r.id = p.restaurant_id AND r.is_active = true
+		 -- LEFT JOIN: see ListEventsByUser above — a platform promo has no
+		 -- venue and must not fall out of the guest's saved list.
+		 LEFT JOIN restaurants r ON r.id = p.restaurant_id
 		 WHERE f.user_id = $1
+		   AND COALESCE(r.is_active, true) = true
 		   AND p.status = 'published'
 		   AND p.starts_at <= $2 AND p.ends_at > $2
 		 ORDER BY f.created_at DESC`, userID, now)

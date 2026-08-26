@@ -110,6 +110,12 @@ func (f *fakeEventRepo) ListPublishedUpcoming(context.Context, uuid.UUID, time.T
 func (f *fakeEventRepo) ListPublicUpcoming(context.Context, domain.PublicEventFilter, time.Time) ([]domain.EventListItem, int, error) {
 	return nil, 0, nil
 }
+func (f *fakeEventRepo) ListPlatform(context.Context, []domain.EventStatus, int, int) ([]domain.Event, int, error) {
+	return nil, 0, nil
+}
+func (f *fakeEventRepo) GetPublicByID(context.Context, uuid.UUID, time.Time) (*domain.EventListItem, error) {
+	return nil, domain.ErrNotFound
+}
 
 type fakePromoRepo struct{ created *domain.Promo }
 
@@ -130,6 +136,15 @@ func (f *fakePromoRepo) ListByRestaurant(context.Context, uuid.UUID, []domain.Pr
 }
 func (f *fakePromoRepo) ListActive(context.Context, uuid.UUID, time.Time, int, int) ([]domain.Promo, int, error) {
 	return nil, 0, nil
+}
+func (f *fakePromoRepo) ListPlatform(context.Context, []domain.PromoStatus, int, int) ([]domain.Promo, int, error) {
+	return nil, 0, nil
+}
+func (f *fakePromoRepo) ListPublicActive(context.Context, domain.PublicPromoFilter, time.Time) ([]domain.PromoListItem, int, error) {
+	return nil, 0, nil
+}
+func (f *fakePromoRepo) GetPublic(context.Context, uuid.UUID, time.Time) (*domain.PromoListItem, error) {
+	return nil, domain.ErrNotFound
 }
 
 // fakeTx runs fn directly (no real transaction).

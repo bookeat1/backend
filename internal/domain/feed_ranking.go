@@ -231,11 +231,17 @@ func ScoreFeedItem(s FeedSignals, now time.Time) FeedScore {
 // against a real database is what proves it does.
 func FeedEligible(item FeedItem, city City, now time.Time) bool {
 	// The venue itself must be visible: a deactivated venue, or one the
-	// platform pulled off the home screen, takes its content with it.
-	if !item.VenueIsActive || item.VenueHiddenFromHome {
+	// platform pulled off the home screen, takes its content with it. A
+	// PLATFORM item has no venue, so there is nothing here to hide it —
+	// checking the flags anyway would mean the whole feature depends on the
+	// read model remembering to project a neutral `true`.
+	if item.RestaurantID != nil && (!item.VenueIsActive || item.VenueHiddenFromHome) {
 		return false
 	}
-	if item.City != city {
+	// A nil city is the platform item that belongs on EVERY city's main screen
+	// (see FeedItem.City). A venue-bound item always has one — its venue's —
+	// so this branch cannot loosen anything that exists today.
+	if item.City != nil && *item.City != city {
 		return false
 	}
 	// The venue published it AND the platform approved it — two independent

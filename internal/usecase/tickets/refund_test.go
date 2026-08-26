@@ -19,7 +19,7 @@ func refundFixture(buyer *uuid.UUID, refundable bool, cutoffMinutes int) (*fakeT
 	event := ticketedEvent(nil, 35000)
 	pid := uuid.New()
 	t := &domain.EventTicket{
-		ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, UserID: buyer,
+		ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, UserID: buyer,
 		Quantity: 2, UnitPriceMinor: 35000, TotalMinor: 70000, Currency: domain.CurrencyKZT,
 		Status: domain.TicketPaid, PaymentID: &pid,
 		RefundPolicyRefundable:    refundable,

@@ -54,6 +54,11 @@ type Facade interface {
 	// ListAdmin returns a restaurant's events (optionally status-filtered) for
 	// the cabinet, paginated. Requires PermRestaurantManage at restaurantID.
 	ListAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error)
+	// ListPlatformAdmin returns the PLATFORM's own events (no host venue), any
+	// status, for the platform cabinet. Authorized by
+	// domain.CanManagePlatformContent, not by a per-restaurant permission —
+	// there is no restaurant to check one at.
+	ListPlatformAdmin(ctx context.Context, actor Actor, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error)
 	// SetRefundPolicy sets the venue's OWN ticket-refund rules for one event
 	// without going through the full-replace Update. Requires
 	// PermRestaurantManage at the event's own restaurant. A change here applies
@@ -72,11 +77,19 @@ type Facade interface {
 	// narrowed by f and paginated. No authorization. An inverted date range is
 	// ErrValidation, never a silently empty page.
 	ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter) ([]domain.EventListItem, int, error)
+	// GetPublicDetail returns ONE published, not-yet-ended event by its own id,
+	// with its venue when it has one. This is the event's own page — the target
+	// an action button points at when it has no external link — and the only
+	// public read that can address a PLATFORM event at all, since the older
+	// GetPublic is reached through a restaurant's path. No authorization.
+	GetPublicDetail(ctx context.Context, eventID uuid.UUID) (*domain.EventListItem, error)
 }
 
 // CreateInput carries a new event's fields. Status defaults to draft when empty.
 type CreateInput struct {
-	RestaurantID     uuid.UUID
+	// RestaurantID is the host venue. nil creates a PLATFORM event — one with
+	// no venue at all — which only domain.CanManagePlatformContent roles may do.
+	RestaurantID     *uuid.UUID
 	Title            string
 	TitleI18n        domain.I18n
 	Description      string
@@ -108,6 +121,10 @@ type CreateInput struct {
 	// as the migration 0047 backfill, so an old client that does not send the
 	// fields never accidentally opens refunds.
 	RefundPolicy domain.TicketRefundPolicy
+	// Action is the optional call-to-action button. nil = no button. A non-nil
+	// Action with a nil URL is a button onto the event's OWN page; with a URL it
+	// is an external link, validated before it is stored.
+	Action *domain.EventAction
 }
 
 // UpdateInput carries an event's mutable fields (full replace). Status must be
@@ -148,6 +165,11 @@ type UpdateInput struct {
 	// title. Money settings do not get turned off as a side effect of an
 	// unrelated edit.
 	RefundPolicy *domain.TicketRefundPolicy
+	// Action replaces the call-to-action button, full replace like everything
+	// else here except RefundPolicy: absent (nil) REMOVES the button. That is
+	// the safe default for an older cabinet build — it removes a button nobody
+	// could have added from that build, rather than stranding one it cannot see.
+	Action *domain.EventAction
 }
 
 // occurrenceSkipRecorder tombstones one slot of a recurrence rule so the
@@ -246,8 +268,13 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if err != nil {
 		return nil, err
 	}
+	action := in.Action
+	if err := domain.ValidateEventAction(action); err != nil {
+		return nil, err
+	}
 	e := &domain.Event{
 		RestaurantID:     in.RestaurantID,
+		Action:           action,
 		Title:            strings.TrimSpace(in.Title),
 		TitleI18n:        in.TitleI18n,
 		Description:      in.Description,
@@ -304,7 +331,11 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	// a different audience than the platform said yes to. Compared on the
 	// RESOLVED value, not the raw input — otherwise re-saving «almaty» over a
 	// stored «Алматы» would read as an edit and cost the venue a re-review.
-	contentChanged := eventContentChanged(*e, in) || !cityPtrEqual(city, e.City)
+	// The button is moderated content as much as the words are: it is what a
+	// guest taps, and repointing it at another site after approval is exactly
+	// the substitution moderation exists to catch.
+	contentChanged := eventContentChanged(*e, in) || !cityPtrEqual(city, e.City) ||
+		!actionEqual(in.Action, e.Action)
 	// Moving a generated occurrence to another time frees its ORIGINAL slot, so
 	// that slot needs the same tombstone a delete leaves — otherwise the next
 	// pass fills the old date back in and the venue ends up with both.
@@ -328,6 +359,10 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
 	e.Tags = normalizeTags(in.Tags)
+	e.Action = in.Action
+	if err := domain.ValidateEventAction(e.Action); err != nil {
+		return nil, err
+	}
 	if in.RefundPolicy != nil {
 		e.TicketsRefundable = in.RefundPolicy.Refundable
 		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
@@ -411,10 +446,17 @@ func (f *facade) GetAdmin(ctx context.Context, actor Actor, eventID uuid.UUID) (
 }
 
 func (f *facade) ListAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error) {
-	if err := f.authorize(ctx, actor, restaurantID); err != nil {
+	if err := f.authorize(ctx, actor, &restaurantID); err != nil {
 		return nil, 0, err
 	}
 	return f.repo.ListByRestaurant(ctx, restaurantID, statuses, page, perPage)
+}
+
+func (f *facade) ListPlatformAdmin(ctx context.Context, actor Actor, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error) {
+	if err := authorizePlatformContent(actor); err != nil {
+		return nil, 0, err
+	}
+	return f.repo.ListPlatform(ctx, statuses, page, perPage)
 }
 
 func (f *facade) ListPublic(ctx context.Context, restaurantID uuid.UUID, page, perPage int) ([]domain.Event, int, error) {
@@ -442,11 +484,26 @@ func (f *facade) GetPublic(ctx context.Context, restaurantID, eventID uuid.UUID)
 	}
 	// Never leak a draft/hidden event or one belonging to another restaurant
 	// through the public endpoint: it simply does not exist to a guest.
-	if e.RestaurantID != restaurantID || e.Status != domain.EventPublished {
+	// A PLATFORM event belongs to no restaurant, so it can never be reached
+	// through a restaurant's path — it has its own (GetPublicDetail).
+	if e.RestaurantID == nil || *e.RestaurantID != restaurantID || e.Status != domain.EventPublished {
 		return nil, fmt.Errorf("get public event: %w", domain.ErrNotFound)
 	}
 	f.attachImages(ctx, e)
 	return e, nil
+}
+
+// GetPublicDetail reads the event's own page. The visibility rule (published,
+// not yet ended, active venue when it has one) is enforced in the repository
+// query, exactly as in the listing, so the two can never disagree about the
+// same event.
+func (f *facade) GetPublicDetail(ctx context.Context, eventID uuid.UUID) (*domain.EventListItem, error) {
+	it, err := f.repo.GetPublicByID(ctx, eventID, f.clock())
+	if err != nil {
+		return nil, err
+	}
+	f.attachImages(ctx, &it.Event)
+	return it, nil
 }
 
 // attachImages дочитывает галерею одного события. Ошибку здесь НЕ поднимаем:
@@ -476,13 +533,26 @@ func normalizeImages(urls []string) []string {
 	return out
 }
 
-// authorize enforces PermRestaurantManage at restaurantID; a superadmin
-// bypasses the check entirely (same contract as usecase/admin).
-func (f *facade) authorize(ctx context.Context, actor Actor, restaurantID uuid.UUID) error {
+// authorize is the ONE gate every event mutation goes through, and it has two
+// shapes because an event has two possible owners:
+//
+//   - a venue-bound event (restaurantID non-nil) — PermRestaurantManage AT THAT
+//     restaurant, superadmin bypasses. Unchanged, byte for byte.
+//   - a PLATFORM event (nil) — there is no restaurant to hold a permission at,
+//     so the global policy decides: domain.CanManagePlatformContent. Today that
+//     is the superadmin alone.
+//
+// Note the ordering: the platform branch is taken from the EVENT's own owner,
+// never from something the caller sent, which is what keeps a venue manager
+// from reaching platform content by omitting a field.
+func (f *facade) authorize(ctx context.Context, actor Actor, restaurantID *uuid.UUID) error {
+	if restaurantID == nil {
+		return authorizePlatformContent(actor)
+	}
 	if actor.Role == domain.RoleAdmin {
 		return nil
 	}
-	ok, err := f.perms.HasPermission(ctx, actor.UserID, restaurantID, domain.PermRestaurantManage)
+	ok, err := f.perms.HasPermission(ctx, actor.UserID, *restaurantID, domain.PermRestaurantManage)
 	if err != nil {
 		return err
 	}
@@ -492,9 +562,26 @@ func (f *facade) authorize(ctx context.Context, actor Actor, restaurantID uuid.U
 	return nil
 }
 
+// authorizePlatformContent gates the platform's own «афиша». A single call site
+// per operation and a single policy function, so widening it to a marketer role
+// is an edit to domain.PlatformContentRoles and nothing else.
+func authorizePlatformContent(actor Actor) error {
+	if !domain.CanManagePlatformContent(actor.Role) {
+		return fmt.Errorf("%w: only the platform may manage events that belong to no venue", domain.ErrForbidden)
+	}
+	return nil
+}
+
 // validateEvent enforces the invariants the DB CHECKs also guard, but with a
 // domain.ErrValidation (422) instead of a 500 from a constraint violation.
 func validateEvent(e *domain.Event) error {
+	// A platform event cannot sell tickets — see the DB CHECK
+	// events_platform_not_ticketed and usecase/tickets.validatePurchasable for
+	// the whole reason (a payment needs a venue to settle to). Refusing it here
+	// turns a 500 from a constraint violation into a 422 that says why.
+	if e.RestaurantID == nil && e.Ticketed {
+		return fmt.Errorf("%w: an event with no venue cannot sell tickets", domain.ErrValidation)
+	}
 	if e.Title == "" {
 		return fmt.Errorf("%w: title is required", domain.ErrValidation)
 	}
@@ -616,6 +703,16 @@ func i18nEqual(a, b domain.I18n) bool {
 		}
 	}
 	return true
+}
+
+// actionEqual compares two call-to-action buttons. Absent equals absent; a
+// button equals another only when both the caption and the destination match,
+// and "the event's own page" (nil url) is a destination like any other.
+func actionEqual(a, b *domain.EventAction) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return strings.TrimSpace(a.Label) == b.Label && strPtrEqual(a.URL, b.URL)
 }
 
 func strPtrEqual(a, b *string) bool {

@@ -102,16 +102,26 @@ type FeedItem struct {
 	// (Kind, ID) is the card's identity.
 	ID uuid.UUID
 
-	RestaurantID       uuid.UUID
+	// RestaurantID is the venue that supplied the item, nil when the PLATFORM
+	// itself did (Promo.RestaurantID / Event.RestaurantID nil, migration 0085).
+	// RestaurantName is then empty and the card draws no venue line.
+	RestaurantID       *uuid.UUID
 	RestaurantName     string
 	RestaurantNameI18n I18n
-	City               City
+	// City is the item's EFFECTIVE city — its own override when it has one,
+	// otherwise the venue's (COALESCE(i.city, r.city)). nil means "no city at
+	// all", which only a platform item with no override can be, and which
+	// FeedEligible reads as "every city's main screen".
+	City *City
 	// CategoryID is the venue's cuisine/category (restaurant_categories), the
 	// same dictionary user_cuisine_preferences points at. nil when untagged.
 	CategoryID *uuid.UUID
 	// VenueIsActive / VenueHiddenFromHome are the venue's own visibility flags.
 	// They are carried (not just filtered on in SQL) so FeedEligible can state
-	// the WHOLE eligibility rule in one readable place.
+	// the WHOLE eligibility rule in one readable place. For a PLATFORM item
+	// there is no venue and they are meaningless: the read model projects the
+	// neutral pair (true, false) and FeedEligible skips them explicitly, so
+	// neither layer can accidentally hide the platform's own card.
 	VenueIsActive       bool
 	VenueHiddenFromHome bool
 

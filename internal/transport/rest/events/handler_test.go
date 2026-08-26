@@ -27,6 +27,10 @@ type fakeFacade struct {
 	// event, when set, is what GetPublic answers with — drives the detail-shape
 	// assertions without a database.
 	event *domain.Event
+	// detail, when set, is what GetPublicDetail (the event's own page) answers
+	// with. It carries the optional venue block, so a platform event is simply
+	// one with a nil Restaurant.
+	detail *domain.EventListItem
 
 	gotFilter domain.PublicEventFilter
 	calls     int
@@ -77,6 +81,17 @@ func (f *fakeFacade) GetPublic(context.Context, uuid.UUID, uuid.UUID) (*domain.E
 	return f.event, nil
 }
 
+func (f *fakeFacade) GetPublicDetail(context.Context, uuid.UUID) (*domain.EventListItem, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.detail, nil
+}
+
+func (f *fakeFacade) ListPlatformAdmin(context.Context, uc.Actor, []domain.EventStatus, int, int) ([]domain.Event, int, error) {
+	return nil, 0, f.err
+}
+
 var _ uc.Facade = (*fakeFacade)(nil)
 
 func newPublicRouter(f uc.Facade) *gin.Engine {
@@ -120,14 +135,14 @@ func sampleItem(startsIn time.Duration, title, venueName string, city domain.Cit
 	cover := "https://cdn.example.com/cover.jpg"
 	return domain.EventListItem{
 		Event: domain.Event{
-			ID: uuid.New(), RestaurantID: rid,
+			ID: uuid.New(), RestaurantID: &rid,
 			Title: title, TitleI18n: domain.I18n{"en": title + " (en)"},
 			Description: "описание", DescriptionI18n: domain.I18n{"en": "description"},
 			StartsAt: start, EndsAt: start.Add(2 * time.Hour),
 			Venue: "rooftop", CoverImageURL: &cover, Status: domain.EventPublished,
 			Tags: []string{"Бранч", "Живая музыка"},
 		},
-		Restaurant: domain.EventRestaurant{
+		Restaurant: &domain.EventRestaurant{
 			ID: rid, Name: venueName, NameI18n: domain.I18n{"en": venueName + " (en)"}, City: city,
 		},
 	}
@@ -452,7 +467,7 @@ func TestListUpcoming_EmptyTagsSerializeAsArray(t *testing.T) {
 func TestGetPublic_CarriesTags(t *testing.T) {
 	start := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
 	ev := &domain.Event{
-		ID: uuid.New(), RestaurantID: uuid.New(),
+		ID: uuid.New(), RestaurantID: ptrUUID(uuid.New()),
 		Title: "Винный ужин", StartsAt: start, EndsAt: start.Add(2 * time.Hour),
 		Status: domain.EventPublished, Tags: []string{"Коктейли", "Красивый вид"},
 	}
@@ -478,3 +493,7 @@ func TestGetPublic_CarriesTags(t *testing.T) {
 		t.Fatalf("detail empty tags must be [], not null, body: %s", rec.Body.String())
 	}
 }
+
+// ptrUUID is the fixture helper for Event.RestaurantID, optional since
+// migration 0085 (nil = a platform event, hosted by no venue).
+func ptrUUID(id uuid.UUID) *uuid.UUID { return &id }

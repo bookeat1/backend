@@ -168,8 +168,12 @@ func (f *facade) Approve(ctx context.Context, actor Actor, draftID uuid.UUID) (*
 	err = f.tx.WithinTx(ctx, func(ctx context.Context) error {
 		switch d.Kind {
 		case domain.DraftKindEvent:
+			// A draft is always proposed for a specific venue (drafts.restaurant_id
+			// is NOT NULL), so the approved entity always has one — the platform's
+			// own content never travels through the draft queue.
+			restaurantID := d.RestaurantID
 			e := &domain.Event{
-				RestaurantID:    d.RestaurantID,
+				RestaurantID:    &restaurantID,
 				Title:           d.SuggestedTitle,
 				TitleI18n:       d.SuggestedTitleI18n,
 				Description:     d.SuggestedDescription,
@@ -188,8 +192,9 @@ func (f *facade) Approve(ctx context.Context, actor Actor, draftID uuid.UUID) (*
 			res.EventID = &id
 			return f.drafts.MarkApproved(ctx, draftID, actor.UserID, now, &id, nil)
 		case domain.DraftKindPromo:
+			restaurantID := d.RestaurantID
 			p := &domain.Promo{
-				RestaurantID:    d.RestaurantID,
+				RestaurantID:    &restaurantID,
 				Title:           d.SuggestedTitle,
 				TitleI18n:       d.SuggestedTitleI18n,
 				Description:     d.SuggestedDescription,

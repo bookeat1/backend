@@ -31,7 +31,7 @@ var _ domain.EventRepository = (*Repository)(nil)
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
 	starts_at, ends_at, venue, cover_image_url, status, ticketed,
 	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
-	recurrence_id, created_at, updated_at, city`
+	recurrence_id, created_at, updated_at, city, action_label, action_url`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as reviews/favorites.
@@ -42,12 +42,13 @@ func (r *Repository) Create(ctx context.Context, e *domain.Event) error {
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
 			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor, capacity,
-			tags, tickets_refundable, ticket_refund_cutoff_minutes, city)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			tags, tickets_refundable, ticket_refund_cutoff_minutes, city, action_label, action_url)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		 RETURNING created_at, updated_at, city`,
 		e.ID, e.RestaurantID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City).
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City,
+		actionLabelToDB(e.Action), actionURLToDB(e.Action)).
 		Scan(&e.CreatedAt, &e.UpdatedAt, &e.City)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -73,11 +74,13 @@ func (r *Repository) Update(ctx context.Context, e *domain.Event) error {
 		`UPDATE events SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
 			starts_at = $6, ends_at = $7, venue = $8, cover_image_url = $9, status = $10,
 			ticketed = $11, ticket_price_minor = $12, capacity = $13, tags = $14,
-			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, city = $17, updated_at = now()
+			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, city = $17,
+			action_label = $18, action_url = $19, updated_at = now()
 		 WHERE id = $1`,
 		e.ID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
-		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City)
+		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City,
+		actionLabelToDB(e.Action), actionURLToDB(e.Action))
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
@@ -133,6 +136,41 @@ func (r *Repository) ListByRestaurant(ctx context.Context, restaurantID uuid.UUI
 	return collect(rows, total)
 }
 
+// ListPlatform returns the PLATFORM's own events — the ones with no host venue
+// (restaurant_id IS NULL) — for the platform cabinet. Same ordering, status
+// filter and pagination contract as ListByRestaurant; `IS NULL` rather than a
+// parameter, because a bound uuid can never mean "no venue" and passing
+// uuid.Nil would silently match nothing.
+func (r *Repository) ListPlatform(ctx context.Context, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error) {
+	page, perPage = normalizePage(page, perPage)
+	q := sqltx.From(ctx, r.pool)
+	statusArg := statusStrings(statuses)
+
+	var total int
+	if err := q.QueryRow(ctx,
+		`SELECT count(*) FROM events
+		 WHERE restaurant_id IS NULL
+		   AND (cardinality($1::text[]) = 0 OR status = ANY($1::text[]))`,
+		statusArg).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count platform events: %w", err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+
+	rows, err := q.Query(ctx,
+		`SELECT `+selectCols+` FROM events
+		 WHERE restaurant_id IS NULL
+		   AND (cardinality($1::text[]) = 0 OR status = ANY($1::text[]))
+		 ORDER BY starts_at DESC, id DESC
+		 LIMIT $2 OFFSET $3`,
+		statusArg, perPage, (page-1)*perPage)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list platform events: %w", err)
+	}
+	return collect(rows, total)
+}
+
 // ListPublishedUpcoming returns a restaurant's published, not-yet-ended events,
 // soonest first with id as a stable tie-breaker. Matches idx_events_published_upcoming.
 func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uuid.UUID, now time.Time, page, perPage int) ([]domain.Event, int, error) {
@@ -169,6 +207,7 @@ const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e
 	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
 	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
 	e.recurrence_id, e.created_at, e.updated_at, e.city AS event_city,
+	e.action_label, e.action_url,
 	r.name, r.name_i18n, r.city`
 
 // collapsedCols reads listCols back out of the derived table the collapse
@@ -182,6 +221,7 @@ const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.descripti
 	c.starts_at, c.ends_at, c.venue, c.cover_image_url, c.status, c.ticketed,
 	c.ticket_price_minor, c.capacity, c.tags, c.tickets_refundable, c.ticket_refund_cutoff_minutes,
 	c.recurrence_id, c.created_at, c.updated_at, c.event_city,
+	c.action_label, c.action_url,
 	c.name, c.name_i18n, c.city`
 
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
@@ -205,7 +245,12 @@ const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.descripti
 // venues may both run "Живая музыка", and a rule is the only thing that
 // actually says "these rows are the same happening".
 func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter, now time.Time) ([]domain.EventListItem, int, error) {
-	where := []string{"e.status = 'published'", "r.is_active = true"}
+	// A PLATFORM event (e.restaurant_id IS NULL) has no venue whose is_active
+	// flag could hide it, and the unconditional `r.is_active = true` this
+	// predicate used to carry would have hidden every one of them — with a LEFT
+	// JOIN r.is_active is NULL there, and NULL = true is not true. COALESCE
+	// states the intent: no venue means nothing to deactivate.
+	where := []string{"e.status = 'published'", "COALESCE(r.is_active, true) = true"}
 	args := []any{now}
 	where = append(where, "e.ends_at > $1")
 	add := func(cond string, val any) {
@@ -218,10 +263,9 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 		// collections (migration 0061): a row with no effective city at all is
 		// shown for EVERY city rather than for none.
 		//
-		// Today the venue is joined with an inner JOIN and restaurants.city is
-		// NOT NULL, so the COALESCE can only be NULL once events without a
-		// venue exist — which is exactly the branch that card will need, and it
-		// is already here so the read does not have to change again.
+		// Since migration 0085 the venue is LEFT-joined, so the COALESCE is
+		// NULL exactly for a platform event with no override — the "shown in
+		// every city" branch this predicate was written for.
 		add("(COALESCE(e.city, r.city) IS NULL OR COALESCE(e.city, r.city) = $%d)", string(*f.City))
 	}
 	if f.RestaurantID != nil {
@@ -234,7 +278,7 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 		add("e.starts_at <= $%d", *f.To)
 	}
 	whereSQL := strings.Join(where, " AND ")
-	from := ` FROM events e JOIN restaurants r ON r.id = e.restaurant_id WHERE ` + whereSQL
+	from := ` FROM events e LEFT JOIN restaurants r ON r.id = e.restaurant_id WHERE ` + whereSQL
 
 	// The collapse rule (see the doc comment): inside the visible set, a
 	// recurring series contributes exactly ONE row — its nearest upcoming
@@ -290,6 +334,37 @@ func (r *Repository) ListPublicUpcoming(ctx context.Context, f domain.PublicEven
 	return items, total, nil
 }
 
+// GetPublicByID reads ONE event by its own id for the guest-facing detail page,
+// with exactly the visibility rule the cross-venue listing enforces: published,
+// not yet ended, and — when it has a venue — at an active one. Whoever hosts it,
+// including nobody.
+//
+// The rule is repeated in SQL rather than delegated to a Go filter over GetByID
+// so that "what a guest may see" cannot drift between the list and the detail:
+// the two would then disagree about the same event, and the app would show a
+// card that 404s when tapped.
+//
+// The recurrence collapse of the listing is deliberately NOT applied here — the
+// detail page addresses ONE occurrence, which is the whole reason the collapse
+// is documented as a listing-only presentation rule.
+func (r *Repository) GetPublicByID(ctx context.Context, id uuid.UUID, now time.Time) (*domain.EventListItem, error) {
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT `+listCols+`
+		 FROM events e LEFT JOIN restaurants r ON r.id = e.restaurant_id
+		 WHERE e.id = $1
+		   AND e.status = 'published'
+		   AND e.ends_at > $2
+		   AND COALESCE(r.is_active, true) = true`, id, now)
+	it, err := scanListItemRow(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("get public event: %w", domain.ErrNotFound)
+		}
+		return nil, fmt.Errorf("get public event: %w", err)
+	}
+	return it, nil
+}
+
 func collect(rows pgx.Rows, total int) ([]domain.Event, int, error) {
 	defer rows.Close()
 	var items []domain.Event
@@ -320,35 +395,89 @@ func scanEvent(row pgx.Row, op string) (*domain.Event, error) {
 func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	var e domain.Event
 	var titleI18n, descI18n []byte
+	var actionLabel, actionURL *string
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City); err != nil {
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
 	e.Tags = tagsFromDB(e.Tags)
+	e.Action = actionFromDB(actionLabel, actionURL)
 	return &e, nil
 }
 
+// scanListItemRow reads an event plus its host venue. Every venue column is
+// scanned into a POINTER: the listing joins the venue with a LEFT JOIN now, so
+// a platform event (events.restaurant_id IS NULL) brings three SQL NULLs back,
+// and scanning those into strings would fail the whole query — the read path of
+// the main Афиша — instead of producing a card without a venue.
 func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	var it domain.EventListItem
 	e := &it.Event
 	var titleI18n, descI18n, venueNameI18n []byte
+	var actionLabel, actionURL, venueName *string
+	var venueCity *domain.City
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City,
-		&it.Restaurant.Name, &venueNameI18n, &it.Restaurant.City); err != nil {
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL,
+		&venueName, &venueNameI18n, &venueCity); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
 	e.Tags = tagsFromDB(e.Tags)
-	it.Restaurant.ID = e.RestaurantID
-	it.Restaurant.NameI18n = i18nFromDB(venueNameI18n)
+	e.Action = actionFromDB(actionLabel, actionURL)
+	it.Restaurant = venueFromDB(e.RestaurantID, venueName, venueNameI18n, venueCity)
 	return &it, nil
+}
+
+// venueFromDB builds the card's venue block, or nil when the event has no host
+// venue. The event's own restaurant_id is the authority on WHICH case this is:
+// the joined columns can only ever be NULL together with it.
+func venueFromDB(restaurantID *uuid.UUID, name *string, nameI18n []byte, city *domain.City) *domain.EventRestaurant {
+	if restaurantID == nil {
+		return nil
+	}
+	v := domain.EventRestaurant{ID: *restaurantID, NameI18n: i18nFromDB(nameI18n)}
+	if name != nil {
+		v.Name = *name
+	}
+	if city != nil {
+		v.City = *city
+	}
+	return &v
+}
+
+// actionFromDB rebuilds the optional call-to-action button. No label = no
+// button, whatever the url column says (a DB CHECK forbids that combination
+// anyway); a label with no url means the button opens the event's own page.
+func actionFromDB(label, actionURL *string) *domain.EventAction {
+	if label == nil {
+		return nil
+	}
+	return &domain.EventAction{Label: *label, URL: actionURL}
+}
+
+// actionLabelToDB / actionURLToDB write the button back, "no button" being two
+// NULLs rather than empty strings — the CHECK constraints and every read here
+// treat NULL as the single representation of absence.
+func actionLabelToDB(a *domain.EventAction) *string {
+	if a == nil {
+		return nil
+	}
+	label := a.Label
+	return &label
+}
+
+func actionURLToDB(a *domain.EventAction) *string {
+	if a == nil {
+		return nil
+	}
+	return a.URL
 }
 
 func statusStrings(statuses []domain.EventStatus) []string {

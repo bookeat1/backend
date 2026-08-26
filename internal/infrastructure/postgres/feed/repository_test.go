@@ -107,7 +107,7 @@ func seedPromo(ctx context.Context, t *testing.T, pool sqltx.Querier, rid uuid.U
 	feedStatus domain.FeedStatus, weight int) uuid.UUID {
 	t.Helper()
 	p := &domain.Promo{
-		RestaurantID: rid, Title: title, Status: status,
+		RestaurantID: &rid, Title: title, Status: status,
 		StartsAt: startsAt, EndsAt: endsAt,
 	}
 	if err := promorepo.New(pool).Create(ctx, p); err != nil {
@@ -126,7 +126,7 @@ func seedEvent(ctx context.Context, t *testing.T, pool sqltx.Querier, rid uuid.U
 	feedStatus domain.FeedStatus, weight int) uuid.UUID {
 	t.Helper()
 	e := &domain.Event{
-		RestaurantID: rid, Title: title, Status: status,
+		RestaurantID: &rid, Title: title, Status: status,
 		StartsAt: startsAt, EndsAt: endsAt,
 		TicketsRefundable:         domain.DefaultTicketRefundPolicy.Refundable,
 		TicketRefundCutoffMinutes: domain.DefaultTicketRefundPolicy.CutoffMinutes,
@@ -267,11 +267,11 @@ func TestListCandidates_CarriesRatingAndPreferences(t *testing.T) {
 		if !it.HasCuisinePreferences {
 			t.Fatal("a guest with preferences must be reported as having them")
 		}
-		wantMatch := it.RestaurantID == matching
+		wantMatch := it.RestaurantID != nil && *it.RestaurantID == matching
 		if it.MatchesCuisinePreference != wantMatch {
 			t.Fatalf("venue %s: match=%v, want %v", it.RestaurantName, it.MatchesCuisinePreference, wantMatch)
 		}
-		if it.RestaurantID == matching {
+		if it.RestaurantID != nil && *it.RestaurantID == matching {
 			if it.RestaurantReviewCount != 2 || it.RestaurantRating != 4.5 {
 				t.Fatalf("rating aggregate must count published reviews only, got %.2f over %d",
 					it.RestaurantRating, it.RestaurantReviewCount)
@@ -459,7 +459,7 @@ func TestListByRestaurantAndQueue(t *testing.T) {
 		t.Fatalf("a venue must see exactly its own promos and events, got %d/%d", len(items), total)
 	}
 	for _, it := range items {
-		if it.RestaurantID != mine {
+		if it.RestaurantID == nil || *it.RestaurantID != mine {
 			t.Fatalf("another venue's item leaked into the list: %s", it.Title)
 		}
 	}

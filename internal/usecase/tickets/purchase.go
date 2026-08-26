@@ -185,9 +185,11 @@ func (u *purchaseUseCase) createTicketPayment(ctx context.Context, actor Actor, 
 func (u *purchaseUseCase) reserve(ctx context.Context, actor Actor, event *domain.Event, unitPrice int64, in PurchaseInput) (*domain.EventTicket, bool, error) {
 	total := unitPrice * int64(in.Quantity)
 	ticket := &domain.EventTicket{
-		ID:                     uuid.New(),
-		EventID:                event.ID,
-		RestaurantID:           event.RestaurantID,
+		ID:      uuid.New(),
+		EventID: event.ID,
+		// Safe to dereference: validatePurchasable has already refused a
+		// platform (venue-less) event before any reservation is attempted.
+		RestaurantID:           *event.RestaurantID,
 		UserID:                 actor.UserID,
 		GuestName:              in.GuestName,
 		GuestPhone:             in.GuestPhone,
@@ -311,6 +313,15 @@ func (u *purchaseUseCase) release(ctx context.Context, ticket *domain.EventTicke
 // validatePurchasable rejects a purchase for an event that is not ticketed, not
 // published, has no price, or has already ended.
 func validatePurchasable(e *domain.Event) error {
+	// A PLATFORM event (no host venue, migration 0085) can never sell tickets:
+	// a ticket becomes a payment, and every payment in this schema settles to a
+	// venue (payments.restaurant_id, the splits of 0077, the refund a venue's
+	// staff issues). A DB CHECK refuses the combination too — this is the
+	// readable half of the same rule, and the one that answers 422 instead of
+	// 500 if a row ever slips past it.
+	if e.RestaurantID == nil {
+		return fmt.Errorf("%w: a platform event does not sell tickets", domain.ErrValidation)
+	}
 	if !e.Ticketed || e.TicketPriceMinor == nil {
 		return fmt.Errorf("%w: this event does not sell tickets", domain.ErrValidation)
 	}

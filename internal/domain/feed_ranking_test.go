@@ -366,7 +366,13 @@ func TestRankFeedItems_EmptyAndSingle(t *testing.T) {
 // exactly one condition and assert that one condition alone hides it.
 func eligibleFixture() FeedItem {
 	it := feedItemFixture(FeedItemPromo, uuid.New())
-	it.City = CityAlmaty
+	// A VENUE-BOUND card: the venue flags below only mean anything when there
+	// is a venue (since migration 0085 an item may have none), so the fixture
+	// has to say which of the two shapes it is.
+	rid := uuid.New()
+	it.RestaurantID = &rid
+	almaty := CityAlmaty
+	it.City = &almaty
 	it.VenueIsActive = true
 	it.ItemStatus = string(PromoPublished)
 	it.Placement.Status = FeedApproved
@@ -389,7 +395,7 @@ func TestFeedEligible(t *testing.T) {
 		{name: "an expired item never appears", mutFn: func(i *FeedItem) { i.EndsAt = rankNow.Add(-time.Minute) }},
 		{name: "an item ending exactly now never appears", mutFn: func(i *FeedItem) { i.EndsAt = rankNow }},
 		{name: "a promo whose window has not opened never appears", mutFn: func(i *FeedItem) { i.StartsAt = rankNow.Add(time.Hour) }},
-		{name: "another city's item never appears", mutFn: func(i *FeedItem) { i.City = CityAstana }},
+		{name: "another city's item never appears", mutFn: func(i *FeedItem) { astana := CityAstana; i.City = &astana }},
 		{name: "a deactivated venue takes its content with it", mutFn: func(i *FeedItem) { i.VenueIsActive = false }},
 		{name: "a venue hidden from home is hidden from the feed", mutFn: func(i *FeedItem) { i.VenueHiddenFromHome = true }},
 		{

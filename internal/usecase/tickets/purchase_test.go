@@ -136,7 +136,7 @@ func TestReplayRepairsMissingPayment(t *testing.T) {
 	buyer := uuid.New()
 	// A pending ticket that never got a payment linked.
 	tk := &domain.EventTicket{
-		ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+		ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 		UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 		Status: domain.TicketPending, UserID: &buyer, PurchaseIdempotencyKey: "k", GuestPhone: "+7700",
 	}
@@ -169,7 +169,7 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 		uc, repo, _ := newPurchaseHarness(t, event)
 		userA := uuid.New()
 		tk := &domain.EventTicket{
-			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 			Status: domain.TicketPaid, UserID: &userA, PurchaseIdempotencyKey: "1", GuestName: "Alice",
 		}
@@ -188,7 +188,7 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 	t.Run("anonymous caller is refused outright", func(t *testing.T) {
 		uc, repo, _ := newPurchaseHarness(t, event)
 		tk := &domain.EventTicket{
-			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 			Status: domain.TicketPaid, PurchaseIdempotencyKey: "1", GuestPhone: "+7700111", GuestName: "Alice",
 		}
@@ -208,7 +208,7 @@ func TestReplayRejectsForeignBuyer(t *testing.T) {
 		uc, repo, _ := newPurchaseHarness(t, event)
 		owner := uuid.New()
 		tk := &domain.EventTicket{
-			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 			Status: domain.TicketPaid, UserID: &owner, PurchaseIdempotencyKey: "1", GuestName: "Alice",
 		}
@@ -237,7 +237,7 @@ func TestReserveRaceRejectsForeignBuyer(t *testing.T) {
 		uc, repo, pay := newPurchaseHarness(t, event)
 		victim := uuid.New()
 		vTicket := &domain.EventTicket{
-			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 			Status: domain.TicketPending, UserID: &victim, PurchaseIdempotencyKey: "1",
 			GuestName: "Alice", GuestPhone: "+7700victim",
@@ -267,7 +267,7 @@ func TestReserveRaceRejectsForeignBuyer(t *testing.T) {
 		event := ticketedEvent(ptr(10), 35000)
 		uc, repo, pay := newPurchaseHarness(t, event)
 		vTicket := &domain.EventTicket{
-			ID: uuid.New(), EventID: event.ID, RestaurantID: event.RestaurantID, Quantity: 1,
+			ID: uuid.New(), EventID: event.ID, RestaurantID: *event.RestaurantID, Quantity: 1,
 			UnitPriceMinor: 35000, TotalMinor: 35000, Currency: domain.CurrencyKZT,
 			Status: domain.TicketPending, PurchaseIdempotencyKey: "1",
 			GuestName: "Alice", GuestPhone: "+7700victim", GuestEmail: "alice@x.io",
