@@ -2,7 +2,9 @@ package menu
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 
@@ -34,6 +36,26 @@ type Facade interface {
 	// concern: an unbounded rail is a slow query a client can ask for by
 	// accident.
 	ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error)
+
+	// ListHighlights resolves the «Лучшие позиции» rail of ONE venue's
+	// storefront: the dishes the venue marked itself, in its own order, and
+	// then — only to fill the rail up to limit — the derived dishes that rail
+	// used to consist of entirely. See resolveHighlights for the rule and why
+	// the fallback exists.
+	ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error)
+	// SetTopPick marks or unmarks one dish of restaurantID as a «Лучшая
+	// позиция». Marking takes the lowest free slot; the venue's own order is
+	// changed only through ReplaceTopPicks. Marking an already marked dish is a
+	// no-op (a double tap in the panel must not shuffle the rail).
+	SetTopPick(ctx context.Context, restaurantID, itemID uuid.UUID, on bool) error
+	// ReplaceTopPicks sets the venue's whole rail at once, in the given order:
+	// itemIDs[0] becomes slot 1. An empty slice clears the rail (and the venue
+	// falls back to the derived list). Atomic — a single bad id changes nothing.
+	ReplaceTopPicks(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID) error
+	// ListTopPicks returns what the venue has marked, in its order, INCLUDING
+	// dishes that are currently unavailable — this is the panel's editor view,
+	// not the guest's rail.
+	ListTopPicks(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error)
 
 	CreateCategory(ctx context.Context, in CategoryInput) (*domain.MenuCategory, error)
 	UpdateCategory(ctx context.Context, id uuid.UUID, in CategoryInput) (*domain.MenuCategory, error)
@@ -183,6 +205,159 @@ func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *strin
 		limit = featuredLimitMax
 	}
 	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Language: lang, Limit: limit})
+}
+
+// highlightLimit bounds a venue's storefront rail. The default is what the app
+// renders today; the ceiling exists so the endpoint cannot be turned into a
+// full menu dump through ?limit=.
+const (
+	highlightLimitDefault = domain.MenuTopPickLimit
+	highlightLimitMax     = 24
+)
+
+// topPickRetries bounds the optimistic retry on a lost slot race. Two managers
+// marking a dish at the same instant compute the same free slot and one of them
+// loses on the partial UNIQUE index; recomputing is the whole fix. Three
+// attempts is far more than the rail's 8 slots can plausibly need, and a bound
+// is what keeps a genuinely full rail from spinning.
+const topPickRetries = 3
+
+func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error) {
+	switch {
+	case limit <= 0:
+		limit = highlightLimitDefault
+	case limit > highlightLimitMax:
+		limit = highlightLimitMax
+	}
+	items, err := f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID, Language: lang})
+	if err != nil {
+		return nil, err
+	}
+	return resolveHighlights(items, limit), nil
+}
+
+// resolveHighlights is the ONLY place the rail's rule lives.
+//
+//  1. The venue's own marks win, in the venue's own order (top_pick_position).
+//  2. What is left of the rail is filled with the derivation that used to BE
+//     the rail: available dishes in the venue's display_order (items already
+//     arrive in that order from the repository).
+//  3. Nothing unavailable is ever returned, marked or not — a stop-listed dish
+//     in a "best of" rail is an invitation to order something the kitchen has
+//     run out of. A deleted dish cannot appear at all: the mark lives on the
+//     dish row, so it dies with it.
+//
+// Why the fallback and not an empty rail: today NO venue has marked anything,
+// and the rail is part of the storefront layout. Dropping it to nothing for
+// every venue on the day this ships would be a visible regression traded for a
+// purity nobody asked for. A venue that wants a curated rail marks dishes and
+// the derived tail shrinks to what its marks leave over; a venue that marks 8
+// dishes never sees a derived dish at all.
+func resolveHighlights(items []domain.MenuItem, limit int) []domain.MenuItem {
+	picked := make([]domain.MenuItem, 0, domain.MenuTopPickLimit)
+	derived := make([]domain.MenuItem, 0, limit)
+	for _, m := range items {
+		if !m.IsAvailable {
+			continue
+		}
+		if m.TopPickPosition != nil {
+			picked = append(picked, m)
+			continue
+		}
+		derived = append(derived, m)
+	}
+	sort.SliceStable(picked, func(i, j int) bool {
+		return *picked[i].TopPickPosition < *picked[j].TopPickPosition
+	})
+	out := picked
+	if len(out) > limit {
+		return out[:limit]
+	}
+	for _, m := range derived {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (f *facade) ListTopPicks(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
+	return f.items.ListTopPicks(ctx, restaurantID)
+}
+
+func (f *facade) SetTopPick(ctx context.Context, restaurantID, itemID uuid.UUID, on bool) error {
+	if !on {
+		// The repository's restaurant_id predicate is the tenant guard; an id
+		// of another venue is ErrNotFound, never a silent no-op.
+		return f.items.SetTopPickPosition(ctx, restaurantID, itemID, nil)
+	}
+	var err error
+	for attempt := 0; attempt < topPickRetries; attempt++ {
+		err = f.tx.WithinTx(ctx, func(ctx context.Context) error {
+			picks, err := f.items.ListTopPicks(ctx, restaurantID)
+			if err != nil {
+				return err
+			}
+			taken := make(map[int]bool, len(picks))
+			for _, p := range picks {
+				if p.ID == itemID {
+					// Already on the rail: keep its place. Re-marking must not
+					// move a dish the venue deliberately ordered.
+					return nil
+				}
+				if p.TopPickPosition != nil {
+					taken[*p.TopPickPosition] = true
+				}
+			}
+			slot := 0
+			for i := 1; i <= domain.MenuTopPickLimit; i++ {
+				if !taken[i] {
+					slot = i
+					break
+				}
+			}
+			if slot == 0 {
+				return domain.WithCode(domain.CodeMenuTopPicksLimit,
+					fmt.Errorf("%w: a venue may mark at most %d dishes as top picks", domain.ErrValidation, domain.MenuTopPickLimit))
+			}
+			return f.items.SetTopPickPosition(ctx, restaurantID, itemID, &slot)
+		})
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			return err
+		}
+	}
+	return err
+}
+
+func (f *facade) ReplaceTopPicks(ctx context.Context, restaurantID uuid.UUID, itemIDs []uuid.UUID) error {
+	if len(itemIDs) > domain.MenuTopPickLimit {
+		return domain.WithCode(domain.CodeMenuTopPicksLimit,
+			fmt.Errorf("%w: a venue may mark at most %d dishes as top picks, got %d",
+				domain.ErrValidation, domain.MenuTopPickLimit, len(itemIDs)))
+	}
+	seen := make(map[uuid.UUID]bool, len(itemIDs))
+	for _, id := range itemIDs {
+		if seen[id] {
+			// Not de-duplicated silently: an ordered list that names the same
+			// dish twice means the panel and the server disagree about the
+			// rail, and guessing which slot was meant is guessing.
+			return fmt.Errorf("%w: duplicate dish %s in the top picks order", domain.ErrValidation, id)
+		}
+		seen[id] = true
+	}
+	return f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if _, err := f.items.ClearTopPicks(ctx, restaurantID); err != nil {
+			return err
+		}
+		for i, id := range itemIDs {
+			slot := i + 1
+			if err := f.items.SetTopPickPosition(ctx, restaurantID, id, &slot); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ownedThen verifies itemID belongs to restaurantID (IDOR) then runs fn.

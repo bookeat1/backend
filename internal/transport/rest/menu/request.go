@@ -47,6 +47,32 @@ type featuredRequest struct {
 	IsFeatured bool `json:"is_featured"`
 }
 
+// topPickRequest is the body of PATCH .../menu-items/:itemId/top-pick.
+type topPickRequest struct {
+	IsTopPick bool `json:"is_top_pick"`
+}
+
+// topPicksOrderRequest is the body of PUT /restaurants/:id/menu-highlights:
+// the venue's whole rail, in order. An empty (but present) list clears it.
+type topPicksOrderRequest struct {
+	ItemIDs []string `json:"item_ids"`
+}
+
+// toUUIDs parses the ordered ids, keeping the order. A malformed id is a 422
+// for the whole request: partially applying an ordering nobody asked for would
+// leave the rail in a state the panel never described.
+func (r topPicksOrderRequest) toUUIDs() ([]uuid.UUID, error) {
+	out := make([]uuid.UUID, 0, len(r.ItemIDs))
+	for _, raw := range r.ItemIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid item id %q", domain.ErrValidation, raw)
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 type menuCategoryRequest struct {
 	Name         string            `json:"name"`
 	NameI18n     map[string]string `json:"name_i18n"`

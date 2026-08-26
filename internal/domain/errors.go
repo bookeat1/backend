@@ -226,6 +226,13 @@ const (
 	// Astana offers shown to a guest in Almaty is worse than an empty rail.
 	CodeCityRequired ErrorCode = "city_required"
 
+	// CodeMenuTopPicksLimit — the venue tried to mark a dish as «Лучшие
+	// позиции» while all MenuTopPickLimit slots of its storefront rail are
+	// already taken. A separate 422 code because the panel must say "снимите
+	// одно из отмеченных блюд" and not "validation failed": nothing about the
+	// request is malformed, the shelf is simply full.
+	CodeMenuTopPicksLimit ErrorCode = "menu_top_picks_limit"
+
 	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
 	// against) a venue is not a usable IANA zone name. Kept apart from the
 	// generic validation code because it is the one venue field money decisions

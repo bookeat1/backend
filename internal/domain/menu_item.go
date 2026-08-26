@@ -74,7 +74,17 @@ type MenuItem struct {
 	// IsAvailable: a picked dish that ran out stays picked but drops out of the
 	// guest rail until it is available again, so staff do not have to re-pick
 	// it after every stop list.
-	IsFeatured      bool
+	IsFeatured bool
+	// TopPickPosition is the venue's OWN placement of this dish in the
+	// «Лучшие позиции» rail of its storefront (1..MenuTopPickLimit), nil when
+	// the venue has not marked it. It is deliberately NOT IsFeatured: that flag
+	// feeds the cross-venue "chef's picks" rail of the main screen and is a
+	// platform-level decision, this one is the venue's own shop window.
+	//
+	// Like IsFeatured it is independent of IsAvailable: a marked dish that ran
+	// out keeps its slot (so staff do not re-mark it after every stop list) but
+	// is not served to guests until it is available again.
+	TopPickPosition *int
 	Category        *string
 	CategoryI18n    I18n
 	Subcategory     *string
@@ -101,6 +111,23 @@ type MenuItemTag struct {
 type MenuItemFilter struct {
 	RestaurantID uuid.UUID
 	Language     *string
+}
+
+// MenuTopPickLimit is the number of dishes one venue may mark as «Лучшие
+// позиции». It matches what the storefront rail actually renders
+// (MENU_HIGHLIGHT_LIMIT = 8 in the mobile app): letting a venue mark a ninth
+// dish would be letting it mark something no guest can ever see. The same
+// bound is enforced by the database (CHECK top_pick_position BETWEEN 1 AND 8
+// plus a partial UNIQUE per venue), so it cannot be exceeded by a race, a data
+// migration or a second writer.
+const MenuTopPickLimit = 8
+
+// MenuHighlightFilter narrows a venue's «Лучшие позиции» rail. RestaurantID is
+// required; Limit is clamped by the usecase.
+type MenuHighlightFilter struct {
+	RestaurantID uuid.UUID
+	Language     *string
+	Limit        int
 }
 
 // FeaturedMenuFilter narrows the cross-venue "chef's picks" rail. City is
@@ -154,6 +181,27 @@ type MenuItemRepository interface {
 	// ids. Returns the number of rows actually changed. This is the fast "we ran
 	// out" path (stop list); a nil/empty ids slice is a no-op returning 0.
 	SetAvailableBulk(ctx context.Context, restaurantID uuid.UUID, ids []uuid.UUID, available bool) (int, error)
+	// ListTopPicks returns the dishes restaurantID has marked as «Лучшие
+	// позиции», ordered by top_pick_position ASC, REGARDLESS of availability —
+	// the admin panel must see a marked dish that is currently stopped, and the
+	// usecase needs the occupied slots to allocate a free one. Filtering
+	// unavailable dishes out is the guest-facing read's job, not this one's.
+	// Tags are not loaded (the rail card does not render them).
+	ListTopPicks(ctx context.Context, restaurantID uuid.UUID) ([]MenuItem, error)
+	// SetTopPickPosition writes top_pick_position for one item that belongs to
+	// restaurantID; a nil position unmarks it. The restaurant_id filter is the
+	// tenant guard, exactly as in SetFeatured: an id belonging to another venue
+	// matches zero rows and comes back as ErrNotFound.
+	//
+	// Taking a slot another dish of the same venue already holds violates the
+	// partial UNIQUE index and is reported as ErrAlreadyExists — the caller is
+	// expected to pick another slot, NOT to pre-check and hope.
+	SetTopPickPosition(ctx context.Context, restaurantID, id uuid.UUID, position *int) error
+	// ClearTopPicks unmarks every dish of restaurantID in ONE statement and
+	// returns how many rows it changed. It exists so a full re-ordering can be
+	// done as clear-then-set inside one transaction, without a slot of the old
+	// arrangement colliding with a slot of the new one.
+	ClearTopPicks(ctx context.Context, restaurantID uuid.UUID) (int, error)
 	// ReplaceTags deletes the item's tags and inserts items (call within a tx).
 	ReplaceTags(ctx context.Context, menuItemID uuid.UUID, tags []MenuItemTag) error
 }

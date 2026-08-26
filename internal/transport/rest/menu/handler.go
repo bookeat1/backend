@@ -27,6 +27,7 @@ func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/restaurants/:id/menu", h.list)
 	rg.GET("/menu-categories", h.categories)
 	rg.GET("/menu-items/featured", h.featured)
+	rg.GET("/restaurants/:id/menu-highlights", h.highlights)
 }
 
 // RegisterScoped mounts per-restaurant menu mutations on a group already gated
@@ -37,6 +38,13 @@ func (h *Handler) RegisterScoped(rg *gin.RouterGroup) {
 	rg.DELETE("/restaurants/:id/menu-items/:itemId", h.delete)
 	rg.PATCH("/restaurants/:id/menu-items/:itemId/availability", h.setAvailability)
 	rg.PATCH("/restaurants/:id/menu-items/:itemId/featured", h.setFeatured)
+	// «Лучшие позиции» of the venue's own storefront. Same group, same gate as
+	// every other menu mutation: whoever may edit the menu may decide which of
+	// its dishes the venue shows off. The repository still filters by
+	// restaurant_id, which is what turns a guessed item id into a 404.
+	rg.PATCH("/restaurants/:id/menu-items/:itemId/top-pick", h.setTopPick)
+	rg.GET("/restaurants/:id/menu-top-picks", h.listTopPicks)
+	rg.PUT("/restaurants/:id/menu-highlights", h.replaceTopPicks)
 }
 
 // RegisterAdmin mounts admin-only menu-category mutations.
@@ -192,6 +200,130 @@ func (h *Handler) setFeatured(c *gin.Context) {
 		return
 	}
 	if err := h.facade.SetFeatured(c.Request.Context(), rid, itemID, req.IsFeatured); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, gin.H{"status": "ok"})
+}
+
+// highlights serves ONE venue's «Лучшие позиции» rail: the dishes the venue
+// marked itself, in its order, then — only to fill the rail — the derived
+// dishes the rail used to consist of entirely. Public, like GET .../menu.
+//
+// @Summary     A venue's «Лучшие позиции» rail
+// @Tags        menu
+// @Produce     json
+// @Param       id     path  string true  "Restaurant ID"
+// @Param       lang   query string false "Menu language"
+// @Param       limit  query int    false "Rail size (default 8, max 24)"
+// @Success     200 {array} menuItemResponse
+// @Router      /api/v1/restaurants/{id}/menu-highlights [get]
+func (h *Handler) highlights(c *gin.Context) {
+	rid, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid restaurant id")
+		return
+	}
+	var lang *string
+	if v := c.Query("lang"); v != "" {
+		lang = &v
+	}
+	limit := 0
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	items, err := h.facade.ListHighlights(c.Request.Context(), rid, lang, limit)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, itemsToResponse(items))
+}
+
+// listTopPicks is the panel's editor view of the rail: what the venue marked,
+// in its order, INCLUDING dishes that are currently stopped. It is venue-scoped
+// (not public) precisely because it shows rows the guest rail hides.
+//
+// @Summary     What the venue marked as «Лучшие позиции» (venue manager)
+// @Tags        menu
+// @Produce     json
+// @Param       id path string true "Restaurant ID"
+// @Success     200 {array} menuItemResponse
+// @Router      /api/v1/restaurants/{id}/menu-top-picks [get]
+func (h *Handler) listTopPicks(c *gin.Context) {
+	rid, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid restaurant id")
+		return
+	}
+	items, err := h.facade.ListTopPicks(c.Request.Context(), rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, itemsToResponse(items))
+}
+
+// setTopPick marks or unmarks one dish. Marking takes the lowest free slot; a
+// full rail is a 422 with its own code (menu_top_picks_limit) so the panel can
+// say "снимите одно из отмеченных" instead of "validation failed".
+//
+// @Summary     Mark/unmark a dish as a «Лучшая позиция» (venue manager)
+// @Tags        menu
+// @Accept      json
+// @Produce     json
+// @Param       id     path string true "Restaurant ID"
+// @Param       itemId path string true "Menu item ID"
+// @Router      /api/v1/restaurants/{id}/menu-items/{itemId}/top-pick [patch]
+func (h *Handler) setTopPick(c *gin.Context) {
+	rid, itemID, ok := parseScoped(c)
+	if !ok {
+		return
+	}
+	var req topPickRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if err := h.facade.SetTopPick(c.Request.Context(), rid, itemID, req.IsTopPick); err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, gin.H{"status": "ok"})
+}
+
+// replaceTopPicks sets the whole rail in one atomic call — what a drag-and-drop
+// editor needs. An empty list clears the rail and the venue falls back to the
+// derived one.
+//
+// @Summary     Replace the venue's «Лучшие позиции» order (venue manager)
+// @Tags        menu
+// @Accept      json
+// @Produce     json
+// @Param       id path string true "Restaurant ID"
+// @Router      /api/v1/restaurants/{id}/menu-highlights [put]
+func (h *Handler) replaceTopPicks(c *gin.Context) {
+	rid, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid restaurant id")
+		return
+	}
+	var req topPicksOrderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	ids, err := req.toUUIDs()
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	if err := h.facade.ReplaceTopPicks(c.Request.Context(), rid, ids); err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
