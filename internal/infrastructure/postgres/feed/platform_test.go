@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -246,5 +247,176 @@ func TestFeedReads_PlatformItemInTheQueueAndByID(t *testing.T) {
 	}
 	if item.RestaurantID != nil || item.RestaurantName != "" {
 		t.Fatalf("item = %+v, want no venue", item)
+	}
+}
+
+// --- auto-approval of the platform's own content (creation-time decision) ---
+
+// seedUnmoderatedPlatformPromo inserts a PUBLISHED platform promo in the state
+// a bare INSERT leaves it in: feed_status = 'not_submitted'. That is the state
+// the owner's first platform promo actually sat in — correct row, invisible
+// card — and it is what ApprovePlatformItem exists to resolve at creation.
+func seedUnmoderatedPlatformPromo(ctx context.Context, t *testing.T, pool sqltx.Querier,
+	title string, startsAt, endsAt time.Time) uuid.UUID {
+	t.Helper()
+	p := &domain.Promo{Title: title, Status: domain.PromoPublished, StartsAt: startsAt, EndsAt: endsAt}
+	if err := promorepo.New(pool).Create(ctx, p); err != nil {
+		t.Fatalf("seed unmoderated platform promo: %v", err)
+	}
+	return p.ID
+}
+
+func feedStatusOf(ctx context.Context, t *testing.T, pool sqltx.Querier, table string, id uuid.UUID) string {
+	t.Helper()
+	var status string
+	if err := pool.QueryRow(ctx,
+		`SELECT feed_status FROM `+table+` WHERE id = $1`, id).Scan(&status); err != nil {
+		t.Fatalf("read %s.feed_status: %v", table, err)
+	}
+	return status
+}
+
+// The whole point of the change: the platform's own promo reaches the home
+// screen without a moderation round trip, and the approval is WRITTEN DOWN —
+// who decided and when — instead of being inferred while reading the feed.
+func TestApprovePlatformItem_PutsThePlatformsOwnCardOnTheHomeScreen(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	repo := New(pool)
+
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
+	id := seedUnmoderatedPlatformPromo(ctx, t, pool, "Акция платформы", open, close)
+
+	before, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListCandidates: %v", err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("an unapproved card must not be on the main screen, got %v", titlesOf(before))
+	}
+
+	reviewer := seedUser(ctx, t, pool, "superadmin")
+	at := feedNow.Add(-30 * time.Minute)
+	if err := repo.ApprovePlatformItem(ctx, domain.FeedItemPromo, id, reviewer, at); err != nil {
+		t.Fatalf("ApprovePlatformItem: %v", err)
+	}
+
+	item, err := repo.GetItem(ctx, domain.FeedItemPromo, id)
+	if err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if item.Placement.Status != domain.FeedApproved {
+		t.Fatalf("feed_status = %q, want approved", item.Placement.Status)
+	}
+	if item.Placement.ReviewedBy == nil || *item.Placement.ReviewedBy != reviewer {
+		t.Fatalf("reviewed_by = %v, want the superadmin who created it (%s)", item.Placement.ReviewedBy, reviewer)
+	}
+	if item.Placement.ReviewedAt == nil || !item.Placement.ReviewedAt.Equal(at) {
+		t.Fatalf("reviewed_at = %v, want %v", item.Placement.ReviewedAt, at)
+	}
+	// An approved row that was never submitted would read like a bug in the
+	// audit trail: the platform submitted and decided in the same act.
+	if item.Placement.SubmittedAt == nil || !item.Placement.SubmittedAt.Equal(at) {
+		t.Fatalf("submitted_at = %v, want %v", item.Placement.SubmittedAt, at)
+	}
+
+	after, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListCandidates: %v", err)
+	}
+	mustContain(t, after, "Акция платформы")
+}
+
+// The guard that keeps venue moderation intact lives in the WHERE clause, so a
+// caller cannot use this write to approve a VENUE's promo without a moderator.
+func TestApprovePlatformItem_RefusesVenueContent(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	repo := New(pool)
+
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
+	venue := seedVenue(ctx, t, pool, "Venue", activeVenue())
+	id := seedPromo(ctx, t, pool, venue, "Скидка заведения", domain.PromoPublished, open, close, domain.FeedNotSubmitted, 0)
+	reviewer := seedUser(ctx, t, pool, "superadmin")
+
+	err := repo.ApprovePlatformItem(ctx, domain.FeedItemPromo, id, reviewer, feedNow)
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("err = %v, want ErrInvalidStatus for a venue-owned promo", err)
+	}
+	if got := feedStatusOf(ctx, t, pool, "promos", id); got != string(domain.FeedNotSubmitted) {
+		t.Fatalf("feed_status = %q, want the venue promo left untouched", got)
+	}
+	items, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListCandidates: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("a venue promo still needs approval, got %v on the main screen", titlesOf(items))
+	}
+}
+
+// A repeated call (a retried create, a duplicated request) must not re-stamp a
+// reviewer over a decision that already exists, and an absent id is a 404, not
+// a silent success.
+func TestApprovePlatformItem_RefusesAnAlreadyDecidedRowAndAnAbsentOne(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	repo := New(pool)
+
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
+	id := seedUnmoderatedPlatformPromo(ctx, t, pool, "Акция платформы", open, close)
+	first := seedUser(ctx, t, pool, "first superadmin")
+	second := seedUser(ctx, t, pool, "second superadmin")
+
+	if err := repo.ApprovePlatformItem(ctx, domain.FeedItemPromo, id, first, feedNow); err != nil {
+		t.Fatalf("first approval: %v", err)
+	}
+	err := repo.ApprovePlatformItem(ctx, domain.FeedItemPromo, id, second, feedNow.Add(time.Hour))
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("err = %v, want ErrInvalidStatus for an already decided row", err)
+	}
+	item, err := repo.GetItem(ctx, domain.FeedItemPromo, id)
+	if err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if item.Placement.ReviewedBy == nil || *item.Placement.ReviewedBy != first {
+		t.Fatalf("reviewed_by = %v, want the first decider %s", item.Placement.ReviewedBy, first)
+	}
+
+	if err := repo.ApprovePlatformItem(ctx, domain.FeedItemPromo, uuid.New(), first, feedNow); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound for an absent id", err)
+	}
+}
+
+// Editing content demotes a VENUE card (this is the rule that stops "get an
+// innocuous promo approved, then edit the title") and leaves a PLATFORM card
+// alone — there is no second party to re-review it, so demoting it would hide
+// the platform's own content behind a review nobody can perform.
+func TestDemoteAfterContentEdit_ExemptsPlatformContent(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+	repo := New(pool)
+
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
+	venue := seedVenue(ctx, t, pool, "Venue", activeVenue())
+	venuePromo := seedPromo(ctx, t, pool, venue, "Скидка заведения", domain.PromoPublished, open, close, domain.FeedApproved, 0)
+	platformPromo := seedPlatformPromo(ctx, t, pool, "Акция платформы", nil, open, close)
+
+	if err := repo.DemoteAfterContentEdit(ctx, domain.FeedItemPromo, venuePromo); err != nil {
+		t.Fatalf("demote venue promo: %v", err)
+	}
+	if err := repo.DemoteAfterContentEdit(ctx, domain.FeedItemPromo, platformPromo); err != nil {
+		t.Fatalf("demote platform promo: %v", err)
+	}
+
+	if got := feedStatusOf(ctx, t, pool, "promos", venuePromo); got != string(domain.FeedPendingReview) {
+		t.Fatalf("venue promo feed_status = %q, want pending_review", got)
+	}
+	if got := feedStatusOf(ctx, t, pool, "promos", platformPromo); got != string(domain.FeedApproved) {
+		t.Fatalf("platform promo feed_status = %q, want approved (exempt)", got)
 	}
 }

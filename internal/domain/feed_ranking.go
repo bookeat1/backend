@@ -5,6 +5,8 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // FeedSignalCode names one ranking signal. The codes are part of the API: the
@@ -373,3 +375,19 @@ func FeedStatusAfterContentEdit(cur FeedStatus) FeedStatus {
 		return cur
 	}
 }
+
+// FeedDemotableAfterContentEdit reports whether editing an item's content may
+// invalidate the platform's moderation decision, given who owns the item.
+//
+// It does for VENUE content: the platform approved specific words, and the
+// venue changing them is exactly the substitution moderation exists to catch.
+// It does NOT for PLATFORM content (restaurantID nil, migration 0085) — the
+// editor and the reviewer are the same superadmin, there is no second party to
+// ask, and a demotion would take the platform's own card off the home screen
+// until the platform re-approved itself. That is a review round trip with
+// nobody on the other side, which is the same reason platform content is
+// approved at creation in the first place.
+//
+// The Postgres implementation of FeedRepository.DemoteAfterContentEdit must
+// agree with this function — it is the single written statement of the rule.
+func FeedDemotableAfterContentEdit(restaurantID *uuid.UUID) bool { return restaurantID != nil }

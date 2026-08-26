@@ -159,7 +159,29 @@ func (f *fakeFeedRepo) DemoteAfterContentEdit(_ context.Context, kind domain.Fee
 	if !ok {
 		return nil
 	}
+	// The fake mirrors the Postgres guard: platform-owned items are exempt.
+	if !domain.FeedDemotableAfterContentEdit(it.RestaurantID) {
+		return nil
+	}
 	it.Placement.Status = domain.FeedStatusAfterContentEdit(it.Placement.Status)
+	return nil
+}
+
+// ApprovePlatformItem mirrors the Postgres guard exactly: platform-owned rows
+// only, and only while nobody decided on them yet.
+func (f *fakeFeedRepo) ApprovePlatformItem(_ context.Context, kind domain.FeedItemKind, id, reviewerID uuid.UUID, at time.Time) error {
+	it, ok := f.items[key{kind, id}]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if it.RestaurantID != nil || it.Placement.Status != domain.FeedNotSubmitted {
+		return domain.ErrInvalidStatus
+	}
+	it.Placement.Status = domain.FeedApproved
+	it.Placement.SubmittedAt = &at
+	it.Placement.ReviewedBy = &reviewerID
+	it.Placement.ReviewedAt = &at
+	it.Placement.RejectionReason = nil
 	return nil
 }
 

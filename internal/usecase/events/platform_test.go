@@ -173,14 +173,15 @@ func TestCreate_ActionURLIsValidated(t *testing.T) {
 
 // Repointing an approved card's button at another site is a content edit: the
 // platform approved a destination, and changing it must send the card back to
-// the moderation queue.
+// the moderation queue. Asserted on a VENUE event — the demotion rule guards
+// content the platform reviewed for somebody else.
 func TestUpdate_RepointingTheButtonDemotesTheCard(t *testing.T) {
 	repo := newFakeRepo()
 	feed := &fakeFeed{}
 	f := NewFacade(repo, &fakePerms{}, feed)
 
 	first := "https://tickets.kz/e/42"
-	in := platformCreate()
+	in := validCreate(uuid.New())
 	in.Action = &domain.EventAction{Label: "Купить билет", URL: &first}
 	e, err := f.Create(context.Background(), superadmin(), in)
 	if err != nil {
@@ -277,5 +278,63 @@ func TestGetPublicDetail_PlatformEvent(t *testing.T) {
 	}
 	if it.ID != e.ID {
 		t.Fatalf("id = %s, want %s", it.ID, e.ID)
+	}
+}
+
+// --- creation-time approval of the platform's own content ---
+
+// The platform's own афиша reaches the home screen without a moderation round
+// trip, with the deciding superadmin recorded. Same rule as usecase/promos.
+func TestCreate_PlatformEventIsApprovedForTheHomeFeedAtCreation(t *testing.T) {
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	actor := superadmin()
+	e, err := f.Create(context.Background(), actor, platformCreate())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(feed.approvals) != 1 {
+		t.Fatalf("approvals = %+v, want the platform event approved exactly once", feed.approvals)
+	}
+	got := feed.approvals[0]
+	if got.kind != domain.FeedItemEvent || got.itemID != e.ID || got.reviewer != actor.UserID {
+		t.Fatalf("approved %+v, want event %s by %s", got, e.ID, actor.UserID)
+	}
+}
+
+// Characterisation: a venue's event still needs the platform's decision.
+func TestCreate_VenueEventStillGoesThroughModeration(t *testing.T) {
+	rid := uuid.New()
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	if _, err := f.Create(context.Background(), superadmin(), validCreate(rid)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(feed.approvals) != 0 {
+		t.Fatalf("approvals = %+v, want a venue event moderated as before", feed.approvals)
+	}
+}
+
+// The platform editing its own афиша keeps it on the screen.
+func TestUpdate_PlatformEventIsNotDemotedByItsOwnEditor(t *testing.T) {
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	e, err := f.Create(context.Background(), superadmin(), platformCreate())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.Update(context.Background(), superadmin(), e.ID, UpdateInput{
+		Title: "Другой заголовок", StartsAt: e.StartsAt, EndsAt: e.EndsAt, Status: domain.EventPublished,
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 0 {
+		t.Fatalf("demoted = %v, want the platform's own card left on the screen", feed.demoted)
 	}
 }
