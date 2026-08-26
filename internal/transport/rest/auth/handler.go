@@ -130,11 +130,16 @@ func (h *Handler) otpRequest(c *gin.Context) {
 // @Description phone number detect when its owner is mid-login. "otp_too_many_attempts"
 // @Description means the code is dead from wrong guesses and only a new code helps.
 // @Description The 422 codes are otp_invalid_phone and otp_code_required.
+// @Description
+// @Description "is_new_user" is true only when THIS call created the account, so
+// @Description the app can show first-run onboarding to genuinely new guests. It
+// @Description is returned by this endpoint only; no other token-pair response
+// @Description carries it.
 // @Tags        auth
 // @Accept      json
 // @Produce     json
 // @Param       body body otpVerifyRequest true "Phone and code"
-// @Success     200 {object} response.Envelope{data=tokenPairResponse}
+// @Success     200 {object} response.Envelope{data=otpVerifyResponse}
 // @Failure     401 {object} response.Envelope "invalid or expired code"
 // @Failure     422 {object} response.Envelope "validation failed"
 // @Router      /api/v1/auth/otp/verify [post]
@@ -149,7 +154,7 @@ func (h *Handler) otpVerify(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, fromPair(pair))
+	response.OK(c.Writer, fromOTPPair(pair))
 }
 
 // refresh exchanges a refresh token for a new token pair.

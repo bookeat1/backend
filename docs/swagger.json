@@ -433,7 +433,7 @@
         },
         "/api/v1/auth/otp/verify": {
             "post": {
-                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.\n\nThe 401 carries one of two codes. \"otp_invalid\" means the code was\nnot accepted and covers three cases on purpose — wrong, expired, and\nno active code at all: telling them apart would let anyone with a\nphone number detect when its owner is mid-login. \"otp_too_many_attempts\"\nmeans the code is dead from wrong guesses and only a new code helps.\nThe 422 codes are otp_invalid_phone and otp_code_required.",
+                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.\n\nThe 401 carries one of two codes. \"otp_invalid\" means the code was\nnot accepted and covers three cases on purpose — wrong, expired, and\nno active code at all: telling them apart would let anyone with a\nphone number detect when its owner is mid-login. \"otp_too_many_attempts\"\nmeans the code is dead from wrong guesses and only a new code helps.\nThe 422 codes are otp_invalid_phone and otp_code_required.\n\n\"is_new_user\" is true only when THIS call created the account, so\nthe app can show first-run onboarding to genuinely new guests. It\nis returned by this endpoint only; no other token-pair response\ncarries it.",
                 "consumes": [
                     "application/json"
                 ],
@@ -467,7 +467,7 @@
                                     "type": "object",
                                     "properties": {
                                         "data": {
-                                            "$ref": "#/definitions/auth.tokenPairResponse"
+                                            "$ref": "#/definitions/auth.otpVerifyResponse"
                                         }
                                     }
                                 }
@@ -2170,6 +2170,27 @@
                 "phone": {
                     "type": "string",
                     "example": "+77011234567"
+                }
+            }
+        },
+        "auth.otpVerifyResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string",
+                    "example": "eyJhbGciOiJSUzI1NiIsImtpZCI6..."
+                },
+                "expires_at": {
+                    "type": "string",
+                    "example": "2026-07-12T18:30:00Z"
+                },
+                "is_new_user": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "refresh_token": {
+                    "type": "string",
+                    "example": "9c8b7a6f-4d3e-2b1a-...-refresh"
                 }
             }
         },

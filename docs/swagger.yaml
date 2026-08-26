@@ -41,6 +41,21 @@ definitions:
     - code
     - phone
     type: object
+  auth.otpVerifyResponse:
+    properties:
+      access_token:
+        example: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+        type: string
+      expires_at:
+        example: "2026-07-12T18:30:00Z"
+        type: string
+      is_new_user:
+        example: true
+        type: boolean
+      refresh_token:
+        example: 9c8b7a6f-4d3e-2b1a-...-refresh
+        type: string
+    type: object
   auth.refreshRequest:
     properties:
       refresh_token:
@@ -642,6 +657,11 @@ paths:
         phone number detect when its owner is mid-login. "otp_too_many_attempts"
         means the code is dead from wrong guesses and only a new code helps.
         The 422 codes are otp_invalid_phone and otp_code_required.
+
+        "is_new_user" is true only when THIS call created the account, so
+        the app can show first-run onboarding to genuinely new guests. It
+        is returned by this endpoint only; no other token-pair response
+        carries it.
       parameters:
       - description: Phone and code
         in: body
@@ -659,7 +679,7 @@ paths:
             - $ref: '#/definitions/response.Envelope'
             - properties:
                 data:
-                  $ref: '#/definitions/auth.tokenPairResponse'
+                  $ref: '#/definitions/auth.otpVerifyResponse'
               type: object
         "401":
           description: invalid or expired code

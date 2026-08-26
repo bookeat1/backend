@@ -68,3 +68,49 @@ func TestVerifyOTPWrongCode(t *testing.T) {
 		t.Error("expected error on wrong code")
 	}
 }
+
+// The find-or-create branch is the only place that knows whether an account is
+// brand new, and the app needs that fact to decide between a first-run
+// onboarding step and letting a returning guest straight in. Guessing it from
+// an empty profile field (what the app did before) misreads every account that
+// simply never filled the field in — so the two logins below are deliberately
+// the SAME phone with an untouched, nameless profile in between.
+func TestVerifyOTPReportsWhetherTheAccountWasJustCreated(t *testing.T) {
+	// Wired here rather than through newTestOTP because this test logs in
+	// TWICE within the same minute and must not trip the per-phone budget.
+	users := newFakeUsers()
+	cfg := Config{RefreshTTL: time.Hour, OTPTTL: 5 * time.Minute, OTPPerMin: 5, OTPPerHour: 5, OTPDevExpose: true}
+	uc := NewOTPUseCase(users, newFakeOTP(), newFakeRefresh(), &fakeBookingLinker{}, noTx{}, testIssuer(t), &stubSender{}, cfg)
+	ctx := context.Background()
+	const raw = "+7 705 333 4444"
+
+	login := func() *TokenPair {
+		t.Helper()
+		code, err := uc.RequestOTP(ctx, raw)
+		if err != nil {
+			t.Fatalf("RequestOTP: %v", err)
+		}
+		pair, err := uc.VerifyOTP(ctx, raw, code)
+		if err != nil {
+			t.Fatalf("VerifyOTP: %v", err)
+		}
+		return pair
+	}
+
+	first := login()
+	if !first.IsNewUser {
+		t.Error("first login for an unknown phone must report a new user")
+	}
+
+	u, err := users.GetByPhone(ctx, "+77053334444")
+	if err != nil {
+		t.Fatalf("user should exist after the first login: %v", err)
+	}
+	if u.FullName != "" {
+		t.Fatalf("fixture assumption broken: a fresh account has no name, got %q", u.FullName)
+	}
+
+	if second := login(); second.IsNewUser {
+		t.Error("second login for the same phone must NOT report a new user")
+	}
+}
