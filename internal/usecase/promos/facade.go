@@ -28,11 +28,14 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
-// feedModerator pulls an item off the main-screen feed when its content
-// changes. Minimal local port (bound to the feed repository in bootstrap): the
-// promos usecase must not know the whole FeedRepository, only this one effect.
+// feedModerator is the promos usecase's minimal slice of the feed's moderation
+// writes (bound to the feed repository in bootstrap): pull an item off the
+// main screen when its content changes, and record the platform's approval of
+// the platform's OWN item at creation. Two effects, not the whole
+// domain.FeedRepository.
 type feedModerator interface {
 	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+	ApprovePlatformItem(ctx context.Context, kind domain.FeedItemKind, itemID, reviewerID uuid.UUID, at time.Time) error
 }
 
 // Facade exposes admin CRUD and public read operations for promos.
@@ -190,6 +193,25 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		return nil, err
 	}
 	p.Images = normalizeImages(in.Images)
+	// PLATFORM content (no venue) does not go through moderation: the feed
+	// review exists so the platform can vet what VENUES publish, and a platform
+	// promo submitted to the platform is a round trip with nobody on the other
+	// side — that is exactly why the owner's first platform promo sat at
+	// not_submitted and never reached the home screen. The approval is WRITTEN
+	// (status + reviewer + timestamps), not inferred at read time, so the audit
+	// trail still answers "who put this on the home screen and when", the
+	// existing withdraw/review levers keep working on the row, and the venue
+	// path below is untouched.
+	//
+	// After the insert, not inside it: the promo exists either way, and a failed
+	// approval leaves it at not_submitted — the pre-change behaviour, which the
+	// superadmin can still fix by hand. Same ordering (and the same trade-off)
+	// as the gallery write above.
+	if p.RestaurantID == nil {
+		if err := f.feed.ApprovePlatformItem(ctx, domain.FeedItemPromo, p.ID, actor.UserID, f.clock()); err != nil {
+			return nil, err
+		}
+	}
 	return p, nil
 }
 
@@ -239,7 +261,14 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	// simple CRUD facade. The residual window (a moderator approving in the
 	// milliseconds between the demotion and the write) is known, self-healing on
 	// the next edit, and judged not worth a tx here.
-	if contentChanged {
+	//
+	// PLATFORM content is exempt (domain.FeedDemotableAfterContentEdit): the
+	// editor and the reviewer are the same superadmin, so a demotion would pull
+	// the platform's own card off the home screen and park it in a queue it
+	// would then have to approve for itself. The repository enforces the same
+	// exemption in SQL, so this is the readable half of one rule, not a second
+	// rule.
+	if contentChanged && domain.FeedDemotableAfterContentEdit(p.RestaurantID) {
 		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemPromo, promoID); err != nil {
 			return nil, err
 		}

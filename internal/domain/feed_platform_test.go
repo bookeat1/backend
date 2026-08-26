@@ -94,3 +94,17 @@ func TestScoreFeedItem_PlatformCardScoresNeutralVenueRating(t *testing.T) {
 		t.Fatal("ranking a platform card must yield that card")
 	}
 }
+
+// The demotion rule reads owner, not status: venue content loses its approval
+// when it is edited, platform content does not (there is no second party to
+// re-review it). Both halves stated here because the SQL is written against
+// this function.
+func TestFeedDemotableAfterContentEdit(t *testing.T) {
+	rid := uuid.New()
+	if !FeedDemotableAfterContentEdit(&rid) {
+		t.Fatal("a venue's item must still be demoted when its content changes")
+	}
+	if FeedDemotableAfterContentEdit(nil) {
+		t.Fatal("platform content must not be demoted: its editor is its reviewer")
+	}
+}

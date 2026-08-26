@@ -132,13 +132,14 @@ func TestCreate_CityOverrideRefusesUnknownAndHidden(t *testing.T) {
 }
 
 // Changing which city an approved card reaches is a content edit: the same
-// approved words are handed to a different audience.
+// approved words are handed to a different audience. Asserted on a VENUE promo
+// — the demotion rule is about content the platform reviewed for somebody else.
 func TestUpdate_ChangingTheCityDemotesTheCard(t *testing.T) {
 	repo := newFakeRepo()
 	feed := &fakeFeed{}
 	f := NewFacade(repo, &fakePerms{}, feed, WithCityResolver(almatyDictionary()))
 
-	p, err := f.Create(context.Background(), superadmin(), platformCreate())
+	p, err := f.Create(context.Background(), superadmin(), validCreate(uuid.New()))
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -215,5 +216,100 @@ func TestListPublicActive_CanonicalizesTheCityFilter(t *testing.T) {
 	}
 	if repo.publicFilter.City == nil || *repo.publicFilter.City != unknown {
 		t.Fatalf("store was asked for %v, want the raw value passed through", repo.publicFilter.City)
+	}
+}
+
+// --- creation-time approval of the platform's own content ---
+
+// The bug this fixes: a platform promo was born at feed_status='not_submitted'
+// and waited for a moderator who is the same person who wrote it. The platform
+// approves its own content at creation, and the approval is recorded with the
+// superadmin who made it.
+func TestCreate_PlatformPromoIsApprovedForTheHomeFeedAtCreation(t *testing.T) {
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	actor := superadmin()
+	before := time.Now()
+	p, err := f.Create(context.Background(), actor, platformCreate())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(feed.approvals) != 1 {
+		t.Fatalf("approvals = %+v, want the platform promo approved exactly once", feed.approvals)
+	}
+	got := feed.approvals[0]
+	if got.kind != domain.FeedItemPromo || got.itemID != p.ID {
+		t.Fatalf("approved %s %s, want promo %s", got.kind, got.itemID, p.ID)
+	}
+	// Who approved it is the audit trail's whole point: it must be the actor,
+	// not a nil uuid and not the item's own id.
+	if got.reviewer != actor.UserID {
+		t.Fatalf("reviewer = %s, want the creating superadmin %s", got.reviewer, actor.UserID)
+	}
+	if got.at.Before(before) || got.at.After(time.Now()) {
+		t.Fatalf("approved at %v, want the creation instant", got.at)
+	}
+}
+
+// Characterisation: venue moderation is untouched. A venue's promo is created
+// with no approval whatsoever — it still has to be submitted and approved.
+func TestCreate_VenuePromoStillGoesThroughModeration(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleOwner), feed)
+
+	if _, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, validCreate(rid)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(feed.approvals) != 0 {
+		t.Fatalf("approvals = %+v, want a venue promo to reach the moderation queue instead", feed.approvals)
+	}
+
+	// Not even when the superadmin creates it on the venue's behalf: the item
+	// belongs to a venue, so it travels the venue's path.
+	if _, err := f.Create(context.Background(), superadmin(), validCreate(rid)); err != nil {
+		t.Fatalf("create as superadmin: %v", err)
+	}
+	if len(feed.approvals) != 0 {
+		t.Fatalf("approvals = %+v, want venue content moderated regardless of who typed it", feed.approvals)
+	}
+}
+
+// A failed approval is reported, not swallowed: the promo exists at
+// not_submitted (the pre-change behaviour) and the caller must learn that its
+// card is not live.
+func TestCreate_PlatformPromoReportsAFailedApproval(t *testing.T) {
+	repo := newFakeRepo()
+	feed := &fakeFeed{approveErr: errors.New("feed down")}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	if _, err := f.Create(context.Background(), superadmin(), platformCreate()); err == nil {
+		t.Fatal("a failed auto-approval must surface, not be swallowed")
+	}
+}
+
+// The platform editing its OWN card must not send it into a queue it would then
+// have to approve for itself — that is the same round trip with nobody on the
+// other side.
+func TestUpdate_PlatformCardIsNotDemotedByItsOwnEditor(t *testing.T) {
+	repo := newFakeRepo()
+	feed := &fakeFeed{}
+	f := NewFacade(repo, &fakePerms{}, feed)
+
+	p, err := f.Create(context.Background(), superadmin(), platformCreate())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.Update(context.Background(), superadmin(), p.ID, UpdateInput{
+		Title: "Другой заголовок", StartsAt: p.StartsAt, EndsAt: p.EndsAt, Status: domain.PromoPublished,
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(feed.demoted) != 0 {
+		t.Fatalf("demoted = %v, want the platform's own card left on the screen", feed.demoted)
 	}
 }

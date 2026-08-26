@@ -238,11 +238,31 @@ type FeedRepository interface {
 	// SetPlacementWeight writes the paid-placement weight without touching the
 	// moderation status. ErrNotFound when the id is absent.
 	SetPlacementWeight(ctx context.Context, kind FeedItemKind, id uuid.UUID, weight int) error
+	// ApprovePlatformItem records the PLATFORM's approval of its OWN item at
+	// the moment it is created: platform content (no venue, migration 0085) has
+	// no second party to review it, so the superadmin who wrote it is the
+	// superadmin who approved it, and that is written down rather than implied.
+	// reviewerID/at land in feed_reviewed_by/feed_reviewed_at (and
+	// feed_submitted_at — the platform submitted and decided in one act), so
+	// the audit trail answers "who put this on the home screen and when" the
+	// same way it does for venue content.
+	//
+	// The implementation MUST refuse anything that is not a fresh platform item
+	// — that guard belongs in the write itself, not in the caller — so this can
+	// never become a back door around venue moderation. ErrNotFound when the id
+	// is absent, ErrInvalidStatus when the row has a venue or already left
+	// not_submitted.
+	ApprovePlatformItem(ctx context.Context, kind FeedItemKind, id uuid.UUID, reviewerID uuid.UUID, at time.Time) error
 	// DemoteAfterContentEdit pulls an item off the main screen when its content
 	// changed after a decision: approved/rejected → pending_review, clearing the
 	// previous decision. A no-op for not_submitted/pending_review items, and it
 	// NEVER touches the placement weight (the venue did not buy or lose it by
 	// editing). This is what stops "get an innocuous promo approved, then edit
 	// the title" — see the ordering note in usecase/promos.
+	//
+	// PLATFORM-owned items are exempt (see FeedDemotableAfterContentEdit):
+	// there is nobody else to re-review them, so demoting one would drop the
+	// platform's own card off the home screen with no way back except the
+	// platform reviewing itself.
 	DemoteAfterContentEdit(ctx context.Context, kind FeedItemKind, id uuid.UUID) error
 }

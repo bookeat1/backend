@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -382,6 +383,43 @@ func (r *Repository) SetPlacementWeight(ctx context.Context, kind domain.FeedIte
 	return nil
 }
 
+// ApprovePlatformItem stamps the platform's own approval on the platform's own
+// item, in ONE guarded UPDATE. The guard is the point:
+//
+//	restaurant_id IS NULL     -- only PLATFORM content, never a venue's
+//	feed_status = 'not_submitted' -- only a fresh item, never a decided one
+//
+// Both conditions live in the WHERE clause rather than in the caller, so no
+// present or future usecase can turn this into a way to approve venue content
+// without a moderator, and a duplicated call (a retried create) cannot re-stamp
+// a reviewer over an existing decision — it gets ErrInvalidStatus instead.
+//
+// feed_submitted_at is written together with the decision: the platform
+// submitted and approved in the same act, and leaving it NULL would produce an
+// approved row that was never submitted — an audit trail that reads like a bug.
+func (r *Repository) ApprovePlatformItem(ctx context.Context, kind domain.FeedItemKind, id, reviewerID uuid.UUID, at time.Time) error {
+	table := tableFor(kind)
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE `+table+` SET
+			feed_status = $2::varchar,
+			feed_submitted_at = $3::timestamptz,
+			feed_reviewed_by = $4::uuid,
+			feed_reviewed_at = $3,
+			feed_rejection_reason = NULL,
+			updated_at = now()
+		 WHERE id = $1
+		   AND restaurant_id IS NULL
+		   AND feed_status = $5::varchar`,
+		id, string(domain.FeedApproved), at, reviewerID, string(domain.FeedNotSubmitted))
+	if err != nil {
+		return fmt.Errorf("approve platform feed item: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return r.explainNoRows(ctx, table, id, "approve platform feed item")
+	}
+	return nil
+}
+
 // DemoteAfterContentEdit mirrors domain.FeedStatusAfterContentEdit: a decision
 // made about specific words stops being valid when the words change. It is a
 // no-op for an item nobody decided on, and it never touches the placement
@@ -390,6 +428,12 @@ func (r *Repository) SetPlacementWeight(ctx context.Context, kind domain.FeedIte
 // A missing id is NOT an error here: the caller invokes this right before
 // editing an item it already resolved, and turning a benign race into a 404
 // would only mask the real edit error.
+//
+// `restaurant_id IS NOT NULL` is domain.FeedDemotableAfterContentEdit in SQL:
+// PLATFORM content is never demoted, because the editor IS the reviewer and a
+// demotion would hide the platform's own card behind a review nobody can
+// perform. The exemption sits in the write, not in the two usecases that call
+// this, so it cannot be half-applied.
 func (r *Repository) DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, id uuid.UUID) error {
 	table := tableFor(kind)
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
@@ -399,7 +443,7 @@ func (r *Repository) DemoteAfterContentEdit(ctx context.Context, kind domain.Fee
 			feed_reviewed_at = NULL,
 			feed_rejection_reason = NULL,
 			updated_at = now()
-		 WHERE id = $1 AND feed_status = ANY($3::text[])`,
+		 WHERE id = $1 AND restaurant_id IS NOT NULL AND feed_status = ANY($3::text[])`,
 		id, string(domain.FeedPendingReview),
 		[]string{string(domain.FeedApproved), string(domain.FeedRejected)})
 	if err != nil {

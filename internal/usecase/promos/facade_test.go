@@ -127,8 +127,20 @@ func (f *fakePerms) HasPermission(_ context.Context, userID, restaurantID uuid.U
 // fakeFeed records the demotions the facade asks for when content changes, and
 // can fail on demand so the "demote first" ordering can be asserted.
 type fakeFeed struct {
-	demoted []uuid.UUID
-	err     error
+	demoted   []uuid.UUID
+	approvals []platformApproval
+	err       error
+	// approveErr fails the platform auto-approval on demand.
+	approveErr error
+}
+
+// platformApproval is one recorded ApprovePlatformItem call — the audit trail
+// the tests assert on.
+type platformApproval struct {
+	kind     domain.FeedItemKind
+	itemID   uuid.UUID
+	reviewer uuid.UUID
+	at       time.Time
 }
 
 func (f *fakeFeed) DemoteAfterContentEdit(_ context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error {
@@ -139,6 +151,17 @@ func (f *fakeFeed) DemoteAfterContentEdit(_ context.Context, kind domain.FeedIte
 		return f.err
 	}
 	f.demoted = append(f.demoted, itemID)
+	return nil
+}
+
+func (f *fakeFeed) ApprovePlatformItem(_ context.Context, kind domain.FeedItemKind, itemID, reviewerID uuid.UUID, at time.Time) error {
+	if kind != domain.FeedItemPromo {
+		return errors.New("promos must approve a promo, not " + string(kind))
+	}
+	if f.approveErr != nil {
+		return f.approveErr
+	}
+	f.approvals = append(f.approvals, platformApproval{kind: kind, itemID: itemID, reviewer: reviewerID, at: at})
 	return nil
 }
 

@@ -146,11 +146,29 @@ func (f *fakePerms) HasPermission(_ context.Context, userID, restaurantID uuid.U
 	return role.HasPermission(perm), nil
 }
 
-// fakeFeed records the demotions the facade asks for when content changes.
-type fakeFeed struct{ demoted []uuid.UUID }
+// fakeFeed records the demotions the facade asks for when content changes and
+// the platform auto-approvals it performs at creation.
+type fakeFeed struct {
+	demoted   []uuid.UUID
+	approvals []platformApproval
+}
+
+// platformApproval is one recorded ApprovePlatformItem call — the audit trail
+// the tests assert on.
+type platformApproval struct {
+	kind     domain.FeedItemKind
+	itemID   uuid.UUID
+	reviewer uuid.UUID
+	at       time.Time
+}
 
 func (f *fakeFeed) DemoteAfterContentEdit(_ context.Context, _ domain.FeedItemKind, itemID uuid.UUID) error {
 	f.demoted = append(f.demoted, itemID)
+	return nil
+}
+
+func (f *fakeFeed) ApprovePlatformItem(_ context.Context, kind domain.FeedItemKind, itemID, reviewerID uuid.UUID, at time.Time) error {
+	f.approvals = append(f.approvals, platformApproval{kind: kind, itemID: itemID, reviewer: reviewerID, at: at})
 	return nil
 }
 

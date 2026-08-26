@@ -36,11 +36,14 @@ type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
 }
 
-// feedModerator pulls an item off the main-screen feed when its content
-// changes. Minimal local port (bound to the feed repository in bootstrap): the
-// events usecase must not know the whole FeedRepository, only this one effect.
+// feedModerator is the events usecase's minimal slice of the feed's moderation
+// writes (bound to the feed repository in bootstrap): pull an item off the main
+// screen when its content changes, and record the platform's approval of the
+// platform's OWN item at creation. Deliberately identical to the port in
+// usecase/promos — the two content types must not disagree about moderation.
 type feedModerator interface {
 	DemoteAfterContentEdit(ctx context.Context, kind domain.FeedItemKind, itemID uuid.UUID) error
+	ApprovePlatformItem(ctx context.Context, kind domain.FeedItemKind, itemID, reviewerID uuid.UUID, at time.Time) error
 }
 
 // Facade exposes admin CRUD and public read operations for events.
@@ -307,6 +310,15 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		return nil, err
 	}
 	e.Images = normalizeImages(in.Images)
+	// PLATFORM content (no venue) skips the moderation round trip — see the
+	// long note in usecase/promos.Create; the rule is one rule and both content
+	// types follow it. The approval is written down with its reviewer, and the
+	// venue path is not touched.
+	if e.RestaurantID == nil {
+		if err := f.feed.ApprovePlatformItem(ctx, domain.FeedItemEvent, e.ID, actor.UserID, f.clock()); err != nil {
+			return nil, err
+		}
+	}
 	return e, nil
 }
 
@@ -375,7 +387,10 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	// makes both failure modes safe — a failed edit after a successful demotion
 	// only costs the venue a re-review, while the reverse order could leave
 	// unreviewed text live on the main screen. See usecase/promos.Update.
-	if contentChanged {
+	//
+	// PLATFORM content is exempt (domain.FeedDemotableAfterContentEdit) for the
+	// reason spelled out there: there is no second party to re-review it.
+	if contentChanged && domain.FeedDemotableAfterContentEdit(e.RestaurantID) {
 		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemEvent, eventID); err != nil {
 			return nil, err
 		}
