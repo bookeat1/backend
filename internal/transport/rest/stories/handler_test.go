@@ -176,3 +176,34 @@ func TestListErrorMapping(t *testing.T) {
 		})
 	}
 }
+
+// TestListCarriesActionURL: the PUBLIC story response must carry the external
+// link, otherwise the mobile app has nowhere to read it from. The key is
+// action_url and it is separate from image_url — image_url is the picture, the
+// tap target is action_url — and it is omitted entirely when the venue set none.
+func TestListCarriesActionURL(t *testing.T) {
+	link := "https://book-eat.com/promo"
+	linked := domain.Story{ID: uuid.New(), ImageURL: "https://cdn/a2.jpg", ActionURL: &link, SortOrder: 2, IsActive: true}
+	plain := domain.Story{ID: uuid.New(), ImageURL: "https://cdn/a1.jpg", SortOrder: 1, IsActive: true}
+	r := newRouter(&fakeFacade{rv: []domain.Story{plain, linked}})
+
+	w := do(r, http.MethodGet, "/api/v1/restaurants/"+uuid.New().String()+"/stories")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	var env struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := env.Data[0]["action_url"]; ok {
+		t.Errorf("a story without a link must omit action_url: %v", env.Data[0])
+	}
+	if env.Data[1]["action_url"] != link {
+		t.Errorf("action_url = %v, want %q", env.Data[1]["action_url"], link)
+	}
+	if env.Data[1]["image_url"] != "https://cdn/a2.jpg" {
+		t.Errorf("action_url must not overwrite image_url: %v", env.Data[1])
+	}
+}
