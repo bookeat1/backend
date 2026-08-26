@@ -51,6 +51,12 @@ type TokenPair struct {
 	AccessToken  string
 	RefreshToken string
 	ExpiresAt    time.Time
+
+	// IsNewUser is true only when THIS call created the account. Set by the
+	// phone-OTP login (completeLogin), which is the one path that does a
+	// find-or-create; the email/password Facade leaves it false and no
+	// transport exposes it there. See the otpVerifyResponse DTO.
+	IsNewUser bool
 }
 
 // Config holds auth timing and OTP policy.

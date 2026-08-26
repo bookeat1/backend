@@ -399,6 +399,7 @@ func (o *otpUseCase) completeLogin(ctx context.Context, p string, rec *domain.OT
 	var pair *TokenPair
 	var attached int64
 	var userID uuid.UUID
+	var created bool
 	err := o.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if rec != nil {
 			if err := o.otp.MarkUsed(ctx, rec.ID); err != nil {
@@ -413,6 +414,7 @@ func (o *otpUseCase) completeLogin(ctx context.Context, p string, rec *domain.OT
 			if err := o.users.Create(ctx, u); err != nil {
 				return err
 			}
+			created = true
 		} else if err != nil {
 			return err
 		} else if u.PhoneVerifiedAt == nil {
@@ -435,7 +437,14 @@ func (o *otpUseCase) completeLogin(ctx context.Context, p string, rec *domain.OT
 		}
 
 		pair, err = issuePair(ctx, o.tokens, o.refresh, o.cfg.RefreshTTL, u)
-		return err
+		if err != nil {
+			return err
+		}
+		// Carried out of the transaction so the app can tell a first-ever login
+		// apart from a returning guest. Assigned here, inside the closure, so a
+		// rolled-back attempt can never leave the flag set on a pair we return.
+		pair.IsNewUser = created
+		return nil
 	})
 	if err != nil {
 		return nil, err
