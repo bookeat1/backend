@@ -50,7 +50,22 @@ type Event struct {
 	EndsAt          time.Time
 	// Venue is free-text location detail within (or outside) the restaurant —
 	// "rooftop terrace", "banquet hall". Empty means "at the restaurant".
-	Venue         string
+	Venue string
+	// City OVERRIDES the city this event is shown in (migration 0084). It is an
+	// override and nothing else — the normal case is nil:
+	//
+	//   nil + a host venue  → the event lives in the VENUE's city, resolved on
+	//                         every read (COALESCE(e.city, r.city)), so it can
+	//                         never go stale when the venue moves.
+	//   nil + no host venue → shown in EVERY city. Unreachable today
+	//                         (RestaurantID is required) and the seam the
+	//                         platform-wide-event card will use.
+	//   set                 → shown in that city regardless of the venue.
+	//
+	// The stored value is the dictionary's own spelling of the city name (the
+	// same currency as Restaurant.City), normalized by the database trigger
+	// trg_events_sync_city — the listing compares cities as exact strings.
+	City          *City
 	CoverImageURL *string
 	// Images — дополнительная галерея события в порядке редактора, БЕЗ обложки:
 	// обложка живёт в CoverImageURL и её читают карточки и лента. Пустой срез —
@@ -113,8 +128,13 @@ type EventListItem struct {
 // Visibility itself is NOT a filter — published, not-yet-ended, at an active
 // venue is always enforced (see EventRepository.ListPublicUpcoming).
 type PublicEventFilter struct {
-	// City filters by the HOST RESTAURANT's city (events carry no city of
-	// their own). An unknown city value simply matches nothing.
+	// City filters by the event's EFFECTIVE city: its own override when set,
+	// otherwise the host venue's city (migration 0084). An event with no
+	// effective city at all is shown for every value of this filter. The value
+	// is resolved through the city dictionary before it reaches the store (see
+	// usecase/events canonicalCity), so a code, an alias or a city's previous
+	// name all work; a value the dictionary does not know is passed through and
+	// simply matches nothing.
 	City *City
 	// RestaurantID narrows to one venue.
 	RestaurantID *uuid.UUID

@@ -69,12 +69,37 @@ type UseCase interface {
 type useCase struct {
 	repo   domain.CityRepository
 	venues venueCityWriter
+	events cityStringWriter
 	tx     domain.TxManager
 }
 
+// cityStringWriter is the same one-column contract as venueCityWriter, for
+// every OTHER table that renders a city as a string next to a city_id. Today
+// that is `events.city` (migration 0084): an event may override the city it is
+// shown in, and the listing compares that override as an exact string, so a
+// rename that stops at the venues would make the overrides point at a name
+// nothing answers to any more.
+type cityStringWriter interface {
+	RenameCityString(ctx context.Context, cityID uuid.UUID, name string) (int64, error)
+}
+
+// Option tunes the usecase without breaking existing positional callers.
+type Option func(*useCase)
+
+// WithEventCityWriter makes a rename also rewrite the city override stored on
+// events. Left unwired (tests), a rename touches venues only — exactly the
+// pre-0084 behaviour, since before it no event carried a city of its own.
+func WithEventCityWriter(w cityStringWriter) Option {
+	return func(u *useCase) { u.events = w }
+}
+
 // NewUseCase constructs the city usecase.
-func NewUseCase(repo domain.CityRepository, venues venueCityWriter, tx domain.TxManager) UseCase {
-	return &useCase{repo: repo, venues: venues, tx: tx}
+func NewUseCase(repo domain.CityRepository, venues venueCityWriter, tx domain.TxManager, opts ...Option) UseCase {
+	u := &useCase{repo: repo, venues: venues, tx: tx}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // SaveInput carries the mutable dictionary fields. Every field is a pointer so
@@ -160,7 +185,19 @@ func (u *useCase) Update(ctx context.Context, actor Actor, id uuid.UUID, in Save
 			if err != nil {
 				return err
 			}
-			slog.Info("city renamed", "city_id", c.ID, "from", before, "to", c.Name, "venues_updated", n)
+			// Events that pin themselves to this city travel in the SAME
+			// transaction, for the same reason the venues do: half a rename
+			// leaves rows advertising a spelling the filter no longer produces,
+			// and they simply stop being found.
+			var events int64
+			if u.events != nil {
+				events, err = u.events.RenameCityString(ctx, c.ID, c.Name)
+				if err != nil {
+					return err
+				}
+			}
+			slog.Info("city renamed", "city_id", c.ID, "from", before, "to", c.Name,
+				"venues_updated", n, "events_updated", events)
 		}
 		out = c
 		return nil
