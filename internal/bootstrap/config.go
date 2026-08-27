@@ -564,9 +564,11 @@ type PushConfig struct {
 // guess about which credential wins — same shape as PushConfig.GuestPushProvider.
 type StaticMapConfig struct {
 	// Provider selects the map vendor. Empty (the default) means no provider:
-	// the endpoint answers map_not_configured. The only value implemented today
-	// is "2gis".
-	Provider string // env: STATIC_MAP_PROVIDER ("" | "2gis")
+	// the endpoint answers map_not_configured. Implemented values: "geoapify"
+	// (free plan, commercial use allowed with the provider's own attribution
+	// burned into the image) and "2gis" (no key yet, no published price list).
+	// Switching vendors is this one variable and a restart.
+	Provider string // env: STATIC_MAP_PROVIDER ("" | "geoapify" | "2gis")
 	// TwoGISAPIKey is the 2GIS Platform Manager access key. A credential: env
 	// only, NEVER logged and never echoed in a response. Empty while Provider
 	// is "2gis" is a misconfiguration, reported once at startup — the endpoint
@@ -574,6 +576,18 @@ type StaticMapConfig struct {
 	TwoGISAPIKey string // env: STATIC_MAP_2GIS_API_KEY
 	// TwoGISBaseURL overrides 2GIS's Static API entry point (tests, staging).
 	TwoGISBaseURL string // env: STATIC_MAP_2GIS_BASE_URL
+	// GeoapifyAPIKey is the Geoapify project API key. A credential: env only,
+	// NEVER logged and never echoed in a response. Empty while Provider is
+	// "geoapify" is a misconfiguration, reported once at startup — the endpoint
+	// then behaves as unconfigured rather than failing every request loudly.
+	GeoapifyAPIKey string // env: STATIC_MAP_GEOAPIFY_API_KEY
+	// GeoapifyBaseURL overrides Geoapify's Static Maps entry point (tests, staging).
+	GeoapifyBaseURL string // env: STATIC_MAP_GEOAPIFY_BASE_URL
+	// GeoapifyStyle is one of Geoapify's map styles. Empty = the client default.
+	GeoapifyStyle string // env: STATIC_MAP_GEOAPIFY_STYLE
+	// GeoapifyLang labels the map. Empty = the client default ("ru"); "-" leaves
+	// the provider's own local-name labelling (Kazakh in KZ).
+	GeoapifyLang string // env: STATIC_MAP_GEOAPIFY_LANG
 	// Timeout caps one provider render call. Kept well inside the HTTP server's
 	// write timeout: a map preview must never be the reason a response is cut off.
 	Timeout time.Duration // env: STATIC_MAP_TIMEOUT
@@ -589,6 +603,8 @@ func (s StaticMapConfig) Configured() bool {
 	switch strings.ToLower(strings.TrimSpace(s.Provider)) {
 	case "2gis":
 		return strings.TrimSpace(s.TwoGISAPIKey) != ""
+	case "geoapify":
+		return strings.TrimSpace(s.GeoapifyAPIKey) != ""
 	default:
 		return false
 	}
@@ -776,6 +792,12 @@ func NewConfig() (Config, error) {
 			Provider:      getEnv("STATIC_MAP_PROVIDER", ""),
 			TwoGISAPIKey:  getEnv("STATIC_MAP_2GIS_API_KEY", ""),
 			TwoGISBaseURL: getEnv("STATIC_MAP_2GIS_BASE_URL", ""),
+
+			GeoapifyAPIKey:  getEnv("STATIC_MAP_GEOAPIFY_API_KEY", ""),
+			GeoapifyBaseURL: getEnv("STATIC_MAP_GEOAPIFY_BASE_URL", ""),
+			GeoapifyStyle:   getEnv("STATIC_MAP_GEOAPIFY_STYLE", ""),
+			GeoapifyLang:    getEnv("STATIC_MAP_GEOAPIFY_LANG", ""),
+
 			Timeout:       getEnvDuration("STATIC_MAP_TIMEOUT", 5*time.Second),
 			CacheTTL:      getEnvDuration("STATIC_MAP_CACHE_TTL", 24*time.Hour),
 			CacheMaxBytes: getEnvInt64("STATIC_MAP_CACHE_MAX_BYTES", 64<<20),

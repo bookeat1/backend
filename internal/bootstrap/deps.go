@@ -55,6 +55,7 @@ import (
 	venuedashboardrepo "backend-core/internal/infrastructure/postgres/venuedashboard"
 	venuefeaturerepo "backend-core/internal/infrastructure/postgres/venuefeature"
 	"backend-core/internal/infrastructure/sqltx"
+	"backend-core/internal/infrastructure/staticmap/geoapify"
 	"backend-core/internal/infrastructure/staticmap/twogis"
 	"backend-core/internal/infrastructure/telegramnotify"
 	"backend-core/internal/infrastructure/token"
@@ -1323,6 +1324,20 @@ func newStaticMap(cfg Config, restaurants staticmap.RestaurantCoords, log *slog.
 			break
 		}
 		provider = twogis.NewClient(twoGIS)
+	case "geoapify":
+		geo := geoapify.Config{
+			APIKey:  cfg.StaticMap.GeoapifyAPIKey,
+			BaseURL: cfg.StaticMap.GeoapifyBaseURL,
+			Style:   cfg.StaticMap.GeoapifyStyle,
+			Lang:    cfg.StaticMap.GeoapifyLang,
+			Timeout: cfg.StaticMap.Timeout,
+		}
+		if !geo.Configured() {
+			// Never log the key — only the fact that it is missing.
+			log.Error("STATIC_MAP_PROVIDER=geoapify but STATIC_MAP_GEOAPIFY_API_KEY is empty — the map proxy stays disabled")
+			break
+		}
+		provider = geoapify.NewClient(geo)
 	default:
 		log.Error("unknown STATIC_MAP_PROVIDER — the map proxy stays disabled",
 			slog.String("provider", cfg.StaticMap.Provider))
