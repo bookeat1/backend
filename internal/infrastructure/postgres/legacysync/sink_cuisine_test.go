@@ -47,24 +47,26 @@ func TestSyncDoesNotOverwriteCuisine(t *testing.T) {
 	}
 
 	// The legacy row changes — including its cuisine — and syncs again.
-	src.restaurants[0].Name = "Rest One Renamed"
+	src.restaurants[0].Phone = "+7702"
 	src.restaurants[0].CuisineType = "italian, cafe"
 	src.restaurants[0].UpdatedAt = t0(5)
 	if err := w.Tick(ctx); err != nil {
 		t.Fatalf("second tick: %v", err)
 	}
 
-	var name, cuisine string
+	var phone, cuisine string
 	var i18n []byte
 	if err := pool.QueryRow(ctx,
-		`SELECT name, cuisine_type, cuisine_type_i18n FROM restaurants WHERE id = $1`,
-		rest1).Scan(&name, &cuisine, &i18n); err != nil {
+		`SELECT phone, cuisine_type, cuisine_type_i18n FROM restaurants WHERE id = $1`,
+		rest1).Scan(&phone, &cuisine, &i18n); err != nil {
 		t.Fatalf("read after second sync: %v", err)
 	}
-	// The columns legacy still owns DID update — otherwise this test would
-	// also pass if the sync simply stopped working.
-	if name != "Rest One Renamed" {
-		t.Errorf("name = %q, want the legacy update to still apply", name)
+	// A column legacy still owns DID update — otherwise this test would also
+	// pass if the sync simply stopped working. The venue's NAME used to play
+	// this role and no longer can: since 2026-08-27 the profile text is ours
+	// too (see TestSyncDoesNotOverwriteProfileText).
+	if phone != "+7702" {
+		t.Errorf("phone = %q, want the legacy update to still apply", phone)
 	}
 	if cuisine != "Итальянская, Европейская" {
 		t.Errorf("cuisine_type = %q, want OUR value untouched by the sync", cuisine)

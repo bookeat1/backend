@@ -417,6 +417,14 @@ type LegacySyncConfig struct {
 	DatabaseURL  string        // env: LEGACY_DB_URL
 	TickInterval time.Duration // env: LEGACY_SYNC_TICK_INTERVAL
 	BatchSize    int           // env: LEGACY_SYNC_BATCH_SIZE
+	// Entities is the comma-separated ALLOWLIST of entities the sync may write
+	// (env: LEGACY_SYNC_ENTITIES). Unset means legacysync.DefaultEntities —
+	// bookings only. The old base is the web site's engine now; venues, tables,
+	// menus and schedules belong to this system, and importing them again
+	// overwrites what the venue edited in its cabinet. Widen this list only for
+	// a deliberate one-off import, and an unknown name here is a startup error,
+	// not a silently disabled entity.
+	Entities []string
 }
 
 // TicketsSweepConfig configures the pending-event-ticket sweep worker. The
@@ -715,6 +723,7 @@ func NewConfig() (Config, error) {
 			DatabaseURL:  getEnv("LEGACY_DB_URL", ""),
 			TickInterval: getEnvDuration("LEGACY_SYNC_TICK_INTERVAL", time.Minute),
 			BatchSize:    getEnvInt("LEGACY_SYNC_BATCH_SIZE", 500),
+			Entities:     getEnvList("LEGACY_SYNC_ENTITIES", ""),
 		},
 		TicketsSweep: TicketsSweepConfig{
 			TickInterval: getEnvDuration("TICKETS_SWEEP_TICK_INTERVAL", 5*time.Minute),

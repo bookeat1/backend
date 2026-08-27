@@ -3,7 +3,9 @@ package legacysync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"backend-core/internal/domain"
@@ -20,6 +22,72 @@ type Config struct {
 	// DefaultDuration is added to a booking's single stored time to derive the
 	// required ends_at / slot end. env: BOOKING_DEFAULT_DURATION_MINUTES (shared).
 	DefaultDuration time.Duration
+	// Entities is the ALLOWLIST of entities this sync is permitted to write.
+	// Empty means DefaultEntities. env: LEGACY_SYNC_ENTITIES.
+	//
+	// The sync no longer moves the catalog. Since the mobile apps went live the
+	// new database — and the admin panel on top of it — OWNS venues, tables,
+	// menus and schedules; the old system stayed behind as the engine of the
+	// web site, which still produces bookings. A pass that kept importing
+	// venues did not "top the data up", it silently reverted whatever the owner
+	// had edited in the cabinet (see the 2026-08-27 rename complaint), and
+	// nothing anywhere reported an error, because from the sync's point of view
+	// the write succeeded.
+	//
+	// This is a list rather than a code deletion on purpose: a one-off import
+	// of some other entity may still be wanted, and it must be a deliberate,
+	// visible act (one env var for one run) instead of a code change.
+	Entities []string
+}
+
+// DefaultEntities is what the sync writes when LEGACY_SYNC_ENTITIES is unset:
+// bookings, and nothing else.
+//
+// Why bookings alone:
+//   - the web site still books against the old base, and those reservations
+//     have to reach the venue's cabinet — this is the entire remaining reason
+//     the sync exists;
+//   - venues / tables / menu categories / menu items / working hours are ours
+//     now, and re-importing them overwrites live cabinet edits;
+//   - EntityBookingTables is off as well, even though it is part of "bookings":
+//     a table assignment points at a restaurant_tables id, and those ids stop
+//     arriving the moment EntityTables is off — every such row would park for a
+//     parent that is never coming. A booking without a table hold still shows
+//     up in the cabinet; a permanently parked row would just wedge the cursor;
+//   - USERS ARE NOT IN THIS LIST BECAUSE THIS SYNC HAS NO USERS ENTITY AT ALL
+//     (there is no Source.Users, no Sink.UpsertUser and no "users" cursor). A
+//     legacy booking made by a web account keeps its user_id only if a user
+//     with that id already exists here, otherwise the column is left NULL and
+//     the booking arrives as a guest booking with its name/phone — which is
+//     also how the guest later reclaims it by verifying that phone
+//     (AttachOrphanedByPhone). Importing accounts would be new work, not a
+//     switch to flip.
+var DefaultEntities = []string{EntityBookings}
+
+// KnownEntities lists every entity name Entities may contain. A name outside
+// this set is a typo, and a typo must not read as "that entity is off".
+func KnownEntities() []string {
+	return []string{
+		EntityRestaurants, EntityTables, EntityMenuCategories, EntityMenuItems,
+		EntityBookings, EntityBookingTables, EntityWorkingHours,
+	}
+}
+
+// ValidateEntities rejects an unknown entity name. Called at wiring time so a
+// mistyped LEGACY_SYNC_ENTITIES fails the worker's startup loudly instead of
+// quietly syncing less than the operator asked for.
+func ValidateEntities(names []string) error {
+	known := make(map[string]bool, len(KnownEntities()))
+	for _, k := range KnownEntities() {
+		known[k] = true
+	}
+	for _, n := range names {
+		if !known[n] {
+			return fmt.Errorf("legacy sync: unknown entity %q (known: %s)",
+				n, strings.Join(KnownEntities(), ", "))
+		}
+	}
+	return nil
 }
 
 const (
@@ -38,7 +106,20 @@ func (c Config) withDefaults() Config {
 	if c.DefaultDuration <= 0 {
 		c.DefaultDuration = defaultBookingDuration
 	}
+	if len(c.Entities) == 0 {
+		c.Entities = DefaultEntities
+	}
 	return c
+}
+
+// enabled reports whether entity is in the configured allowlist.
+func (w *Worker) enabled(entity string) bool {
+	for _, e := range w.cfg.Entities {
+		if e == entity {
+			return true
+		}
+	}
+	return false
 }
 
 // Worker periodically pulls changed rows from the old system and upserts them
@@ -80,7 +161,12 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer t.Stop()
 	w.log.Info("legacy sync started",
 		slog.Duration("tick", w.cfg.TickInterval),
-		slog.Int("batch", w.cfg.BatchSize))
+		slog.Int("batch", w.cfg.BatchSize),
+		// The allowlist is the single most consequential setting here: it is
+		// the difference between "import the bookings the web site takes" and
+		// "revert everything the cabinet edited". It belongs in the startup
+		// line, where an operator turning the sync on for one run will see it.
+		slog.String("entities", strings.Join(w.cfg.Entities, ",")))
 	for {
 		select {
 		case <-ctx.Done():
@@ -102,17 +188,25 @@ func (w *Worker) Run(ctx context.Context) error {
 // is returned (and logged by Run) but does not corrupt state: each entity
 // advances its own cursor only over the rows it actually wrote.
 func (w *Worker) Tick(ctx context.Context) error {
-	steps := []func(context.Context) (EntityResult, error){
-		w.syncRestaurants,
-		w.syncTables,
-		w.syncMenuCategories,
-		w.syncMenuItems,
-		w.syncBookings,
-		w.syncBookingTables,
+	// Order is FK-safe (parents first) and stays that way whatever the
+	// allowlist keeps: filtering preserves it.
+	steps := []struct {
+		entity string
+		run    func(context.Context) (EntityResult, error)
+	}{
+		{EntityRestaurants, w.syncRestaurants},
+		{EntityTables, w.syncTables},
+		{EntityMenuCategories, w.syncMenuCategories},
+		{EntityMenuItems, w.syncMenuItems},
+		{EntityBookings, w.syncBookings},
+		{EntityBookingTables, w.syncBookingTables},
 	}
 	var firstErr error
 	for _, step := range steps {
-		res, err := step(ctx)
+		if !w.enabled(step.entity) {
+			continue
+		}
+		res, err := step.run(ctx)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -133,11 +227,16 @@ func (w *Worker) Tick(ctx context.Context) error {
 	// Working hours run last and are NOT part of the steps loop: they are not
 	// cursored, they are derived from the restaurants rows the pass above has
 	// just written, and they report their own counters (see workinghours.go).
-	hours, err := w.syncWorkingHours(ctx)
-	if err != nil && firstErr == nil {
-		firstErr = err
+	// They are gated by the same allowlist — the pass reads the venues' legacy
+	// free text, so leaving it on while venues are off would keep rewriting a
+	// schedule from a source we no longer trust.
+	if w.enabled(EntityWorkingHours) {
+		hours, err := w.syncWorkingHours(ctx)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		w.logWorkingHours(hours)
 	}
-	w.logWorkingHours(hours)
 	return firstErr
 }
 
@@ -195,8 +294,15 @@ func syncEntity[T any](
 		case Parked:
 			res.Parked++
 			contiguous = false
+			// The row id is in the line on purpose. A park is retried forever
+			// and holds the cursor where it is, so a parent that is never
+			// coming (a venue that only ever existed in the old system, now
+			// that venues are not imported) shows up as the same warning every
+			// tick — an operator needs to know WHICH row, not just that one
+			// exists.
 			log.Warn("legacy sync row parked (parent not synced yet)",
-				slog.String("entity", entity))
+				slog.String("entity", entity),
+				slog.String("row_id", key(row).ID.String()))
 		}
 	}
 	if err := advanceCursor(ctx, sink, entity, cur, watermark); err != nil {

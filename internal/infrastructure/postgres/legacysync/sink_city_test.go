@@ -11,8 +11,9 @@ import (
 // TestSyncDoesNotOverwriteCity is the guard on the city half of ADR-023.
 //
 // The city is chosen in OUR panel now. The legacy row still carries whatever
-// city was typed into the old admin, and the legacy sync still owns name and
-// address — so the update must land on those columns and step over `city`.
+// city was typed into the old admin, and the legacy sync still owns the
+// contact/marketing columns — so the update must land on those and step over
+// `city`.
 //
 // The "and other columns still updated" half is not decoration: without it the
 // test would also pass if the sync silently stopped writing restaurants at all,
@@ -42,28 +43,30 @@ func TestSyncDoesNotOverwriteCity(t *testing.T) {
 		t.Fatalf("set our city: %v", err)
 	}
 
-	// The legacy row changes — name, address and its own stale city — and syncs.
-	src.restaurants[0].Name = "Rest One Renamed"
-	src.restaurants[0].Address = "Legacy Address 2"
+	// The legacy row changes — phone, price category and its own stale city —
+	// and syncs. (Name and address used to be the canary here; they are ours
+	// since 2026-08-27, see TestSyncDoesNotOverwriteProfileText.)
+	src.restaurants[0].Phone = "+7702"
+	src.restaurants[0].PriceCategory = "₸₸₸"
 	src.restaurants[0].City = "Алматы"
 	src.restaurants[0].UpdatedAt = t0(5)
 	if err := w.Tick(ctx); err != nil {
 		t.Fatalf("second tick: %v", err)
 	}
 
-	var name, address, city string
+	var phone, priceCategory, city string
 	if err := pool.QueryRow(ctx,
-		`SELECT name, address, city FROM restaurants WHERE id = $1`, rest1).
-		Scan(&name, &address, &city); err != nil {
+		`SELECT phone, price_category, city FROM restaurants WHERE id = $1`, rest1).
+		Scan(&phone, &priceCategory, &city); err != nil {
 		t.Fatalf("read after second sync: %v", err)
 	}
 	// The columns legacy still owns DID update — otherwise this test would
 	// also pass if the sync simply stopped working.
-	if name != "Rest One Renamed" {
-		t.Errorf("name = %q, want the legacy update to still apply", name)
+	if phone != "+7702" {
+		t.Errorf("phone = %q, want the legacy update to still apply", phone)
 	}
-	if address != "Legacy Address 2" {
-		t.Errorf("address = %q, want the legacy update to still apply", address)
+	if priceCategory != "₸₸₸" {
+		t.Errorf("price_category = %q, want the legacy update to still apply", priceCategory)
 	}
 	if city != "Астана" {
 		t.Errorf("city = %q, want OUR value untouched by the sync", city)

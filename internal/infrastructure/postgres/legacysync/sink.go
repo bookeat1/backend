@@ -125,18 +125,35 @@ SET last_synced_at = EXCLUDED.last_synced_at,
 // query, for one reason: the columns that are NOT here matter as much as the
 // ones that are, and an omission inside a 12-line SQL literal is invisible.
 //
-// cuisine_type / cuisine_type_i18n and city are absent BY DESIGN — see the
-// notes in the middle of the list. Adding them back reverts every venue's
-// cuisine and city to the legacy value on the next sync run.
+// The venue's PROFILE TEXT, cuisine_type / cuisine_type_i18n and city are
+// absent BY DESIGN — see the notes in the middle of the list. Adding any of
+// them back reverts that column to the legacy value on the next sync run, in
+// silence: the sync reports "written" either way.
 const legacyRestaurantUpdateSet = `
- name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n, description=EXCLUDED.description,
- description_i18n=EXCLUDED.description_i18n,
+ -- name / name_i18n / description / description_i18n / address / address_i18n /
+ -- opening_hours / opening_hours_i18n: НЕ ПРИСВАИВАЮТСЯ. Профиль — наш, по той
+ -- же логике, что кухня и город ниже (ADR-023): его редактирует владелец в
+ -- нашем кабинете, а старая система хранит текст на момент выхода в прод.
+ --
+ -- Это не гипотеза, а разбор жалобы 2026-08-27: владелец переименовывал
+ -- заведение 85817ed1 в «Тбилиси», ближайший прогон переноса возвращал
+ -- легаси-имя «THE ME'ET», и ни одной ошибки нигде не появлялось. Перенос по
+ -- решению владельца выключен и запускается только по запросу — а раз он
+ -- запускается, он не имеет права затирать ручные правки.
+ --
+ -- Карты переводов (*_i18n) выключены ВМЕСТЕ со своими колонками, и это
+ -- обязательное условие, а не симметрия ради симметрии: чтения резолвят карту
+ -- ПЕРВОЙ (domain.I18n.Resolve), поэтому перенос одной только name_i18n вернул
+ -- бы старое имя на всех экранах, а колонка с новым именем осталась бы лежать
+ -- невидимой — ровно тот баг, который чинит syncRussianTranslations в
+ -- usecase/restaurants.
+ --
+ -- Всё перечисленное по-прежнему пишется на INSERT (см. UpsertRestaurant):
+ -- заведение, приехавшее ВПЕРВЫЕ, получает легаси-текст целиком, иначе оно
+ -- появилось бы безымянным.
  -- cuisine_type / cuisine_type_i18n: НЕ ПРИСВАИВАЮТСЯ. Кухня — наша (ADR-023):
  -- источник истины с миграции 0079 это restaurant_cuisines, а строка —
  -- производная от него. Старая система кухню больше не трогает.
- address=EXCLUDED.address,
- address_i18n=EXCLUDED.address_i18n, opening_hours=EXCLUDED.opening_hours,
- opening_hours_i18n=EXCLUDED.opening_hours_i18n,
  -- city: НЕ ПРИСВАИВАЕТСЯ. Город — наш (ADR-023): его редактируют в нашем
  -- кабинете, старая система им больше не владеет. Верните строку обратно —
  -- и ближайший прогон синхронизации молча откатит правку кабинета.
@@ -148,6 +165,12 @@ const legacyRestaurantUpdateSet = `
  updated_at=EXCLUDED.updated_at`
 
 // UpsertRestaurant writes one venue from the LEGACY system.
+//
+// THE PROFILE TEXT IS OURS (decided 2026-08-27, same rule as ADR-023). `name`,
+// `description`, `address`, `opening_hours` and their `*_i18n` maps are absent
+// from legacyRestaurantUpdateSet: they are what the venue's own cabinet edits,
+// and a sync run that re-asserted the legacy wording silently undid the edit —
+// which is exactly the complaint that got the sync switched off in production.
 //
 // CUISINE IS OURS, NOT THEIRS (ADR-023). `cuisine_type` / `cuisine_type_i18n`
 // are deliberately ABSENT from the ON CONFLICT DO UPDATE list, which lives in
@@ -165,10 +188,14 @@ const legacyRestaurantUpdateSet = `
 // old admin. Assigning it on update would let the next sync run silently undo
 // an edit made in the panel.
 //
-// All three columns are still written on INSERT: a venue that appears in the
-// legacy system for the first time has no cuisine links and no city of ours
-// yet, and is better off with the legacy values than with an empty cuisine and
-// an empty city (city is NOT NULL — see migration 0002).
+// EVERY ONE OF THEM IS STILL WRITTEN ON INSERT. That split is not a detail,
+// it is the whole design: the statement below lists all the columns in its
+// INSERT, and only ON CONFLICT (i.e. "we already know this venue") falls back
+// to the shorter assignment list. A venue appearing for the FIRST time has no
+// cuisine links, no city and no profile text of ours yet, so it is far better
+// off with the legacy values than arriving nameless (name and city are both
+// NOT NULL — see migration 0002); a venue we already have is one whose text
+// may have been edited in our cabinet since, and we must not guess which.
 func (s *Sink) UpsertRestaurant(ctx context.Context, r legacysync.Restaurant) (legacysync.Outcome, error) {
 	return exec(ctx, s.pool, `
 INSERT INTO restaurants

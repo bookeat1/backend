@@ -139,10 +139,25 @@ func newFakeSource() *fakeSource {
 	}
 }
 
+// newWorker builds a worker with EVERY entity enabled — the one-off full import
+// (LEGACY_SYNC_ENTITIES listing everything), which is still a supported mode and
+// is what the older tests in this file exercise. Production runs the DEFAULT
+// allowlist instead; see newDefaultWorker and sink_entities_test.go.
 func newWorker(src uc.Source, pool *pgxpool.Pool) *uc.Worker {
+	return newWorkerWith(src, pool, uc.KnownEntities()...)
+}
+
+// newDefaultWorker builds the worker exactly as production wires it: no
+// LEGACY_SYNC_ENTITIES, so uc.DefaultEntities applies.
+func newDefaultWorker(src uc.Source, pool *pgxpool.Pool) *uc.Worker {
+	return newWorkerWith(src, pool)
+}
+
+func newWorkerWith(src uc.Source, pool *pgxpool.Pool, entities ...string) *uc.Worker {
 	log := logger.New("error", "text")
 	return uc.NewWorker(src, legacysink.NewSink(pool), sqltx.NewManager(pool), uc.Config{
 		TickInterval: time.Hour, BatchSize: 100, DefaultDuration: 90 * time.Minute,
+		Entities: entities,
 	}, log)
 }
 
@@ -454,6 +469,9 @@ func TestSyncBookingTablesKeysetNoLoss(t *testing.T) {
 	log := logger.New("error", "text")
 	w := uc.NewWorker(src, legacysink.NewSink(pool), sqltx.NewManager(pool), uc.Config{
 		TickInterval: time.Hour, BatchSize: 2, DefaultDuration: 90 * time.Minute,
+		// Every entity: this test is about keyset pagination, and the parents
+		// (venue, tables) have to arrive for the join rows to land at all.
+		Entities: uc.KnownEntities(),
 	}, log)
 
 	// Drain across as many ticks as needed.
@@ -517,14 +535,21 @@ func TestWorkingHoursFillAgainstRealSchema(t *testing.T) {
 		t.Fatalf("working hours rows=%d after a re-run, want 7", got)
 	}
 
-	// The venue edits Wednesday in the admin panel, and the legacy text changes
-	// too. The venue's edit must win: nothing may be rewritten.
+	// The venue edits Wednesday in the admin panel, and its free-text line
+	// changes too. The venue's edit must win: nothing may be rewritten.
+	//
+	// Both edits are made HERE, in our database, because that is the only way
+	// they can happen now: since 2026-08-27 the sync no longer imports a venue's
+	// profile text over an existing row (see legacyRestaurantUpdateSet), so the
+	// free text this pass reads is the cabinet's, not the legacy system's.
 	if _, err := pool.Exec(ctx,
 		`UPDATE restaurant_working_hours SET open_time='19:00' WHERE restaurant_id=$1 AND day_of_week=3`, rest1); err != nil {
 		t.Fatalf("simulate admin edit: %v", err)
 	}
-	src.restaurants[0].OpeningHours = "Пн-Вс: 08:00-23:00"
-	src.restaurants[0].UpdatedAt = t0(30) // move the cursor so the row re-syncs
+	if _, err := pool.Exec(ctx,
+		`UPDATE restaurants SET opening_hours=$2 WHERE id=$1`, rest1, "Пн-Вс: 08:00-23:00"); err != nil {
+		t.Fatalf("simulate the venue rewriting its hours line: %v", err)
+	}
 	if err := w.Tick(ctx); err != nil {
 		t.Fatalf("tick 3: %v", err)
 	}

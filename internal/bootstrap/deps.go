@@ -1496,6 +1496,12 @@ func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legac
 		log.Info("legacy sync disabled (LEGACY_DB_URL unset)")
 		return nil, nil, nil
 	}
+	// Validate the allowlist BEFORE opening anything: a mistyped entity name
+	// would otherwise read as "that entity is off", which is the one failure
+	// mode this list exists to prevent.
+	if err := legacysync.ValidateEntities(cfg.LegacySync.Entities); err != nil {
+		return nil, nil, err
+	}
 	pool, err := legacysource.OpenReadOnlyPool(context.Background(), cfg.LegacySync.DatabaseURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open legacy source: %w", err)
@@ -1508,6 +1514,7 @@ func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legac
 			TickInterval:    cfg.LegacySync.TickInterval,
 			BatchSize:       cfg.LegacySync.BatchSize,
 			DefaultDuration: cfg.Booking.DefaultDuration,
+			Entities:        cfg.LegacySync.Entities,
 		},
 		log,
 	)
