@@ -475,6 +475,9 @@ func (f *facade) SubmitPartnership(ctx context.Context, in PartnershipInput) err
 
 // applyRestaurant overlays the fields present in in (non-nil) onto m, leaving
 // everything else — including columns in isn't able to address — untouched.
+//
+// Writing a localized TEXT field also rewrites the ru entry of its i18n map —
+// see syncRussianTranslations, which runs last on purpose.
 func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	if in.CategoryID != nil {
 		m.CategoryID = in.CategoryID
@@ -535,6 +538,54 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	}
 	if in.PriceMax != nil {
 		m.PriceMax = in.PriceMax
+	}
+	syncRussianTranslations(m, in)
+}
+
+// syncRussianTranslations keeps every localized text column and the ru entry of
+// its i18n map telling the same story.
+//
+// WHY THIS EXISTS. The plain columns (name, description, address,
+// opening_hours) ARE the Russian text — see domain.LocaleRU — while every read
+// resolves the map FIRST and only falls back to the column
+// (domain.I18n.Resolve). A venue that has a ru translation therefore had two
+// values for one field, and a caller writing the plain column wrote into the
+// one nobody reads: the cabinet renamed a venue, got 200, and was handed the
+// old ru translation back on the next read — which it then sent back as the
+// new name, silently reverting the rename. Description and address could not be
+// edited from the cabinet at all, since their maps are not even in the request
+// body.
+//
+// RULES:
+//   - only fields the request actually PROVIDED are touched (nil = untouched),
+//     so a PATCH never invents a translation for a field it did not mention;
+//   - other languages are preserved — WithLocale copies the map and replaces
+//     one key, so kk/en/… survive a Russian edit;
+//   - it runs AFTER the explicit *I18n maps are applied, so when a client sends
+//     both `name` and `name_i18n` the plain field wins for ru. The two
+//     disagreeing means the client is confused about which one is Russian, and
+//     the answer is fixed: the column is.
+//
+// Clearing a field (empty string) drops the ru entry but keeps the other
+// languages: we are told the Russian text is gone, not that the Kazakh
+// translation is wrong.
+//
+// cuisine_type is deliberately NOT synced here: since migration 0079 it is a
+// derived rendering of the venue's dictionary links (restaurant_cuisines), the
+// public payload re-derives it per language from that set, and the column is
+// rewritten by the cuisine-set writer rather than by this input.
+func syncRussianTranslations(m *domain.Restaurant, in SaveInput) {
+	if in.Name != nil {
+		m.NameI18n = m.NameI18n.WithLocale(domain.LocaleRU, *in.Name)
+	}
+	if in.Description != nil {
+		m.DescriptionI18n = m.DescriptionI18n.WithLocale(domain.LocaleRU, *in.Description)
+	}
+	if in.Address != nil {
+		m.AddressI18n = m.AddressI18n.WithLocale(domain.LocaleRU, *in.Address)
+	}
+	if in.OpeningHours != nil {
+		m.OpeningHoursI18n = m.OpeningHoursI18n.WithLocale(domain.LocaleRU, *in.OpeningHours)
 	}
 }
 

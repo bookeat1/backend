@@ -53,10 +53,12 @@ func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
 }
 
-// RegisterRestaurantScoped mounts mutations on an existing restaurant's own
-// fields. Mount on a RequireRestaurantManager(..., "id") group (admin or the
-// restaurant's own manager).
+// RegisterRestaurantScoped mounts the cabinet's reads and mutations on an
+// existing restaurant's own fields. Mount on a
+// RequireRestaurantManager(..., "id") group (admin or the restaurant's own
+// manager).
 func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
+	rg.GET("/admin/restaurants/:id", h.adminGet)
 	rg.PATCH("/restaurants/:id", h.update)
 	rg.DELETE("/restaurants/:id", h.deactivate)
 }
@@ -359,6 +361,44 @@ func (h *Handler) get(c *gin.Context) {
 	list := []restaurantResponse{aggregateToResponse(agg, lang)}
 	h.attachFavorites(c.Request.Context(), list, []uuid.UUID{agg.Restaurant.ID})
 	response.OK(c.Writer, list[0])
+}
+
+// adminGet is the venue as ITS OWN CABINET must see it: the same detail payload
+// the public route serves, but for a DEACTIVATED venue too, and in the stored
+// (Russian) wording rather than a translation.
+//
+// Why it exists at all — the panel had no read that fits:
+//   - GET /restaurants/:id (public) answers 404 once is_active goes false, so
+//     hiding a venue also hid its own settings screen (the «Средний чек» and
+//     «Соцсети» cards, which prefill from that route, went blank);
+//   - GET /admin/restaurants/:id/profile works on a hidden venue but carries
+//     neither social_links nor the numeric price_range;
+//   - GET /admin/restaurants (the superadmin catalog) has price_range but no
+//     social links, and a venue's own manager may not call it.
+//
+// Authorization is the group's: RequireRestaurantManager("id") — the venue's
+// own staff or a superadmin, exactly the gate on PATCH /restaurants/:id right
+// next to it. Whoever may edit the venue may read what they are editing; this
+// widens nothing.
+//
+// NOT localized on purpose. The public route resolves each text field through
+// its i18n map into the caller's language, and a browser sends
+// Accept-Language: ru — so the cabinet would edit the translation it was shown
+// instead of the column it writes. Here the scalar fields are the stored
+// columns and the *_i18n maps travel alongside, which is the same contract as
+// GET /admin/restaurants/:id/profile.
+func (h *Handler) adminGet(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid id")
+		return
+	}
+	agg, err := h.facade.Get(c.Request.Context(), id)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, aggregateToResponse(agg, ""))
 }
 
 // attachFavorites sets IsFavorite on each element of out (in place, matched

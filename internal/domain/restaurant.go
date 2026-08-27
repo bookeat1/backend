@@ -89,6 +89,43 @@ func (i I18n) Resolve(lang, base string) string {
 	return base
 }
 
+// WithLocale returns a COPY of i whose lang entry is v, leaving every other
+// language untouched. i itself is never mutated: the map usually comes from a
+// row just read out of the database and may be shared with the caller's
+// aggregate.
+//
+// It exists to keep ONE invariant that the whole i18n scheme silently depends
+// on: the plain column and i[LocaleRU] are the same Russian text. Reads resolve
+// through the map first (Resolve), so a write that touched only the column
+// would land in a value nobody reads back — and the next read would hand the
+// stale translation straight back to the editor (see applyRestaurant).
+//
+// An empty v REMOVES the entry rather than storing "": Resolve already treats
+// an empty translation as missing, and keeping the key would leave a value that
+// reads as absent but shows up in the payload. A map left with no entries at
+// all comes back nil, so the column stays NULL instead of becoming `{}`.
+func (i I18n) WithLocale(lang, v string) I18n {
+	if lang == "" {
+		return i
+	}
+	if len(i) == 0 && v == "" {
+		return nil
+	}
+	out := make(I18n, len(i)+1)
+	for k, val := range i {
+		out[k] = val
+	}
+	if v == "" {
+		delete(out, lang)
+	} else {
+		out[lang] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // Restaurant is a venue in the catalog. ID equals the original Supabase id.
 type Restaurant struct {
 	ID               uuid.UUID
