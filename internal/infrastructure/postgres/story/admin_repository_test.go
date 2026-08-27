@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -255,7 +256,7 @@ func TestActionURLRoundTrips(t *testing.T) {
 		t.Fatalf("image_url must stay the picture's address, got %q", got.ImageURL)
 	}
 
-	list, err := repo.ListActiveByRestaurant(ctx, rid)
+	list, err := repo.ListActiveByRestaurant(ctx, rid, time.Now())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
