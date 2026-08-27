@@ -512,6 +512,19 @@ type PushConfig struct {
 	// header, so an unset secret must mean "no endpoint", never "no check".
 	TelegramWebhookSecret string // env: TELEGRAM_NOTIFY_WEBHOOK_SECRET
 
+	// RestaurantsBotToken is the SECOND, newer staff bot
+	// (@book_eat_restaurants_bot) that venue alerts are being migrated to. It
+	// lives BESIDE TelegramBotToken, never instead of it: a venue only receives
+	// from it after its own staff pressed Start (telegram_new_bot_ready_at), and
+	// a refusal falls straight back to the old bot. Absent → the migration is
+	// simply off and nothing changes. A credential: env only, never logged.
+	RestaurantsBotToken string // env: RESTAURANTS_BOT_TOKEN
+	// RestaurantsBotWebhookSecret is the new bot's OWN secret_token. It must not
+	// be the same value as TelegramWebhookSecret: the two webhooks are separate
+	// endpoints reached by separate bots, and reusing one secret would mean a
+	// leak of either compromises both.
+	RestaurantsBotWebhookSecret string // env: RESTAURANTS_BOT_WEBHOOK_SECRET
+
 	// GuestPushProvider selects the GUEST mobile-push provider. Empty (the
 	// default) means no provider is configured and the guest channel is a clean
 	// no-op — the dispatcher still drains, it just sends nothing. The only value
@@ -752,6 +765,9 @@ func NewConfig() (Config, error) {
 			RetryMaxAttempts:      getEnvInt("NOTIFY_RETRY_MAX_ATTEMPTS", 12),
 			TelegramBotToken:      getEnv("TELEGRAM_NOTIFY_BOT_TOKEN", ""),
 			TelegramWebhookSecret: getEnv("TELEGRAM_NOTIFY_WEBHOOK_SECRET", ""),
+
+			RestaurantsBotToken:         getEnv("RESTAURANTS_BOT_TOKEN", ""),
+			RestaurantsBotWebhookSecret: getEnv("RESTAURANTS_BOT_WEBHOOK_SECRET", ""),
 
 			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
 			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),
