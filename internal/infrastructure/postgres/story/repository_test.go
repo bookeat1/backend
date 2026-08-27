@@ -3,6 +3,7 @@ package story
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -38,7 +39,7 @@ func TestListActiveByRestaurant(t *testing.T) {
 	}
 
 	repo := New(pool)
-	got, err := repo.ListActiveByRestaurant(ctx, ridA)
+	got, err := repo.ListActiveByRestaurant(ctx, ridA, time.Now())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestListActiveByRestaurantStableTieBreak(t *testing.T) {
 	}
 
 	repo := New(pool)
-	first, err := repo.ListActiveByRestaurant(ctx, rid)
+	first, err := repo.ListActiveByRestaurant(ctx, rid, time.Now())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestListActiveByRestaurantStableTieBreak(t *testing.T) {
 		t.Fatalf("tie-break order = [%v, %v], want [%v, %v]", first[0].ID, first[1].ID, loID, hiID)
 	}
 	// And it is stable — a second read returns the same order.
-	second, err := repo.ListActiveByRestaurant(ctx, rid)
+	second, err := repo.ListActiveByRestaurant(ctx, rid, time.Now())
 	if err != nil {
 		t.Fatalf("list again: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestListActiveByRestaurantEmpty(t *testing.T) {
 	ctx := context.Background()
 
 	repo := New(pool)
-	got, err := repo.ListActiveByRestaurant(ctx, uuid.New())
+	got, err := repo.ListActiveByRestaurant(ctx, uuid.New(), time.Now())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

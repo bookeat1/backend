@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -20,16 +21,21 @@ type fakeStoryRepo struct {
 	updated *domain.Story
 	deleted *[2]uuid.UUID // {id, restaurantID}
 	listErr error
+	// publicNow records the instant the facade handed the public read, so a
+	// test can assert the clock is actually threaded through rather than the
+	// repository quietly reading one of its own.
+	publicNow time.Time
 }
 
 func newFakeRepo() *fakeStoryRepo {
 	return &fakeStoryRepo{byID: map[uuid.UUID]*domain.Story{}}
 }
 
-func (f *fakeStoryRepo) ListActiveByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.Story, error) {
+func (f *fakeStoryRepo) ListActiveByRestaurant(_ context.Context, rid uuid.UUID, now time.Time) ([]domain.Story, error) {
+	f.publicNow = now
 	var out []domain.Story
 	for _, s := range f.byID {
-		if s.RestaurantID == rid && s.IsActive {
+		if s.RestaurantID == rid && s.IsActive && !s.IsExpired(now) {
 			out = append(out, *s)
 		}
 	}

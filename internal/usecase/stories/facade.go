@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -30,12 +31,16 @@ type permissionChecker interface {
 // gating: a story is not a moderated main-screen card, so content edits do not
 // pull anything back into a review queue.
 type Facade interface {
-	// List returns the active stories of restaurantID in display order (public,
-	// no authorization).
+	// List returns the stories of restaurantID a guest may see right now, in
+	// display order (public, no authorization): active, and not past their
+	// optional expiry. The clock comes from the facade, so the filter is applied
+	// server-side for EVERY client rather than being each app's own job.
 	List(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error)
 
-	// ListForAdmin returns ALL of a restaurant's stories (active AND inactive) in
-	// display order, gated by PermRestaurantManage at restaurantID.
+	// ListForAdmin returns ALL of a restaurant's stories — inactive and EXPIRED
+	// included — in display order, gated by PermRestaurantManage at
+	// restaurantID. Expiry is reported, never applied, here: the venue must be
+	// able to see and extend a card that has run out.
 	ListForAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.Story, error)
 
 	// CreateStory adds a story to restaurantID.
@@ -67,6 +72,14 @@ type CreateInput struct {
 	// card leads nowhere"; anything else must pass
 	// domain.ValidateExternalActionURL.
 	ActionURL *string
+	// ExpiresAt is the OPTIONAL lifetime — an RFC3339 instant after which
+	// guests stop being served the card. nil or a blank string means "no
+	// expiry, show it until the venue says otherwise", which is also what every
+	// story predating migration 0088 carries. The cabinet OFFERS +24h as a
+	// default; that default is a product decision of the panel's form, not a
+	// rule of this usecase, which would otherwise start expiring stories
+	// created by API clients that never asked for it.
+	ExpiresAt *string
 	SortOrder *int
 	IsActive  *bool
 }
@@ -83,6 +96,13 @@ type UpdateInput struct {
 	// operator can un-link a story through the edit form), and anything else is
 	// validated and stored.
 	ActionURL *string
+	// ExpiresAt follows the SAME three-state rule as Caption and ActionURL —
+	// the convention this package already uses twice — because a *string is the
+	// only shape in which "leave it alone" and "clear it" are distinguishable
+	// over JSON: nil leaves the stored expiry untouched, an empty/whitespace
+	// string clears it (the story becomes permanent again), and anything else
+	// must parse as RFC3339.
+	ExpiresAt *string
 	SortOrder *int
 	IsActive  *bool
 }
@@ -90,16 +110,20 @@ type UpdateInput struct {
 type facade struct {
 	stories domain.StoryRepository
 	perms   permissionChecker
+	// clock supplies the instant the public read filters expiry against.
+	// Injectable for the same reason the events facade holds one: a test needs
+	// to place "now" on either side of a story's expiry without sleeping.
+	clock func() time.Time
 }
 
 // NewFacade constructs the stories Facade. perms is the same RBAC checker
 // promos/events use; the admin methods require it.
 func NewFacade(stories domain.StoryRepository, perms permissionChecker) Facade {
-	return &facade{stories: stories, perms: perms}
+	return &facade{stories: stories, perms: perms, clock: time.Now}
 }
 
 func (f *facade) List(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
-	return f.stories.ListActiveByRestaurant(ctx, restaurantID)
+	return f.stories.ListActiveByRestaurant(ctx, restaurantID, f.clock())
 }
 
 func (f *facade) ListForAdmin(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.Story, error) {
@@ -121,6 +145,10 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 	if err != nil {
 		return nil, err
 	}
+	expiresAt, err := normalizeExpiresAt(in.ExpiresAt)
+	if err != nil {
+		return nil, err
+	}
 	sortOrder, err := f.resolveSortOrder(ctx, in.RestaurantID, in.SortOrder)
 	if err != nil {
 		return nil, err
@@ -134,6 +162,7 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 		ImageURL:     imageURL,
 		Caption:      normalizeCaption(in.Caption),
 		ActionURL:    actionURL,
+		ExpiresAt:    expiresAt,
 		SortOrder:    sortOrder,
 		IsActive:     isActive,
 	}
@@ -167,6 +196,13 @@ func (f *facade) UpdateStory(ctx context.Context, actor Actor, storyID uuid.UUID
 			return nil, err
 		}
 		s.ActionURL = actionURL
+	}
+	if in.ExpiresAt != nil {
+		expiresAt, err := normalizeExpiresAt(in.ExpiresAt)
+		if err != nil {
+			return nil, err
+		}
+		s.ExpiresAt = expiresAt
 	}
 	if in.SortOrder != nil {
 		s.SortOrder = *in.SortOrder
@@ -265,6 +301,27 @@ func normalizeActionURL(raw *string) (*string, error) {
 		return nil, err
 	}
 	return &v, nil
+}
+
+// normalizeExpiresAt turns the operator's "show until" input into what gets
+// stored: nil (or a blank string) means "no expiry", and anything else must
+// parse as RFC3339 — the same wire format events use for starts_at/ends_at, and
+// the same 422 on anything else.
+//
+// A moment in the PAST is accepted on purpose. It is not a mistake to guard
+// against but two legitimate operations: "hide this card right now" without
+// touching the is_active switch, and re-saving a story that has already expired
+// while only its caption is being fixed. Rejecting the past would make an
+// expired card uneditable — the exact trap this feature exists to avoid.
+func normalizeExpiresAt(raw *string) (*time.Time, error) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(*raw))
+	if err != nil {
+		return nil, fmt.Errorf("%w: expires_at must be an RFC3339 timestamp", domain.ErrValidation)
+	}
+	return &t, nil
 }
 
 // validateImageURL turns what would otherwise be a NOT NULL / bad-data write
