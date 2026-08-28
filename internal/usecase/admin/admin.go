@@ -42,6 +42,9 @@ type UseCase struct {
 	paySettings  paymentSettingsWriter
 	telegram     telegramSettings
 	preorder     preorderLister
+	// acquirerAccounts is optional (see Option / WithAcquirerAccounts): nil in
+	// a deployment that maps no venue to an acquirer-side account.
+	acquirerAccounts acquirerAccountStore
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -56,12 +59,17 @@ func NewUseCase(
 	bookingTx bookingTransitioner,
 	paySettings paymentSettingsWriter,
 	telegram telegramSettings,
+	opts ...Option,
 ) *UseCase {
-	return &UseCase{
+	u := &UseCase{
 		perms: perms, restaurants: rest, menu: menu, workingHours: workingHours,
 		overrides: overrides, guests: guests, bookingList: bookingList, bookingTx: bookingTx,
 		paySettings: paySettings, telegram: telegram,
 	}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // Bounds for the free-cancellation window (minutes), enforced here rather than

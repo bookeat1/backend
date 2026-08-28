@@ -540,6 +540,23 @@ type AuthorizeRequest struct {
 	// Metadata is passed through to the acquirer and echoed back in webhooks.
 	// It must never contain card data or anything secret (spec §8).
 	Metadata map[string]string
+	// MerchantAccountRef is the venue's identity AT THIS ACQUIRER: the
+	// acquirer-side account this charge is routed to
+	// (restaurant_split_accounts.account_ref for the resolved provider). It is
+	// an ADDRESS, never a credential — keys stay in each adapter's env
+	// configuration.
+	//
+	// It exists because not every acquirer settles onto one platform account.
+	// Kaspi Pay is reached through our own multi-tenant service where a
+	// venue's money belongs to a COMPANY, and which company is a per-venue
+	// setting the adapter cannot look up for itself. Adapters that do not need
+	// it ignore it; an adapter that DOES need it must refuse an empty value
+	// rather than fall back to a default account, because "the default
+	// account" means crediting somebody else's money.
+	//
+	// It is deliberately separate from Splits: a split DIVIDES one charge
+	// between recipients, this only says whose till the charge lands in.
+	MerchantAccountRef string
 	// Splits divides this one charge between its recipients at the acquirer —
 	// the venue's share and the platform's commission — instead of landing the
 	// whole amount on our merchant account and settling it later by payout. It

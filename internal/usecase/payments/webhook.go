@@ -33,6 +33,10 @@ type webhookUseCase struct {
 	gateways       gatewayResolver
 	tx             domain.TxManager
 	ticketObserver PaymentSubjectObserver
+	// bookings / lateSettler are the OPTIONAL late-payment guard, wired
+	// together by WithLateCancelSettlement. Both nil = the previous behaviour.
+	bookings    bookingReader
+	lateSettler DepositCancellationUseCase
 }
 
 // PaymentSubjectObserver is notified after a webhook has successfully applied a
@@ -59,6 +63,30 @@ type WebhookOption func(*webhookUseCase)
 // WithPaymentSubjectObserver wires a non-booking subject projection (tickets).
 func WithPaymentSubjectObserver(obs PaymentSubjectObserver) WebhookOption {
 	return func(u *webhookUseCase) { u.ticketObserver = obs }
+}
+
+// WithLateCancelSettlement closes the "the guest paid AFTER the booking was
+// cancelled" hole.
+//
+// It is reachable for every acquirer, but a payment LINK makes it ordinary
+// rather than exotic: a Kaspi link is created in status `created`, and a
+// `created` payment is deliberately NOT "live" (idx_payments_live_per_booking
+// — a guest may abandon a checkout), so a cancellation that happens while the
+// link is still unpaid finds nothing to settle and returns a clean no-op.
+// If the guest then opens the link and pays, the callback arrives against a
+// booking that no longer exists as far as the venue is concerned, and without
+// this the money is simply taken and nobody is told.
+//
+// Wiring it makes the webhook re-run the SAME settlement the cancellation
+// itself would have run (SettleDepositOnCancel), with the trigger derived from
+// who cancelled — so an early guest cancel or a venue cancel refunds in full,
+// and a late cancel / no-show leaves the money with the venue, exactly as the
+// policy says. Nothing new decides anything about money here.
+func WithLateCancelSettlement(bookings bookingReader, settler DepositCancellationUseCase) WebhookOption {
+	return func(u *webhookUseCase) {
+		u.bookings = bookings
+		u.lateSettler = settler
+	}
 }
 
 // NewWebhookUseCase constructs the webhook-processing usecase.
@@ -270,8 +298,76 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 	if u.ticketObserver != nil && p.EventTicketID != nil {
 		return u.ticketObserver.OnPaymentApplied(ctx, p)
 	}
-	return nil
+	return u.settleIfBookingAlreadyCancelled(ctx, p)
 }
+
+// settleIfBookingAlreadyCancelled settles money that arrived for a booking the
+// venue has already closed (see WithLateCancelSettlement).
+//
+// It runs only after the callback was applied successfully, so the payment's
+// status is the truth before any decision is taken. An error is RETURNED,
+// which leaves the webhook event unprocessed and gets it retried: money taken
+// for a cancelled booking that nobody settled must stay visible, not be
+// swallowed by an acknowledged callback.
+func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p *domain.Payment) error {
+	if u.lateSettler == nil || u.bookings == nil || p.BookingID == uuid.Nil {
+		return nil
+	}
+	// Only a payment that is holding or has taken money is worth settling; a
+	// failed / expired callback leaves nothing behind.
+	if !p.Status.HoldsMoney() {
+		return nil
+	}
+	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	trigger, ok := lateSettlementTrigger(b)
+	if !ok {
+		return nil // the booking is alive; the ordinary flow owns this payment
+	}
+
+	logging.FromContext(ctx).Warn("payment.paid_after_booking_closed",
+		slog.String("payment_id", p.ID.String()),
+		slog.String("booking_id", p.BookingID.String()),
+		slog.String("booking_status", string(b.Status)),
+		slog.String("trigger", string(trigger)),
+	)
+	_, err = u.lateSettler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
+		Trigger:     trigger,
+		CancelledAt: b.CancelledAt,
+		Reason:      strPtr("payment arrived after the booking was already closed"),
+	})
+	return err
+}
+
+// lateSettlementTrigger maps a closed booking onto the refund trigger whose
+// policy applies. ok=false means the booking is still alive.
+//
+// A no-show is its own trigger (the venue keeps the money). A cancellation is
+// attributed to whoever made it: the guest's own cancel is judged against the
+// free-cancellation window, while a venue or system cancellation always
+// returns the money in full. An unrecorded cancelled_by is treated as the
+// VENUE's — the guest must not lose money because we failed to write down who
+// cancelled.
+func lateSettlementTrigger(b *domain.Booking) (domain.RefundTrigger, bool) {
+	switch b.Status {
+	case domain.BookingNoShow:
+		return domain.RefundTriggerNoShow, true
+	case domain.BookingCancelled:
+		if b.CancelledBy != nil && *b.CancelledBy == domain.CancelledByGuest {
+			return domain.RefundTriggerGuestCancel, true
+		}
+		return domain.RefundTriggerVenueCancel, true
+	default:
+		return "", false
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 func (u *webhookUseCase) applyToPayment(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
 	switch event.Type {

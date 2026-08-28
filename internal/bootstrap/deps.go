@@ -20,6 +20,7 @@ import (
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
 	"backend-core/internal/infrastructure/payment/freedompay"
+	"backend-core/internal/infrastructure/payment/kaspi"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
@@ -385,8 +386,17 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// exact same callback flow a booking does.
 	eventTicketsRepo := eventticketrepo.New(db)
 	ticketObserver := tickets.NewPaymentObserver(eventTicketsRepo)
+	// Deposit hold settlement on booking cancel / no-show (void-early /
+	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
+	// uses. Hooked into the booking cancel/no-show transitions below, and into
+	// the webhook so that money which lands AFTER a cancellation is settled by
+	// the same policy instead of quietly staying taken.
+	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, txm, payments.WithPaymentSubjectObserver(ticketObserver))
+		paymentGateways, txm,
+		payments.WithPaymentSubjectObserver(ticketObserver),
+		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
 		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
@@ -394,12 +404,6 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, restaurantManagers)
 	ticketAdmin := tickets.NewAdminUseCase(eventTicketsRepo, eventrepo.New(db), restaurantManagers)
 	myTickets := tickets.NewMyTicketsUseCase(eventTicketsRepo)
-	// Deposit hold settlement on booking cancel / no-show (void-early /
-	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
-	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
-	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
-
 	// Named facade/usecase variables so both the Deps struct and the admin
 	// panel below share the SAME instances (rather than re-constructing them).
 	// The public catalog reports each venue's structured weekly schedule, an
@@ -454,6 +458,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		scheduleRepo, guestrepo.New(db), bookingsFacade, bookingStatus,
 		restRepo,                         // paymentSettingsWriter: edits free_cancel_window_minutes
 		notificationrepo.NewSettings(db), // telegramSettings: connects/clears the venue's Telegram alert chat
+		// Which acquirer account a venue's money goes to (Kaspi: which company
+		// inside our Kaspi service). The SAME repo instance the checkout reads
+		// at Authorize time, so the panel and the charge can never disagree.
+		admin.WithAcquirerAccounts(paymentSplitAccounts),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -975,6 +983,17 @@ func newPaymentGateways(cfg PaymentsConfig, providers domain.PaymentProviderRepo
 		gw, err := tiptoppay.New(ttpCfg, client, log)
 		if err != nil {
 			return nil, fmt.Errorf("build tiptoppay gateway: %w", err)
+		}
+		gateways = append(gateways, gw)
+	}
+
+	kaspiCfg := kaspi.ConfigFromEnv()
+	if err := kaspiCfg.Validate(); err != nil {
+		log.Warn("kaspi adapter not configured, skipping", slog.String("reason", err.Error()))
+	} else {
+		gw, err := kaspi.New(kaspiCfg, client, log)
+		if err != nil {
+			return nil, fmt.Errorf("build kaspi gateway: %w", err)
 		}
 		gateways = append(gateways, gw)
 	}

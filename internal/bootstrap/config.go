@@ -899,7 +899,7 @@ func getEnv(key, def string) string {
 // shape without importing the domain; a provider added to the domain and
 // forgotten here simply has no per-provider env knob and falls back to the
 // global rate, which is the safe direction.
-var knownPaymentProviders = []string{"freedompay", "tiptoppay", "partnerspay"}
+var knownPaymentProviders = []string{"freedompay", "tiptoppay", "partnerspay", "kaspi"}
 
 // maxBasisPoints is 100% — the domain's ApplyBasisPoints refuses anything
 // above it, so a larger configured rate could only ever fail at settle time.
