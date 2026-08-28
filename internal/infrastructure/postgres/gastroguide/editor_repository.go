@@ -132,6 +132,10 @@ func (r *EditorRepository) ListCollectionsAdmin(ctx context.Context, f domain.Gu
 		args = append(args, string(*f.City))
 		where = append(where, `c.city = $`+strconv.Itoa(len(args)))
 	}
+	if f.Kind != nil {
+		args = append(args, string(*f.Kind))
+		where = append(where, `c.kind = $`+strconv.Itoa(len(args)))
+	}
 	if q := strings.TrimSpace(f.Query); q != "" {
 		args = append(args, "%"+q+"%")
 		n := strconv.Itoa(len(args))
@@ -208,10 +212,11 @@ func (r *EditorRepository) CreateCollection(ctx context.Context, in domain.Guide
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO gastroguide_collections
 			(id, slug, title, title_i18n, subtitle, subtitle_i18n, description, description_i18n,
-			 cover_image_url, city, status, position)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', $11)`,
+			 cover_image_url, city, kind, status, position)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12)`,
 		id, in.Slug, in.Title, i18nToDB(in.TitleI18n), in.Subtitle, i18nToDB(in.SubtitleI18n),
-		in.Description, i18nToDB(in.DescriptionI18n), in.CoverImageURL, cityArg(in.City), in.Position)
+		in.Description, i18nToDB(in.DescriptionI18n), in.CoverImageURL, cityArg(in.City),
+		string(in.Kind), in.Position)
 	if err != nil {
 		return nil, mapSlugConflict("create guide collection", err)
 	}
@@ -225,10 +230,11 @@ func (r *EditorRepository) UpdateCollection(ctx context.Context, id uuid.UUID, i
 		`UPDATE gastroguide_collections
 		 SET slug = $2, title = $3, title_i18n = $4, subtitle = $5, subtitle_i18n = $6,
 			 description = $7, description_i18n = $8, cover_image_url = $9, city = $10,
-			 position = $11, updated_at = now()
+			 kind = $11, position = $12, updated_at = now()
 		 WHERE id = $1`,
 		id, in.Slug, in.Title, i18nToDB(in.TitleI18n), in.Subtitle, i18nToDB(in.SubtitleI18n),
-		in.Description, i18nToDB(in.DescriptionI18n), in.CoverImageURL, cityArg(in.City), in.Position)
+		in.Description, i18nToDB(in.DescriptionI18n), in.CoverImageURL, cityArg(in.City),
+		string(in.Kind), in.Position)
 	if err != nil {
 		return nil, mapSlugConflict("update guide collection", err)
 	}

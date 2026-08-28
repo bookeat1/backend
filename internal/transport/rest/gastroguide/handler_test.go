@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -214,5 +215,143 @@ func TestGetCollection_EmptyVenueListIsAnArrayNotNull(t *testing.T) {
 	}
 	if data["venue_count"] != float64(0) {
 		t.Fatalf("venue_count = %v, want 0", data["venue_count"])
+	}
+}
+
+// --- articles vs collections (migration 0092) ---
+
+// GET /gastroguide/collections asks the usecase for kind='collection', and
+// GET /articles for kind='article'. The kind comes from the ROUTE, so neither
+// listing can be talked into returning the other's rows by a query parameter.
+func TestListings_AreScopedByKind(t *testing.T) {
+	cases := []struct {
+		url  string
+		want domain.GuideCollectionKind
+	}{
+		{"/api/v1/gastroguide/collections", domain.GuideKindCollection},
+		{"/api/v1/articles", domain.GuideKindArticle},
+	}
+	for _, tc := range cases {
+		f := &fakeFacade{}
+		w, _ := do(t, router(f), tc.url)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200 (%s)", tc.url, w.Code, w.Body.String())
+		}
+		if f.gotInput.Kind == nil {
+			t.Fatalf("%s: kind filter is nil — the listing would return both kinds", tc.url)
+		}
+		if *f.gotInput.Kind != tc.want {
+			t.Fatalf("%s: kind = %q, want %q", tc.url, *f.gotInput.Kind, tc.want)
+		}
+	}
+}
+
+// An article carries no rubric, so ?category= has no meaning on /articles. It is
+// IGNORED rather than refused: a client reusing its collections screen with a
+// stale rubric in the query string must still get the article feed, not a 422
+// for asking a question that does not apply. It must not reach the usecase
+// either — a rubric filter would empty the feed.
+func TestListArticles_IgnoresTheCategoryFilter(t *testing.T) {
+	f := &fakeFacade{}
+	w, _ := do(t, router(f), "/api/v1/articles?category=breakfasts")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if f.gotInput.CategorySlug != nil {
+		t.Fatalf("category = %v, want nil — an article has no rubric", *f.gotInput.CategorySlug)
+	}
+}
+
+// The city filter behaves on /articles exactly as it does on the collections
+// listing, including the coded refusal of an unknown city.
+func TestListArticles_CityFilterBehavesLikeTheCollectionsListing(t *testing.T) {
+	f := &fakeFacade{}
+	w, _ := do(t, router(f), "/api/v1/articles?city="+url.QueryEscape(string(domain.CityAlmaty)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if f.gotInput.City == nil || *f.gotInput.City != domain.CityAlmaty {
+		t.Fatalf("city = %v, want Алматы", f.gotInput.City)
+	}
+
+	f2 := &fakeFacade{}
+	w2, body := do(t, router(f2), "/api/v1/articles?city="+url.QueryEscape("Париж"))
+	if w2.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w2.Code)
+	}
+	if body["code"] != string(domain.CodeCityRequired) {
+		t.Fatalf("code = %v, want %s", body["code"], domain.CodeCityRequired)
+	}
+	if f2.gotInput.City != nil {
+		t.Fatal("a rejected city must not reach the usecase")
+	}
+}
+
+// `kind` is always present on a card, on both listings, so a client can branch
+// on what it got. Never omitempty: a missing field would make "article" and "an
+// old server" indistinguishable.
+func TestListings_ExposeKindOnEveryCard(t *testing.T) {
+	cases := []struct {
+		url  string
+		kind domain.GuideCollectionKind
+	}{
+		{"/api/v1/gastroguide/collections", domain.GuideKindCollection},
+		{"/api/v1/articles", domain.GuideKindArticle},
+	}
+	for _, tc := range cases {
+		f := &fakeFacade{collections: []domain.GuideCollection{
+			{ID: uuid.New(), Slug: "s", Title: "T", Kind: tc.kind},
+		}}
+		_, body := do(t, router(f), tc.url)
+		item := body["data"].(map[string]any)["items"].([]any)[0].(map[string]any)
+		if item["kind"] != string(tc.kind) {
+			t.Fatalf("%s: kind = %v, want %q", tc.url, item["kind"], tc.kind)
+		}
+	}
+}
+
+// BOTH detail routes resolve ANY slug, article or collection. Mobile builds
+// already in the wild deep-link articles through /gastroguide/collections/:slug;
+// kind-scoping the detail read would 404 every one of those links on the next
+// OTA, for rows that did not move anywhere. The response says which kind it is.
+func TestDetailRoutes_ResolveEitherKind(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		slug string
+		kind domain.GuideCollectionKind
+	}{
+		{"article through the legacy collection route",
+			"/api/v1/gastroguide/collections/gde-poest-s-rebenkom-v-almaty",
+			"gde-poest-s-rebenkom-v-almaty", domain.GuideKindArticle},
+		{"collection through the article route",
+			"/api/v1/articles/kazakh-cuisine",
+			"kazakh-cuisine", domain.GuideKindCollection},
+		{"article through the article route",
+			"/api/v1/articles/gde-poest-s-rebenkom-v-almaty",
+			"gde-poest-s-rebenkom-v-almaty", domain.GuideKindArticle},
+		{"collection through the collection route",
+			"/api/v1/gastroguide/collections/kazakh-cuisine",
+			"kazakh-cuisine", domain.GuideKindCollection},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeFacade{detail: &domain.GuideCollectionDetail{
+				GuideCollection: domain.GuideCollection{
+					ID: uuid.New(), Slug: tc.slug, Title: "Т", Kind: tc.kind,
+				},
+			}}
+			w, body := do(t, router(f), tc.url)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+			}
+			if f.gotSlug != tc.slug {
+				t.Fatalf("slug = %q, want %q", f.gotSlug, tc.slug)
+			}
+			data := body["data"].(map[string]any)
+			if data["kind"] != string(tc.kind) {
+				t.Fatalf("kind = %v, want %q", data["kind"], tc.kind)
+			}
+		})
 	}
 }

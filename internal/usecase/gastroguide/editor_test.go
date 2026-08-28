@@ -27,6 +27,9 @@ type fakeEditorRepo struct {
 	gotOrder       []uuid.UUID
 	reorderCalls   int
 	writes         int
+	gotWrite       domain.GuideCollectionWrite
+	gotAdminFilter domain.GuideCollectionAdminFilter
+	gotCategoryIDs []uuid.UUID
 }
 
 func (f *fakeEditorRepo) ListAllCategories(context.Context) ([]domain.GuideCategory, error) {
@@ -44,8 +47,9 @@ func (f *fakeEditorRepo) UpdateCategory(context.Context, uuid.UUID, domain.Guide
 	return &domain.GuideCategory{ID: uuid.New()}, f.err
 }
 
-func (f *fakeEditorRepo) ListCollectionsAdmin(context.Context, domain.GuideCollectionAdminFilter) ([]domain.GuideCollection, int, error) {
+func (f *fakeEditorRepo) ListCollectionsAdmin(_ context.Context, filter domain.GuideCollectionAdminFilter) ([]domain.GuideCollection, int, error) {
 	f.writes++
+	f.gotAdminFilter = filter
 	return nil, 0, f.err
 }
 
@@ -59,13 +63,15 @@ func (f *fakeEditorRepo) GetCollectionAdmin(context.Context, uuid.UUID) (*domain
 	return f.detail, nil
 }
 
-func (f *fakeEditorRepo) CreateCollection(context.Context, domain.GuideCollectionWrite) (*domain.GuideCollection, error) {
+func (f *fakeEditorRepo) CreateCollection(_ context.Context, in domain.GuideCollectionWrite) (*domain.GuideCollection, error) {
 	f.writes++
+	f.gotWrite = in
 	return &domain.GuideCollection{ID: uuid.New()}, f.err
 }
 
-func (f *fakeEditorRepo) UpdateCollection(context.Context, uuid.UUID, domain.GuideCollectionWrite) (*domain.GuideCollection, error) {
+func (f *fakeEditorRepo) UpdateCollection(_ context.Context, _ uuid.UUID, in domain.GuideCollectionWrite) (*domain.GuideCollection, error) {
 	f.writes++
+	f.gotWrite = in
 	return &domain.GuideCollection{ID: uuid.New()}, f.err
 }
 
@@ -83,8 +89,9 @@ func (f *fakeEditorRepo) CountActiveVenues(context.Context, uuid.UUID) (int, err
 	return f.activeVenues, f.err
 }
 
-func (f *fakeEditorRepo) SetCollectionCategories(context.Context, uuid.UUID, []uuid.UUID) error {
+func (f *fakeEditorRepo) SetCollectionCategories(_ context.Context, _ uuid.UUID, ids []uuid.UUID) error {
 	f.writes++
+	f.gotCategoryIDs = ids
 	return f.err
 }
 
@@ -395,4 +402,165 @@ func TestEditor_ReorderPassesTheOrderThroughUntouched(t *testing.T) {
 // подсветки проверяется отдельно.
 func (r *fakeEditorRepo) SetVenueHighlight(_ context.Context, _, _ uuid.UUID, _, _ *uuid.UUID) error {
 	return nil
+}
+
+// --- articles vs collections (migration 0092) ---
+
+// An admin build that predates the split posts no `kind` at all. Its creates
+// must keep producing exactly what they always produced — a collection — and
+// not a row of some empty third kind the CHECK would reject.
+func TestEditor_KindDefaultsToCollection(t *testing.T) {
+	repo := &fakeEditorRepo{}
+	e := NewEditor(repo)
+
+	if _, err := e.CreateCollection(context.Background(), superadmin(),
+		CollectionInput{Slug: "kids", Title: "С детьми"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if repo.gotWrite.Kind != domain.GuideKindCollection {
+		t.Fatalf("kind = %q, want %q", repo.gotWrite.Kind, domain.GuideKindCollection)
+	}
+}
+
+// An explicit kind is carried through untouched.
+func TestEditor_ExplicitArticleKindReachesTheRepository(t *testing.T) {
+	repo := &fakeEditorRepo{}
+	e := NewEditor(repo)
+
+	if _, err := e.CreateCollection(context.Background(), superadmin(), CollectionInput{
+		Slug: "chto-proishodit", Title: "Что происходит", Kind: domain.GuideKindArticle,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if repo.gotWrite.Kind != domain.GuideKindArticle {
+		t.Fatalf("kind = %q, want %q", repo.gotWrite.Kind, domain.GuideKindArticle)
+	}
+}
+
+// A kind we cannot store is refused with a machine-readable code and NOTHING is
+// written. Coercing it to "collection" would silently put a piece the editor
+// meant as an article into the guide's rubric navigation.
+func TestEditor_UnknownKindIsRefusedAndNothingIsWritten(t *testing.T) {
+	for _, bad := range []domain.GuideCollectionKind{"post", "Collection ", "статья"} {
+		repo := &fakeEditorRepo{}
+		e := NewEditor(repo)
+
+		_, err := e.CreateCollection(context.Background(), superadmin(), CollectionInput{
+			Slug: "kids", Title: "С детьми", Kind: bad,
+		})
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Fatalf("kind %q: err = %v, want ErrValidation", bad, err)
+		}
+		if code, ok := domain.CodeOf(err); !ok || code != domain.CodeGuideUnknownKind {
+			t.Fatalf("kind %q: code = %q, want %q", bad, code, domain.CodeGuideUnknownKind)
+		}
+		if repo.writes != 0 {
+			t.Fatalf("kind %q: %d write(s) reached the repository", bad, repo.writes)
+		}
+	}
+}
+
+// Turning an item that carries rubrics into an article is refused rather than
+// silently dropping the rubrics: dropping them is a destructive edit the editor
+// did not ask for and would not see in the response.
+func TestEditor_ArticleWithRubricsIsRefusedOnUpdate(t *testing.T) {
+	repo := &fakeEditorRepo{detail: &domain.GuideCollectionAdminDetail{
+		GuideCollection: domain.GuideCollection{ID: uuid.New(), Slug: "kids", Title: "С детьми"},
+		Categories:      []domain.GuideCategory{{ID: uuid.New(), Slug: "breakfasts"}},
+	}}
+	e := NewEditor(repo)
+
+	_, err := e.UpdateCollection(context.Background(), superadmin(), uuid.New(), CollectionInput{
+		Slug: "kids", Title: "С детьми", Kind: domain.GuideKindArticle,
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeGuideArticleHasRubrics {
+		t.Fatalf("code = %q, want %q", code, domain.CodeGuideArticleHasRubrics)
+	}
+	if repo.writes != 0 {
+		t.Fatalf("%d write(s) reached the repository", repo.writes)
+	}
+}
+
+// The same item WITHOUT rubrics converts freely — that is how a collection
+// becomes an article once its rubrics are detached.
+func TestEditor_RubriclessCollectionMayBecomeAnArticle(t *testing.T) {
+	repo := &fakeEditorRepo{detail: &domain.GuideCollectionAdminDetail{
+		GuideCollection: domain.GuideCollection{ID: uuid.New(), Slug: "kids", Title: "С детьми"},
+	}}
+	e := NewEditor(repo)
+
+	if _, err := e.UpdateCollection(context.Background(), superadmin(), uuid.New(), CollectionInput{
+		Slug: "kids", Title: "С детьми", Kind: domain.GuideKindArticle,
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if repo.gotWrite.Kind != domain.GuideKindArticle {
+		t.Fatalf("kind = %q, want %q", repo.gotWrite.Kind, domain.GuideKindArticle)
+	}
+}
+
+// The invariant holds from the other direction too: attaching a rubric to an
+// existing article is refused.
+func TestEditor_AttachingRubricsToAnArticleIsRefused(t *testing.T) {
+	repo := &fakeEditorRepo{detail: &domain.GuideCollectionAdminDetail{
+		GuideCollection: domain.GuideCollection{
+			ID: uuid.New(), Slug: "chto-proishodit", Kind: domain.GuideKindArticle,
+		},
+	}}
+	e := NewEditor(repo)
+
+	err := e.SetCategories(context.Background(), superadmin(), uuid.New(), []uuid.UUID{uuid.New()})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeGuideArticleHasRubrics {
+		t.Fatalf("code = %q, want %q", code, domain.CodeGuideArticleHasRubrics)
+	}
+	if repo.writes != 0 {
+		t.Fatalf("%d write(s) reached the repository", repo.writes)
+	}
+}
+
+// DETACHING every rubric from an article is legal: an empty list is how the
+// invariant is satisfied, so refusing it would make an article that somehow
+// acquired rubrics impossible to fix.
+func TestEditor_ClearingRubricsOnAnArticleIsAllowed(t *testing.T) {
+	repo := &fakeEditorRepo{detail: &domain.GuideCollectionAdminDetail{
+		GuideCollection: domain.GuideCollection{
+			ID: uuid.New(), Slug: "chto-proishodit", Kind: domain.GuideKindArticle,
+		},
+	}}
+	e := NewEditor(repo)
+
+	if err := e.SetCategories(context.Background(), superadmin(), uuid.New(), nil); err != nil {
+		t.Fatalf("clear rubrics: %v", err)
+	}
+	if repo.writes != 1 {
+		t.Fatalf("writes = %d, want 1", repo.writes)
+	}
+}
+
+// The cabinet listing passes its ?kind= through, and refuses an unknown one
+// instead of answering with a silently empty page.
+func TestEditor_ListCollectionsKindFilter(t *testing.T) {
+	repo := &fakeEditorRepo{}
+	e := NewEditor(repo)
+	kind := domain.GuideKindArticle
+
+	if _, _, err := e.ListCollections(context.Background(), superadmin(),
+		AdminListInput{Kind: &kind}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if repo.gotAdminFilter.Kind == nil || *repo.gotAdminFilter.Kind != domain.GuideKindArticle {
+		t.Fatalf("filter kind = %v, want article", repo.gotAdminFilter.Kind)
+	}
+
+	bogus := domain.GuideCollectionKind("post")
+	_, _, err := e.ListCollections(context.Background(), superadmin(), AdminListInput{Kind: &bogus})
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeGuideUnknownKind {
+		t.Fatalf("code = %q, want %q", code, domain.CodeGuideUnknownKind)
+	}
 }

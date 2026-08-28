@@ -32,6 +32,10 @@ type Facade interface {
 	ListCollections(ctx context.Context, in ListInput) ([]domain.GuideCollection, int, error)
 	// GetCollection returns one live collection with its ordered venues.
 	// ErrNotFound covers both "no such slug" and "not published".
+	//
+	// Deliberately KIND-AGNOSTIC: a slug is unique across the whole table, so
+	// this resolves an article and a collection alike. See the transport for
+	// why (deep links already in the wild).
 	GetCollection(ctx context.Context, slug string) (*domain.GuideCollectionDetail, error)
 }
 
@@ -39,8 +43,13 @@ type Facade interface {
 type ListInput struct {
 	City         *domain.City
 	CategorySlug *string
-	Page         int
-	PerPage      int
+	// Kind selects collections or articles (migration 0092). Nil means both,
+	// which is what the endpoint that predates the split would ask for; the
+	// transport always sets it, so /gastroguide/collections and /articles
+	// cannot leak into each other.
+	Kind    *domain.GuideCollectionKind
+	Page    int
+	PerPage int
 }
 
 type facade struct {
@@ -64,9 +73,14 @@ func (f *facade) ListCategories(ctx context.Context, city *domain.City) ([]domai
 }
 
 func (f *facade) ListCollections(ctx context.Context, in ListInput) ([]domain.GuideCollection, int, error) {
+	if in.Kind != nil && !in.Kind.Valid() {
+		return nil, 0, domain.WithCode(domain.CodeGuideUnknownKind,
+			fmt.Errorf("%w: unknown collection kind %q", domain.ErrValidation, *in.Kind))
+	}
 	return f.repo.ListPublishedCollections(ctx, domain.GuideCollectionFilter{
 		City:         in.City,
 		CategorySlug: in.CategorySlug,
+		Kind:         in.Kind,
 		Page:         in.Page,
 		PerPage:      in.PerPage,
 	}, f.clock())

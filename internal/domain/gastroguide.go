@@ -35,6 +35,36 @@ func (s GuideCollectionStatus) Valid() bool {
 	return false
 }
 
+// GuideCollectionKind splits the guide's rows into the two things an editor
+// actually writes, stored as VARCHAR (validated here, never a Postgres ENUM —
+// migration 0092).
+//
+// The two share every field of the table and the same venue links; what
+// differs is that a collection carries rubrics and surfaces in the guide's
+// rubric navigation, while an article carries none and surfaces in its own
+// feed. That is why this is a column and not a second table.
+type GuideCollectionKind string
+
+const (
+	// GuideKindCollection is a curated set of venues filed under rubrics
+	// ("лучшие завтраки"). The default: everything that existed before
+	// migration 0092 and still holds a rubric is one.
+	GuideKindCollection GuideCollectionKind = "collection"
+	// GuideKindArticle is an editorial piece that may point at venues but
+	// carries NO rubric. An article with a rubric is a contradiction and is
+	// refused by the editor usecase, not silently normalized.
+	GuideKindArticle GuideCollectionKind = "article"
+)
+
+// Valid reports whether k is a known collection kind.
+func (k GuideCollectionKind) Valid() bool {
+	switch k {
+	case GuideKindCollection, GuideKindArticle:
+		return true
+	}
+	return false
+}
+
 // GuideCategory is a rubric of the gastroguide ("Завтраки", "С детьми"). Slug is
 // the stable client-facing name: the app links to a rubric by slug so a title
 // rewrite does not break a link. Position is the editorial order.
@@ -65,7 +95,11 @@ type GuideCollection struct {
 	// no cover. Never a placeholder: nil means "there is no image".
 	CoverImageURL *string
 	// City nil means the collection is shown in every city.
-	City        *City
+	City *City
+	// Kind tells a collection from an article. Always set on a row read from
+	// the database (the column is NOT NULL DEFAULT 'collection'), so a client
+	// never has to guess from the presence of CategorySlugs.
+	Kind        GuideCollectionKind
 	Status      GuideCollectionStatus
 	PublishedAt *time.Time
 	Position    int
@@ -159,8 +193,16 @@ type GuideCollectionFilter struct {
 	City *City
 	// CategorySlug narrows to one rubric.
 	CategorySlug *string
-	Page         int
-	PerPage      int
+	// Kind narrows to collections or to articles. Nil means no kind filter at
+	// all — the pre-0092 behaviour, kept so the detail read (which resolves a
+	// slug of either kind) does not have to know what it is looking for.
+	//
+	// Like every other field here it can only NARROW: the published-and-live
+	// rule stays in SQL, so no value of Kind can surface a draft, an archived
+	// row or a row scheduled for tomorrow.
+	Kind    *GuideCollectionKind
+	Page    int
+	PerPage int
 }
 
 // GastroguideRepository is the guest-facing read model of the gastroguide. It
@@ -175,6 +217,8 @@ type GastroguideRepository interface {
 	// collection (a rubric that opens into an empty screen is not shown),
 	// in editorial order. A rubric counts as non-empty even when its only live
 	// collection has no visible venue — the collection itself is the content.
+	// Only kind='collection' rows count: an article carries no rubric by
+	// invariant, and the SQL says so explicitly rather than relying on it.
 	ListCategories(ctx context.Context, city *City, now time.Time) ([]GuideCategory, error)
 	// ListPublishedCollections returns live collections in editorial order, with
 	// their guest-visible venue count, paginated, plus the total. A live
