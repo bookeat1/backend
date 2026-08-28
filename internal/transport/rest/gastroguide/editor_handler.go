@@ -606,7 +606,7 @@ type collectionRequest struct {
 	DescriptionI18n domain.I18n `json:"description_i18n"`
 	CoverImageURL   *string     `json:"cover_image_url"`
 	City            *string     `json:"city"`
-	// Kind is "collection" or "article" (migration 0092). Omitted or empty
+	// Kind is "collection" or "article" (migration 0096). Omitted or empty
 	// means "collection", so an admin build that predates the split keeps
 	// creating exactly what it used to.
 	Kind     string `json:"kind"`

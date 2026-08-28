@@ -298,7 +298,7 @@ const (
 	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
 
 	// CodeGuideUnknownKind — the write named a kind that is not 'collection'
-	// or 'article' (migration 0092). An omitted kind is NOT this error: it
+	// or 'article' (migration 0096). An omitted kind is NOT this error: it
 	// defaults to 'collection', so an admin build that predates the split keeps
 	// working. Only a value we cannot store is refused, and it is refused
 	// rather than coerced — silently turning a typo into a collection would put

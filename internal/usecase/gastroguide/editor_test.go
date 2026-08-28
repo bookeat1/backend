@@ -404,7 +404,7 @@ func (r *fakeEditorRepo) SetVenueHighlight(_ context.Context, _, _ uuid.UUID, _,
 	return nil
 }
 
-// --- articles vs collections (migration 0092) ---
+// --- articles vs collections (migration 0096) ---
 
 // An admin build that predates the split posts no `kind` at all. Its creates
 // must keep producing exactly what they always produced — a collection — and

@@ -355,7 +355,7 @@ func (f *fakeEditor) SetVenueHighlight(_ context.Context, _ uc.EditorActor, _, _
 	return nil
 }
 
-// --- articles vs collections (migration 0092) ---
+// --- articles vs collections (migration 0096) ---
 
 // A panel build older than the split posts no `kind` field at all. The handler
 // must pass an EMPTY kind down (the usecase defaults it to "collection"), not

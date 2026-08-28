@@ -37,7 +37,7 @@ func (s GuideCollectionStatus) Valid() bool {
 
 // GuideCollectionKind splits the guide's rows into the two things an editor
 // actually writes, stored as VARCHAR (validated here, never a Postgres ENUM —
-// migration 0092).
+// migration 0096).
 //
 // The two share every field of the table and the same venue links; what
 // differs is that a collection carries rubrics and surfaces in the guide's
@@ -48,7 +48,7 @@ type GuideCollectionKind string
 const (
 	// GuideKindCollection is a curated set of venues filed under rubrics
 	// ("лучшие завтраки"). The default: everything that existed before
-	// migration 0092 and still holds a rubric is one.
+	// migration 0096 and still holds a rubric is one.
 	GuideKindCollection GuideCollectionKind = "collection"
 	// GuideKindArticle is an editorial piece that may point at venues but
 	// carries NO rubric. An article with a rubric is a contradiction and is

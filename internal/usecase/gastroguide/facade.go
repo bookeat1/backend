@@ -43,7 +43,7 @@ type Facade interface {
 type ListInput struct {
 	City         *domain.City
 	CategorySlug *string
-	// Kind selects collections or articles (migration 0092). Nil means both,
+	// Kind selects collections or articles (migration 0096). Nil means both,
 	// which is what the endpoint that predates the split would ask for; the
 	// transport always sets it, so /gastroguide/collections and /articles
 	// cannot leak into each other.

@@ -45,7 +45,7 @@ type collectionSeed struct {
 	publishedAt *time.Time
 	position    int
 	city        *domain.City
-	// kind is empty in most seeds: that is the point of migration 0092's
+	// kind is empty in most seeds: that is the point of migration 0096's
 	// DEFAULT — a row written without one is a collection.
 	kind domain.GuideCollectionKind
 }
@@ -680,7 +680,7 @@ func TestCategories_RubricWithOnlyAnEmptyCollectionIsOffered(t *testing.T) {
 	}
 }
 
-// --- articles vs collections (migration 0092) ---
+// --- articles vs collections (migration 0096) ---
 
 // The kind filter really partitions the table: neither listing can see the
 // other's rows, and no filter returns both. Read against a real Postgres,
@@ -774,7 +774,7 @@ func TestKind_IsScannedOnBothListingAndDetail(t *testing.T) {
 	}
 }
 
-// The backfill rule of migration 0092, run against a real schema: a row with no
+// The backfill rule of migration 0096, run against a real schema: a row with no
 // rubric row at all becomes an article, a row with one stays a collection. This
 // is the statement that decided the live 4/4 split, so it is tested as SQL and
 // not as a paragraph in a migration comment.
@@ -796,7 +796,7 @@ func TestKindBackfillRule_RubriclessRowsBecomeArticles(t *testing.T) {
 	}
 
 	// Both rows are collections right now — that is the column DEFAULT, which
-	// is what migration 0092 relies on for the "has a rubric" half.
+	// is what migration 0096 relies on for the "has a rubric" half.
 	var before int
 	if err := pool.QueryRow(ctx,
 		`SELECT count(*) FROM gastroguide_collections WHERE kind = 'collection'`).Scan(&before); err != nil {

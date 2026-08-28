@@ -77,7 +77,7 @@ type GuideCollectionWrite struct {
 	// Status): an editor decides what they are writing when they write it, and
 	// a piece that turned out to be an article is retyped in the same form, not
 	// through a separate state machine. The usecase defaults an omitted value
-	// to 'collection' so admin builds that predate migration 0092 keep working.
+	// to 'collection' so admin builds that predate migration 0096 keep working.
 	Kind     GuideCollectionKind
 	Position int
 }

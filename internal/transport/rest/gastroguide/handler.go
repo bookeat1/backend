@@ -45,7 +45,7 @@ func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 
 // RegisterPublic mounts the guest read routes.
 //
-// Two LISTINGS over one table (migration 0092): /gastroguide/collections
+// Two LISTINGS over one table (migration 0096): /gastroguide/collections
 // returns kind='collection', /articles returns kind='article'. Neither can
 // return the other's rows — the kind is set by the route, not by a query
 // parameter.

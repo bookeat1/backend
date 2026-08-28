@@ -98,7 +98,7 @@ type CollectionInput struct {
 	CoverImageURL   *string
 	City            *domain.City
 	// Kind is "collection" or "article". EMPTY means "collection": an admin
-	// build that predates migration 0092 does not send the field, and its
+	// build that predates migration 0096 does not send the field, and its
 	// creates must keep producing what they always produced. An unknown value
 	// is a 422 (CodeGuideUnknownKind), never coerced.
 	Kind     domain.GuideCollectionKind
@@ -313,7 +313,7 @@ func (e *editor) Archive(ctx context.Context, actor EditorActor, id uuid.UUID) (
 // SetCategories replaces a collection's whole rubric set. Attaching a rubric to
 // an ARTICLE is refused: rubrics are what a collection is, and an article that
 // carried one would show up in the guide's rubric navigation, which is exactly
-// the thing migration 0092 separates. Detaching (an empty list) stays legal for
+// the thing migration 0096 separates. Detaching (an empty list) stays legal for
 // either kind — that is how a collection is turned into an article.
 func (e *editor) SetCategories(ctx context.Context, actor EditorActor, collectionID uuid.UUID, categoryIDs []uuid.UUID) error {
 	if err := e.authorize(actor); err != nil {
@@ -442,7 +442,7 @@ func validateCollection(in CollectionInput) (domain.GuideCollectionWrite, error)
 			cover = &trimmed
 		}
 	}
-	// An omitted kind is a collection: the field arrived with migration 0092,
+	// An omitted kind is a collection: the field arrived with migration 0096,
 	// and every admin build older than it posts a collection without saying so.
 	kind := in.Kind
 	if kind == "" {

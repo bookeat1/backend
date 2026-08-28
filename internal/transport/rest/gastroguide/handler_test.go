@@ -218,7 +218,7 @@ func TestGetCollection_EmptyVenueListIsAnArrayNotNull(t *testing.T) {
 	}
 }
 
-// --- articles vs collections (migration 0092) ---
+// --- articles vs collections (migration 0096) ---
 
 // GET /gastroguide/collections asks the usecase for kind='collection', and
 // GET /articles for kind='article'. The kind comes from the ROUTE, so neither
