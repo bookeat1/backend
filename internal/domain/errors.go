@@ -297,6 +297,22 @@ const (
 	// key forbids is the same venue twice in one.
 	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
 
+	// CodeGuideUnknownKind — the write named a kind that is not 'collection'
+	// or 'article' (migration 0092). An omitted kind is NOT this error: it
+	// defaults to 'collection', so an admin build that predates the split keeps
+	// working. Only a value we cannot store is refused, and it is refused
+	// rather than coerced — silently turning a typo into a collection would put
+	// an article into the rubric navigation. Not retryable as sent.
+	CodeGuideUnknownKind ErrorCode = "guide_unknown_kind"
+
+	// CodeGuideArticleHasRubrics — the write would leave an article carrying
+	// rubrics: either kind was set to 'article' on a row that already has them,
+	// or rubrics were attached to a row that is already an article. Refused
+	// instead of dropping the rubrics, because dropping them is a destructive
+	// edit the editor did not ask for and would not see. Fixed by detaching the
+	// rubrics first (or by keeping the item a collection).
+	CodeGuideArticleHasRubrics ErrorCode = "guide_article_has_rubrics"
+
 	// CodeGuideRouteEmpty — publishing a route with no stops (migration 0078).
 	// Deliberately NOT the mirror of a collection, where the same guard was
 	// removed: a collection is an article whose venues are a bonus, so an empty

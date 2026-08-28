@@ -45,6 +45,9 @@ type collectionSeed struct {
 	publishedAt *time.Time
 	position    int
 	city        *domain.City
+	// kind is empty in most seeds: that is the point of migration 0092's
+	// DEFAULT — a row written without one is a collection.
+	kind domain.GuideCollectionKind
 }
 
 func seedCollection(t *testing.T, pool *pgxpool.Pool, ctx context.Context, s collectionSeed) uuid.UUID {
@@ -55,10 +58,14 @@ func seedCollection(t *testing.T, pool *pgxpool.Pool, ctx context.Context, s col
 		v := string(*s.city)
 		city = &v
 	}
+	kind := s.kind
+	if kind == "" {
+		kind = domain.GuideKindCollection
+	}
 	_, err := pool.Exec(ctx,
-		`INSERT INTO gastroguide_collections (id, slug, title, status, published_at, position, city)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		id, s.slug, "Подборка "+s.slug, string(s.status), s.publishedAt, s.position, city)
+		`INSERT INTO gastroguide_collections (id, slug, title, status, published_at, position, city, kind)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, s.slug, "Подборка "+s.slug, string(s.status), s.publishedAt, s.position, city, string(kind))
 	if err != nil {
 		t.Fatalf("seed collection %s: %v", s.slug, err)
 	}
@@ -670,5 +677,191 @@ func TestCategories_RubricWithOnlyAnEmptyCollectionIsOffered(t *testing.T) {
 	}
 	if total != 1 || len(items) != 1 || items[0].Slug != "story-no-venues" {
 		t.Fatalf("rubric filter lost the empty collection: total=%d items=%+v", total, items)
+	}
+}
+
+// --- articles vs collections (migration 0092) ---
+
+// The kind filter really partitions the table: neither listing can see the
+// other's rows, and no filter returns both. Read against a real Postgres,
+// because the whole split is one WHERE clause and a wrong one compiles fine.
+func TestKindFilter_PartitionsTheListing(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+	live := ptrTime(now.Add(-time.Hour))
+
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "kazakh-cuisine", status: domain.GuideCollectionPublished,
+		publishedAt: live, position: 1, kind: domain.GuideKindCollection,
+	})
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "gde-poest-s-rebenkom-v-almaty", status: domain.GuideCollectionPublished,
+		publishedAt: live, position: 2, kind: domain.GuideKindArticle,
+	})
+	// A draft article: the kind filter must not resurrect it. Visibility stays
+	// in SQL and no filter can widen it.
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "draft-article", status: domain.GuideCollectionDraft,
+		position: 3, kind: domain.GuideKindArticle,
+	})
+
+	collections, articles := domain.GuideKindCollection, domain.GuideKindArticle
+	cases := []struct {
+		name  string
+		kind  *domain.GuideCollectionKind
+		slugs []string
+	}{
+		{"collections only", &collections, []string{"kazakh-cuisine"}},
+		{"articles only", &articles, []string{"gde-poest-s-rebenkom-v-almaty"}},
+		{"no kind filter sees both", nil,
+			[]string{"kazakh-cuisine", "gde-poest-s-rebenkom-v-almaty"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			items, total, err := repo.ListPublishedCollections(ctx,
+				domain.GuideCollectionFilter{Kind: tc.kind}, now)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if total != len(tc.slugs) {
+				t.Fatalf("total = %d, want %d", total, len(tc.slugs))
+			}
+			var got []string
+			for _, it := range items {
+				got = append(got, it.Slug)
+			}
+			if len(got) != len(tc.slugs) {
+				t.Fatalf("items = %v, want %v", got, tc.slugs)
+			}
+			for i := range got {
+				if got[i] != tc.slugs[i] {
+					t.Fatalf("items = %v, want %v", got, tc.slugs)
+				}
+			}
+		})
+	}
+}
+
+// The kind is read back on the row, so the transport does not have to infer it
+// from the presence of rubrics.
+func TestKind_IsScannedOnBothListingAndDetail(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+	live := ptrTime(now.Add(-time.Hour))
+
+	seedCollection(t, pool, ctx, collectionSeed{
+		slug: "chto-proishodit", status: domain.GuideCollectionPublished,
+		publishedAt: live, position: 1, kind: domain.GuideKindArticle,
+	})
+
+	items, _, err := repo.ListPublishedCollections(ctx, domain.GuideCollectionFilter{}, now)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("list: items=%d err=%v", len(items), err)
+	}
+	if items[0].Kind != domain.GuideKindArticle {
+		t.Fatalf("listing kind = %q, want article", items[0].Kind)
+	}
+
+	// The detail read is kind-agnostic ON PURPOSE: a slug is unique across the
+	// table and mobile deep-links already point articles at the collection
+	// route. It must resolve, and it must say what it resolved.
+	detail, err := repo.GetPublishedCollectionBySlug(ctx, "chto-proishodit", now)
+	if err != nil {
+		t.Fatalf("get by slug: %v", err)
+	}
+	if detail.Kind != domain.GuideKindArticle {
+		t.Fatalf("detail kind = %q, want article", detail.Kind)
+	}
+}
+
+// The backfill rule of migration 0092, run against a real schema: a row with no
+// rubric row at all becomes an article, a row with one stays a collection. This
+// is the statement that decided the live 4/4 split, so it is tested as SQL and
+// not as a paragraph in a migration comment.
+func TestKindBackfillRule_RubriclessRowsBecomeArticles(t *testing.T) {
+	pool, _, ctx := setup(t)
+
+	catID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO gastroguide_categories (id, slug, title) VALUES ($1, 'kazakh-cuisine', 'Казахская')`,
+		catID); err != nil {
+		t.Fatalf("seed category: %v", err)
+	}
+	withRubric := seedCollection(t, pool, ctx, collectionSeed{slug: "with-rubric", status: domain.GuideCollectionDraft})
+	seedCollection(t, pool, ctx, collectionSeed{slug: "without-rubric", status: domain.GuideCollectionDraft, position: 2})
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO gastroguide_collection_categories (collection_id, category_id, position)
+		 VALUES ($1, $2, 1)`, withRubric, catID); err != nil {
+		t.Fatalf("link rubric: %v", err)
+	}
+
+	// Both rows are collections right now — that is the column DEFAULT, which
+	// is what migration 0092 relies on for the "has a rubric" half.
+	var before int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM gastroguide_collections WHERE kind = 'collection'`).Scan(&before); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+	if before != 2 {
+		t.Fatalf("collections before backfill = %d, want 2 (the column DEFAULT)", before)
+	}
+
+	// The exact statement from the migration.
+	if _, err := pool.Exec(ctx,
+		`UPDATE gastroguide_collections SET kind = 'article'
+		 WHERE id NOT IN (SELECT collection_id FROM gastroguide_collection_categories)`); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	got := map[string]string{}
+	rows, err := pool.Query(ctx, `SELECT slug, kind FROM gastroguide_collections`)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var slug, kind string
+		if err := rows.Scan(&slug, &kind); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[slug] = kind
+	}
+	if got["with-rubric"] != "collection" || got["without-rubric"] != "article" {
+		t.Fatalf("backfill = %v, want with-rubric=collection without-rubric=article", got)
+	}
+}
+
+// The rubric listing counts kind='collection' rows only. The usecase already
+// refuses to give an article a rubric; this pins the SQL half of the invariant,
+// so a bad backfill or a hand-written UPDATE cannot put an article into the
+// guide's rubric navigation.
+func TestCategories_AnArticleNeverMakesARubricNonEmpty(t *testing.T) {
+	pool, repo, ctx := setup(t)
+	now := time.Now()
+
+	catID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO gastroguide_categories (id, slug, title, position, is_active)
+		 VALUES ($1, 'kids', 'С детьми', 1, true)`, catID); err != nil {
+		t.Fatalf("seed category: %v", err)
+	}
+	article := seedCollection(t, pool, ctx, collectionSeed{
+		slug: "gde-poest-s-rebenkom-v-almaty", status: domain.GuideCollectionPublished,
+		publishedAt: ptrTime(now.Add(-time.Hour)), position: 1, kind: domain.GuideKindArticle,
+	})
+	// Attached straight in SQL, bypassing the usecase — exactly the state the
+	// application layer refuses to create.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO gastroguide_collection_categories (collection_id, category_id, position)
+		 VALUES ($1, $2, 1)`, article, catID); err != nil {
+		t.Fatalf("link rubric to article: %v", err)
+	}
+
+	cats, err := repo.ListCategories(ctx, nil, now)
+	if err != nil {
+		t.Fatalf("list categories: %v", err)
+	}
+	if len(cats) != 0 {
+		t.Fatalf("categories = %+v, want none: only a COLLECTION makes a rubric non-empty", cats)
 	}
 }

@@ -97,16 +97,24 @@ type CollectionInput struct {
 	DescriptionI18n domain.I18n
 	CoverImageURL   *string
 	City            *domain.City
-	Position        int
+	// Kind is "collection" or "article". EMPTY means "collection": an admin
+	// build that predates migration 0092 does not send the field, and its
+	// creates must keep producing what they always produced. An unknown value
+	// is a 422 (CodeGuideUnknownKind), never coerced.
+	Kind     domain.GuideCollectionKind
+	Position int
 }
 
 // AdminListInput narrows the cabinet's collection listing.
 type AdminListInput struct {
 	Statuses []domain.GuideCollectionStatus
 	City     *domain.City
-	Query    string
-	Page     int
-	PerPage  int
+	// Kind narrows the cabinet listing to collections or to articles. Nil means
+	// both.
+	Kind    *domain.GuideCollectionKind
+	Query   string
+	Page    int
+	PerPage int
 }
 
 // AttachVenueInput puts one venue into a collection, at the end.
@@ -186,8 +194,12 @@ func (e *editor) ListCollections(ctx context.Context, actor EditorActor, in Admi
 		return nil, 0, domain.WithCode(domain.CodeCityRequired,
 			fmt.Errorf("%w: unknown city", domain.ErrValidation))
 	}
+	if in.Kind != nil && !in.Kind.Valid() {
+		return nil, 0, domain.WithCode(domain.CodeGuideUnknownKind,
+			fmt.Errorf("%w: unknown collection kind %q", domain.ErrValidation, *in.Kind))
+	}
 	return e.repo.ListCollectionsAdmin(ctx, domain.GuideCollectionAdminFilter{
-		Statuses: in.Statuses, City: in.City, Query: in.Query,
+		Statuses: in.Statuses, City: in.City, Kind: in.Kind, Query: in.Query,
 		Page: in.Page, PerPage: in.PerPage,
 	})
 }
@@ -210,6 +222,14 @@ func (e *editor) CreateCollection(ctx context.Context, actor EditorActor, in Col
 	return e.repo.CreateCollection(ctx, w)
 }
 
+// UpdateCollection replaces the editable fields, and refuses to turn an item
+// that carries rubrics into an article.
+//
+// The refusal is here and not only in SQL on purpose: the alternative — writing
+// kind='article' and quietly deleting the rubric links — is a destructive edit
+// the editor never asked for and would not see in the response. Making them
+// detach the rubrics first costs one extra call and keeps the deletion an
+// explicit act.
 func (e *editor) UpdateCollection(ctx context.Context, actor EditorActor, id uuid.UUID, in CollectionInput) (*domain.GuideCollection, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
@@ -217,6 +237,17 @@ func (e *editor) UpdateCollection(ctx context.Context, actor EditorActor, id uui
 	w, err := validateCollection(in)
 	if err != nil {
 		return nil, err
+	}
+	if w.Kind == domain.GuideKindArticle {
+		current, err := e.repo.GetCollectionAdmin(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if len(current.Categories) > 0 {
+			return nil, domain.WithCode(domain.CodeGuideArticleHasRubrics,
+				fmt.Errorf("%w: an article carries no rubrics — detach %d rubric(s) first",
+					domain.ErrValidation, len(current.Categories)))
+		}
 	}
 	return e.repo.UpdateCollection(ctx, id, w)
 }
@@ -279,9 +310,24 @@ func (e *editor) Archive(ctx context.Context, actor EditorActor, id uuid.UUID) (
 
 // --- membership ---
 
+// SetCategories replaces a collection's whole rubric set. Attaching a rubric to
+// an ARTICLE is refused: rubrics are what a collection is, and an article that
+// carried one would show up in the guide's rubric navigation, which is exactly
+// the thing migration 0092 separates. Detaching (an empty list) stays legal for
+// either kind — that is how a collection is turned into an article.
 func (e *editor) SetCategories(ctx context.Context, actor EditorActor, collectionID uuid.UUID, categoryIDs []uuid.UUID) error {
 	if err := e.authorize(actor); err != nil {
 		return err
+	}
+	if len(categoryIDs) > 0 {
+		current, err := e.repo.GetCollectionAdmin(ctx, collectionID)
+		if err != nil {
+			return err
+		}
+		if current.Kind == domain.GuideKindArticle {
+			return domain.WithCode(domain.CodeGuideArticleHasRubrics,
+				fmt.Errorf("%w: an article carries no rubrics", domain.ErrValidation))
+		}
 	}
 	seen := make(map[uuid.UUID]bool, len(categoryIDs))
 	for _, id := range categoryIDs {
@@ -396,11 +442,21 @@ func validateCollection(in CollectionInput) (domain.GuideCollectionWrite, error)
 			cover = &trimmed
 		}
 	}
+	// An omitted kind is a collection: the field arrived with migration 0092,
+	// and every admin build older than it posts a collection without saying so.
+	kind := in.Kind
+	if kind == "" {
+		kind = domain.GuideKindCollection
+	}
+	if !kind.Valid() {
+		return domain.GuideCollectionWrite{}, domain.WithCode(domain.CodeGuideUnknownKind,
+			fmt.Errorf("%w: unknown collection kind %q", domain.ErrValidation, in.Kind))
+	}
 	return domain.GuideCollectionWrite{
 		Slug: slug, Title: title, TitleI18n: cleanI18n(in.TitleI18n),
 		Subtitle: strings.TrimSpace(in.Subtitle), SubtitleI18n: cleanI18n(in.SubtitleI18n),
 		Description: strings.TrimSpace(in.Description), DescriptionI18n: cleanI18n(in.DescriptionI18n),
-		CoverImageURL: cover, City: in.City, Position: in.Position,
+		CoverImageURL: cover, City: in.City, Kind: kind, Position: in.Position,
 	}, nil
 }
 

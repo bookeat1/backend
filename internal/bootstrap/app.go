@@ -283,10 +283,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// object that is not already theirs — see media/avatar.go.
 	mediaHandler.RegisterUserRoutes(authed)
 
-	// Gastroguide — the home screen's editorial collections. Plain public group,
-	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the
-	// user lookup would only cost a query. Guest reads only; the editor cabinet
-	// that fills these collections is a separate task.
+	// Gastroguide — the home screen's editorial collections AND (migration
+	// 0092) the article feed under /articles, which is the same table filtered
+	// by kind and therefore the same handler. Plain public group, NOT
+	// OptionalAuth: unlike the feed, nothing here is personalized, so the user
+	// lookup would only cost a query. Guest reads only.
 	gastroguiderest.NewHandler(deps.GastroguideFacade).RegisterPublic(api)
 	// «Гастропрогулки» — the guide's ordered itineraries, on the same public
 	// group and for the same reason.

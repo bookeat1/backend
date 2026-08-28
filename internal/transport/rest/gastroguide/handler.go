@@ -44,10 +44,25 @@ type Handler struct{ facade uc.Facade }
 func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 
 // RegisterPublic mounts the guest read routes.
+//
+// Two LISTINGS over one table (migration 0092): /gastroguide/collections
+// returns kind='collection', /articles returns kind='article'. Neither can
+// return the other's rows — the kind is set by the route, not by a query
+// parameter.
+//
+// The DETAIL reads are deliberately NOT kind-scoped. A slug is unique across
+// the whole table, and mobile builds already in the wild deep-link ARTICLES
+// through /gastroguide/collections/:slug; scoping that route to collections
+// would turn every one of those links into a 404 on the next OTA, for rows that
+// did not move anywhere. So both detail routes resolve any slug, and the
+// response carries "kind" so a client can branch on what it actually got.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
 	rg.GET("/gastroguide/categories", h.listCategories)
 	rg.GET("/gastroguide/collections", h.listCollections)
 	rg.GET("/gastroguide/collections/:slug", h.getCollection)
+
+	rg.GET("/articles", h.listArticles)
+	rg.GET("/articles/:slug", h.getCollection)
 }
 
 func (h *Handler) listCategories(c *gin.Context) {
@@ -77,9 +92,35 @@ func (h *Handler) listCollections(c *gin.Context) {
 	if raw := strings.TrimSpace(c.Query("category")); raw != "" {
 		categorySlug = &raw
 	}
+	kind := domain.GuideKindCollection
+	h.listByKind(c, city, categorySlug, &kind)
+}
+
+// listArticles is the same listing, filtered to articles.
+//
+// ?category= is IGNORED here rather than refused: an article carries no rubric
+// at all, so the parameter has no meaning on this route — but a client that
+// reuses its collections screen and keeps a stale rubric in the query string
+// would get a 422 for asking a question that simply does not apply, instead of
+// the article feed it wanted. Ignoring it can only ever return MORE of what
+// this route is for; it cannot widen visibility, because the kind and the
+// published-and-live rule are both set below the transport.
+func (h *Handler) listArticles(c *gin.Context) {
+	city, ok := optionalCity(c)
+	if !ok {
+		return
+	}
+	kind := domain.GuideKindArticle
+	h.listByKind(c, city, nil, &kind)
+}
+
+// listByKind is the one listing body both routes share: same pagination, same
+// city filter, same response shape — only the kind differs, and it comes from
+// the route rather than from the request.
+func (h *Handler) listByKind(c *gin.Context, city *domain.City, categorySlug *string, kind *domain.GuideCollectionKind) {
 	page, perPage := pagination(c)
 	items, total, err := h.facade.ListCollections(c.Request.Context(), uc.ListInput{
-		City: city, CategorySlug: categorySlug, Page: page, PerPage: perPage,
+		City: city, CategorySlug: categorySlug, Kind: kind, Page: page, PerPage: perPage,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -180,6 +221,11 @@ type collectionResponse struct {
 	CoverImageURL *string `json:"cover_image_url,omitempty"`
 	// City is omitted when the collection is not tied to one city.
 	City string `json:"city,omitempty"`
+	// Kind is "collection" or "article". ALWAYS present, never omitempty: the
+	// detail routes resolve a slug of either kind, so this is the only way a
+	// client can tell what it opened — and a field that disappears would make
+	// "article" and "an old server" indistinguishable.
+	Kind string `json:"kind"`
 	// Position is the editor's explicit order. Exposed so a client that caches
 	// pages can re-sort them itself and land on the same sequence.
 	Position int `json:"position"`
@@ -199,6 +245,7 @@ func newCollectionResponse(c domain.GuideCollection, lang string) collectionResp
 		Position:      c.Position,
 		VenueCount:    c.VenueCount,
 		CategorySlugs: c.CategorySlugs,
+		Kind:          string(c.Kind),
 	}
 	if c.City != nil {
 		out.City = string(*c.City)

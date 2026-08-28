@@ -67,7 +67,7 @@ const visibleVenues = `(SELECT count(*) FROM gastroguide_collection_venues cv
 		WHERE cv.collection_id = c.id AND r.is_active)`
 
 const collectionCols = `c.id, c.slug, c.title, c.title_i18n, c.subtitle, c.subtitle_i18n,
-	c.description, c.description_i18n, c.cover_image_url, c.city, c.status, c.published_at,
+	c.description, c.description_i18n, c.cover_image_url, c.city, c.kind, c.status, c.published_at,
 	c.position, c.created_at, c.updated_at,
 	` + visibleVenues + `::int AS venue_count,
 	COALESCE((SELECT array_agg(cat.slug ORDER BY cc.position, cat.id)
@@ -92,6 +92,12 @@ func (r *Repository) ListCategories(ctx context.Context, city *domain.City, now 
 			JOIN gastroguide_collections c ON c.id = cc.collection_id
 			WHERE cc.category_id = cat.id
 			  AND `+liveCollection+`
+			  -- An article carries no rubric by invariant (usecase/gastroguide
+			  -- refuses the combination), so this predicate should never remove
+			  -- a row. It is written out anyway: an invariant that only lives in
+			  -- Go is one bad backfill away from putting an article into the
+			  -- guide's rubric navigation.
+			  AND c.kind = 'collection'
 			  AND ($2::varchar IS NULL OR c.city IS NULL OR c.city = $2)
 		   )
 		 ORDER BY cat.position, cat.id`,
@@ -132,6 +138,11 @@ func (r *Repository) ListPublishedCollections(ctx context.Context, f domain.Guid
 	from := ` FROM gastroguide_collections c
 		WHERE ` + liveCollection + `
 		  AND ($2::varchar IS NULL OR c.city IS NULL OR c.city = $2)`
+	if f.Kind != nil {
+		args = append(args, string(*f.Kind))
+		from += `
+		  AND c.kind = $` + strconv.Itoa(len(args))
+	}
 	if f.CategorySlug != nil {
 		args = append(args, *f.CategorySlug)
 		from += `
@@ -287,7 +298,7 @@ func scanCollection(row pgx.Row) (*domain.GuideCollection, error) {
 	var city *string
 	var slugs []string
 	if err := row.Scan(&c.ID, &c.Slug, &c.Title, &titleI18n, &c.Subtitle, &subtitleI18n,
-		&c.Description, &descI18n, &c.CoverImageURL, &city, &c.Status, &c.PublishedAt,
+		&c.Description, &descI18n, &c.CoverImageURL, &city, &c.Kind, &c.Status, &c.PublishedAt,
 		&c.Position, &c.CreatedAt, &c.UpdatedAt, &c.VenueCount, &slugs); err != nil {
 		return nil, err
 	}

@@ -181,9 +181,19 @@ func (h *EditorHandler) listCollections(c *gin.Context) {
 		v := domain.City(raw)
 		city = &v
 	}
+	// ?kind=collection|article. Absent means both — the cabinet's default
+	// screen still lists everything the editor owns. An unknown value is a 422
+	// from the usecase (guide_unknown_kind), not a silently empty page: on an
+	// admin screen "nothing found" because of a typo in a filter is
+	// indistinguishable from "you have written nothing".
+	var kind *domain.GuideCollectionKind
+	if raw := strings.TrimSpace(c.Query("kind")); raw != "" {
+		v := domain.GuideCollectionKind(raw)
+		kind = &v
+	}
 	page, perPage := pagination(c)
 	items, total, err := h.editor.ListCollections(c.Request.Context(), actor, uc.AdminListInput{
-		Statuses: statuses, City: city, Query: strings.TrimSpace(c.Query("q")),
+		Statuses: statuses, City: city, Kind: kind, Query: strings.TrimSpace(c.Query("q")),
 		Page: page, PerPage: perPage,
 	})
 	if err != nil {
@@ -596,7 +606,11 @@ type collectionRequest struct {
 	DescriptionI18n domain.I18n `json:"description_i18n"`
 	CoverImageURL   *string     `json:"cover_image_url"`
 	City            *string     `json:"city"`
-	Position        int         `json:"position"`
+	// Kind is "collection" or "article" (migration 0092). Omitted or empty
+	// means "collection", so an admin build that predates the split keeps
+	// creating exactly what it used to.
+	Kind     string `json:"kind"`
+	Position int    `json:"position"`
 }
 
 func (r collectionRequest) toInput() uc.CollectionInput {
@@ -605,6 +619,7 @@ func (r collectionRequest) toInput() uc.CollectionInput {
 		Subtitle: r.Subtitle, SubtitleI18n: r.SubtitleI18n,
 		Description: r.Description, DescriptionI18n: r.DescriptionI18n,
 		CoverImageURL: r.CoverImageURL, Position: r.Position,
+		Kind: domain.GuideCollectionKind(strings.ToLower(strings.TrimSpace(r.Kind))),
 	}
 	// An empty city string is "every city", the same thing a missing field
 	// means: a <select> with nothing chosen posts "".
@@ -676,6 +691,7 @@ type adminCollectionResponse struct {
 	DescriptionI18n domain.I18n `json:"description_i18n,omitempty"`
 	CoverImageURL   *string     `json:"cover_image_url"`
 	City            *string     `json:"city"`
+	Kind            string      `json:"kind"`
 	Status          string      `json:"status"`
 	PublishedAt     *time.Time  `json:"published_at"`
 	Position        int         `json:"position"`
@@ -693,8 +709,8 @@ func newAdminCollectionResponse(c domain.GuideCollection) adminCollectionRespons
 		Title: c.Title, TitleI18n: c.TitleI18n,
 		Subtitle: c.Subtitle, SubtitleI18n: c.SubtitleI18n,
 		Description: c.Description, DescriptionI18n: c.DescriptionI18n,
-		CoverImageURL: c.CoverImageURL,
-		Status:        string(c.Status), PublishedAt: c.PublishedAt,
+		CoverImageURL: c.CoverImageURL, Kind: string(c.Kind),
+		Status: string(c.Status), PublishedAt: c.PublishedAt,
 		Position: c.Position, VenueCount: c.VenueCount,
 		CategorySlugs: c.CategorySlugs, UpdatedAt: c.UpdatedAt,
 	}

@@ -30,6 +30,9 @@ type fakeEditor struct {
 	gotColl   uuid.UUID
 	gotAttach uc.AttachVenueInput
 	calls     int
+
+	gotCollection uc.CollectionInput
+	gotAdminList  uc.AdminListInput
 }
 
 func (f *fakeEditor) ListCategories(_ context.Context, a uc.EditorActor) ([]domain.GuideCategory, error) {
@@ -47,8 +50,8 @@ func (f *fakeEditor) UpdateCategory(_ context.Context, a uc.EditorActor, _ uuid.
 	return &domain.GuideCategory{ID: uuid.New()}, f.err
 }
 
-func (f *fakeEditor) ListCollections(_ context.Context, a uc.EditorActor, _ uc.AdminListInput) ([]domain.GuideCollection, int, error) {
-	f.calls, f.gotActor = f.calls+1, a
+func (f *fakeEditor) ListCollections(_ context.Context, a uc.EditorActor, in uc.AdminListInput) ([]domain.GuideCollection, int, error) {
+	f.calls, f.gotActor, f.gotAdminList = f.calls+1, a, in
 	return nil, 0, f.err
 }
 
@@ -60,14 +63,14 @@ func (f *fakeEditor) GetCollection(_ context.Context, a uc.EditorActor, _ uuid.U
 	return &domain.GuideCollectionAdminDetail{}, nil
 }
 
-func (f *fakeEditor) CreateCollection(_ context.Context, a uc.EditorActor, _ uc.CollectionInput) (*domain.GuideCollection, error) {
-	f.calls, f.gotActor = f.calls+1, a
-	return &domain.GuideCollection{ID: uuid.New()}, f.err
+func (f *fakeEditor) CreateCollection(_ context.Context, a uc.EditorActor, in uc.CollectionInput) (*domain.GuideCollection, error) {
+	f.calls, f.gotActor, f.gotCollection = f.calls+1, a, in
+	return &domain.GuideCollection{ID: uuid.New(), Kind: in.Kind}, f.err
 }
 
-func (f *fakeEditor) UpdateCollection(_ context.Context, a uc.EditorActor, _ uuid.UUID, _ uc.CollectionInput) (*domain.GuideCollection, error) {
-	f.calls, f.gotActor = f.calls+1, a
-	return &domain.GuideCollection{ID: uuid.New()}, f.err
+func (f *fakeEditor) UpdateCollection(_ context.Context, a uc.EditorActor, _ uuid.UUID, in uc.CollectionInput) (*domain.GuideCollection, error) {
+	f.calls, f.gotActor, f.gotCollection = f.calls+1, a, in
+	return &domain.GuideCollection{ID: uuid.New(), Kind: in.Kind}, f.err
 }
 
 func (f *fakeEditor) Publish(_ context.Context, a uc.EditorActor, _ uuid.UUID, at *time.Time) (*domain.GuideCollection, error) {
@@ -350,4 +353,120 @@ func TestEditorHandler_PublishAcceptsAnEmptyBody(t *testing.T) {
 // затем, чтобы удовлетворить интерфейс.
 func (f *fakeEditor) SetVenueHighlight(_ context.Context, _ uc.EditorActor, _, _ uuid.UUID, _, _ *uuid.UUID) error {
 	return nil
+}
+
+// --- articles vs collections (migration 0092) ---
+
+// A panel build older than the split posts no `kind` field at all. The handler
+// must pass an EMPTY kind down (the usecase defaults it to "collection"), not
+// invent some third value — and the create must still succeed.
+func TestEditorHandler_OmittedKindIsPassedThroughEmpty(t *testing.T) {
+	f := &fakeEditor{}
+	r := adminRouter(f, domain.RoleAdmin)
+
+	w := send(t, r, http.MethodPost, "/api/v1/admin/gastroguide/collections",
+		map[string]any{"slug": "kids", "title": "С детьми"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s, want 201", w.Code, w.Body.String())
+	}
+	if f.gotCollection.Kind != "" {
+		t.Fatalf("kind = %q, want empty (the usecase owns the default)", f.gotCollection.Kind)
+	}
+}
+
+// An explicit kind reaches the usecase normalized (trimmed, lowercased), so a
+// panel that posts "Article" is not refused for a cosmetic difference.
+func TestEditorHandler_KindIsNormalizedOnTheWayIn(t *testing.T) {
+	for _, raw := range []string{"article", " Article ", "ARTICLE"} {
+		f := &fakeEditor{}
+		r := adminRouter(f, domain.RoleAdmin)
+
+		w := send(t, r, http.MethodPost, "/api/v1/admin/gastroguide/collections",
+			map[string]any{"slug": "chto-proishodit", "title": "Что происходит", "kind": raw})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("%q: status = %d, body %s", raw, w.Code, w.Body.String())
+		}
+		if f.gotCollection.Kind != domain.GuideKindArticle {
+			t.Fatalf("%q: kind = %q, want %q", raw, f.gotCollection.Kind, domain.GuideKindArticle)
+		}
+	}
+}
+
+// The kind is echoed back on the admin response, so the panel can render the
+// row without guessing from the rubric list.
+func TestEditorHandler_ResponseCarriesKind(t *testing.T) {
+	f := &fakeEditor{}
+	r := adminRouter(f, domain.RoleAdmin)
+
+	w := send(t, r, http.MethodPost, "/api/v1/admin/gastroguide/collections",
+		map[string]any{"slug": "chto-proishodit", "title": "Что происходит", "kind": "article"})
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %q: %v", w.Body.String(), err)
+	}
+	if got := body["data"].(map[string]any)["kind"]; got != "article" {
+		t.Fatalf("kind = %v, want article", got)
+	}
+}
+
+// ?kind= narrows the cabinet listing; absent means both kinds.
+func TestEditorHandler_ListKindFilter(t *testing.T) {
+	f := &fakeEditor{}
+	r := adminRouter(f, domain.RoleAdmin)
+
+	if w := send(t, r, http.MethodGet, "/api/v1/admin/gastroguide/collections?kind=article", nil); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	if f.gotAdminList.Kind == nil || *f.gotAdminList.Kind != domain.GuideKindArticle {
+		t.Fatalf("kind = %v, want article", f.gotAdminList.Kind)
+	}
+
+	f2 := &fakeEditor{}
+	r2 := adminRouter(f2, domain.RoleAdmin)
+	if w := send(t, r2, http.MethodGet, "/api/v1/admin/gastroguide/collections", nil); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	if f2.gotAdminList.Kind != nil {
+		t.Fatalf("kind = %v, want nil (no filter)", *f2.gotAdminList.Kind)
+	}
+}
+
+// The two refusals the split introduces arrive at the client as 422 with their
+// own machine-readable codes, not as a bare validation failure the panel cannot
+// explain.
+func TestEditorHandler_KindRefusalsAre422WithTheirCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code domain.ErrorCode
+	}{
+		{"unknown kind",
+			domain.WithCode(domain.CodeGuideUnknownKind,
+				fmt.Errorf("%w: unknown collection kind", domain.ErrValidation)),
+			domain.CodeGuideUnknownKind},
+		{"article with rubrics",
+			domain.WithCode(domain.CodeGuideArticleHasRubrics,
+				fmt.Errorf("%w: an article carries no rubrics", domain.ErrValidation)),
+			domain.CodeGuideArticleHasRubrics},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeEditor{err: tc.err}
+			r := adminRouter(f, domain.RoleAdmin)
+
+			w := send(t, r, http.MethodPut,
+				"/api/v1/admin/gastroguide/collections/"+uuid.NewString(),
+				map[string]any{"slug": "kids", "title": "С детьми", "kind": "article"})
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, body %s, want 422", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode %q: %v", w.Body.String(), err)
+			}
+			if body["code"] != string(tc.code) {
+				t.Fatalf("code = %v, want %s", body["code"], tc.code)
+			}
+		})
+	}
 }

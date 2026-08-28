@@ -25,6 +25,9 @@ type GuideCollectionAdminFilter struct {
 	// guest listing adds, because an editor filtering by Astana is asking "what
 	// is pinned to Astana", not "what would an Astana guest see".
 	City *City
+	// Kind limits the listing to collections or to articles. Nil means both —
+	// the cabinet's default screen still shows everything the editor owns.
+	Kind *GuideCollectionKind
 	// Query is a case-insensitive substring match over slug and title, so an
 	// editor can find a collection without paging.
 	Query   string
@@ -67,7 +70,16 @@ type GuideCollectionWrite struct {
 	DescriptionI18n I18n
 	CoverImageURL   *string
 	City            *City
-	Position        int
+	// Kind is 'collection' or 'article'. It has NO usable zero value: the
+	// column's CHECK refuses an empty string, so every caller must set it —
+	// defaulting an omitted kind is the usecase's job (validateCollection), and
+	// the repository writes what it is given. It IS part of the write (unlike
+	// Status): an editor decides what they are writing when they write it, and
+	// a piece that turned out to be an article is retyped in the same form, not
+	// through a separate state machine. The usecase defaults an omitted value
+	// to 'collection' so admin builds that predate migration 0092 keep working.
+	Kind     GuideCollectionKind
+	Position int
 }
 
 // GuideCategoryWrite is a rubric's editable fields. Categories carry no
