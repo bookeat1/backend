@@ -113,6 +113,16 @@ type Event struct {
 	// deleting the occurrence — an event that already happened, with tickets
 	// sold against it, must survive its rule.
 	RecurrenceID *uuid.UUID
+	// ContentOverrides lists the editorial fields THIS DATE owns (migration
+	// 0097). A field listed here was set on the date itself and is never
+	// rewritten when the series content changes; a field that is absent is
+	// inherited and kept equal to the rule's own content. Always empty for an
+	// event with no RecurrenceID — a one-off event has no series to inherit
+	// from, so there is nothing to override.
+	//
+	// See event_series_content.go for why the inheritance is materialised into
+	// this row instead of resolved on read.
+	ContentOverrides []EventContentField
 	// Action is the optional call-to-action button on the card (migration
 	// 0085): a caption plus a destination that is either this event's own page
 	// or an external partner link. nil = no button, which is what every event
@@ -185,8 +195,10 @@ type EventRepository interface {
 	// GetByID returns an event by its id regardless of status (staff resolve the
 	// target and its restaurant before authorizing).
 	GetByID(ctx context.Context, id uuid.UUID) (*Event, error)
-	// Update overwrites the mutable fields of an existing event by id. Returns
-	// ErrNotFound if id is absent.
+	// Update overwrites the mutable fields of an existing event by id —
+	// INCLUDING ContentOverrides, so a date's content and the record of which
+	// fields it now owns are written in one statement and can never disagree.
+	// Returns ErrNotFound if id is absent.
 	Update(ctx context.Context, e *Event) error
 	// Delete removes an event. Returns ErrNotFound if id is absent.
 	Delete(ctx context.Context, id uuid.UUID) error

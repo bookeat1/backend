@@ -60,6 +60,11 @@ func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.PUT("/admin/events/:eventId", h.update)
 	rg.DELETE("/admin/events/:eventId", h.delete)
 	rg.PUT("/admin/events/:eventId/refund-policy", h.setRefundPolicy)
+	// One date of a series back to what the series says. A narrow route rather
+	// than a flag on the full-replace PUT: "верни как у всех" must not require
+	// the cabinet to first fetch what the series currently says, and it is the
+	// only way to clear an override without knowing its value.
+	rg.POST("/admin/events/:eventId/content/reset", h.resetSeriesContent)
 }
 
 func (h *Handler) listPublic(c *gin.Context) {
@@ -223,6 +228,49 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, adminResponse(*e))
+}
+
+// resetSeriesContent hands the listed content fields of this DATE back to its
+// series (migration 0097). An empty or absent `fields` resets every content
+// field, which is the button the cabinet actually shows; the list exists for
+// "верни только афишу, текст оставь мой".
+func (h *Handler) resetSeriesContent(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	eid, ok := pathUUID(c, "eventId", "invalid event id")
+	if !ok {
+		return
+	}
+	var req resetContentRequest
+	// An empty body is the normal case ("reset everything"), so a missing or
+	// blank payload is not an error — only a malformed one is.
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+	}
+	fields := make([]domain.EventContentField, 0, len(req.Fields))
+	for _, f := range req.Fields {
+		fields = append(fields, domain.EventContentField(strings.TrimSpace(f)))
+	}
+	e, err := h.facade.ResetSeriesContent(c.Request.Context(), actor, eid, fields)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, adminResponse(*e))
+}
+
+// resetContentRequest names the fields to hand back to the series. The
+// vocabulary is domain.EventContentFields ("title", "description", "venue",
+// "cover_image_url", "tags"); an unknown name is a 422 rather than a silent
+// no-op, because a cabinet that misspells a field would otherwise believe it
+// reset something.
+type resetContentRequest struct {
+	Fields []string `json:"fields"`
 }
 
 // setRefundPolicy lets an authorized venue role set THIS event's ticket-refund
@@ -598,6 +646,11 @@ type eventResponse struct {
 	// for an ordinary one-off event. The cabinet uses it to tell the venue "this
 	// date comes from a series" before they edit or delete it.
 	RecurrenceID *string `json:"recurrence_id,omitempty"`
+	// ContentOverrides — какие поля контента эта дата ведёт САМА, а какие
+	// наследует от серии (миграция 0097). Поле административное: в гостевом
+	// ответе его нет (publicResponse его снимает), а у обычного события и у
+	// даты, которая целиком следует серии, оно пустое и потому не сериализуется.
+	ContentOverrides []string `json:"content_overrides,omitempty"`
 	// Action — кнопка карточки. Отсутствует, когда кнопки нет.
 	Action    *eventActionResponse `json:"action,omitempty"`
 	CreatedAt string               `json:"created_at"`
@@ -682,6 +735,7 @@ func adminResponse(e domain.Event) eventResponse {
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
 		RecurrenceID:              recurrenceID,
+		ContentOverrides:          overridesResponse(e.ContentOverrides),
 		Action:                    actionResponse(e.Action),
 		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
@@ -726,5 +780,24 @@ func publicResponse(e domain.Event, lang string) eventResponse {
 	r.Description = e.DescriptionI18n.Resolve(lang, e.Description)
 	r.TitleI18n = nil
 	r.DescriptionI18n = nil
+	// Which fields this date inherits from its series is a cabinet's concern,
+	// not a guest's: the guest sees the resolved content, exactly as before
+	// migration 0097, and the response keeps the shape it always had.
+	r.ContentOverrides = nil
 	return r
+}
+
+// overridesResponse renders the override markers as plain strings, and returns
+// nil (not an empty slice) when there are none — the field is omitempty, so
+// "this date follows its series entirely" is an ABSENT field rather than an
+// empty array that a cabinet might mistake for something to render.
+func overridesResponse(fields []domain.EventContentField) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, string(f))
+	}
+	return out
 }

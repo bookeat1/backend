@@ -327,10 +327,18 @@ func TestWithdrawPullsFutureOccurrencesOffTheFeed(t *testing.T) {
 	}
 }
 
-// Editing the template invalidates the platform's decision about the SERIES —
-// so the next generated date is born off the feed again — while the dates that
-// already exist keep the words the moderator actually approved.
-func TestEditingTheTemplateDemotesTheSeriesButNotTheExistingDates(t *testing.T) {
+// Editing the series text now rewrites the dates that already exist (migration
+// 0097) — that is the feature — so the platform's approval of the OLD words
+// cannot survive it. This test pins both halves of that trade:
+//
+//   - the rule goes back to the moderation queue, and the dates it had already
+//     put on the main screen leave it, because their words changed;
+//   - a date that OWNS its title keeps both its words and its place: nothing
+//     changed on it, so there is nothing to re-review.
+//
+// It replaces the pre-0097 expectation ("an edit never touches an existing
+// date"), which the shared-content feature deliberately reverses.
+func TestEditingTheTemplateRewritesExistingDatesAndPullsThemOffTheFeed(t *testing.T) {
 	now := time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC)
 	h := newFeedHarness(t, now, 7*24*time.Hour)
 
@@ -349,6 +357,16 @@ func TestEditingTheTemplateDemotesTheSeriesButNotTheExistingDates(t *testing.T) 
 		t.Fatal("precondition: the approved series should be on the main screen")
 	}
 
+	// One date of the series has its own title, claimed the way the event
+	// editor claims it.
+	dates := h.occurrenceIDs(t, rule.ID)
+	own := dates[len(dates)-1]
+	if _, err := h.pool.Exec(h.ctx,
+		`UPDATE events SET title = 'Джазовый вечер', content_overrides = ARRAY['title']::text[]
+		 WHERE id = $1`, own); err != nil {
+		t.Fatalf("claim the title of one date: %v", err)
+	}
+
 	edited, err := h.facade.Update(h.ctx, h.venue, rule.ID, Input{
 		Title:            "Совсем другой вечер",
 		OccurrenceStatus: domain.EventPublished,
@@ -365,21 +383,52 @@ func TestEditingTheTemplateDemotesTheSeriesButNotTheExistingDates(t *testing.T) 
 		t.Fatalf("an edited series must go back to the queue, got %q", edited.OccurrenceFeedStatus)
 	}
 
-	// The dates already generated still carry the reviewed content, so they keep
-	// their place; only what is generated from the NEW template is held back.
-	after := h.feedEventIDs(t)
-	for id := range before {
-		if !after[id] {
-			t.Fatalf("occurrence %s was pulled off the feed by an edit that did not change it", id)
+	// The whole point: the dates carry the new words without anyone editing
+	// them one by one.
+	for _, id := range dates {
+		var title, feedStatus string
+		if err := h.pool.QueryRow(h.ctx, `SELECT title, feed_status FROM events WHERE id = $1`, id).
+			Scan(&title, &feedStatus); err != nil {
+			t.Fatalf("read occurrence: %v", err)
+		}
+		if id == own {
+			if title != "Джазовый вечер" {
+				t.Fatalf("a date that owns its title must keep it, got %q", title)
+			}
+			if feedStatus != string(domain.FeedApproved) {
+				t.Fatalf("a date nothing changed on must keep its approval, got %q", feedStatus)
+			}
+			continue
+		}
+		if title != "Совсем другой вечер" {
+			t.Fatalf("date %s did not follow the series, got %q", id, title)
+		}
+		if feedStatus != string(domain.FeedNotSubmitted) {
+			t.Fatalf("a rewritten date must leave the main screen, got %q", feedStatus)
 		}
 	}
+
+	// And the guest screen agrees: the only card of this series still standing
+	// is the one that was not rewritten.
+	after := h.feedEventIDs(t)
+	for id := range before {
+		if id != own && after[id] {
+			t.Fatalf("occurrence %s shows unreviewed words on the main screen", id)
+		}
+	}
+
+	// Dates generated from the unreviewed template are still born off the feed.
 	h.gen.cfg.Window = 21 * 24 * time.Hour
 	if _, err := h.gen.Generate(h.ctx); err != nil {
 		t.Fatalf("generate after edit: %v", err)
 	}
 	fresh := h.feedEventIDs(t)
 	for _, id := range h.occurrenceIDs(t, rule.ID) {
-		if !before[id] && fresh[id] {
+		// `own` is excluded by name, not by "was it on the feed before": the
+		// feed shows ONE card per series, so the card before the edit was the
+		// nearest date, and `own` is the one that legitimately took its place
+		// afterwards — it still carries the words the moderator approved.
+		if id != own && !before[id] && fresh[id] {
 			t.Fatalf("occurrence %s generated from an unreviewed template reached the main screen", id)
 		}
 	}

@@ -55,10 +55,18 @@ func ISOWeekdayOf(w time.Weekday) ISOWeekday {
 // what the Афиша, the ticketing and the feed read.
 //
 // Everything from Title to TicketRefundCutoffMinutes is the TEMPLATE: it is
-// copied verbatim onto each occurrence at generation time. Changing the
-// template changes what FUTURE occurrences look like; occurrences that already
-// exist are left exactly as they are, including any edit the venue made to a
-// single date. That asymmetry is the point — see the Generator's doc.
+// copied verbatim onto each occurrence at generation time. Two different rules
+// govern what an edit to it does to the dates that ALREADY exist:
+//
+//   - the EDITORIAL CONTENT (Content(), migration 0097) is SHARED. Changing it
+//     rewrites every occurrence still ahead that has not overridden the field —
+//     that is the whole point of a series, and the reason a venue fills the
+//     poster in once instead of eighteen times. See SyncOccurrenceContent.
+//   - everything else — the status a date is in, the ticketing terms, the
+//     capacity, the schedule — applies only to occurrences generated from now
+//     on. A date the venue hid, sold out or priced separately must not be
+//     resurrected by a text edit, and a ticket already sold was sold under the
+//     terms of its own date.
 //
 // The rule stores wall-clock time (StartMinutes + a zone), never an instant.
 // "Every Wednesday at 19:00" means 19:00 on the wall in the venue's zone, on
@@ -340,6 +348,32 @@ type EventRecurrenceRepository interface {
 	// screen by a decision about its series, and a past occurrence is never
 	// rewritten at all.
 	SyncOccurrenceFeedStatus(ctx context.Context, recurrenceID uuid.UUID, notEndedBefore time.Time, from []FeedStatus, upd FeedPlacementUpdate) (int, error)
+	// SyncOccurrenceContent pushes the series' editorial content (migration
+	// 0097) down onto the occurrences it has already generated. It is what
+	// makes «заполнил один раз — поменялось на всех датах» true, and it is the
+	// content twin of SyncOccurrenceFeedStatus, with the same three bounds plus
+	// one:
+	//
+	//   - recurrence_id = the rule — one series at a time;
+	//   - ends_at > notEndedBefore — a date that already happened is history
+	//     and is never retitled;
+	//   - per FIELD, events.content_overrides — a field this date owns
+	//     («в эту субботу другой гость») is left exactly as the venue set it,
+	//     while the rest of the same row still follows the series;
+	//   - only rows that actually CHANGE are written, so updated_at is not
+	//     churned and the returned count means something.
+	//
+	// A row it does rewrite loses the platform's approval for the main screen:
+	// feed_status approved → not_submitted with the reviewer stamp cleared. The
+	// alternative — new words under an old approval — is exactly what the
+	// item-level moderation exists to prevent, and demoting to
+	// not_submitted rather than pending_review keeps 18 identical dates out of
+	// the item queue (see OccurrenceFeedStatusOf). The series itself goes to
+	// pending_review through DemoteFeedAfterContentEdit, and re-approving it
+	// brings its dates back (ReviewFeed → SyncOccurrenceFeedStatus).
+	//
+	// Returns how many occurrences were rewritten.
+	SyncOccurrenceContent(ctx context.Context, recurrenceID uuid.UUID, notEndedBefore time.Time, c EventContent) (int, error)
 	// ListByFeedStatus is the superadmin's rule queue: rules platform-wide in
 	// the given series-level feed status, oldest submission first with id as the
 	// stable tie-break, paginated, plus the total count.

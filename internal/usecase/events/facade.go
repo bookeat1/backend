@@ -9,6 +9,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -62,6 +63,13 @@ type Facade interface {
 	// domain.CanManagePlatformContent, not by a per-restaurant permission —
 	// there is no restaurant to check one at.
 	ListPlatformAdmin(ctx context.Context, actor Actor, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error)
+	// ResetSeriesContent hands the named content fields of one DATE back to
+	// its series (migration 0097): the series values are copied onto the event
+	// and the override markers for those fields are cleared, so the date
+	// follows the series again. An empty field list resets every content
+	// field. ErrValidation when the event belongs to no series. Requires
+	// PermRestaurantManage at the event's own restaurant.
+	ResetSeriesContent(ctx context.Context, actor Actor, eventID uuid.UUID, fields []domain.EventContentField) (*domain.Event, error)
 	// SetRefundPolicy sets the venue's OWN ticket-refund rules for one event
 	// without going through the full-replace Update. Requires
 	// PermRestaurantManage at the event's own restaurant. A change here applies
@@ -184,6 +192,20 @@ type occurrenceSkipRecorder interface {
 	RecordSkip(ctx context.Context, recurrenceID uuid.UUID, slot time.Time) error
 }
 
+// seriesContentReader is the minimal slice of the recurrence repository this
+// package needs: "what does the SERIES this date belongs to say?". Declared
+// here and bound in bootstrap (to the event-recurrence repository), so the
+// events usecase never depends on usecase/eventrecurrence — the same one-effect
+// port shape as feedModerator and occurrenceSkipRecorder above.
+//
+// It answers two questions and only those two: which fields of an edited date
+// now differ from its series (and are therefore this date's own — see
+// domain.EventContentDiff), and what content to put back when an override is
+// reset.
+type seriesContentReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.EventRecurrence, error)
+}
+
 // cityResolver is the minimal slice of usecase/cities this package needs:
 // "which dictionary entry does this written spelling mean". Declared here and
 // bound in bootstrap/deps.go, so the events usecase never depends on the
@@ -206,6 +228,9 @@ type facade struct {
 	// 0084 — the raw string is compared to the stored spelling, and an event's
 	// own city override is validated against the two legacy constants.
 	cities cityResolver
+	// series reads the rule a generated occurrence belongs to (see
+	// WithSeriesContent). Nil unless wired.
+	series seriesContentReader
 	clock  func() time.Time
 }
 
@@ -221,6 +246,21 @@ type Option func(*facade)
 // touch a generated event.
 func WithOccurrenceSkips(r occurrenceSkipRecorder) Option {
 	return func(f *facade) { f.skips = r }
+}
+
+// WithSeriesContent wires the reader of the recurrence rules, which is what
+// lets a single DATE of a series be told apart from the series itself
+// (migration 0097).
+//
+// Without it the facade still works exactly as it did before 0097, with one
+// documented consequence: editing one date of a series no longer records WHICH
+// fields that date now owns, so the next edit of the series would overwrite
+// them. The existing override markers are never dropped in that case — a
+// missing dependency must not silently un-own a venue's poster. bootstrap
+// always supplies it; only tests that never touch a generated occurrence may
+// omit it.
+func WithSeriesContent(r seriesContentReader) Option {
+	return func(f *facade) { f.series = r }
 }
 
 // WithCityResolver teaches the events usecase the city dictionary (migration
@@ -382,6 +422,15 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	if err := validateEvent(e); err != nil {
 		return nil, err
 	}
+	// A date of a series records WHICH content it now owns. Derived from the
+	// diff against the series rather than declared by the client: the cabinet
+	// sends the date as a full replace and always has, so nothing has to change
+	// on the wire for an existing build — and re-typing the series text on a
+	// date hands that field BACK to the series instead of freezing a copy of
+	// today's wording. See domain.EventContentDiff.
+	if err := f.markContentOverrides(ctx, e); err != nil {
+		return nil, err
+	}
 	// Demote BEFORE writing the new content: the platform approved specific
 	// words and dates, so changing them invalidates the decision. This ordering
 	// makes both failure modes safe — a failed edit after a successful demotion
@@ -402,6 +451,92 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		return nil, err
 	}
 	e.Images = normalizeImages(in.Images)
+	return e, nil
+}
+
+// markContentOverrides recomputes e.ContentOverrides from the difference
+// between this date's content and its series'.
+//
+// A one-off event (no rule) can own nothing — there is no series to inherit
+// from — so its marker list is cleared. A date whose rule has been deleted
+// (recurrence_id nulled by ON DELETE SET NULL) is left exactly as it is: it is
+// an ordinary event now, and rewriting a marker list nothing reads would be
+// churn. Same for a facade with no series reader wired: keep what is stored
+// rather than silently un-owning a poster (see WithSeriesContent).
+func (f *facade) markContentOverrides(ctx context.Context, e *domain.Event) error {
+	if e.RecurrenceID == nil {
+		e.ContentOverrides = nil
+		return nil
+	}
+	if f.series == nil {
+		return nil
+	}
+	rec, err := f.series.GetByID(ctx, *e.RecurrenceID)
+	if err != nil {
+		// The rule vanished between the read and here: the row is an ordinary
+		// event now and the edit must not fail because of it.
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	e.ContentOverrides = domain.EventContentDiff(rec.Content(), e.Content())
+	return nil
+}
+
+// ResetSeriesContent hands the named content fields of ONE date back to its
+// series: the series values are copied onto the date and the override markers
+// for those fields disappear, so every later edit of the series reaches this
+// date again. An empty field list resets everything.
+//
+// It is a separate operation rather than "send the series text through Update"
+// because the cabinet must be able to say "стоп, эта дата снова как все" in one
+// click, without knowing what the series currently says. The authorization is
+// the same resolve-the-event-then-check-its-restaurant gate every other event
+// mutation uses.
+func (f *facade) ResetSeriesContent(ctx context.Context, actor Actor, eventID uuid.UUID, fields []domain.EventContentField) (*domain.Event, error) {
+	e, err := f.repo.GetByID(ctx, eventID)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
+		return nil, err
+	}
+	if e.RecurrenceID == nil {
+		return nil, fmt.Errorf("%w: this event does not belong to a series", domain.ErrValidation)
+	}
+	if f.series == nil {
+		return nil, fmt.Errorf("resetting series content is not available: no recurrence source is wired")
+	}
+	if len(fields) == 0 {
+		fields = domain.EventContentFields
+	}
+	for _, fld := range fields {
+		if !fld.Valid() {
+			return nil, fmt.Errorf("%w: unknown content field %q", domain.ErrValidation, fld)
+		}
+	}
+	rec, err := f.series.GetByID(ctx, *e.RecurrenceID)
+	if err != nil {
+		return nil, err
+	}
+	before := e.Content()
+	domain.ApplyEventContent(e, rec.Content(), fields)
+	e.ContentOverrides = domain.EventContentDiff(rec.Content(), e.Content())
+	// Nothing to do — and, importantly, nothing to re-moderate: a reset that
+	// changes no word must not cost the venue a review.
+	changed := len(domain.EventContentDiff(before, e.Content())) > 0
+	if changed && domain.FeedDemotableAfterContentEdit(e.RestaurantID) {
+		// Same ordering and the same reason as Update: the platform approved
+		// the words that are being replaced.
+		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemEvent, eventID); err != nil {
+			return nil, err
+		}
+	}
+	if err := f.repo.Update(ctx, e); err != nil {
+		return nil, err
+	}
+	f.attachImages(ctx, e)
 	return e, nil
 }
 

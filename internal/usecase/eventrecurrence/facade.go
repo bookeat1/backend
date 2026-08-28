@@ -146,13 +146,26 @@ func (f *facade) Create(ctx context.Context, actor Actor, in Input) (*domain.Eve
 	return rec, nil
 }
 
-// Update replaces the rule's template and schedule. What it deliberately does
-// NOT do is rewrite the occurrences already generated from the old version:
-// they are live events a guest may have bookmarked or bought a ticket for, and
-// silently retitling or moving them from a rule edit would be an invisible
-// change to a published promise. The new template applies to occurrences
-// generated from now on; the cabinet fixes an individual date in the event
-// editor, as it always did.
+// Update replaces the rule's template and schedule, and — since migration 0097
+// — pushes the EDITORIAL CONTENT of the series down onto the dates that are
+// still ahead.
+//
+// That push is the point of the feature: a venue fills the poster, the title
+// and the text in ONCE for «Афиша Greek Party» instead of eighteen times. It is
+// bounded on three sides so it stays honest:
+//
+//   - only the content (title, description, venue line, cover, chips). The
+//     schedule, the status, the price and the capacity still apply to future
+//     occurrences only — a date the venue hid or sold tickets for is not
+//     rewritten by a text edit;
+//   - only dates that have not ended. History is never retitled;
+//   - only fields the date has not overridden. «В эту субботу другой гость»
+//     survives every later edit of the series.
+//
+// A date the venue edited by hand keeps that edit because usecase/events
+// records WHICH fields it changed (domain.EventContentDiff) — the override is
+// per field, so the same date can own its poster and still follow the series
+// text.
 func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input) (*domain.EventRecurrence, error) {
 	rec, err := f.repo.GetByID(ctx, id)
 	if err != nil {
@@ -162,9 +175,15 @@ func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input
 		return nil, err
 	}
 	// Whether the platform's decision about this series survives the edit is
-	// decided against the CURRENT rule, before apply() overwrites it.
+	// decided against the CURRENT rule, before apply() overwrites it. So is the
+	// narrower question "did the words and pictures change", which decides
+	// whether the occurrences need rewriting at all: recurrenceContentChanged
+	// is broader (it counts a schedule change as content, and a schedule change
+	// touches no existing date).
 	contentChanged := recurrenceContentChanged(*rec, in)
+	before := rec.Content()
 	apply(rec, in)
+	seriesContentChanged := len(domain.EventContentDiff(before, rec.Content())) > 0
 	if err := validate(rec); err != nil {
 		return nil, err
 	}
@@ -173,11 +192,13 @@ func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input
 	// demotion only costs a re-review, while the reverse order can leave
 	// unreviewed words feeding the main screen.
 	//
-	// Only FUTURE occurrences are affected by this, and only because they are
-	// born from the new template — the occurrences that already exist still
-	// carry the exact words the moderator approved (the generator never
-	// rewrites an existing row), so they keep their own feed status. An edit is
-	// not a withdrawal; WithdrawFromFeed is.
+	// The dates that already exist are affected too, and they have to be: since
+	// 0097 this edit rewrites their words, so an approved card would otherwise
+	// show text nobody reviewed. SyncOccurrenceContent moves exactly the rows
+	// it rewrites from approved back to not_submitted (not pending_review — see
+	// domain.OccurrenceFeedStatusOf), and re-approving the series brings them
+	// back in one click. A date that overrode the field keeps both its words and
+	// its place. An edit is still not a withdrawal: WithdrawFromFeed is.
 	if contentChanged {
 		if err := f.repo.DemoteFeedAfterContentEdit(ctx, rec.ID); err != nil {
 			return nil, err
@@ -186,6 +207,17 @@ func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input
 	}
 	if err := f.repo.Update(ctx, rec); err != nil {
 		return nil, err
+	}
+	// AFTER the rule is stored, never before: the occurrences must not be given
+	// content that failed to save. The two writes are deliberately not one
+	// transaction — this usecase owns no transaction manager, and the failure
+	// mode is benign and self-healing: the rule is correct, some dates are one
+	// edit behind, and the very next save (or the caller's retry — the sync is
+	// idempotent, it writes only rows that actually differ) fixes them.
+	if seriesContentChanged {
+		if _, err := f.repo.SyncOccurrenceContent(ctx, rec.ID, f.clock(), rec.Content()); err != nil {
+			return nil, err
+		}
 	}
 	return rec, nil
 }

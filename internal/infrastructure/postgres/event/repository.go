@@ -31,7 +31,7 @@ var _ domain.EventRepository = (*Repository)(nil)
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
 	starts_at, ends_at, venue, cover_image_url, status, ticketed,
 	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
-	recurrence_id, created_at, updated_at, city, action_label, action_url`
+	recurrence_id, created_at, updated_at, city, action_label, action_url, content_overrides`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as reviews/favorites.
@@ -67,20 +67,22 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Event, 
 	return scanEvent(row, "get event")
 }
 
-// Update overwrites the mutable fields of an existing event. A zero-rows UPDATE
-// means the id is absent.
+// Update overwrites the mutable fields of an existing event, content_overrides
+// among them: a date's content and the record of which fields it now owns are
+// one fact and are written in one statement, so they can never drift apart. A
+// zero-rows UPDATE means the id is absent.
 func (r *Repository) Update(ctx context.Context, e *domain.Event) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE events SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
 			starts_at = $6, ends_at = $7, venue = $8, cover_image_url = $9, status = $10,
 			ticketed = $11, ticket_price_minor = $12, capacity = $13, tags = $14,
 			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, city = $17,
-			action_label = $18, action_url = $19, updated_at = now()
+			action_label = $18, action_url = $19, content_overrides = $20, updated_at = now()
 		 WHERE id = $1`,
 		e.ID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
 		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
 		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City,
-		actionLabelToDB(e.Action), actionURLToDB(e.Action))
+		actionLabelToDB(e.Action), actionURLToDB(e.Action), overridesToDB(e.ContentOverrides))
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
@@ -207,7 +209,7 @@ const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e
 	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
 	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
 	e.recurrence_id, e.created_at, e.updated_at, e.city AS event_city,
-	e.action_label, e.action_url,
+	e.action_label, e.action_url, e.content_overrides,
 	r.name, r.name_i18n, r.city`
 
 // collapsedCols reads listCols back out of the derived table the collapse
@@ -221,7 +223,7 @@ const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.descripti
 	c.starts_at, c.ends_at, c.venue, c.cover_image_url, c.status, c.ticketed,
 	c.ticket_price_minor, c.capacity, c.tags, c.tickets_refundable, c.ticket_refund_cutoff_minutes,
 	c.recurrence_id, c.created_at, c.updated_at, c.event_city,
-	c.action_label, c.action_url,
+	c.action_label, c.action_url, c.content_overrides,
 	c.name, c.name_i18n, c.city`
 
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
@@ -396,16 +398,19 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	var e domain.Event
 	var titleI18n, descI18n []byte
 	var actionLabel, actionURL *string
+	var overrides []string
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL); err != nil {
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL,
+		&overrides); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
 	e.Tags = tagsFromDB(e.Tags)
 	e.Action = actionFromDB(actionLabel, actionURL)
+	e.ContentOverrides = overridesFromDB(overrides)
 	return &e, nil
 }
 
@@ -420,17 +425,19 @@ func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	var titleI18n, descI18n, venueNameI18n []byte
 	var actionLabel, actionURL, venueName *string
 	var venueCity *domain.City
+	var overrides []string
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
 		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
 		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL,
-		&venueName, &venueNameI18n, &venueCity); err != nil {
+		&overrides, &venueName, &venueNameI18n, &venueCity); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
 	e.Tags = tagsFromDB(e.Tags)
 	e.Action = actionFromDB(actionLabel, actionURL)
+	e.ContentOverrides = overridesFromDB(overrides)
 	it.Restaurant = venueFromDB(e.RestaurantID, venueName, venueNameI18n, venueCity)
 	return &it, nil
 }
@@ -516,6 +523,30 @@ func tagsFromDB(tags []string) []string {
 		return []string{}
 	}
 	return tags
+}
+
+// overridesToDB renders the per-date override markers for the text[] NOT NULL
+// column. Same nil-is-not-NULL rule as tagsToDB, and the same reason: pgx
+// encodes a nil slice as SQL NULL and the column refuses it. An event with no
+// overrides — every one-off event, and every date that follows its series —
+// writes the empty array.
+func overridesToDB(fields []domain.EventContentField) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, string(f))
+	}
+	return out
+}
+
+// overridesFromDB reads the markers back. An unknown value cannot appear (a DB
+// CHECK closes the vocabulary — migration 0097), so this is a plain retyping;
+// a nil array becomes an empty slice so "no overrides" is never a nil-surprise.
+func overridesFromDB(fields []string) []domain.EventContentField {
+	out := make([]domain.EventContentField, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, domain.EventContentField(f))
+	}
+	return out
 }
 
 func i18nToDB(m domain.I18n) any {

@@ -386,6 +386,73 @@ func (r *Repository) SyncOccurrenceFeedStatus(ctx context.Context, recurrenceID 
 	return int(tag.RowsAffected()), nil
 }
 
+// SyncOccurrenceContent pushes the series' editorial content down onto the
+// occurrences already generated — the statement that makes «заполнил один раз»
+// true for all eighteen dates of «Афиша Greek Party».
+//
+// It is one statement on purpose. The CTE decides, per row and per FIELD,
+// whether that field is BOTH inherited (not listed in content_overrides) and
+// actually different from the series; the UPDATE then writes only those fields,
+// only on rows where at least one of them changed. Consequences worth naming:
+//
+//   - a date that owns its poster keeps it while still following the series
+//     text — the override is per field, not per row;
+//   - a row that is already identical is not written at all, so updated_at is
+//     not churned and RowsAffected answers "how many dates actually changed";
+//   - ends_at > $2 keeps history out of it: a date that already happened is
+//     never retitled, whatever the venue does to the rule afterwards.
+//
+// The feed columns move with the content, and only for the rows being
+// rewritten: an APPROVED occurrence goes back to not_submitted with its
+// reviewer stamp cleared, because the platform approved the old words. It goes
+// to not_submitted rather than pending_review deliberately — see
+// domain.OccurrenceFeedStatusOf: the object under review is the series (which
+// DemoteFeedAfterContentEdit has just moved to pending_review), and eighteen
+// identical dates must never land in the item queue.
+func (r *Repository) SyncOccurrenceContent(ctx context.Context, recurrenceID uuid.UUID, notEndedBefore time.Time, c domain.EventContent) (int, error) {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`WITH target AS (
+			SELECT e.id,
+				NOT ('title' = ANY (e.content_overrides))
+					AND (e.title IS DISTINCT FROM $3::varchar
+						OR e.title_i18n IS DISTINCT FROM $4::jsonb)                AS chg_title,
+				NOT ('description' = ANY (e.content_overrides))
+					AND (e.description IS DISTINCT FROM $5::text
+						OR e.description_i18n IS DISTINCT FROM $6::jsonb)          AS chg_description,
+				NOT ('venue' = ANY (e.content_overrides))
+					AND e.venue IS DISTINCT FROM $7::varchar                       AS chg_venue,
+				NOT ('cover_image_url' = ANY (e.content_overrides))
+					AND e.cover_image_url IS DISTINCT FROM $8::varchar             AS chg_cover,
+				NOT ('tags' = ANY (e.content_overrides))
+					AND e.tags IS DISTINCT FROM $9::text[]                         AS chg_tags
+			FROM events e
+			WHERE e.recurrence_id = $1 AND e.ends_at > $2
+		)
+		UPDATE events e SET
+			title            = CASE WHEN t.chg_title THEN $3::varchar ELSE e.title END,
+			title_i18n       = CASE WHEN t.chg_title THEN $4::jsonb ELSE e.title_i18n END,
+			description      = CASE WHEN t.chg_description THEN $5::text ELSE e.description END,
+			description_i18n = CASE WHEN t.chg_description THEN $6::jsonb ELSE e.description_i18n END,
+			venue            = CASE WHEN t.chg_venue THEN $7::varchar ELSE e.venue END,
+			cover_image_url  = CASE WHEN t.chg_cover THEN $8::varchar ELSE e.cover_image_url END,
+			tags             = CASE WHEN t.chg_tags THEN $9::text[] ELSE e.tags END,
+			feed_status      = CASE WHEN e.feed_status = $10::varchar THEN $11::varchar ELSE e.feed_status END,
+			feed_reviewed_by = CASE WHEN e.feed_status = $10::varchar THEN NULL ELSE e.feed_reviewed_by END,
+			feed_reviewed_at = CASE WHEN e.feed_status = $10::varchar THEN NULL ELSE e.feed_reviewed_at END,
+			updated_at       = now()
+		FROM target t
+		WHERE e.id = t.id
+		  AND (t.chg_title OR t.chg_description OR t.chg_venue OR t.chg_cover OR t.chg_tags)`,
+		recurrenceID, notEndedBefore,
+		c.Title, i18nToDB(c.TitleI18n), c.Description, i18nToDB(c.DescriptionI18n),
+		c.Venue, c.CoverImageURL, tagsToDB(c.Tags),
+		string(domain.FeedApproved), string(domain.FeedNotSubmitted))
+	if err != nil {
+		return 0, fmt.Errorf("sync occurrence content: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // ListByFeedStatus is the superadmin's rule queue: oldest submission first, id
 // as the stable tie-break (same FIFO shape as the item queue).
 func (r *Repository) ListByFeedStatus(ctx context.Context, status domain.FeedStatus, page, perPage int) ([]domain.EventRecurrence, int, error) {

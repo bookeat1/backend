@@ -306,6 +306,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		citiesuc.WithEventCityWriter(eventRepo))
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
+		// The same repository again, in its second one-effect role: editing ONE
+		// date of a series has to know what the series says, or it cannot tell
+		// "this date now has its own poster" from "this date just re-saved the
+		// series poster" (migration 0097).
+		events.WithSeriesContent(recurrenceRepo),
 		// Same seam as the catalog: ?city=almaty, a historical spelling or a
 		// renamed city resolve to the one spelling the listing compares.
 		events.WithCityResolver(citiesUC))
