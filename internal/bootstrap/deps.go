@@ -35,6 +35,7 @@ import (
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
 	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
+	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
@@ -75,6 +76,7 @@ import (
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
 	"backend-core/internal/usecase/gastroguide"
+	"backend-core/internal/usecase/homepicks"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
@@ -116,6 +118,7 @@ type Deps struct {
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
 	EventRecurrences  eventrecurrence.Facade
 	PromosFacade      promos.Facade
+	HomePicks         homepicks.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
 	// GastroRoutes / GastroRouteEditor — «Гастропрогулки» (migration 0078): the
@@ -434,6 +437,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// Teaches ?city= the dictionary: a code, a historical spelling and the
 		// Russian name all resolve to the one spelling stored on the venue.
 		restaurants.WithCityResolver(citiesUC))
+	// «Выбрали для вас» (migration 0090): the hand-curated venue rail on the
+	// main screen. It takes the catalog FACADE, not the repository, so the
+	// curated cards and the automatic fallback go through the very same
+	// listing — same enrichment, same city resolution — as GET /restaurants.
+	// The city dictionary is wired into the KEY of the curation as well: the
+	// panel saves the canonical name while a phone may send a code or an older
+	// spelling, and without folding both to one entry a curated rail would
+	// quietly fail to appear for exactly the guests it was curated for.
+	homePicksFacade := homepicks.NewFacade(homepicksrepo.New(db, txm), restaurantsFacade,
+		homepicks.WithCityResolver(citiesUC))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
@@ -483,6 +496,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
+		HomePicks:             homePicksFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
 		Cities:                citiesUC,

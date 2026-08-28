@@ -131,6 +131,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic := api.Group("")
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
+	// «Выбрали для вас» rides the SAME OptionalAuth group as the catalog: its
+	// cards are catalog cards and carry the same is_favorite flag for a
+	// signed-in guest. Mounted here, right after the catalog, so the two static
+	// segments (/restaurants/search, /restaurants/picks) and /restaurants/:id
+	// are declared in one place.
+	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.FavoritesFacade)
+	picksHandler.RegisterPublic(restPublic)
 
 	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and
 	// the venue panel's checkbox list read the same route, so they can never
@@ -314,6 +321,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal := authed.Group("")
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
+	// The curated main-screen rail is platform editorial content (same rule as
+	// the cuisine/feature/city dictionaries and the gastroguide): only the
+	// superadmin picks who is on the main screen.
+	picksHandler.RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
 	// The cuisine dictionary is the PLATFORM's, not a venue's: only the
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that

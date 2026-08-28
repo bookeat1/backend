@@ -311,6 +311,9 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	if f.Category != nil {
 		add("r.category_id = $%d", *f.Category)
 	}
+	if len(f.IDs) > 0 {
+		add("r.id = ANY($%d)", f.IDs)
+	}
 	if f.IsPopular != nil {
 		add("r.is_popular = $%d", *f.IsPopular)
 	}

@@ -229,8 +229,18 @@ const CatalogScanLimit = 2000
 
 // RestaurantFilter narrows a listing query. Zero-value fields are ignored.
 type RestaurantFilter struct {
-	City      *City
-	Category  *uuid.UUID
+	City     *City
+	Category *uuid.UUID
+	// IDs restricts the listing to these venues. Nil/empty means no
+	// restriction; a non-empty slice is an OR-set (r.id = ANY(...)).
+	//
+	// It exists for the hand-picked rails, which know WHICH venues they want
+	// and need everything else the catalog listing attaches — images, cuisines,
+	// features, venue state. Note that it does not carry ORDER: the listing
+	// still comes back in catalog order (display_order, name), and a caller
+	// that curated an order re-applies it over the result (see
+	// usecase/homepicks).
+	IDs       []uuid.UUID
 	IsPopular *bool
 	IsNew     *bool
 	Search    string // case-insensitive substring match on name

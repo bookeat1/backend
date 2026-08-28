@@ -407,14 +407,22 @@ func (h *Handler) adminGet(c *gin.Context) {
 // the favorites flag is a secondary enhancement and must never break the
 // catalog response it's attached to.
 func (h *Handler) attachFavorites(ctx context.Context, out []restaurantResponse, ids []uuid.UUID) {
-	if h.favorites == nil || len(out) != len(ids) {
+	attachFavoritesTo(ctx, h.favorites, out, ids)
+}
+
+// attachFavoritesTo is the body of the above, as a free function, so the picks
+// handler (picks_handler.go) gets the identical behaviour without a second copy
+// of it or a borrowed receiver. Both handlers hold the same optional dependency
+// and there is exactly one right answer to "is this venue a favorite".
+func attachFavoritesTo(ctx context.Context, favorites favoriteChecker, out []restaurantResponse, ids []uuid.UUID) {
+	if favorites == nil || len(out) != len(ids) {
 		return
 	}
 	au, ok := middleware.GetAuthUser(ctx)
 	if !ok {
 		return
 	}
-	set, err := h.favorites.FavoriteSet(ctx, au.ID, ids)
+	set, err := favorites.FavoriteSet(ctx, au.ID, ids)
 	if err != nil {
 		slog.Warn("favorite lookup failed, serving catalog without is_favorite", "error", err)
 		return
