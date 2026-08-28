@@ -269,8 +269,12 @@ type RestaurantFilter struct {
 // catalog listing. Only active restaurants are ever returned.
 type RestaurantSearchFilter struct {
 	// Query is free text matched against the venue's name + description across
-	// ALL locales (base ru columns plus every *_i18n translation). Empty Query
-	// means "no text constraint" — the search degrades to a filtered browse.
+	// ALL locales (base ru columns plus every *_i18n translation) AND against
+	// the names of its AVAILABLE menu items (also across all locales). A venue
+	// therefore answers «паста» either because it says so about itself or
+	// because it cooks it; a dish in the stop list (is_available = false) never
+	// pulls its venue into the result. Empty Query means "no text constraint" —
+	// the search degrades to a filtered browse.
 	Query string
 	// City, Cuisines and Price are AND-combined with the text query. Cuisines is
 	// an OR-set (cuisine_type IN (...)); an empty/nil slice means "any cuisine".
@@ -301,9 +305,11 @@ type RestaurantRepository interface {
 	// Ordering: display_order (NULLs last), then name. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
 	// Search returns active restaurants matching f's text query and filters plus
-	// the total count. When f.Query is non-empty, results are ranked by full-text
-	// relevance then trigram word-similarity, with a deterministic id tie-break
-	// so pagination is stable; when it is empty, ordering matches ListActive.
+	// the total count. When f.Query is non-empty, venues matched by their own
+	// name/description rank above venues matched only through a menu item, then
+	// by full-text relevance, then trigram word-similarity, with a deterministic
+	// id tie-break so pagination is stable; when it is empty, ordering matches
+	// ListActive. Rows matched through the menu carry MatchedDish.
 	Search(ctx context.Context, f RestaurantSearchFilter) ([]RestaurantListItem, int, error)
 	SetActive(ctx context.Context, id uuid.UUID, active bool) error
 	// UpdateBookingPolicy patches the venue's booking-policy overrides: only
@@ -326,6 +332,25 @@ type RestaurantListItem struct {
 	Features []VenueFeature
 	// VenueState — see RestaurantAggregate.VenueState. Nil = not computed.
 	VenueState *PublicVenueState
+	// MatchedDish is the dish that pulled this venue into a SEARCH result, and
+	// is set only by Search and only when the text query matched a menu item.
+	// Nil everywhere else — the catalog listing has no query and therefore no
+	// answer to "why is this here".
+	//
+	// It exists because a venue found by its menu is otherwise inexplicable:
+	// the guest types «паста», gets a venue whose name, description and cuisine
+	// say nothing about pasta, and has to trust it. The card can now say which
+	// dish matched.
+	MatchedDish *MatchedDish
+}
+
+// MatchedDish is the best-matching available menu item behind a search hit —
+// just enough to render a caption, not a menu row (no price, no image: the card
+// explains the match, it does not sell the dish).
+type MatchedDish struct {
+	ID       uuid.UUID
+	Name     string
+	NameI18n I18n
 }
 
 // RestaurantBrief is a minimal (id, localizable name) row. It backs the

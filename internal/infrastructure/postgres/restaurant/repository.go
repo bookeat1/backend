@@ -493,9 +493,53 @@ func appendFeatureConds(where []string, args []any, keys []string) ([]string, []
 
 const searchTextExpr = `restaurant_search_text(r.name, r.description, r.name_i18n, r.description_i18n)`
 
+// menuSearchTextExpr is the exact SQL expression the two GIN indexes in
+// migration 0095 are built over (menu_item_search_text applied to the dish name
+// and its translations). Same rule as searchTextExpr: reference it VERBATIM or
+// the planner will not use the indexes. `m.` resolves to the same columns the
+// unqualified index expression names.
+const menuSearchTextExpr = `menu_item_search_text(m.name, m.name_i18n)`
+
+// menuMatchExpr is the text predicate over a menu item: FTS match OR trigram
+// word-similarity, the same two branches (and therefore the same typo
+// tolerance) the venue's own text gets. $%d is the query, cast ::text at every
+// use site — the parameter feeds plainto_tsquery, <% and word_similarity, and a
+// bare $n reused across differently-typed call sites trips SQLSTATE 42P08 (see
+// bugs/bookeat-backend-cas-sql-type-inference.md).
+//
+// `m.is_available` is NOT decoration: it is both the product rule (a dish in
+// the stop list must not pull its venue into the result) and the predicate of
+// the partial indexes — drop it and the indexes stop matching.
+const menuMatchExpr = `m.is_available
+	AND (to_tsvector('russian', ` + menuSearchTextExpr + `) @@ plainto_tsquery('russian', $%[1]d::text)
+	     OR $%[1]d::text <%% ` + menuSearchTextExpr + `)`
+
+// menuMatchJoin is a LEFT JOIN over ONE pre-aggregated, UNCORRELATED scan of
+// the matching dishes, keyed by venue. Shape matters:
+//
+//   - uncorrelated + grouped means Postgres runs the menu side ONCE, driven by
+//     the GIN indexes, and hashes the result; the outer scan then costs a hash
+//     probe per venue. A correlated `EXISTS (... WHERE m.restaurant_id = r.id)`
+//     under an OR degrades into a per-row SubPlan instead — same answer, one
+//     index probe per venue;
+//   - it is a LEFT JOIN, not an inner one, because a venue matched by its OWN
+//     name must still come back when nothing in its menu matches;
+//   - the aggregates are what let the ORDER BY rank dish-only hits among
+//     themselves instead of leaving them all tied at zero.
+const menuMatchJoin = `LEFT JOIN (
+		SELECT m.restaurant_id,
+		       max(ts_rank(to_tsvector('russian', ` + menuSearchTextExpr + `),
+		                   plainto_tsquery('russian', $%[1]d::text))) AS fts_rank,
+		       max(word_similarity($%[1]d::text, ` + menuSearchTextExpr + `)) AS sim
+		  FROM menu_items m
+		 WHERE ` + menuMatchExpr + `
+		 GROUP BY m.restaurant_id
+	) mm ON mm.restaurant_id = r.id`
+
 // Search implements domain.RestaurantRepository.Search: a full-text +
 // trigram-fuzzy search over the localized name/description of active
-// restaurants, combined with the city / cuisine / price filters.
+// restaurants AND over the localized names of their available menu items,
+// combined with the city / cuisine / price / feature filters.
 func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
 	where := []string{"r.is_active = true"}
 	args := []any{}
@@ -527,41 +571,60 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 	// 42P08 (see bugs/bookeat-backend-cas-sql-type-inference.md).
 	q := strings.TrimSpace(f.Query)
 	var qN int
+	// joinSQL is empty unless there is a text query: without one there is
+	// nothing to match a dish against, and the browse must not pay for a join.
+	joinSQL := ""
+	// venueMatch is the venue's OWN text predicate, reused verbatim in the WHERE
+	// and in the ORDER BY (where it separates "found by its name" from "found by
+	// its menu"). Kept as one string so those two can never drift apart.
+	venueMatch := ""
 	if q != "" {
 		args = append(args, q)
 		qN = len(args)
 		// FTS match OR trigram word-similarity (typo tolerance). Both branches
 		// are index-backed (idx_restaurants_search_fts / _trgm), so the planner
 		// can BitmapOr them instead of scanning.
-		where = append(where, fmt.Sprintf(
+		venueMatch = fmt.Sprintf(
 			`(to_tsvector('russian', %s) @@ plainto_tsquery('russian', $%d::text)
 			  OR $%d::text <%% %s)`,
-			searchTextExpr, qN, qN, searchTextExpr))
+			searchTextExpr, qN, qN, searchTextExpr)
+		joinSQL = fmt.Sprintf(menuMatchJoin, qN)
+		// The venue answers the query either about itself or through its menu.
+		// mm.restaurant_id IS NOT NULL is "the LEFT JOIN found a matching
+		// available dish" — see menuMatchJoin for why this is a hashed join and
+		// not a correlated EXISTS.
+		where = append(where, `(`+venueMatch+` OR mm.restaurant_id IS NOT NULL)`)
 	}
 	whereSQL := strings.Join(where, " AND ")
 
 	var total int
 	if err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT count(*) FROM restaurants r WHERE `+whereSQL, args...).Scan(&total); err != nil {
+		`SELECT count(*) FROM restaurants r `+joinSQL+` WHERE `+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count search restaurants: %w", err)
 	}
 
-	// Ordering: with a text query, rank by FTS relevance then trigram
-	// word-similarity, tie-broken by id so a page boundary is deterministic
-	// (equal-ranked rows never reshuffle between pages). Without a query the
-	// endpoint degrades to a filtered browse ordered like the catalog listing.
+	// Ordering: with a text query, a venue matched by its own name/description
+	// outranks one matched only through a dish — the guest typed a word, and
+	// "this place IS that" is a stronger answer than "this place cooks that".
+	// Within each class: FTS relevance, then trigram word-similarity, then the
+	// best-matching dish's ranks, tie-broken by id so a page boundary is
+	// deterministic (equal-ranked rows never reshuffle between pages). Without a
+	// query the endpoint degrades to a filtered browse ordered like the catalog
+	// listing.
 	orderSQL := `ORDER BY r.display_order ASC NULLS LAST, r.name ASC, r.id ASC`
 	if q != "" {
 		orderSQL = fmt.Sprintf(
-			`ORDER BY ts_rank(to_tsvector('russian', %s), plainto_tsquery('russian', $%d::text)) DESC,
-			 word_similarity($%d::text, %s) DESC, r.id ASC`,
-			searchTextExpr, qN, qN, searchTextExpr)
+			`ORDER BY %s DESC,
+			 ts_rank(to_tsvector('russian', %s), plainto_tsquery('russian', $%d::text)) DESC,
+			 word_similarity($%d::text, %s) DESC,
+			 COALESCE(mm.fts_rank, 0) DESC, COALESCE(mm.sim, 0) DESC, r.id ASC`,
+			venueMatch, searchTextExpr, qN, qN, searchTextExpr)
 	}
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
 	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
-		FROM restaurants r WHERE ` + whereSQL + `
+		FROM restaurants r ` + joinSQL + ` WHERE ` + whereSQL + `
 		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
@@ -588,7 +651,69 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 	if err := r.attachFeatures(ctx, items); err != nil {
 		return nil, 0, err
 	}
+	if err := r.attachMatchedDishes(ctx, items, q); err != nil {
+		return nil, 0, err
+	}
 	return items, total, nil
+}
+
+// attachMatchedDishes fills RestaurantListItem.MatchedDish for the rows that a
+// menu item pulled in, so the card can say WHY the venue is in the result.
+//
+// One extra query per page, batched over the page's ids — the same shape as
+// attachCuisines / attachFeatures. Deliberately not a lateral join inside the
+// main query: that would drag the dish columns through the count query, the
+// ordering and every scan path, to decorate at most `per_page` rows.
+//
+// DISTINCT ON picks ONE dish per venue — the best-matching available one, by
+// the same FTS-then-trigram order the venues themselves are ranked with, with
+// the id tie-break so the caption is stable between identical requests. A venue
+// found by its own name and by a dish gets the dish too: that is not a
+// contradiction, it is extra explanation the transport is free to ignore.
+func (r *Repository) attachMatchedDishes(ctx context.Context, items []domain.RestaurantListItem, q string) error {
+	if q == "" || len(items) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	for i := range items {
+		ids = append(ids, items[i].Restaurant.ID)
+	}
+	sql := fmt.Sprintf(`SELECT DISTINCT ON (m.restaurant_id)
+			m.restaurant_id, m.id, m.name, m.name_i18n
+		  FROM menu_items m
+		 WHERE m.restaurant_id = ANY($1::uuid[]) AND %s
+		 ORDER BY m.restaurant_id,
+			ts_rank(to_tsvector('russian', %s), plainto_tsquery('russian', $2::text)) DESC,
+			word_similarity($2::text, %s) DESC, m.id ASC`,
+		fmt.Sprintf(menuMatchExpr, 2), menuSearchTextExpr, menuSearchTextExpr)
+
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, sql, ids, q)
+	if err != nil {
+		return fmt.Errorf("matched dishes: %w", err)
+	}
+	defer rows.Close()
+
+	byVenue := make(map[uuid.UUID]domain.MatchedDish, len(items))
+	for rows.Next() {
+		var venueID uuid.UUID
+		var d domain.MatchedDish
+		var nameI18n []byte
+		if err := rows.Scan(&venueID, &d.ID, &d.Name, &nameI18n); err != nil {
+			return fmt.Errorf("scan matched dish: %w", err)
+		}
+		d.NameI18n = i18nFromDB(nameI18n)
+		byVenue[venueID] = d
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("matched dishes: %w", err)
+	}
+	for i := range items {
+		if d, ok := byVenue[items[i].Restaurant.ID]; ok {
+			dish := d
+			items[i].MatchedDish = &dish
+		}
+	}
+	return nil
 }
 
 func (r *Repository) args(m *domain.Restaurant) []any {

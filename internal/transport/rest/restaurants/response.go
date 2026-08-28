@@ -43,11 +43,16 @@ type restaurantResponse struct {
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
 	PrimaryImage *string             `json:"primary_image,omitempty"`
-	Images       []imageResponse     `json:"images,omitempty"`
-	Features     []featureResponse   `json:"features,omitempty"`
-	Tags         []tagResponse       `json:"tags,omitempty"`
-	SocialLinks  []socialResponse    `json:"social_links,omitempty"`
-	CreatedAt    time.Time           `json:"created_at"`
+	// MatchedDish is set ONLY by the search endpoint, and only when the venue
+	// was pulled in by a menu item. Absent from the JSON otherwise — a pointer
+	// so "no dish matched" and "this response has no notion of a query" are
+	// both simply "no field", never an empty object the app has to special-case.
+	MatchedDish *matchedDishResponse `json:"matched_dish,omitempty"`
+	Images      []imageResponse      `json:"images,omitempty"`
+	Features    []featureResponse    `json:"features,omitempty"`
+	Tags        []tagResponse        `json:"tags,omitempty"`
+	SocialLinks []socialResponse     `json:"social_links,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
 	// IsFavorite is nil for an anonymous caller (omitted from the JSON
 	// entirely) and an explicit true/false for an authenticated one — a
 	// pointer so "not favorited" and "we don't know because you're not
@@ -165,6 +170,16 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 type priceRangeResponse struct {
 	Min int `json:"min"`
 	Max int `json:"max"`
+}
+
+// matchedDishResponse explains a SEARCH hit that the venue's own name and
+// description do not explain: the guest typed "pasta" and got a venue that says
+// nothing about pasta because the pasta is in its menu. Present only on
+// /restaurants/search, and only for such rows — the catalog listing has no
+// query and never fills it, so the field is simply not serialized there.
+type matchedDishResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type imageResponse struct {
@@ -299,6 +314,12 @@ func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantRes
 	// shown under a «Wi-Fi» filter has to be able to say why it matched.
 	resp.Features = featuresToResponse(it.Features, lang)
 	applyVenueState(&resp, it.VenueState)
+	if d := it.MatchedDish; d != nil {
+		resp.MatchedDish = &matchedDishResponse{
+			ID:   d.ID.String(),
+			Name: d.NameI18n.Resolve(lang, d.Name),
+		}
+	}
 	return resp
 }
 
