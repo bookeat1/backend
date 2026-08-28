@@ -238,3 +238,23 @@ type telegramChatRequest struct {
 type whatsAppPhoneRequest struct {
 	WhatsAppPhone string `json:"whatsapp_phone"`
 }
+
+// acquirerAccountRequest points a venue at one of an acquirer's accounts.
+// account_ref is an ADDRESS (for Kaspi, the company id inside our Kaspi
+// service), never a key — credentials are read from env and are not settable
+// over HTTP.
+type acquirerAccountRequest struct {
+	Provider   string `json:"provider"`
+	AccountRef string `json:"account_ref"`
+	// IsActive suspends the mapping without losing it. Absent means false, so
+	// the panel must send it explicitly when enabling a venue.
+	IsActive bool `json:"is_active"`
+}
+
+func (r acquirerAccountRequest) toInput() adminuc.AcquirerAccount {
+	return adminuc.AcquirerAccount{
+		Provider:   domain.PaymentProvider(strings.TrimSpace(r.Provider)),
+		AccountRef: r.AccountRef,
+		IsActive:   r.IsActive,
+	}
+}

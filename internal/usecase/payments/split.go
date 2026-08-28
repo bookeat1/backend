@@ -2,7 +2,6 @@ package payments
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -51,20 +50,19 @@ func (u *createUseCase) resolveSplitPlan(
 	ctx context.Context,
 	provider domain.PaymentProvider,
 	restaurantID uuid.UUID,
+	account *domain.RestaurantSplitAccount,
 	base, fee, total domain.Money,
 ) (domain.PaymentSplitPlan, error) {
 	if !u.cfg.SplitEnabled || u.splitAccounts == nil {
 		return nil, nil
 	}
-
-	account, err := u.splitAccounts.GetActive(ctx, provider, restaurantID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return nil, domain.WithCode(domain.CodeSplitAccountMissing, fmt.Errorf(
-				"restaurant %s has no active %s sub-merchant account, split payments cannot be taken for it: %w",
-				restaurantID, provider, domain.ErrUnavailable))
-		}
-		return nil, err
+	// account is resolved once by the caller (createUseCase.resolveSplitAccount)
+	// and is nil for a venue that was never onboarded, or whose account was
+	// deactivated.
+	if account == nil {
+		return nil, domain.WithCode(domain.CodeSplitAccountMissing, fmt.Errorf(
+			"restaurant %s has no active %s sub-merchant account, split payments cannot be taken for it: %w",
+			restaurantID, provider, domain.ErrUnavailable))
 	}
 
 	plan, err := domain.BuildPaymentSplitPlan(base, fee, account.AccountRef, u.cfg.PlatformSplitAccountRef)

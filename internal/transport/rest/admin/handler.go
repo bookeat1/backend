@@ -12,6 +12,7 @@ package admin
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -41,6 +42,12 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	// Payment settings: the pre-order policy (offer pre-payment + optional minimum).
 	rg.GET("/admin/restaurants/:id/payment-settings/preorder", h.getPreorderSettings)
 	rg.PUT("/admin/restaurants/:id/payment-settings/preorder", h.setPreorderSettings)
+
+	// Payment settings: which of an acquirer's accounts this venue's money is
+	// routed to (Kaspi: the company inside our Kaspi service). Readable by the
+	// venue, writable by the platform only — see uc.SetAcquirerAccount.
+	rg.GET("/admin/restaurants/:id/payment-settings/acquirer-account", h.getAcquirerAccount)
+	rg.PUT("/admin/restaurants/:id/payment-settings/acquirer-account", h.setAcquirerAccount)
 
 	// Notification settings: the venue's Telegram alert chat.
 	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
@@ -168,6 +175,52 @@ func (h *Handler) setPreorderSettings(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, preorderSettingsResponse{Enabled: req.Enabled, MinAmountMinor: req.MinAmountMinor})
+}
+
+// ---- Payment settings (acquirer account) -----------------------------------
+
+// getAcquirerAccount reports which of the acquirer's accounts this venue's
+// money is routed to. The provider is a required query parameter (?provider=kaspi):
+// a venue may be onboarded to more than one acquirer, and defaulting it would
+// answer about an acquirer the caller did not ask about. owner/manager, enforced
+// in the usecase.
+func (h *Handler) getAcquirerAccount(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	provider := domain.PaymentProvider(strings.TrimSpace(c.Query("provider")))
+	if provider == "" {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "provider query parameter is required")
+		return
+	}
+	account, err := h.panel.GetAcquirerAccount(c.Request.Context(), actor, rid, provider)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, acquirerAccountToResponse(account))
+}
+
+// setAcquirerAccount points a venue's money at one of the acquirer's accounts.
+// SUPERADMIN ONLY (enforced in the usecase): this value decides whose account a
+// guest's money lands in.
+func (h *Handler) setAcquirerAccount(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req acquirerAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	account, err := h.panel.SetAcquirerAccount(c.Request.Context(), actor, rid, req.toInput())
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, acquirerAccountToResponse(account))
 }
 
 // ---- Notification settings (Telegram) --------------------------------------

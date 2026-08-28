@@ -180,10 +180,35 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	}
 	provider := gw.Name()
 
-	// Decided BEFORE the idempotency replay and before any acquirer call: a
-	// venue that cannot receive its share must not get as far as a hold that
-	// somebody then has to void.
-	splits, err := u.resolveSplitPlan(ctx, provider, booking.RestaurantID, base, fee, total)
+	// An acquirer that cannot charge a fraction of its currency unit (Kaspi
+	// takes whole tenge) needs the total adjusted BEFORE the payment row is
+	// written, so the amount we record, the amount we charge and the amount its
+	// webhook reports back are one number. Done here rather than inside the
+	// adapter on purpose: an adapter that rounded silently would charge a
+	// number the ledger never saw.
+	fee, total, err = roundToGatewayGranularity(gw, base, fee, total)
+	if err != nil {
+		return nil, err
+	}
+
+	// The venue's identity at this acquirer, read exactly ONCE and then used
+	// for both things that need it: where the charge lands
+	// (MerchantAccountRef) and how it is divided (the split plan). One read,
+	// because two reads of the same row inside one checkout can disagree.
+	//
+	// Resolved BEFORE the idempotency replay and before any acquirer call: a
+	// venue nobody finished onboarding must not get as far as a payable link
+	// that credits the wrong till, nor as far as a hold somebody has to void.
+	account, err := u.resolveSplitAccount(ctx, provider, booking.RestaurantID)
+	if err != nil {
+		return nil, err
+	}
+	var accountRef string
+	if account != nil {
+		accountRef = account.AccountRef
+	}
+
+	splits, err := u.resolveSplitPlan(ctx, provider, booking.RestaurantID, account, base, fee, total)
 	if err != nil {
 		return nil, err
 	}
@@ -224,9 +249,20 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		CustomerPhone:  booking.PhoneNormalized,
 		CustomerEmail:  booking.Email,
 		Splits:         splits,
+
+		MerchantAccountRef: accountRef,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("authorize with %s: %w", provider, err)
+	}
+	// The acquirer's own deadline wins over our configured HoldTTL whenever it
+	// gave one. A Kaspi payment link lives MINUTES, not hours: showing the
+	// guest our own longer guess would put a live countdown on a dead link and
+	// tell the venue a table is still being paid for when it is not. Only a
+	// deadline in the future is taken — a clock skew or a stale answer must
+	// not create a payment that is already expired the moment it is stored.
+	if gwResp.ExpiresAt != nil && gwResp.ExpiresAt.After(now) {
+		expiresAt = *gwResp.ExpiresAt
 	}
 
 	p := &domain.Payment{
@@ -399,4 +435,77 @@ func nullableStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// amountGranularity is an OPTIONAL acquirer capability: the smallest amount
+// step it is able to charge, in minor units.
+//
+// It is not part of domain.PaymentGateway because almost no acquirer needs it
+// — FreedomPay and TipTopPay both charge tiyn — and the domain must not carry
+// a method half its adapters would have to answer "1" to. Kaspi Pay charges
+// whole tenge (100 minor units) and implements it; callers type-assert, the
+// same pattern as payment.MerchantIDFinder.
+type amountGranularity interface {
+	MinChargeableUnitMinor() int64
+}
+
+// roundToGatewayGranularity raises the total to the acquirer's next chargeable
+// step and puts the difference on the PLATFORM's side of the split.
+//
+// Which side absorbs the rounding is the whole decision here, and it is not
+// arbitrary: BaseAmountMinor is what the venue is owed (a pre-order total the
+// guest was shown, or a deposit the venue set) and must not move — a guest who
+// saw 2 538 ₸ of food must not be charged for 2 539 ₸ of food. The service fee
+// is ours and can absorb up to 99 tiyn. The invariant amount = base + fee
+// (chk_payments_amount_split) is preserved by construction.
+func roundToGatewayGranularity(gw domain.PaymentGateway, base, fee, total domain.Money) (domain.Money, domain.Money, error) {
+	g, ok := gw.(amountGranularity)
+	if !ok {
+		return fee, total, nil
+	}
+	unit := g.MinChargeableUnitMinor()
+	if unit <= 1 || total.AmountMinor <= 0 {
+		return fee, total, nil
+	}
+	remainder := total.AmountMinor % unit
+	if remainder == 0 {
+		return fee, total, nil
+	}
+	bump := unit - remainder
+	newTotal, err := domain.NewMoney(total.AmountMinor+bump, total.Currency)
+	if err != nil {
+		return domain.Money{}, domain.Money{}, err
+	}
+	newFee, err := domain.NewMoney(fee.AmountMinor+bump, fee.Currency)
+	if err != nil {
+		return domain.Money{}, domain.Money{}, err
+	}
+	if newFee.AmountMinor+base.AmountMinor != newTotal.AmountMinor {
+		// Unreachable by construction; asserted because a silent break here
+		// would be a payment whose parts do not add up to its total.
+		return domain.Money{}, domain.Money{}, fmt.Errorf(
+			"%w: rounding to the acquirer's %d-minor step broke base+fee=total", domain.ErrValidation, unit)
+	}
+	return newFee, newTotal, nil
+}
+
+// resolveSplitAccount reads the venue's identity at this acquirer
+// (restaurant_split_accounts). A venue with no row gets (nil, nil): most
+// acquirers settle onto one platform account and need no per-venue address at
+// all, and whether a missing mapping is fatal is decided by the callers —
+// resolveSplitPlan refuses it when split payments are on, and an adapter that
+// needs an address refuses an empty ref itself, naming the venue (see
+// kaspi.validateAuthorize).
+func (u *createUseCase) resolveSplitAccount(ctx context.Context, provider domain.PaymentProvider, restaurantID uuid.UUID) (*domain.RestaurantSplitAccount, error) {
+	if u.splitAccounts == nil {
+		return nil, nil
+	}
+	account, err := u.splitAccounts.GetActive(ctx, provider, restaurantID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return account, nil
 }

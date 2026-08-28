@@ -40,6 +40,7 @@ package payments
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -147,6 +148,38 @@ func (h *Handler) RegisterWebhooks(rg *gin.RouterGroup) {
 	g := rg.Group("/webhooks/payments")
 	g.POST("/freedompay", h.freedomPayWebhook)
 	g.POST("/tiptoppay/:type", h.tipTopPayWebhook)
+	g.POST("/kaspi", h.kaspiWebhook)
+}
+
+// kaspiWebhook receives a delivery from our multi-tenant Kaspi service.
+//
+// Unlike the other two, this one does NOT acknowledge unconditionally, and the
+// difference is deliberate: the sender is our own service, whose retry
+// behaviour is known rather than guessed (5 attempts at 5s/30s/2m/10m/1h, a
+// delivery is closed on any 2xx and retried otherwise). So the HTTP status is
+// used for what it is worth — a callback we failed to APPLY (a database blip
+// while capturing) comes back and gets another chance, instead of being
+// acknowledged and lost. Redelivery is safe by construction: the event's
+// idempotency key is the service's own, and payment_events dedups on it.
+//
+// A bad signature answers 401 and is never interpreted (spec §7); the attempt
+// is still recorded as evidence inside the usecase.
+func (h *Handler) kaspiWebhook(c *gin.Context) {
+	raw, ok := readWebhookBody(c)
+	if !ok {
+		return
+	}
+	err := h.webhook.HandleWebhook(c.Request.Context(), domain.ProviderKaspi, raw, headerMap(c.Request.Header))
+	switch {
+	case err == nil:
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	case errors.Is(err, domain.ErrUnauthorized):
+		response.Error(c.Writer, http.StatusUnauthorized, "signature verification failed")
+	default:
+		// Do not echo err: it may name internal state. The event row carries
+		// the full text for an operator.
+		response.Error(c.Writer, http.StatusInternalServerError, "callback could not be processed, retry it")
+	}
 }
 
 // createPayment starts (or replays) the payment for a booking.

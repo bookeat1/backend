@@ -265,3 +265,22 @@ type telegramSettingsResponse struct {
 	TelegramChatID string `json:"telegram_chat_id"`
 	Enabled        bool   `json:"enabled"`
 }
+
+// acquirerAccountResponse is the panel's view of a venue↔acquirer mapping.
+// connected=false is the ordinary state of a venue nobody has onboarded to
+// that acquirer yet.
+type acquirerAccountResponse struct {
+	Provider   string `json:"provider"`
+	Connected  bool   `json:"connected"`
+	AccountRef string `json:"account_ref"`
+	IsActive   bool   `json:"is_active"`
+}
+
+func acquirerAccountToResponse(a uc.AcquirerAccount) acquirerAccountResponse {
+	return acquirerAccountResponse{
+		Provider:   string(a.Provider),
+		Connected:  a.AccountRef != "",
+		AccountRef: a.AccountRef,
+		IsActive:   a.IsActive,
+	}
+}
