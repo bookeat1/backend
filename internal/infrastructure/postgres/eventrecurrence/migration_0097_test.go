@@ -22,6 +22,15 @@ import (
 // at 96 would fail every other package in the suite.
 const seriesContentMigrationVersion = 97
 
+// seriesContentMigrationFloor is the version immediately below 0097. The round
+// trip reverts down TO this version instead of "one step down": goose's Down
+// takes off the LAST applied migration, which stopped being 0097 the moment
+// 0098 landed — the rollback then removed somebody else's migration, 0097 was
+// never re-applied, and its backfill was never exercised at all. Reverting to a
+// floor keeps the step pointing at 0097 no matter how much is stacked on top
+// (same rule as cuisineMigrationFloor / featuresMigrationFloor).
+const seriesContentMigrationFloor = seriesContentMigrationVersion - 1
+
 func gooseDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("pgx", os.Getenv("TEST_DATABASE_URL"))
@@ -55,8 +64,8 @@ func gooseDB(t *testing.T) *sql.DB {
 func downMutateUp(t *testing.T, db *sql.DB, mutate func()) {
 	t.Helper()
 	ctx := context.Background()
-	if err := goose.DownContext(ctx, db, "."); err != nil {
-		t.Fatalf("goose down: %v", err)
+	if err := goose.DownToContext(ctx, db, ".", seriesContentMigrationFloor); err != nil {
+		t.Fatalf("goose down to %d: %v", seriesContentMigrationFloor, err)
 	}
 	if mutate != nil {
 		mutate()
@@ -227,8 +236,8 @@ func TestMigration0097RollsBackAndReapplies(t *testing.T) {
 	})
 
 	// Roll back once more and check what a rollback actually costs.
-	if err := goose.DownContext(ctx, db, "."); err != nil {
-		t.Fatalf("goose down: %v", err)
+	if err := goose.DownToContext(ctx, db, ".", seriesContentMigrationFloor); err != nil {
+		t.Fatalf("goose down to %d: %v", seriesContentMigrationFloor, err)
 	}
 	var title string
 	if err := pool.QueryRow(ctx, `SELECT title FROM events WHERE id = $1`, date).Scan(&title); err != nil {
