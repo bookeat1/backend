@@ -7,27 +7,38 @@ import (
 )
 
 type restaurantResponse struct {
-	ID          string            `json:"id"`
-	CategoryID  *string           `json:"category_id"`
-	Name        string            `json:"name"`
-	NameI18n    map[string]string `json:"name_i18n,omitempty"`
-	Description string            `json:"description"`
+	ID         string            `json:"id"`
+	CategoryID *string           `json:"category_id"`
+	Name       string            `json:"name"`
+	NameI18n   map[string]string `json:"name_i18n,omitempty"`
+	// Description/Address/OpeningHours/CuisineType are resolved into the
+	// caller's language; the raw translation maps next to them are the
+	// CABINET's view and are attached only by aggregateToResponse when the
+	// caller asked for no language at all (see attachRawTranslations). A guest
+	// never needs them — the server already resolved the text — and shipping
+	// three languages of every description with every catalog card would pay
+	// for an editing screen on the hottest read in the app.
+	Description     string            `json:"description"`
+	DescriptionI18n map[string]string `json:"description_i18n,omitempty"`
 	// CuisineType is the LEGACY single-string cuisine field: the venue's
 	// cuisines joined with ", ". It is NOT removed and never will be silently:
 	// the store builds (1.4 live, 1.5 in review) read exactly this string and
 	// send it back as a filter value. `cuisines` below is the structured form
 	// new clients should read.
-	CuisineType string `json:"cuisine_type"`
+	CuisineType     string            `json:"cuisine_type"`
+	CuisineTypeI18n map[string]string `json:"cuisine_type_i18n,omitempty"`
 	// Cuisines is the venue's cuisine set from the platform dictionary, in the
 	// venue's own order (first = main). Omitted entirely when the venue has no
 	// dictionary links yet — a venue whose historical value is still awaiting a
 	// manual split has cuisine_type and nothing here, and an empty array would
 	// read as "this venue declared no cuisine", which is a different statement.
-	Cuisines      []cuisineResponse `json:"cuisines,omitempty"`
-	Address       string            `json:"address"`
-	OpeningHours  string            `json:"opening_hours"`
-	City          string            `json:"city"`
-	PriceCategory string            `json:"price_category"`
+	Cuisines         []cuisineResponse `json:"cuisines,omitempty"`
+	Address          string            `json:"address"`
+	AddressI18n      map[string]string `json:"address_i18n,omitempty"`
+	OpeningHours     string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]string `json:"opening_hours_i18n,omitempty"`
+	City             string            `json:"city"`
+	PriceCategory    string            `json:"price_category"`
 	// PriceRange is the numeric average-check range in whole tenge, shown next
 	// to the categorical PriceCategory. A pointer with omitempty so it is absent
 	// entirely when the venue has not declared a range (both bounds NULL) —
@@ -334,8 +345,26 @@ func PublicListItem(it domain.RestaurantListItem, lang string) any {
 	return listItemToResponse(it, lang)
 }
 
+// attachRawTranslations adds the editable translation maps to a response.
+//
+// It runs ONLY for a caller that asked for no language, which is what the
+// cabinet reads do (aggregateToResponse(agg, "")): whoever edits a venue has to
+// see the translations they are about to patch, and whoever merely reads it has
+// already been served the resolved text. The maps are the WHOLE stored value,
+// including languages this build does not serve (the old import left ko/zh
+// behind) — an editor must be able to see what is actually in the row.
+func attachRawTranslations(resp *restaurantResponse, r domain.Restaurant) {
+	resp.DescriptionI18n = r.DescriptionI18n
+	resp.CuisineTypeI18n = r.CuisineTypeI18n
+	resp.AddressI18n = r.AddressI18n
+	resp.OpeningHoursI18n = r.OpeningHoursI18n
+}
+
 func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantResponse {
 	resp := baseFromDomain(a.Restaurant, lang)
+	if lang == "" {
+		attachRawTranslations(&resp, a.Restaurant)
+	}
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {

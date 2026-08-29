@@ -595,3 +595,49 @@ func TestListCandidates_CarriesThePromoDiscount(t *testing.T) {
 		t.Fatalf("an event must carry nil discount, got %v", *it.DiscountPercent)
 	}
 }
+
+// The main screen shows a promo's fine print, so it has to carry its
+// translations too. The event branch of the union has no terms at all and
+// projects NULL — a mismatch there fails the WHOLE feed query, not one row.
+func TestListCandidates_CarriesTermsTranslations(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, feedTables...)
+	ctx := context.Background()
+
+	rid := seedVenue(ctx, t, pool, "Almaty venue", activeVenue())
+	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
+	promoID := seedPromo(ctx, t, pool, rid, "Счастливые часы", domain.PromoPublished, open, close, domain.FeedApproved, 0)
+	eventID := seedEvent(ctx, t, pool, rid, "Вечер", domain.EventPublished,
+		feedNow.Add(72*time.Hour), feedNow.Add(96*time.Hour), domain.FeedApproved, 0)
+	if _, err := pool.Exec(ctx,
+		`UPDATE promos SET terms = 'Только зал', terms_i18n = $2 WHERE id = $1`,
+		promoID, []byte(`{"ru":"Только зал","kk":"Тек залда"}`)); err != nil {
+		t.Fatalf("set terms: %v", err)
+	}
+
+	got, err := New(pool).ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListCandidates: %v", err)
+	}
+	var sawPromo, sawEvent bool
+	for _, it := range got {
+		switch it.ID {
+		case promoID:
+			sawPromo = true
+			if it.TermsI18n["kk"] != "Тек залда" {
+				t.Errorf("the feed must carry terms_i18n, got %v", it.TermsI18n)
+			}
+			if v := it.TermsI18n.Resolve(domain.LocaleKK, it.Terms); v != "Тек залда" {
+				t.Errorf("kk terms = %q", v)
+			}
+		case eventID:
+			sawEvent = true
+			if it.TermsI18n != nil {
+				t.Errorf("an event has no fine print, got %v", it.TermsI18n)
+			}
+		}
+	}
+	if !sawPromo || !sawEvent {
+		t.Fatalf("both cards must be in the feed, got promo=%v event=%v", sawPromo, sawEvent)
+	}
+}

@@ -28,11 +28,23 @@ func gooseDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open goose db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
 	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("goose dialect: %v", err)
 	}
+	// Put the SHARED database back at the latest version whatever happens here,
+	// including a t.Fatal in the middle of a down/up dance. Without this, a
+	// failing assertion between the rollback and the re-apply leaves the
+	// database one migration short, and every package that runs afterwards
+	// fails on a column that is missing for reasons of its own. The assertions
+	// themselves are untouched: this only guarantees the cleanup the happy path
+	// already does.
+	t.Cleanup(func() {
+		if err := goose.UpContext(context.Background(), db, "."); err != nil {
+			t.Errorf("restore the shared test database: %v", err)
+		}
+		_ = db.Close()
+	})
 	return db
 }
 

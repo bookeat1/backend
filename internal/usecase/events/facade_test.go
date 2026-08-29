@@ -489,3 +489,169 @@ func (f *fakeEventRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string
 func (f *fakeEventRepo) ImagesByEvent(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
 	return map[uuid.UUID][]string{}, nil
 }
+
+// --- venue and button translations (migration 0101) ---
+
+func strPtr(s string) *string { return &s }
+
+// The venue line and the button caption are guest-facing text and now travel
+// with translations, kept in step with their Russian columns.
+func TestCreate_WritesVenueAndActionLabelTranslations(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	in := validCreate(rid)
+	in.Venue = "Летняя терраса"
+	in.VenueI18n = domain.I18nPatch{"kk": strPtr("Жазғы террасса")}
+	in.Action = &domain.EventAction{Label: "Купить билет"}
+	in.ActionLabelI18n = domain.I18nPatch{"en": strPtr("Buy a ticket")}
+
+	if _, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got := repo.created
+	if got.VenueI18n["kk"] != "Жазғы террасса" {
+		t.Errorf("VenueI18n[kk] = %q", got.VenueI18n["kk"])
+	}
+	if got.VenueI18n["ru"] != "Летняя терраса" {
+		t.Errorf(`VenueI18n["ru"] = %q, want it equal to the venue column`, got.VenueI18n["ru"])
+	}
+	if got.Action == nil || got.Action.LabelI18n["en"] != "Buy a ticket" {
+		t.Errorf("action label translations = %#v", got.Action)
+	}
+	if got.Action.LabelI18n["ru"] != "Купить билет" {
+		t.Errorf(`LabelI18n["ru"] = %q, want it equal to the label`, got.Action.LabelI18n["ru"])
+	}
+	// No Kazakh caption: the guest falls back to the Russian one, never to an
+	// empty button.
+	if v := got.Action.LabelI18n.Resolve(domain.LocaleKK, got.Action.Label); v != "Купить билет" {
+		t.Errorf("kk label = %q, want the Russian fallback", v)
+	}
+}
+
+// The neighbour-language rule for an event: naming kk must not cost it English.
+func TestUpdate_VenueTranslationPatchKeepsOtherLanguages(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Вечер", Status: domain.EventPublished,
+		Venue:     "Терраса",
+		VenueI18n: domain.I18n{"ru": "Терраса", "en": "Terrace"},
+		Action:    &domain.EventAction{Label: "Купить", LabelI18n: domain.I18n{"ru": "Купить", "en": "Buy"}},
+	}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, UpdateInput{
+		Title:           "Вечер",
+		StartsAt:        time.Now(),
+		EndsAt:          time.Now().Add(time.Hour),
+		Status:          domain.EventPublished,
+		Venue:           "Терраса",
+		VenueI18n:       domain.I18nPatch{"kk": strPtr("Террасса")},
+		Action:          &domain.EventAction{Label: "Купить"},
+		ActionLabelI18n: domain.I18nPatch{"kk": strPtr("Сатып алу")},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got.VenueI18n["en"] != "Terrace" {
+		t.Errorf("VenueI18n[en] = %q, want the untouched English kept", got.VenueI18n["en"])
+	}
+	if got.VenueI18n["kk"] != "Террасса" {
+		t.Errorf("VenueI18n[kk] = %q", got.VenueI18n["kk"])
+	}
+	if got.Action.LabelI18n["en"] != "Buy" {
+		t.Errorf("LabelI18n[en] = %q, want the English caption kept", got.Action.LabelI18n["en"])
+	}
+	if got.Action.LabelI18n["kk"] != "Сатып алу" {
+		t.Errorf("LabelI18n[kk] = %q", got.Action.LabelI18n["kk"])
+	}
+}
+
+// Removing the button removes its translations with it: a caption that does
+// not exist cannot be translated (the DB CHECK from 0101 says so too).
+func TestUpdate_RemovingTheButtonDropsItsTranslations(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Вечер", Status: domain.EventPublished,
+		Action: &domain.EventAction{Label: "Купить", LabelI18n: domain.I18n{"ru": "Купить", "en": "Buy"}},
+	}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, UpdateInput{
+		Title:    "Вечер",
+		StartsAt: time.Now(),
+		EndsAt:   time.Now().Add(time.Hour),
+		Status:   domain.EventPublished,
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if repo.updated.Action != nil {
+		t.Fatalf("the button must be gone, got %#v", repo.updated.Action)
+	}
+}
+
+// Writing the Russian venue line re-syncs its ru translation — otherwise every
+// read keeps returning the room the venue just renamed.
+func TestUpdate_VenueColumnRewritesItsRussianTranslation(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Вечер", Status: domain.EventPublished,
+		Venue:     "Терраса",
+		VenueI18n: domain.I18n{"ru": "Терраса", "kk": "Террасса"},
+	}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, UpdateInput{
+		Title:    "Вечер",
+		StartsAt: time.Now(),
+		EndsAt:   time.Now().Add(time.Hour),
+		Status:   domain.EventPublished,
+		Venue:    "Банкетный зал",
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got.VenueI18n["ru"] != "Банкетный зал" {
+		t.Errorf(`VenueI18n["ru"] = %q, want the new room`, got.VenueI18n["ru"])
+	}
+	if got.VenueI18n["kk"] != "Террасса" {
+		t.Errorf("the Kazakh room name was lost: %v", got.VenueI18n)
+	}
+}
+
+func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	ev := &domain.Event{ID: uuid.New(), RestaurantID: &rid, Title: "Вечер", Status: domain.EventPublished}
+	repo.byID[ev.ID] = ev
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, ev.ID, UpdateInput{
+		Title:     "Вечер",
+		StartsAt:  time.Now(),
+		EndsAt:    time.Now().Add(time.Hour),
+		Status:    domain.EventPublished,
+		VenueI18n: domain.I18nPatch{"zh": strPtr("文")},
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation (→ 422), got %v", err)
+	}
+	if repo.updated != nil {
+		t.Error("nothing must be written when the translation is refused")
+	}
+}

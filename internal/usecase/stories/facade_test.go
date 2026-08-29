@@ -574,3 +574,145 @@ func TestUpdateStory_DangerousActionURLRejected(t *testing.T) {
 		t.Fatal("nothing must be written when the link is refused")
 	}
 }
+
+// --- caption translations (migration 0101) ---
+
+func TestCreateStory_WritesCaptionTranslations(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.CreateStory(context.Background(), managerActor(actorID), CreateInput{
+		RestaurantID: rid,
+		ImageURL:     "https://cdn/x.jpg",
+		Caption:      strptr("Новое меню"),
+		CaptionI18n:  domain.I18nPatch{"kk": strptr("Жаңа мәзір")},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if s.CaptionI18n["kk"] != "Жаңа мәзір" {
+		t.Errorf("CaptionI18n[kk] = %q", s.CaptionI18n["kk"])
+	}
+	if s.CaptionI18n["ru"] != "Новое меню" {
+		t.Errorf(`CaptionI18n["ru"] = %q, want it equal to the caption column`, s.CaptionI18n["ru"])
+	}
+	// The guest read: Kazakh gets the translation, English falls back to the
+	// Russian caption rather than to an empty label.
+	if v := s.CaptionI18n.Resolve(domain.LocaleEN, *s.Caption); v != "Новое меню" {
+		t.Errorf("en caption = %q, want the Russian fallback", v)
+	}
+}
+
+// A card with no caption can have no translations: there is nothing to
+// translate, and the DB CHECK from 0101 refuses the pair outright.
+func TestCreateStory_TranslationsWithoutACaptionAreDropped(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.CreateStory(context.Background(), managerActor(actorID), CreateInput{
+		RestaurantID: rid,
+		ImageURL:     "https://cdn/x.jpg",
+		CaptionI18n:  domain.I18nPatch{"kk": strptr("Жаңа мәзір")},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if s.Caption != nil {
+		t.Fatalf("no caption was sent, got %q", *s.Caption)
+	}
+	if s.CaptionI18n != nil {
+		t.Fatalf("a captionless card must carry no translations, got %v", s.CaptionI18n)
+	}
+}
+
+// Editing one language leaves the others where they were — and keeps the ru
+// entry equal to the caption column.
+func TestUpdateStory_CaptionTranslationPatchKeepsOtherLanguages(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.Caption = strptr("Новое меню")
+	cur.CaptionI18n = domain.I18n{"ru": "Новое меню", "en": "New menu"}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		CaptionI18n: domain.I18nPatch{"kk": strptr("Жаңа мәзір")},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if s.CaptionI18n["en"] != "New menu" {
+		t.Errorf("CaptionI18n[en] = %q, want the English caption kept", s.CaptionI18n["en"])
+	}
+	if s.CaptionI18n["kk"] != "Жаңа мәзір" {
+		t.Errorf("CaptionI18n[kk] = %q", s.CaptionI18n["kk"])
+	}
+	if s.Caption == nil || *s.Caption != "Новое меню" || s.CaptionI18n["ru"] != "Новое меню" {
+		t.Errorf("the Russian caption moved on a Kazakh-only edit: %v / %v", s.Caption, s.CaptionI18n)
+	}
+}
+
+// Clearing the caption takes its translations with it: leaving them would keep
+// a Kazakh caption on a card whose Russian one was deleted.
+func TestUpdateStory_ClearingTheCaptionDropsTranslations(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.Caption = strptr("Новое меню")
+	cur.CaptionI18n = domain.I18n{"ru": "Новое меню", "kk": "Жаңа мәзір"}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{Caption: strptr("")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if s.Caption != nil || s.CaptionI18n != nil {
+		t.Fatalf("caption and its translations must go together, got %v / %v", s.Caption, s.CaptionI18n)
+	}
+}
+
+// A `ru` key writes the caption column itself — that column IS the Russian text.
+func TestUpdateStory_RussianInsideThePatchWritesTheCaption(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.Caption = strptr("Старое")
+	cur.CaptionI18n = domain.I18n{"ru": "Старое", "kk": "Ескі"}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	s, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		CaptionI18n: domain.I18nPatch{"ru": strptr("Новое")},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if s.Caption == nil || *s.Caption != "Новое" {
+		t.Errorf("caption column = %v, want the ru value promoted to it", s.Caption)
+	}
+	if s.CaptionI18n["ru"] != "Новое" {
+		t.Errorf(`CaptionI18n["ru"] = %q, want it equal to the column`, s.CaptionI18n["ru"])
+	}
+	if s.CaptionI18n["kk"] != "Ескі" {
+		t.Errorf("the Kazakh caption was lost: %v", s.CaptionI18n)
+	}
+}
+
+func TestUpdateStory_RejectsUnsupportedTranslationLanguage(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	cur := seedStory(repo, rid, 0, true)
+	cur.Caption = strptr("Подпись")
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	_, err := f.UpdateStory(context.Background(), managerActor(actorID), cur.ID, UpdateInput{
+		CaptionI18n: domain.I18nPatch{"zh": strptr("文")},
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation (→ 422), got %v", err)
+	}
+	if repo.updated != nil {
+		t.Error("nothing must be written when the translation is refused")
+	}
+}

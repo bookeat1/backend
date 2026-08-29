@@ -22,24 +22,34 @@ const dateLayout = "2006-01-02"
 // profileRequest carries the venue-editable profile fields. Editorial/platform
 // flags are deliberately not present — they cannot be set through this panel.
 type profileRequest struct {
-	Name         *string           `json:"name"`
-	NameI18n     map[string]string `json:"name_i18n"`
-	Description  *string           `json:"description"`
-	Address      *string           `json:"address"`
-	Phone        *string           `json:"phone"`
-	Email        *string           `json:"email"`
-	OpeningHours *string           `json:"opening_hours"`
+	Name *string `json:"name"`
+	// The `*_i18n` objects are PARTIAL translation updates — see
+	// domain.I18nPatch and the same fields on saveRestaurantRequest: a named
+	// language is written, a null one removed, an unmentioned one kept, and a
+	// `ru` key writes the plain field it belongs to.
+	NameI18n         map[string]*string `json:"name_i18n"`
+	Description      *string            `json:"description"`
+	DescriptionI18n  map[string]*string `json:"description_i18n"`
+	Address          *string            `json:"address"`
+	AddressI18n      map[string]*string `json:"address_i18n"`
+	Phone            *string            `json:"phone"`
+	Email            *string            `json:"email"`
+	OpeningHours     *string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]*string `json:"opening_hours_i18n"`
 }
 
 func (r profileRequest) toInput() adminuc.ProfileInput {
 	return adminuc.ProfileInput{
-		Name:         r.Name,
-		NameI18n:     domain.I18n(r.NameI18n),
-		Description:  r.Description,
-		Address:      r.Address,
-		Phone:        r.Phone,
-		Email:        r.Email,
-		OpeningHours: r.OpeningHours,
+		Name:             r.Name,
+		NameI18n:         domain.I18nPatch(r.NameI18n),
+		Description:      r.Description,
+		DescriptionI18n:  domain.I18nPatch(r.DescriptionI18n),
+		Address:          r.Address,
+		AddressI18n:      domain.I18nPatch(r.AddressI18n),
+		Phone:            r.Phone,
+		Email:            r.Email,
+		OpeningHours:     r.OpeningHours,
+		OpeningHoursI18n: domain.I18nPatch(r.OpeningHoursI18n),
 	}
 }
 

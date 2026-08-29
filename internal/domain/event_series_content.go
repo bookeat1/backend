@@ -44,7 +44,9 @@ const (
 	EventContentTitle EventContentField = "title"
 	// EventContentDescription covers description + description_i18n.
 	EventContentDescription EventContentField = "description"
-	// EventContentVenue covers the free-text room inside the venue.
+	// EventContentVenue covers the free-text room inside the venue — venue +
+	// venue_i18n, one editorial decision in several languages, exactly like
+	// title and description.
 	EventContentVenue EventContentField = "venue"
 	// EventContentCover covers the poster (cover_image_url).
 	EventContentCover EventContentField = "cover_image_url"
@@ -87,6 +89,7 @@ type EventContent struct {
 	Description     string
 	DescriptionI18n I18n
 	Venue           string
+	VenueI18n       I18n
 	CoverImageURL   *string
 	Tags            []string
 }
@@ -100,6 +103,7 @@ func (r EventRecurrence) Content() EventContent {
 		Description:     r.Description,
 		DescriptionI18n: r.DescriptionI18n,
 		Venue:           r.Venue,
+		VenueI18n:       r.VenueI18n,
 		CoverImageURL:   r.CoverImageURL,
 		Tags:            r.Tags,
 	}
@@ -115,6 +119,7 @@ func (e Event) Content() EventContent {
 		Description:     e.Description,
 		DescriptionI18n: e.DescriptionI18n,
 		Venue:           e.Venue,
+		VenueI18n:       e.VenueI18n,
 		CoverImageURL:   e.CoverImageURL,
 		Tags:            e.Tags,
 	}
@@ -142,13 +147,13 @@ func (e Event) OverridesContent(f EventContentField) bool {
 // today's wording.
 func EventContentDiff(base, want EventContent) []EventContentField {
 	out := make([]EventContentField, 0, len(EventContentFields))
-	if want.Title != base.Title || !i18nMapEqual(want.TitleI18n, base.TitleI18n) {
+	if !I18nRenderEqual(want.Title, want.TitleI18n, base.Title, base.TitleI18n) {
 		out = append(out, EventContentTitle)
 	}
-	if want.Description != base.Description || !i18nMapEqual(want.DescriptionI18n, base.DescriptionI18n) {
+	if !I18nRenderEqual(want.Description, want.DescriptionI18n, base.Description, base.DescriptionI18n) {
 		out = append(out, EventContentDescription)
 	}
-	if want.Venue != base.Venue {
+	if !I18nRenderEqual(want.Venue, want.VenueI18n, base.Venue, base.VenueI18n) {
 		out = append(out, EventContentVenue)
 	}
 	if !optStringEqual(want.CoverImageURL, base.CoverImageURL) {
@@ -172,28 +177,13 @@ func ApplyEventContent(e *Event, c EventContent, fields []EventContentField) {
 		case EventContentDescription:
 			e.Description, e.DescriptionI18n = c.Description, c.DescriptionI18n
 		case EventContentVenue:
-			e.Venue = c.Venue
+			e.Venue, e.VenueI18n = c.Venue, c.VenueI18n
 		case EventContentCover:
 			e.CoverImageURL = c.CoverImageURL
 		case EventContentTags:
 			e.Tags = c.Tags
 		}
 	}
-}
-
-// i18nMapEqual compares two localized maps by content: nil and empty read the
-// same to a guest, so they must never count as a difference (the same rule the
-// events usecase applies when deciding whether an edit needs re-moderation).
-func i18nMapEqual(a, b I18n) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }
 
 // optStringEqual compares two optional strings; absent equals absent only.

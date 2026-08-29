@@ -65,7 +65,9 @@ type Event struct {
 	EndsAt          time.Time
 	// Venue is free-text location detail within (or outside) the restaurant —
 	// "rooftop terrace", "banquet hall". Empty means "at the restaurant".
-	Venue string
+	// VenueI18n carries its translations, the column being the Russian text.
+	Venue     string
+	VenueI18n I18n
 	// City OVERRIDES the city this event is shown in (migration 0084). It is an
 	// override and nothing else — the normal case is nil:
 	//

@@ -448,3 +448,167 @@ func (f *fakePromoRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string
 func (f *fakePromoRepo) ImagesByPromo(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
 	return map[uuid.UUID][]string{}, nil
 }
+
+// --- terms translations (migration 0101) ---
+
+func strPtr(s string) *string { return &s }
+
+// The fine print is guest-facing text and now has translations like the title
+// does: written on create, kept in step with the ru column.
+func TestCreate_WritesTermsTranslations(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, CreateInput{
+		RestaurantID: &rid,
+		Title:        "Счастливые часы",
+		StartsAt:     time.Now(),
+		EndsAt:       time.Now().Add(time.Hour),
+		Terms:        "Только зал",
+		TermsI18n:    domain.I18nPatch{"kk": strPtr("Тек залда")},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got := repo.created
+	if got.TermsI18n["kk"] != "Тек залда" {
+		t.Errorf("TermsI18n[kk] = %q", got.TermsI18n["kk"])
+	}
+	if got.TermsI18n["ru"] != "Только зал" {
+		t.Errorf(`TermsI18n["ru"] = %q, want it equal to the terms column`, got.TermsI18n["ru"])
+	}
+	// A guest with no Kazakh translation of the title still gets the Russian
+	// one — the fallback is per field, not per card.
+	if v := got.TitleI18n.Resolve(domain.LocaleKK, got.Title); v != "Счастливые часы" {
+		t.Errorf("kk title = %q, want the Russian fallback", v)
+	}
+	if v := got.TermsI18n.Resolve(domain.LocaleKK, got.Terms); v != "Тек залда" {
+		t.Errorf("kk terms = %q, want the translation", v)
+	}
+}
+
+// An update that names only Kazakh must not cost the promo its English: the
+// *_i18n objects are patches, unlike every scalar field around them.
+func TestUpdate_TermsTranslationPatchKeepsOtherLanguages(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Акция", Status: domain.PromoPublished,
+		Terms:     "Только зал",
+		TermsI18n: domain.I18n{"ru": "Только зал", "en": "Dine-in only"},
+	}
+	repo.byID[pr.ID] = pr
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, UpdateInput{
+		Title:     "Акция",
+		StartsAt:  time.Now(),
+		EndsAt:    time.Now().Add(time.Hour),
+		Status:    domain.PromoPublished,
+		Terms:     "Только зал",
+		TermsI18n: domain.I18nPatch{"kk": strPtr("Тек залда")},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got.TermsI18n["en"] != "Dine-in only" {
+		t.Errorf("TermsI18n[en] = %q, want the untouched English kept", got.TermsI18n["en"])
+	}
+	if got.TermsI18n["kk"] != "Тек залда" {
+		t.Errorf("TermsI18n[kk] = %q", got.TermsI18n["kk"])
+	}
+	if got.TermsI18n["ru"] != "Только зал" {
+		t.Errorf(`TermsI18n["ru"] = %q, want it still equal to the column`, got.TermsI18n["ru"])
+	}
+}
+
+// Changing the Russian fine print re-syncs its ru translation, or the card
+// would keep showing the fine print the venue just replaced.
+func TestUpdate_TermsColumnRewritesItsRussianTranslation(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Акция", Status: domain.PromoPublished,
+		Terms:     "Только зал",
+		TermsI18n: domain.I18n{"ru": "Только зал", "kk": "Тек залда"},
+	}
+	repo.byID[pr.ID] = pr
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, UpdateInput{
+		Title:    "Акция",
+		StartsAt: time.Now(),
+		EndsAt:   time.Now().Add(time.Hour),
+		Status:   domain.PromoPublished,
+		Terms:    "Только на террасе",
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got.TermsI18n["ru"] != "Только на террасе" {
+		t.Errorf(`TermsI18n["ru"] = %q, want the new fine print`, got.TermsI18n["ru"])
+	}
+	if got.TermsI18n["kk"] != "Тек залда" {
+		t.Errorf("the Kazakh fine print was lost: %v", got.TermsI18n)
+	}
+}
+
+// Translating an approved card is an editorial change and goes back for review:
+// the platform approved the words in every language the card shows.
+func TestUpdate_TranslationOnlyEditDemotesTheFeedApproval(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{
+		ID: uuid.New(), RestaurantID: &rid, Title: "Акция", Status: domain.PromoPublished,
+		Terms: "Только зал",
+	}
+	repo.byID[pr.ID] = pr
+	fd := &fakeFeed{}
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), fd)
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, UpdateInput{
+		Title:     "Акция",
+		StartsAt:  time.Now(),
+		EndsAt:    time.Now().Add(time.Hour),
+		Status:    domain.PromoPublished,
+		Terms:     "Только зал",
+		TermsI18n: domain.I18nPatch{"kk": strPtr("Тек залда")},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(fd.demoted) != 1 {
+		t.Fatalf("a new translation must demote the feed placement, got %v", fd.demoted)
+	}
+}
+
+// A language nothing can serve is refused, not stored.
+func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
+	rid := uuid.New()
+	actorID := uuid.New()
+	repo := newFakeRepo()
+	pr := &domain.Promo{ID: uuid.New(), RestaurantID: &rid, Title: "Акция", Status: domain.PromoPublished}
+	repo.byID[pr.ID] = pr
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager), &fakeFeed{})
+
+	_, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, pr.ID, UpdateInput{
+		Title:     "Акция",
+		StartsAt:  time.Now(),
+		EndsAt:    time.Now().Add(time.Hour),
+		Status:    domain.PromoPublished,
+		TermsI18n: domain.I18nPatch{"zh": strPtr("文")},
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation (→ 422), got %v", err)
+	}
+	if repo.updated != nil {
+		t.Error("nothing must be written when the translation is refused")
+	}
+}

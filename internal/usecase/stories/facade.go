@@ -62,6 +62,13 @@ type CreateInput struct {
 	RestaurantID uuid.UUID
 	ImageURL     string
 	Caption      *string
+	// CaptionI18n carries the caption's translations as a PARTIAL update
+	// (domain.I18nPatch): a named language is written, a null one removed, an
+	// unmentioned one kept. A `ru` key writes the caption itself — that column
+	// IS the Russian text. Translations of a card with NO caption are dropped:
+	// there is nothing to translate, and the DB CHECK from migration 0101 says
+	// the same.
+	CaptionI18n domain.I18nPatch
 	// ActionURL is the EXTERNAL link a tap on the card follows — NOT the
 	// picture's address, which is ImageURL. nil or an empty string means "the
 	// card leads nowhere"; anything else must pass
@@ -78,6 +85,10 @@ type CreateInput struct {
 type UpdateInput struct {
 	ImageURL *string
 	Caption  *string
+	// CaptionI18n is a PARTIAL translation update — see CreateInput. Sending it
+	// alone (without caption) edits only the translations; sending a `ru` key
+	// edits the caption column itself.
+	CaptionI18n domain.I18nPatch
 	// ActionURL follows the same three-state rule as Caption: nil leaves the
 	// stored link untouched, an empty/whitespace string clears it (so the
 	// operator can un-link a story through the edit form), and anything else is
@@ -117,6 +128,10 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 	if err := validateImageURL(imageURL); err != nil {
 		return nil, err
 	}
+	if err := in.CaptionI18n.Validate("caption_i18n"); err != nil {
+		return nil, err
+	}
+	caption := normalizeCaption(promoteRussianCaption(in.Caption, in.CaptionI18n))
 	actionURL, err := normalizeActionURL(in.ActionURL)
 	if err != nil {
 		return nil, err
@@ -132,7 +147,8 @@ func (f *facade) CreateStory(ctx context.Context, actor Actor, in CreateInput) (
 	s := &domain.Story{
 		RestaurantID: in.RestaurantID,
 		ImageURL:     imageURL,
-		Caption:      normalizeCaption(in.Caption),
+		Caption:      caption,
+		CaptionI18n:  captionTranslations(nil, in.CaptionI18n, caption),
 		ActionURL:    actionURL,
 		SortOrder:    sortOrder,
 		IsActive:     isActive,
@@ -158,8 +174,19 @@ func (f *facade) UpdateStory(ctx context.Context, actor Actor, storyID uuid.UUID
 		}
 		s.ImageURL = imageURL
 	}
-	if in.Caption != nil {
-		s.Caption = normalizeCaption(in.Caption)
+	if err := in.CaptionI18n.Validate("caption_i18n"); err != nil {
+		return nil, err
+	}
+	// The caption and its translations move together, whichever of the two the
+	// request actually carried: editing only the map still has to keep
+	// i18n["ru"] equal to the column, and clearing the caption has to take the
+	// translations with it (a card with no Russian text has nothing the other
+	// languages could be a translation OF — and the DB CHECK refuses the pair).
+	if caption := promoteRussianCaption(in.Caption, in.CaptionI18n); caption != nil {
+		s.Caption = normalizeCaption(caption)
+	}
+	if in.Caption != nil || in.CaptionI18n != nil {
+		s.CaptionI18n = captionTranslations(s.CaptionI18n, in.CaptionI18n, s.Caption)
 	}
 	if in.ActionURL != nil {
 		actionURL, err := normalizeActionURL(in.ActionURL)
@@ -230,6 +257,29 @@ func (f *facade) authorize(ctx context.Context, actor Actor, restaurantID uuid.U
 		return fmt.Errorf("%w: restaurant.manage required to manage this restaurant's stories", domain.ErrForbidden)
 	}
 	return nil
+}
+
+// promoteRussianCaption routes a `ru` entry inside the translation patch to the
+// caption column it belongs to, unless the request already wrote the column
+// itself (in which case the column wins — see domain.ApplyTranslations).
+func promoteRussianCaption(caption *string, patch domain.I18nPatch) *string {
+	if caption != nil {
+		return caption
+	}
+	if v, ok := patch.Russian(); ok {
+		return &v
+	}
+	return nil
+}
+
+// captionTranslations merges the patch onto the stored map and re-establishes
+// the ru invariant — except for a card with NO caption, which can have no
+// translations at all.
+func captionTranslations(stored domain.I18n, patch domain.I18nPatch, caption *string) domain.I18n {
+	if caption == nil {
+		return nil
+	}
+	return domain.ApplyTranslations(stored, patch, *caption)
 }
 
 // normalizeCaption trims the caption and collapses an empty result to nil, so

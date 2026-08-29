@@ -29,6 +29,10 @@ const (
 // caption cannot be drawn, and the client must never have to invent one.
 type EventAction struct {
 	Label string
+	// LabelI18n carries the button's caption in the other languages; Label
+	// itself is the Russian one, exactly like every other localized text in
+	// the catalog (see I18n.Resolve).
+	LabelI18n I18n
 	// URL nil = the event's own page. Non-nil = an EXTERNAL link, already
 	// validated by ValidateExternalActionURL: absolute, http/https, with a host
 	// and without embedded credentials.

@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/postgres/testdb"
 )
 
@@ -125,5 +126,76 @@ func TestListActiveByRestaurantEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("len = %d, want 0", len(got))
+	}
+}
+
+// The caption's translations (migration 0101) must survive create, update and
+// both listing reads — and a card without a caption must keep the column NULL,
+// which is what the CHECK added by the same migration insists on.
+func TestCaptionI18nRoundTrip(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurant_stories", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'A','Алматы','₸')`, rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+	repo := New(pool)
+
+	caption := "Летнее меню"
+	s := &domain.Story{
+		RestaurantID: rid,
+		ImageURL:     "https://cdn/a.jpg",
+		Caption:      &caption,
+		CaptionI18n:  domain.I18n{"ru": caption, "kk": "Жазғы мәзір"},
+		IsActive:     true,
+	}
+	if err := repo.Create(ctx, s); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.CaptionI18n["kk"] != "Жазғы мәзір" {
+		t.Fatalf("caption_i18n did not survive the write: %v", got.CaptionI18n)
+	}
+	if v := got.CaptionI18n.Resolve(domain.LocaleEN, *got.Caption); v != caption {
+		t.Errorf("en caption = %q, want the Russian fallback", v)
+	}
+
+	got.CaptionI18n = domain.I18n{"ru": caption, "en": "Summer menu"}
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	list, err := repo.ListActiveByRestaurant(ctx, rid)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].CaptionI18n["en"] != "Summer menu" || list[0].CaptionI18n["kk"] != "" {
+		t.Fatalf("the public listing must carry the updated map, got %v", list)
+	}
+	admin, err := repo.ListByRestaurant(ctx, rid)
+	if err != nil {
+		t.Fatalf("admin list: %v", err)
+	}
+	if len(admin) != 1 || admin[0].CaptionI18n["en"] != "Summer menu" {
+		t.Fatalf("the cabinet listing must carry the map, got %v", admin)
+	}
+
+	plain := &domain.Story{RestaurantID: rid, ImageURL: "https://cdn/b.jpg", IsActive: true}
+	if err := repo.Create(ctx, plain); err != nil {
+		t.Fatalf("create captionless: %v", err)
+	}
+	var isNull bool
+	if err := pool.QueryRow(ctx,
+		`SELECT caption_i18n IS NULL FROM restaurant_stories WHERE id = $1`, plain.ID).Scan(&isNull); err != nil {
+		t.Fatalf("read raw column: %v", err)
+	}
+	if !isNull {
+		t.Error("a card without a caption must leave caption_i18n NULL")
 	}
 }

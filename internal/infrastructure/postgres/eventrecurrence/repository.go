@@ -31,7 +31,7 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.EventRecurrenceRepository = (*Repository)(nil)
 
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
-	venue, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
+	venue, venue_i18n, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
 	tickets_refundable, ticket_refund_cutoff_minutes,
 	frequency, weekdays, month_day, start_minutes, duration_minutes, timezone,
 	starts_on, until_date, is_active,
@@ -53,14 +53,14 @@ func (r *Repository) Create(ctx context.Context, rec *domain.EventRecurrence) er
 	rec.FeedSubmittedAt, rec.FeedReviewedBy, rec.FeedReviewedAt, rec.FeedRejectionReason = nil, nil, nil, nil
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO event_recurrences (id, restaurant_id, title, title_i18n, description, description_i18n,
-			venue, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
+			venue, venue_i18n, cover_image_url, tags, occurrence_status, ticketed, ticket_price_minor, capacity,
 			tickets_refundable, ticket_refund_cutoff_minutes,
 			frequency, weekdays, month_day, start_minutes, duration_minutes, timezone,
 			starts_on, until_date, is_active)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		 RETURNING created_at, updated_at`,
 		rec.ID, rec.RestaurantID, rec.Title, i18nToDB(rec.TitleI18n), rec.Description, i18nToDB(rec.DescriptionI18n),
-		rec.Venue, rec.CoverImageURL, tagsToDB(rec.Tags), rec.OccurrenceStatus, rec.Ticketed,
+		rec.Venue, i18nToDB(rec.VenueI18n), rec.CoverImageURL, tagsToDB(rec.Tags), rec.OccurrenceStatus, rec.Ticketed,
 		rec.TicketPriceMinor, rec.Capacity, rec.TicketsRefundable, rec.TicketRefundCutoffMinutes,
 		rec.Frequency, weekdaysToDB(rec.Weekdays), rec.MonthDay, rec.StartMinutes, rec.DurationMinutes,
 		timezoneToDB(rec.Timezone), dateToDB(&rec.StartsOn), dateToDB(rec.UntilDate), rec.IsActive).
@@ -102,7 +102,7 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.EventRe
 func (r *Repository) Update(ctx context.Context, rec *domain.EventRecurrence) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE event_recurrences SET title=$2, title_i18n=$3, description=$4, description_i18n=$5,
-			venue=$6, cover_image_url=$7, tags=$8, occurrence_status=$9, ticketed=$10,
+			venue=$6, venue_i18n=$24, cover_image_url=$7, tags=$8, occurrence_status=$9, ticketed=$10,
 			ticket_price_minor=$11, capacity=$12, tickets_refundable=$13, ticket_refund_cutoff_minutes=$14,
 			frequency=$15, weekdays=$16, month_day=$17, start_minutes=$18, duration_minutes=$19,
 			timezone=$20, starts_on=$21, until_date=$22, is_active=$23, updated_at=now()
@@ -111,7 +111,8 @@ func (r *Repository) Update(ctx context.Context, rec *domain.EventRecurrence) er
 		rec.Venue, rec.CoverImageURL, tagsToDB(rec.Tags), rec.OccurrenceStatus, rec.Ticketed,
 		rec.TicketPriceMinor, rec.Capacity, rec.TicketsRefundable, rec.TicketRefundCutoffMinutes,
 		rec.Frequency, weekdaysToDB(rec.Weekdays), rec.MonthDay, rec.StartMinutes, rec.DurationMinutes,
-		timezoneToDB(rec.Timezone), dateToDB(&rec.StartsOn), dateToDB(rec.UntilDate), rec.IsActive)
+		timezoneToDB(rec.Timezone), dateToDB(&rec.StartsOn), dateToDB(rec.UntilDate), rec.IsActive,
+		i18nToDB(rec.VenueI18n))
 	if err != nil {
 		return fmt.Errorf("update event recurrence: %w", err)
 	}
@@ -257,11 +258,11 @@ func (r *Repository) InsertOccurrences(ctx context.Context, rec *domain.EventRec
 	}
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
-			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor,
+			starts_at, ends_at, venue, venue_i18n, cover_image_url, status, ticketed, ticket_price_minor,
 			capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes, recurrence_id,
 			feed_status, feed_submitted_at, feed_reviewed_by, feed_reviewed_at)
 		 SELECT s.id, $1, $2, $3, $4, $5,
-			s.starts_at, s.ends_at, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+			s.starts_at, s.ends_at, $6, $23, $7, $8, $9, $10, $11, $12, $13, $14, $15,
 			$19::varchar, $20, $21, $22
 		 FROM unnest($16::uuid[], $17::timestamptz[], $18::timestamptz[]) AS s(id, starts_at, ends_at)
 		 WHERE NOT EXISTS (
@@ -272,7 +273,7 @@ func (r *Repository) InsertOccurrences(ctx context.Context, rec *domain.EventRec
 		rec.Venue, rec.CoverImageURL, rec.OccurrenceStatus, rec.Ticketed, rec.TicketPriceMinor,
 		rec.Capacity, tagsToDB(rec.Tags), rec.TicketsRefundable, rec.TicketRefundCutoffMinutes,
 		rec.ID, ids, starts, ends,
-		string(feedStatus), submittedAt, reviewedBy, reviewedAt)
+		string(feedStatus), submittedAt, reviewedBy, reviewedAt, i18nToDB(rec.VenueI18n))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
@@ -420,7 +421,8 @@ func (r *Repository) SyncOccurrenceContent(ctx context.Context, recurrenceID uui
 					AND (e.description IS DISTINCT FROM $5::text
 						OR e.description_i18n IS DISTINCT FROM $6::jsonb)          AS chg_description,
 				NOT ('venue' = ANY (e.content_overrides))
-					AND e.venue IS DISTINCT FROM $7::varchar                       AS chg_venue,
+					AND (e.venue IS DISTINCT FROM $7::varchar
+						OR e.venue_i18n IS DISTINCT FROM $12::jsonb)               AS chg_venue,
 				NOT ('cover_image_url' = ANY (e.content_overrides))
 					AND e.cover_image_url IS DISTINCT FROM $8::varchar             AS chg_cover,
 				NOT ('tags' = ANY (e.content_overrides))
@@ -434,6 +436,7 @@ func (r *Repository) SyncOccurrenceContent(ctx context.Context, recurrenceID uui
 			description      = CASE WHEN t.chg_description THEN $5::text ELSE e.description END,
 			description_i18n = CASE WHEN t.chg_description THEN $6::jsonb ELSE e.description_i18n END,
 			venue            = CASE WHEN t.chg_venue THEN $7::varchar ELSE e.venue END,
+			venue_i18n       = CASE WHEN t.chg_venue THEN $12::jsonb ELSE e.venue_i18n END,
 			cover_image_url  = CASE WHEN t.chg_cover THEN $8::varchar ELSE e.cover_image_url END,
 			tags             = CASE WHEN t.chg_tags THEN $9::text[] ELSE e.tags END,
 			feed_status      = CASE WHEN e.feed_status = $10::varchar THEN $11::varchar ELSE e.feed_status END,
@@ -446,7 +449,7 @@ func (r *Repository) SyncOccurrenceContent(ctx context.Context, recurrenceID uui
 		recurrenceID, notEndedBefore,
 		c.Title, i18nToDB(c.TitleI18n), c.Description, i18nToDB(c.DescriptionI18n),
 		c.Venue, c.CoverImageURL, tagsToDB(c.Tags),
-		string(domain.FeedApproved), string(domain.FeedNotSubmitted))
+		string(domain.FeedApproved), string(domain.FeedNotSubmitted), i18nToDB(c.VenueI18n))
 	if err != nil {
 		return 0, fmt.Errorf("sync occurrence content: %w", err)
 	}
@@ -528,7 +531,7 @@ func scanRecurrence(row pgx.Row) (*domain.EventRecurrence, error) {
 // scanRecurrenceInto reads selectCols into rec, appending any extra
 // destinations (ListActive adds the venue timezone) after them.
 func scanRecurrenceInto(row pgx.Row, rec *domain.EventRecurrence, extra ...any) error {
-	var titleI18n, descI18n []byte
+	var titleI18n, descI18n, venueI18n []byte
 	var timezone *string
 	var weekdays []int16
 	var startsOn time.Time
@@ -536,7 +539,7 @@ func scanRecurrenceInto(row pgx.Row, rec *domain.EventRecurrence, extra ...any) 
 
 	dest := []any{
 		&rec.ID, &rec.RestaurantID, &rec.Title, &titleI18n, &rec.Description, &descI18n,
-		&rec.Venue, &rec.CoverImageURL, &rec.Tags, &rec.OccurrenceStatus, &rec.Ticketed,
+		&rec.Venue, &venueI18n, &rec.CoverImageURL, &rec.Tags, &rec.OccurrenceStatus, &rec.Ticketed,
 		&rec.TicketPriceMinor, &rec.Capacity, &rec.TicketsRefundable, &rec.TicketRefundCutoffMinutes,
 		&rec.Frequency, &weekdays, &rec.MonthDay, &rec.StartMinutes, &rec.DurationMinutes, &timezone,
 		&startsOn, &until, &rec.IsActive,
@@ -550,6 +553,7 @@ func scanRecurrenceInto(row pgx.Row, rec *domain.EventRecurrence, extra ...any) 
 	}
 	rec.TitleI18n = i18nFromDB(titleI18n)
 	rec.DescriptionI18n = i18nFromDB(descI18n)
+	rec.VenueI18n = i18nFromDB(venueI18n)
 	rec.Tags = tagsFromDB(rec.Tags)
 	rec.Weekdays = weekdaysFromDB(weekdays)
 	if timezone != nil {

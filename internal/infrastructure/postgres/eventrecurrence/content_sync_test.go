@@ -413,3 +413,95 @@ func seedUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	}
 	return id
 }
+
+// venue_i18n travels with venue: it is the SAME editorial decision (see
+// domain.EventContentVenue), so a date that inherits the room inherits its
+// translations, and a date that owns the room owns them too.
+func TestSyncOccurrenceContentCarriesVenueTranslations(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, contentTables...)
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Greek", "Asia/Almaty")
+	ruleID := seedRule(ctx, t, pool, rid)
+	now := time.Now()
+
+	base := occurrenceRow{
+		title: "Greek Party", description: "Сиртаки и узо", venue: "терраса",
+		cover: strptr("https://cdn.example/greek.jpg"), tags: []string{"Живая музыка"},
+		overrides: []string{}, status: "published", feedStatus: "not_submitted",
+	}
+	inheriting := seedOccurrence(ctx, t, pool, rid, ruleID, now.Add(24*time.Hour), base)
+
+	ownsVenue := base
+	ownsVenue.venue = "банкетный зал"
+	ownsVenue.overrides = []string{"venue"}
+	own := seedOccurrence(ctx, t, pool, rid, ruleID, now.Add(48*time.Hour), ownsVenue)
+
+	n, err := New(pool).SyncOccurrenceContent(ctx, ruleID, now, domain.EventContent{
+		Title: "Greek Party", Description: "Сиртаки и узо",
+		Venue:         "терраса",
+		VenueI18n:     domain.I18n{"ru": "терраса", "kk": "террасса"},
+		CoverImageURL: strptr("https://cdn.example/greek.jpg"),
+		Tags:          []string{"Живая музыка"},
+	})
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	// Only the venue TRANSLATIONS changed, and that alone must be enough to
+	// rewrite the inheriting date — a sync that compared the column only would
+	// report zero rows and leave a Kazakh guest reading Russian.
+	if n != 1 {
+		t.Fatalf("only the inheriting date must be rewritten, got %d", n)
+	}
+
+	var i18n map[string]string
+	if err := pool.QueryRow(ctx, `SELECT venue_i18n FROM events WHERE id = $1`, inheriting).Scan(&i18n); err != nil {
+		t.Fatalf("read inheriting date: %v", err)
+	}
+	if i18n["kk"] != "террасса" {
+		t.Fatalf("the inheriting date must receive the series translations, got %v", i18n)
+	}
+
+	var ownI18n *string
+	var ownVenue string
+	if err := pool.QueryRow(ctx,
+		`SELECT venue, venue_i18n::text FROM events WHERE id = $1`, own).Scan(&ownVenue, &ownI18n); err != nil {
+		t.Fatalf("read overriding date: %v", err)
+	}
+	if ownVenue != "банкетный зал" || ownI18n != nil {
+		t.Fatalf("a date that owns its room must keep it untranslated by the series: %q / %v", ownVenue, ownI18n)
+	}
+}
+
+// A rule's translations reach the dates it GENERATES, not only the ones it
+// later syncs.
+func TestInsertOccurrencesCarriesVenueTranslations(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, contentTables...)
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Greek", "Asia/Almaty")
+	repo := New(pool)
+
+	rec := fullRule(rid)
+	rec.Venue = "терраса"
+	rec.VenueI18n = domain.I18n{"ru": "терраса", "kk": "террасса"}
+	if err := repo.Create(ctx, rec); err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	start := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	n, err := repo.InsertOccurrences(ctx, rec, []time.Time{start})
+	if err != nil {
+		t.Fatalf("insert occurrences: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("want one generated date, got %d", n)
+	}
+	var i18n map[string]string
+	if err := pool.QueryRow(ctx,
+		`SELECT venue_i18n FROM events WHERE recurrence_id = $1`, rec.ID).Scan(&i18n); err != nil {
+		t.Fatalf("read generated date: %v", err)
+	}
+	if i18n["kk"] != "террасса" {
+		t.Fatalf("a generated date must inherit the rule's venue translations, got %v", i18n)
+	}
+}

@@ -14,27 +14,39 @@ import (
 // Update the facade preserves omitted fields (read-modify-write) instead of
 // wiping them.
 type saveRestaurantRequest struct {
-	CategoryID    *string           `json:"category_id"`
-	Name          *string           `json:"name"`
-	NameI18n      map[string]string `json:"name_i18n"`
-	Description   *string           `json:"description"`
-	CuisineType   *string           `json:"cuisine_type"`
-	Address       *string           `json:"address"`
-	OpeningHours  *string           `json:"opening_hours"`
-	City          *string           `json:"city"`
-	PriceCategory *string           `json:"price_category"`
-	PriceMin      *int              `json:"price_min"`
-	PriceMax      *int              `json:"price_max"`
-	Email         *string           `json:"email"`
-	Phone         *string           `json:"phone"`
-	Latitude      *float64          `json:"latitude"`
-	Longitude     *float64          `json:"longitude"`
-	IsActive      *bool             `json:"is_active"`
-	IsNew         *bool             `json:"is_new"`
-	IsPopular     *bool             `json:"is_popular"`
-	IsPremium     *bool             `json:"is_premium"`
-	DisplayOrder  *int              `json:"display_order"`
-	Images        []imageInput      `json:"images"`
+	CategoryID *string `json:"category_id"`
+	Name       *string `json:"name"`
+	// The `*_i18n` objects are PARTIAL updates of the translation maps:
+	//
+	//	{"description_i18n": {"kk": "Жайлы орын", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored. Sending a
+	// `ru` key writes the plain field instead — the Russian text lives in the
+	// column, and the two are never allowed to disagree. See domain.I18nPatch.
+	NameI18n         map[string]*string `json:"name_i18n"`
+	Description      *string            `json:"description"`
+	DescriptionI18n  map[string]*string `json:"description_i18n"`
+	CuisineType      *string            `json:"cuisine_type"`
+	CuisineTypeI18n  map[string]*string `json:"cuisine_type_i18n"`
+	Address          *string            `json:"address"`
+	AddressI18n      map[string]*string `json:"address_i18n"`
+	OpeningHours     *string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]*string `json:"opening_hours_i18n"`
+	City             *string            `json:"city"`
+	PriceCategory    *string            `json:"price_category"`
+	PriceMin         *int               `json:"price_min"`
+	PriceMax         *int               `json:"price_max"`
+	Email            *string            `json:"email"`
+	Phone            *string            `json:"phone"`
+	Latitude         *float64           `json:"latitude"`
+	Longitude        *float64           `json:"longitude"`
+	IsActive         *bool              `json:"is_active"`
+	IsNew            *bool              `json:"is_new"`
+	IsPopular        *bool              `json:"is_popular"`
+	IsPremium        *bool              `json:"is_premium"`
+	DisplayOrder     *int               `json:"display_order"`
+	Images           []imageInput       `json:"images"`
 	// Features is still PARSED, but only so that a client which still sends the
 	// old free-text array gets a clear 422 instead of a silent no-op. The
 	// free-text table behind it was dropped in migration 0082; a venue's
@@ -71,8 +83,11 @@ type socialInput struct {
 // silently dropped, so a typo can't slip through as "field omitted".
 func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 	in := uc.SaveInput{
-		Name: r.Name, NameI18n: domain.I18n(r.NameI18n), Description: r.Description,
-		CuisineType: r.CuisineType, Address: r.Address, OpeningHours: r.OpeningHours,
+		Name: r.Name, NameI18n: domain.I18nPatch(r.NameI18n),
+		Description: r.Description, DescriptionI18n: domain.I18nPatch(r.DescriptionI18n),
+		CuisineType: r.CuisineType, CuisineTypeI18n: domain.I18nPatch(r.CuisineTypeI18n),
+		Address: r.Address, AddressI18n: domain.I18nPatch(r.AddressI18n),
+		OpeningHours: r.OpeningHours, OpeningHoursI18n: domain.I18nPatch(r.OpeningHoursI18n),
 		City: r.City, PriceCategory: r.PriceCategory, PriceMin: r.PriceMin, PriceMax: r.PriceMax,
 		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,

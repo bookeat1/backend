@@ -85,9 +85,9 @@ type facadeFixture struct {
 func updateFrom(e domain.Event) UpdateInput {
 	return UpdateInput{
 		Title:           e.Title,
-		TitleI18n:       e.TitleI18n,
+		TitleI18n:       patchOf(e.TitleI18n),
 		Description:     e.Description,
-		DescriptionI18n: e.DescriptionI18n,
+		DescriptionI18n: patchOf(e.DescriptionI18n),
 		StartsAt:        e.StartsAt,
 		EndsAt:          e.EndsAt,
 		Venue:           e.Venue,
@@ -294,4 +294,18 @@ func TestResetSeriesContent_NoOpDoesNotDemote(t *testing.T) {
 	if len(fx.feed.demoted) != 0 {
 		t.Fatalf("a no-op reset must not re-enter moderation, got %v", fx.feed.demoted)
 	}
+}
+
+// patchOf turns a stored translation map into the patch that re-sends it
+// unchanged — what a cabinet doing a full re-save produces.
+func patchOf(m domain.I18n) domain.I18nPatch {
+	if m == nil {
+		return nil
+	}
+	out := make(domain.I18nPatch, len(m))
+	for k, v := range m {
+		v := v
+		out[k] = &v
+	}
+	return out
 }

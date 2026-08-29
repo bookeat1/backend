@@ -479,7 +479,11 @@ func (h *Handler) create(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.Created(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
+	// NOT localized, for the same reason adminGet is not: this is a cabinet
+	// write, its answer is what the editor's form re-reads, and a browser
+	// sending Accept-Language: ru would get the ru TRANSLATION back in the
+	// scalar fields and post it as the next value of the column.
+	response.Created(c.Writer, aggregateToResponse(agg, ""))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -515,7 +519,8 @@ func (h *Handler) update(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
+	// NOT localized — see create above and adminGet below.
+	response.OK(c.Writer, aggregateToResponse(agg, ""))
 }
 
 func (h *Handler) deactivate(c *gin.Context) {

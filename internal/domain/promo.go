@@ -51,8 +51,10 @@ type Promo struct {
 	StartsAt        time.Time
 	EndsAt          time.Time
 	// Terms is free-text fine print ("dine-in only, not combinable with other
-	// offers"). Not localized in this increment.
-	Terms string
+	// offers"). Localized like the rest of the card: the column is the Russian
+	// text and TermsI18n carries the translations (see I18n.Resolve).
+	Terms     string
+	TermsI18n I18n
 	// CoverImageURL is the promo card's picture — the FULL public URL, exactly
 	// like Event.CoverImageURL and Image.ImageURL. Nil means the promo has no
 	// picture: the API omits the field rather than inventing a placeholder, and
