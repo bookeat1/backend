@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -14,7 +15,10 @@ import (
 // Facade exposes menu reads and per-restaurant mutations. Mutating methods take
 // restaurantID (from the route) and enforce that the item belongs to it (IDOR).
 type Facade interface {
-	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error)
+	// ListByRestaurant returns the venue's whole menu. It takes no language:
+	// the dish SET is the same in every language, and the texts are localized
+	// at the transport edge from the *_i18n maps.
+	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error)
 	Get(ctx context.Context, itemID uuid.UUID) (*domain.MenuItem, error)
 	Categories(ctx context.Context) ([]domain.MenuCategory, error)
 
@@ -35,14 +39,14 @@ type Facade interface {
 	// limit is clamped here (not in the repository) because it is a transport
 	// concern: an unbounded rail is a slow query a client can ask for by
 	// accident.
-	ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error)
+	ListFeatured(ctx context.Context, city domain.City, limit int) ([]domain.FeaturedMenuItem, error)
 
 	// ListHighlights resolves the «Лучшие позиции» rail of ONE venue's
 	// storefront: the dishes the venue marked itself, in its own order, and
 	// then — only to fill the rail up to limit — the derived dishes that rail
 	// used to consist of entirely. See resolveHighlights for the rule and why
 	// the fallback exists.
-	ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error)
+	ListHighlights(ctx context.Context, restaurantID uuid.UUID, limit int) ([]domain.MenuItem, error)
 	// SetTopPick marks or unmarks one dish of restaurantID as a «Лучшая
 	// позиция». Marking takes the lowest free slot; the venue's own order is
 	// changed only through ReplaceTopPicks. Marking an already marked dish is a
@@ -103,8 +107,8 @@ type CategoryInput struct {
 	DisplayOrder int
 }
 
-func (f *facade) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error) {
-	return f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID, Language: lang})
+func (f *facade) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
+	return f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID})
 }
 
 func (f *facade) Get(ctx context.Context, itemID uuid.UUID) (*domain.MenuItem, error) {
@@ -121,6 +125,9 @@ func (f *facade) Create(ctx context.Context, restaurantID uuid.UUID, in ItemInpu
 	}
 	if *in.Name == "" || !domain.ValidPrice(*in.Price) {
 		return nil, domain.ErrValidation
+	}
+	if err := checkBaseLanguage(nil, in.Language); err != nil {
+		return nil, err
 	}
 	m := &domain.MenuItem{ID: uuid.New(), RestaurantID: restaurantID, IsAvailable: true}
 	applyItem(m, in)
@@ -150,6 +157,9 @@ func (f *facade) Update(ctx context.Context, restaurantID, itemID uuid.UUID, in 
 		}
 		if existing.RestaurantID != restaurantID {
 			return domain.ErrNotFound // IDOR: item belongs to another restaurant
+		}
+		if err := checkBaseLanguage(existing.Language, in.Language); err != nil {
+			return err
 		}
 		applyItem(existing, in)
 		if err := f.items.Update(ctx, existing); err != nil {
@@ -194,7 +204,7 @@ const (
 	featuredLimitMax     = 50
 )
 
-func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error) {
+func (f *facade) ListFeatured(ctx context.Context, city domain.City, limit int) ([]domain.FeaturedMenuItem, error) {
 	if !city.Valid() {
 		return nil, domain.WithCode(domain.CodeCityRequired, fmt.Errorf("%w: city is required", domain.ErrValidation))
 	}
@@ -204,7 +214,7 @@ func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *strin
 	case limit > featuredLimitMax:
 		limit = featuredLimitMax
 	}
-	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Language: lang, Limit: limit})
+	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Limit: limit})
 }
 
 // highlightLimit bounds a venue's storefront rail. The default is what the app
@@ -222,14 +232,14 @@ const (
 // is what keeps a genuinely full rail from spinning.
 const topPickRetries = 3
 
-func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error) {
+func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, limit int) ([]domain.MenuItem, error) {
 	switch {
 	case limit <= 0:
 		limit = highlightLimitDefault
 	case limit > highlightLimitMax:
 		limit = highlightLimitMax
 	}
-	items, err := f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID, Language: lang})
+	items, err := f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID})
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +441,57 @@ func (f *facade) checkNoCycle(ctx context.Context, id, parentID uuid.UUID) error
 }
 
 // applyItem copies the non-nil fields of in onto m.
+// checkBaseLanguage keeps the panel from creating a dish the guest can never
+// see.
+//
+// Visibility rule (repository.baseRowsPredicate): the guest listing serves a
+// venue's BASE rows — language NULL or 'ru' — because part of the imported data
+// stores a translation as a separate row, and listing those next to their
+// originals is the same dish twice. That rule is per VENUE, so a NEW dish
+// labelled 'en' at a venue that already has base rows would be filtered out of
+// every language at once, while still looking perfectly normal in the cabinet.
+// Nobody would ever get a signal.
+//
+// So the write side enforces what the read side assumes: a dish row IS the base
+// row, and translations go into the *_i18n maps (which is also the only place
+// the panel and the app read them from). A non-base label is refused loudly with
+// its own code instead of being silently rewritten to 'ru' — an editor who typed
+// "en" meant something, and quietly storing the text as Russian would put the
+// wrong words on the guest's screen.
+//
+// The one allowed non-base value is the one the row ALREADY has: the 124
+// imported Kazakh copy rows are visible in the cabinet, and refusing to save an
+// edit of a legacy row would make those dishes uneditable. Such a row is already
+// out of the listing; keeping its label changes nothing for the guest.
+func checkBaseLanguage(existing, in *string) error {
+	if in == nil || isBaseLanguage(*in) {
+		return nil
+	}
+	if existing != nil && canonicalLanguage(*existing) == canonicalLanguage(*in) {
+		return nil
+	}
+	return domain.WithCode(domain.CodeMenuItemLanguageNotBase,
+		fmt.Errorf("%w: a menu item is always the base (ru) row; put translations into name_i18n/description_i18n", domain.ErrValidation))
+}
+
+// isBaseLanguage reports whether the label marks a row the guest listing serves.
+// It mirrors the SQL predicate (NULL or 'ru', case-insensitive) — the two must
+// agree, or the panel would accept a dish the listing hides.
+func isBaseLanguage(l string) bool {
+	l = strings.TrimSpace(l)
+	return l == "" || strings.EqualFold(l, domain.LocaleRU)
+}
+
+// canonicalLanguage folds the historical spellings together so that re-saving a
+// legacy row does not fail on 'kz' vs 'kk' (the panel echoes back whatever it
+// was given, and migration 0100 rewrote the stored value).
+func canonicalLanguage(l string) string {
+	if norm := domain.NormalizeLocale(l); norm != "" {
+		return norm
+	}
+	return strings.ToLower(strings.TrimSpace(l))
+}
+
 func applyItem(m *domain.MenuItem, in ItemInput) {
 	if in.Name != nil {
 		m.Name = *in.Name
@@ -472,7 +533,16 @@ func applyItem(m *domain.MenuItem, in ItemInput) {
 		m.PortionSizeI18n = in.PortionSizeI18n
 	}
 	if in.Language != nil {
-		m.Language = in.Language
+		// Normalize the label so the data stops disagreeing with the code
+		// ('kz' from the old import vs 'kk' everywhere else — see migration
+		// 0100). An unrecognized code is kept verbatim rather than dropped:
+		// losing what the editor typed is worse than storing an odd label,
+		// and the label no longer selects rows for anybody.
+		lang := *in.Language
+		if norm := domain.NormalizeLocale(lang); norm != "" {
+			lang = norm
+		}
+		m.Language = &lang
 	}
 	if in.DisplayOrder != nil {
 		m.DisplayOrder = in.DisplayOrder

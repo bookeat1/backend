@@ -48,15 +48,10 @@ func TestMenuItemCRUDListTagsAvailability(t *testing.T) {
 		t.Errorf("roundtrip mismatch: price=%q tags=%d", got.Price, len(got.Tags))
 	}
 
-	// language filter: nil → ru or null; "en" → none
+	// The listing is language-independent: one venue, one set of dishes.
 	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid})
 	if err != nil || len(items) != 1 || len(items[0].Tags) != 2 {
 		t.Fatalf("list(default) = %d items err=%v", len(items), err)
-	}
-	en := "en"
-	items, _ = repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid, Language: &en})
-	if len(items) != 0 {
-		t.Errorf("list(en) = %d, want 0", len(items))
 	}
 
 	if err := repo.SetAvailable(ctx, m.ID, false); err != nil {
@@ -121,7 +116,9 @@ func TestMenuItemUpdate(t *testing.T) {
 		t.Errorf("created_at changed: got %v, want %v", got.CreatedAt, created.CreatedAt)
 	}
 
-	// positive language filter: item with Language="en" must be returned by ListByRestaurant(Language: "en").
+	// A translation row (a separate row labelled with another language, which is
+	// how part of the imported data stores translations) must NOT appear next to
+	// the venue's base rows: that would be the same dish twice in the menu.
 	en := "en"
 	enOrder := 2
 	enItem := &domain.MenuItem{
@@ -131,12 +128,12 @@ func TestMenuItemUpdate(t *testing.T) {
 	if err := repo.Create(ctx, enItem); err != nil {
 		t.Fatalf("create en item: %v", err)
 	}
-	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid, Language: &en})
+	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid})
 	if err != nil {
-		t.Fatalf("list(en): %v", err)
+		t.Fatalf("list: %v", err)
 	}
-	if len(items) != 1 || items[0].ID != enItem.ID {
-		t.Fatalf("list(en) = %d items, want 1 matching enItem.ID", len(items))
+	if len(items) != 1 || items[0].ID != m.ID {
+		t.Fatalf("list = %d items, want only the base row %v", len(items), m.ID)
 	}
 }
 

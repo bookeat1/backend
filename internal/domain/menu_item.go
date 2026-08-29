@@ -57,8 +57,13 @@ func PriceStringToMinor(s string) (int64, error) {
 }
 
 // MenuItem is a dish on a restaurant's menu. Price is a decimal string
-// ("4500.00"). Category/Subcategory are free text (not FKs). Language is set
-// only for multilingual menus (nil = default/ru).
+// ("4500.00"). Category/Subcategory are free text (not FKs).
+//
+// Language LABELS the row's own text (nil = the base/Russian row). It is NOT a
+// selector for reads: translations belong in the *_i18n maps, and the guest
+// listing serves base rows only (see MenuItemRepository.ListByRestaurant).
+// Values are normalized to SupportedLocales on write — the import spelled
+// Kazakh 'kz', the rest of the system 'kk'.
 type MenuItem struct {
 	ID              uuid.UUID
 	RestaurantID    uuid.UUID
@@ -91,11 +96,12 @@ type MenuItem struct {
 	SubcategoryI18n I18n
 	PortionSize     *string
 	PortionSizeI18n I18n
-	Language        *string
-	DisplayOrder    *int
-	Tags            []MenuItemTag
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// Language is the label described above, not a read filter.
+	Language     *string
+	DisplayOrder *int
+	Tags         []MenuItemTag
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // MenuItemTag is a free-text tag attached to a menu item.
@@ -106,11 +112,16 @@ type MenuItemTag struct {
 	CreatedAt  time.Time
 }
 
-// MenuItemFilter narrows a menu listing. Language nil means the default
-// language chain (ru or NULL).
+// MenuItemFilter narrows a menu listing.
+//
+// There is deliberately NO language field: WHICH dishes a venue serves does not
+// depend on the language the guest reads them in. The requested locale is a
+// presentation concern and is resolved from the *_i18n maps at the transport
+// edge (domain.I18n.Resolve), exactly like every other localized entity. See
+// MenuItemRepository.ListByRestaurant for what the row-per-language leftovers
+// in the data do instead.
 type MenuItemFilter struct {
 	RestaurantID uuid.UUID
-	Language     *string
 }
 
 // MenuTopPickLimit is the number of dishes one venue may mark as «Лучшие
@@ -126,7 +137,6 @@ const MenuTopPickLimit = 8
 // required; Limit is clamped by the usecase.
 type MenuHighlightFilter struct {
 	RestaurantID uuid.UUID
-	Language     *string
 	Limit        int
 }
 
@@ -135,9 +145,8 @@ type MenuHighlightFilter struct {
 // Astana is the same mistake the main feed already refuses to make. Limit is
 // clamped by the usecase, not here.
 type FeaturedMenuFilter struct {
-	City     City
-	Language *string
-	Limit    int
+	City  City
+	Limit int
 }
 
 // FeaturedMenuItem is one card of the "chef's picks" rail: the dish plus the
@@ -151,8 +160,16 @@ type FeaturedMenuItem struct {
 // MenuItemRepository persists menu items. Get* return ErrNotFound when absent.
 type MenuItemRepository interface {
 	// ListByRestaurant returns items (with Tags) for f.RestaurantID, ordered by
-	// display_order (NULLs last), then name. When f.Language is nil, items with
-	// language 'ru' OR NULL are returned; otherwise items with that language.
+	// display_order (NULLs last), then name — the SAME set of dishes whatever
+	// language the caller reads them in.
+	//
+	// menu_items.language exists because part of the imported data stores a
+	// translation as a SEPARATE ROW (a Kazakh copy of a dish that also exists in
+	// Russian). Returning those rows alongside their originals would show the
+	// dish twice, so the listing returns the venue's BASE rows (language NULL or
+	// 'ru') and lets the *_i18n maps carry the translations. A venue whose menu
+	// consists ONLY of non-base rows is the one exception: it gets those rows,
+	// because a hidden menu is worse than an untranslated one.
 	ListByRestaurant(ctx context.Context, f MenuItemFilter) ([]MenuItem, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*MenuItem, error)
 	Create(ctx context.Context, m *MenuItem) error

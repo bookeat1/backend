@@ -143,3 +143,57 @@ func TestSetAvailableChecksOwnership(t *testing.T) {
 		t.Error("expected SetAvailable(false) on the owned item")
 	}
 }
+
+// Editing an existing dish must not be able to hide it from the guest either:
+// flipping a base row's label to another language is the same mistake as
+// creating one, only on a dish guests already see today.
+func TestUpdateCannotHideAnExistingDishBehindALanguageLabel(t *testing.T) {
+	rid, itemID := uuid.New(), uuid.New()
+	ru := "ru"
+	items := newFakeItems()
+	items.store[itemID] = &domain.MenuItem{
+		ID: itemID, RestaurantID: rid, Name: "Плов", Price: "2500.00",
+		IsAvailable: true, Language: &ru,
+	}
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	en := "en"
+	_, err := f.Update(context.Background(), rid, itemID, ItemInput{Language: &en})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeMenuItemLanguageNotBase {
+		t.Fatalf("want code %q, got %q (present=%v)", domain.CodeMenuItemLanguageNotBase, code, ok)
+	}
+	if got := items.store[itemID].Language; got == nil || *got != "ru" {
+		t.Fatalf("the refused write must not touch the stored label: %v", got)
+	}
+}
+
+// ...but a LEGACY row that already carries a non-base label stays editable: the
+// 124 imported Kazakh copies are visible in the cabinet, and refusing their
+// edits would make those dishes unfixable. Such a row is already out of the
+// guest listing, so keeping its label changes nothing for the guest. 'kz' is
+// accepted as the same value as 'kk' because the panel echoes back whatever it
+// was given and migration 0100 rewrote what is stored.
+func TestUpdateStillSavesALegacyTranslationRow(t *testing.T) {
+	rid, itemID := uuid.New(), uuid.New()
+	kk := "kk"
+	items := newFakeItems()
+	items.store[itemID] = &domain.MenuItem{
+		ID: itemID, RestaurantID: rid, Name: "Палау", Price: "2500.00",
+		IsAvailable: true, Language: &kk,
+	}
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	newName := "Палау (тауық еті)"
+	for _, echoed := range []string{"kk", "kz", "KK-KZ"} {
+		lang := echoed
+		if _, err := f.Update(context.Background(), rid, itemID, ItemInput{Name: &newName, Language: &lang}); err != nil {
+			t.Fatalf("echoed label %q must stay saveable: %v", echoed, err)
+		}
+	}
+	if got := items.store[itemID].Language; got == nil || *got != "kk" {
+		t.Fatalf("the label must be stored canonically, got %v", got)
+	}
+}

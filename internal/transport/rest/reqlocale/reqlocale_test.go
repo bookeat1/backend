@@ -24,6 +24,12 @@ func TestResolve(t *testing.T) {
 		{"Accept-Language matches a supported tag", "", "kk-KZ,ru;q=0.8", "kk"},
 		{"Accept-Language with no supported tag falls back to ru", "", "fr-FR,de;q=0.8", "ru"},
 		{"query param wins over Accept-Language", "?lang=en", "kk", "en"},
+		// Old store builds (and the imported menu rows) spell Kazakh 'kz'. It
+		// must resolve to kk, not fall back to ru: falling back is what made the
+		// Kazakh menu look empty.
+		{"legacy kz alias resolves to kk", "?lang=kz", "", "kk"},
+		{"legacy kz alias with a region subtag", "?lang=kz-KZ", "", "kk"},
+		{"legacy kz alias in Accept-Language", "", "kz,ru;q=0.8", "kk"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

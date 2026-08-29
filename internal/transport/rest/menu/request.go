@@ -23,9 +23,13 @@ type menuItemRequest struct {
 	SubcategoryI18n map[string]string `json:"subcategory_i18n"`
 	PortionSize     *string           `json:"portion_size"`
 	PortionSizeI18n map[string]string `json:"portion_size_i18n"`
-	Language        *string           `json:"language"`
-	DisplayOrder    *int              `json:"display_order"`
-	Tags            *[]string         `json:"tags"`
+	// Language labels the row's own text. The only values a write accepts are
+	// null and "ru": a dish row IS the base row, translations go into the
+	// *_i18n maps. Anything else is refused with code
+	// menu_item_language_not_base — see checkBaseLanguage in usecase/menu.
+	Language     *string   `json:"language"`
+	DisplayOrder *int      `json:"display_order"`
+	Tags         *[]string `json:"tags"`
 }
 
 func (r menuItemRequest) toInput() uc.ItemInput {

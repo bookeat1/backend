@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/transport/rest/reqlocale"
 	"backend-core/internal/transport/rest/response"
 	uc "backend-core/internal/usecase/menu"
 )
@@ -54,26 +55,25 @@ func (h *Handler) RegisterAdmin(rg *gin.RouterGroup) {
 	rg.DELETE("/menu-categories/:id", h.deleteCategory)
 }
 
+// list serves ONE venue's menu.
+//
+// The dish set never depends on the requested language — only the texts do.
+// ?lang= / Accept-Language go through the shared reqlocale, so an unknown or
+// untranslated language falls back to Russian instead of emptying the menu (it
+// used to select ROWS by menu_items.language: ?lang=kk answered `[]` because
+// the imported rows were labelled 'kz').
 func (h *Handler) list(c *gin.Context) {
 	rid, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid restaurant id")
 		return
 	}
-	var lang *string
-	if v := c.Query("lang"); v != "" {
-		lang = &v
-	}
-	items, err := h.facade.ListByRestaurant(c.Request.Context(), rid, lang)
+	items, err := h.facade.ListByRestaurant(c.Request.Context(), rid)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	out := make([]menuItemResponse, 0, len(items))
-	for i := range items {
-		out = append(out, itemToResponse(&items[i]))
-	}
-	response.OK(c.Writer, out)
+	response.OK(c.Writer, itemsToResponse(items, reqlocale.Resolve(c)))
 }
 
 func (h *Handler) categories(c *gin.Context) {
@@ -82,9 +82,10 @@ func (h *Handler) categories(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	lang := reqlocale.Resolve(c)
 	out := make([]menuCategoryResponse, 0, len(cats))
 	for _, cat := range cats {
-		out = append(out, categoryToResponse(cat))
+		out = append(out, categoryToResponse(cat, lang))
 	}
 	response.OK(c.Writer, out)
 }
@@ -105,7 +106,7 @@ func (h *Handler) create(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.Created(c.Writer, itemToResponse(m))
+	response.Created(c.Writer, itemToResponse(m, ""))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -123,7 +124,7 @@ func (h *Handler) update(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, itemToResponse(m))
+	response.OK(c.Writer, itemToResponse(m, ""))
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -160,10 +161,6 @@ func (h *Handler) setAvailability(c *gin.Context) {
 // shown to a guest in Astana is worse than no rail, so a missing or unknown
 // city is a 422 with its own code rather than a silent country-wide list.
 func (h *Handler) featured(c *gin.Context) {
-	var lang *string
-	if v := c.Query("lang"); v != "" {
-		lang = &v
-	}
 	limit := 0
 	if v := c.Query("limit"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -173,14 +170,15 @@ func (h *Handler) featured(c *gin.Context) {
 		}
 		limit = n
 	}
-	items, err := h.facade.ListFeatured(c.Request.Context(), domain.City(c.Query("city")), lang, limit)
+	items, err := h.facade.ListFeatured(c.Request.Context(), domain.City(c.Query("city")), limit)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	lang := reqlocale.Resolve(c)
 	out := make([]featuredItemResponse, 0, len(items))
 	for _, it := range items {
-		out = append(out, featuredToResponse(it))
+		out = append(out, featuredToResponse(it, lang))
 	}
 	response.OK(c.Writer, out)
 }
@@ -224,10 +222,6 @@ func (h *Handler) highlights(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid restaurant id")
 		return
 	}
-	var lang *string
-	if v := c.Query("lang"); v != "" {
-		lang = &v
-	}
 	limit := 0
 	if v := c.Query("limit"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -237,12 +231,12 @@ func (h *Handler) highlights(c *gin.Context) {
 		}
 		limit = n
 	}
-	items, err := h.facade.ListHighlights(c.Request.Context(), rid, lang, limit)
+	items, err := h.facade.ListHighlights(c.Request.Context(), rid, limit)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, itemsToResponse(items))
+	response.OK(c.Writer, itemsToResponse(items, reqlocale.Resolve(c)))
 }
 
 // listTopPicks is the panel's editor view of the rail: what the venue marked,
@@ -266,7 +260,9 @@ func (h *Handler) listTopPicks(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, itemsToResponse(items))
+	// No localization: this is the venue's own editor view, which edits the
+	// base text and renders the *_i18n maps itself.
+	response.OK(c.Writer, itemsToResponse(items, ""))
 }
 
 // setTopPick marks or unmarks one dish. Marking takes the lowest free slot; a
@@ -346,7 +342,8 @@ func (h *Handler) createCategory(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.Created(c.Writer, categoryToResponse(*cat))
+	// Admin write echo: base text, not a localization of it.
+	response.Created(c.Writer, categoryToResponse(*cat, ""))
 }
 
 func (h *Handler) updateCategory(c *gin.Context) {
@@ -370,7 +367,7 @@ func (h *Handler) updateCategory(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, categoryToResponse(*cat))
+	response.OK(c.Writer, categoryToResponse(*cat, ""))
 }
 
 func (h *Handler) deleteCategory(c *gin.Context) {
