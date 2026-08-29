@@ -524,6 +524,12 @@ type PushConfig struct {
 	// endpoints reached by separate bots, and reusing one secret would mean a
 	// leak of either compromises both.
 	RestaurantsBotWebhookSecret string // env: RESTAURANTS_BOT_WEBHOOK_SECRET
+	// MiniAppInitDataTTL is how long a signed Telegram initData blob is accepted
+	// after Telegram stamped it. It bounds the value of one leaking: past the
+	// window a captured blob is a string in a log, not a key to a shift screen.
+	// One hour is long enough to survive a hostess putting the phone down mid
+	// shift and short enough that a blob out of yesterday's proxy log is dead.
+	MiniAppInitDataTTL time.Duration // env: MINIAPP_INITDATA_TTL
 
 	// GuestPushProvider selects the GUEST mobile-push provider. Empty (the
 	// default) means no provider is configured and the guest channel is a clean
@@ -768,6 +774,7 @@ func NewConfig() (Config, error) {
 
 			RestaurantsBotToken:         getEnv("RESTAURANTS_BOT_TOKEN", ""),
 			RestaurantsBotWebhookSecret: getEnv("RESTAURANTS_BOT_WEBHOOK_SECRET", ""),
+			MiniAppInitDataTTL:          getEnvDuration("MINIAPP_INITDATA_TTL", time.Hour),
 
 			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
 			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),

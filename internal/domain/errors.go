@@ -403,6 +403,44 @@ const (
 	// number. Nothing to verify and nothing to change; a plain validation_failed
 	// would make the app show a field error with no actionable reason. 422.
 	CodePhoneUnchanged ErrorCode = "phone_unchanged"
+
+	// --- Telegram mini app «кабинет ресторана» (spec §5.2) ------------------
+	//
+	// The mini app's three sign-in codes exist because the app has to tell four
+	// outcomes apart on one screen and they share only two statuses. A generic
+	// "unauthorized" would leave it unable to choose between showing the
+	// password form, sending the user back to the bot, and saying access was
+	// withdrawn.
+
+	// CodeInitDataInvalid — the initData blob did not verify against the bot
+	// token: a forged or edited field, or a signature from a DIFFERENT bot. 401.
+	// The app must NOT show the password form for this — nothing the person
+	// types can fix it. It means the request did not come from our mini app.
+	CodeInitDataInvalid ErrorCode = "init_data_invalid"
+
+	// CodeInitDataExpired — the signature is genuine but auth_date is outside
+	// the accepted window (stale, or in the future beyond the clock-skew
+	// allowance). 401. Recoverable and boring: reopen the mini app from the bot
+	// and Telegram mints a fresh blob.
+	CodeInitDataExpired ErrorCode = "init_data_expired"
+
+	// CodeLinkRequired — initData verified, but this Telegram account has never
+	// been linked to a BookEat account (or the link was revoked). 403, and the
+	// ONLY code that means "show the email + password form". Not 401: nothing is
+	// wrong with the credentials presented, there simply are none yet.
+	CodeLinkRequired ErrorCode = "link_required"
+
+	// CodeStaffNotFound — the BookEat account is real and the password (or the
+	// link) checked out, but the person is not staff of any venue: a guest
+	// account, or an employee removed from their last restaurant. 403. On the
+	// link path no link is written; on the sign-in path the existing link is
+	// revoked, so the next open asks for the password again instead of looping.
+	CodeStaffNotFound ErrorCode = "staff_not_found"
+
+	// CodeInvalidCredentials — wrong email or wrong password on the first sign
+	// in. 401. Deliberately ONE code for both, like /auth/login: telling them
+	// apart turns the mini app into an oracle for which emails have an account.
+	CodeInvalidCredentials ErrorCode = "invalid_credentials"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

@@ -122,6 +122,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
+	// Telegram venue mini app sign-in (spec §5.2 A–C). PUBLIC on purpose: these
+	// three endpoints are how a bearer token is obtained in the first place, so
+	// none of them can sit behind Auth. Registered unconditionally — without
+	// RESTAURANTS_BOT_TOKEN they answer 404, which is the same as not existing
+	// but keeps the wiring in one place. POST /auth/telegram/link is listed as
+	// TierStrict in middleware.routeTiers: it reaches the same password check as
+	// /auth/login and must not be a more generous door to it.
+	authrest.NewTelegramHandler(deps.AuthMiniApp).RegisterRoutes(api)
 
 	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers, deps.FavoritesFacade)
 	// OptionalAuth (not Auth): the catalog itself is public, but a logged-in

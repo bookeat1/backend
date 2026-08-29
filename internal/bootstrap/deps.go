@@ -50,6 +50,7 @@ import (
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
 	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	storyrepo "backend-core/internal/infrastructure/postgres/story"
+	telegramlinkrepo "backend-core/internal/infrastructure/postgres/telegramlink"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
@@ -105,16 +106,19 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
-	Cities             citiesuc.UseCase
-	Cuisines           cuisinesuc.UseCase
-	VenueFeatures      venuefeaturesuc.UseCase
-	PushSubscriptions  *notifications.SubscriptionUseCase
-	DeviceTokens       *notifications.DeviceTokenUseCase
-	NotificationFeed   *notifications.NotificationFeedUseCase
-	FavoritesFacade    favorites.Facade
-	ConsentFacade      consent.Facade
-	ReviewsFacade      reviews.Facade
-	EventsFacade       events.Facade
+	// AuthMiniApp is sign-in for the Telegram venue mini app. Always built; it
+	// disables its own routes when RESTAURANTS_BOT_TOKEN is unset.
+	AuthMiniApp       *auth.MiniAppUseCase
+	Cities            citiesuc.UseCase
+	Cuisines          cuisinesuc.UseCase
+	VenueFeatures     venuefeaturesuc.UseCase
+	PushSubscriptions *notifications.SubscriptionUseCase
+	DeviceTokens      *notifications.DeviceTokenUseCase
+	NotificationFeed  *notifications.NotificationFeedUseCase
+	FavoritesFacade   favorites.Facade
+	ConsentFacade     consent.Facade
+	ReviewsFacade     reviews.Facade
+	EventsFacade      events.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
 	EventRecurrences  eventrecurrence.Facade
@@ -270,6 +274,18 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
+	// Telegram venue mini app sign-in. The venue list goes through the SAME
+	// usecase the admin panel's picker uses (wrapped by staffVenueLister below),
+	// so the mini app and the panel can never disagree about who works where.
+	authMiniApp := auth.NewMiniAppUseCase(
+		telegramlinkrepo.New(db), usersRepo, credsRepo, refreshRepo,
+		staffVenueLister{myRestaurants}, txm, issuer, authCfg,
+		auth.MiniAppConfig{
+			BotToken:    strings.TrimSpace(cfg.Push.RestaurantsBotToken),
+			InitDataTTL: cfg.Push.MiniAppInitDataTTL,
+		},
+		log,
+	)
 	pushSubscriptions := notifications.NewSubscriptionUseCase(notificationrepo.NewSubscriptions(db), restManagers)
 	// Guest mobile push tokens: no restaurant, no RBAC — a guest device is
 	// notified about the guest's own bookings, so owning the account IS the
@@ -524,6 +540,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		HomePicks:             homePicksFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
+		AuthMiniApp:           authMiniApp,
 		Cities:                citiesUC,
 		Cuisines:              cuisinesUC,
 		VenueFeatures:         venueFeaturesUC,
@@ -1607,4 +1624,30 @@ func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legac
 		log,
 	)
 	return worker, pool.Close, nil
+}
+
+// staffVenueLister adapts the admin panel's venue picker to the port
+// usecase/auth declares for the mini app. The adapter lives here rather than in
+// either usecase so neither imports the other: usecase/auth keeps depending on
+// domain alone, and "which venues does this person work at" stays one
+// implementation with two callers instead of two implementations that drift.
+type staffVenueLister struct {
+	uc *restaurants.MyRestaurantsUseCase
+}
+
+func (l staffVenueLister) ListForStaff(ctx context.Context, userID uuid.UUID, role domain.Role) ([]auth.StaffVenue, error) {
+	items, err := l.uc.List(ctx, restaurants.Actor{UserID: userID, Role: role})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]auth.StaffVenue, 0, len(items))
+	for _, it := range items {
+		out = append(out, auth.StaffVenue{
+			RestaurantID: it.RestaurantID,
+			Name:         it.Name,
+			NameI18n:     it.NameI18n,
+			Role:         it.Role,
+		})
+	}
+	return out, nil
 }
