@@ -50,7 +50,7 @@ type fakeMenu struct {
 	bulkIDs                             []uuid.UUID
 }
 
-func (f *fakeMenu) ListByRestaurant(_ context.Context, _ uuid.UUID, _ *string) ([]domain.MenuItem, error) {
+func (f *fakeMenu) ListByRestaurant(_ context.Context, _ uuid.UUID) ([]domain.MenuItem, error) {
 	return nil, nil
 }
 func (f *fakeMenu) Categories(_ context.Context) ([]domain.MenuCategory, error) { return nil, nil }

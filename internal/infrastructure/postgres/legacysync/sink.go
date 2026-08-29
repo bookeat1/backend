@@ -222,7 +222,7 @@ ON CONFLICT (id) DO UPDATE SET
  language=EXCLUDED.language, display_order=EXCLUDED.display_order, updated_at=EXCLUDED.updated_at`,
 		m.ID, m.RestaurantID, m.Name, jsonb(m.NameI18n), m.Description, jsonb(m.DescriptionI18n),
 		m.Price, m.ImageURL, m.IsAvailable, m.Category, jsonb(m.CategoryI18n), m.Subcategory,
-		jsonb(m.SubcategoryI18n), m.PortionSize, jsonb(m.PortionSizeI18n), m.Language,
+		jsonb(m.SubcategoryI18n), m.PortionSize, jsonb(m.PortionSizeI18n), normalizedLanguage(m.Language),
 		m.DisplayOrder, m.CreatedAt, m.UpdatedAt)
 }
 
@@ -450,4 +450,21 @@ func jsonb(b []byte) any {
 		return nil
 	}
 	return b
+}
+
+// normalizedLanguage canonicalizes the old menu's language label on the way in.
+// The legacy base spells Kazakh 'kz'; the whole new system (SupportedLocales,
+// every *_i18n key) spells it 'kk', and migration 0100 normalized what is
+// already stored — without this the very next sync tick would write the old
+// spelling straight back. An unrecognized code is passed through unchanged
+// rather than dropped: the label is descriptive, and losing imported data is
+// worse than keeping an odd value.
+func normalizedLanguage(lang *string) *string {
+	if lang == nil {
+		return nil
+	}
+	if norm := domain.NormalizeLocale(*lang); norm != "" {
+		return &norm
+	}
+	return lang
 }

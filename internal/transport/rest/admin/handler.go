@@ -347,11 +347,10 @@ func (h *Handler) listMenu(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var lang *string
-	if v := c.Query("lang"); v != "" {
-		lang = &v
-	}
-	items, err := h.panel.ListMenu(c.Request.Context(), actor, rid, lang)
+	// ?lang= is accepted and ignored on purpose: the cabinet must always show
+	// every dish it can edit, and it renders the *_i18n maps itself. Filtering
+	// the editor's rows by language is exactly the bug the guest menu had.
+	items, err := h.panel.ListMenu(c.Request.Context(), actor, rid)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return

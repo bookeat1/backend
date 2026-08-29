@@ -27,10 +27,16 @@ type fakeFacade struct {
 	setErr          error
 
 	replaced []uuid.UUID
+
+	// items backs ListByRestaurant; listRID records what the transport asked
+	// for.
+	items   []domain.MenuItem
+	listRID uuid.UUID
 }
 
-func (f *fakeFacade) ListByRestaurant(context.Context, uuid.UUID, *string) ([]domain.MenuItem, error) {
-	return nil, nil
+func (f *fakeFacade) ListByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.MenuItem, error) {
+	f.listRID = rid
+	return f.items, nil
 }
 func (f *fakeFacade) Get(context.Context, uuid.UUID) (*domain.MenuItem, error) { return nil, nil }
 func (f *fakeFacade) Categories(context.Context) ([]domain.MenuCategory, error) {
@@ -50,10 +56,10 @@ func (f *fakeFacade) SetAvailableBulk(context.Context, uuid.UUID, []uuid.UUID, b
 	return 0, nil
 }
 func (f *fakeFacade) SetFeatured(context.Context, uuid.UUID, uuid.UUID, bool) error { return nil }
-func (f *fakeFacade) ListFeatured(context.Context, domain.City, *string, int) ([]domain.FeaturedMenuItem, error) {
+func (f *fakeFacade) ListFeatured(context.Context, domain.City, int) ([]domain.FeaturedMenuItem, error) {
 	return nil, nil
 }
-func (f *fakeFacade) ListHighlights(_ context.Context, rid uuid.UUID, _ *string, limit int) ([]domain.MenuItem, error) {
+func (f *fakeFacade) ListHighlights(_ context.Context, rid uuid.UUID, limit int) ([]domain.MenuItem, error) {
 	f.highlightsRID, f.highlightsLim = rid, limit
 	return f.highlights, nil
 }

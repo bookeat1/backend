@@ -309,11 +309,15 @@ func (u *UseCase) UpdateProfile(ctx context.Context, actor Actor, restaurantID u
 // ---- Menu ------------------------------------------------------------------
 
 // ListMenu returns the venue's menu items. owner/manager.
-func (u *UseCase) ListMenu(ctx context.Context, actor Actor, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error) {
+//
+// No language argument: the cabinet edits the dish, not a per-language copy of
+// it, so it must always see the same rows. Translations travel in the *_i18n
+// maps of each item.
+func (u *UseCase) ListMenu(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
 	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
 		return nil, err
 	}
-	return u.menu.ListByRestaurant(ctx, restaurantID, lang)
+	return u.menu.ListByRestaurant(ctx, restaurantID)
 }
 
 // ListCategories returns the GLOBAL menu-category reference tree (read-only for

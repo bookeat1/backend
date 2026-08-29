@@ -55,31 +55,54 @@ type menuCategoryResponse struct {
 	DisplayOrder int               `json:"display_order"`
 }
 
-func itemToResponse(m *domain.MenuItem) menuItemResponse {
+// itemToResponse maps one dish. lang is the resolved caller locale ("" when the
+// caller asked for nothing, and for the cabinet views, which edit base text).
+//
+// Both models are served at once, on purpose: the scalar fields are resolved
+// HERE, like every other localized entity (restaurants, events, guide), while
+// the raw *_i18n maps stay in the payload because the mobile app resolves the
+// menu itself today. Dropping the maps would break installed builds; not
+// resolving the scalars leaves every other client with Russian text.
+func itemToResponse(m *domain.MenuItem, lang string) menuItemResponse {
 	tags := make([]string, 0, len(m.Tags))
 	for _, t := range m.Tags {
 		tags = append(tags, t.Tag)
 	}
 	return menuItemResponse{
-		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(), Name: m.Name, NameI18n: m.NameI18n,
-		Description: m.Description, DescriptionI18n: m.DescriptionI18n, Price: m.Price,
+		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(),
+		Name: m.NameI18n.Resolve(lang, m.Name), NameI18n: m.NameI18n,
+		Description: m.DescriptionI18n.Resolve(lang, m.Description), DescriptionI18n: m.DescriptionI18n,
+		Price:      m.Price,
 		PriceMinor: priceMinorOf(m.Price), ImageURL: m.ImageURL,
 		IsAvailable: m.IsAvailable, IsFeatured: m.IsFeatured,
 		IsTopPick: m.TopPickPosition != nil, TopPickPosition: m.TopPickPosition,
-		Category: m.Category, CategoryI18n: m.CategoryI18n,
-		Subcategory: m.Subcategory, SubcategoryI18n: m.SubcategoryI18n, PortionSize: m.PortionSize,
+		Category: resolvePtr(m.CategoryI18n, lang, m.Category), CategoryI18n: m.CategoryI18n,
+		Subcategory: resolvePtr(m.SubcategoryI18n, lang, m.Subcategory), SubcategoryI18n: m.SubcategoryI18n,
+		PortionSize:     resolvePtr(m.PortionSizeI18n, lang, m.PortionSize),
 		PortionSizeI18n: m.PortionSizeI18n, Language: m.Language, DisplayOrder: m.DisplayOrder,
 		Tags: tags, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 	}
 }
 
-func categoryToResponse(c domain.MenuCategory) menuCategoryResponse {
+// resolvePtr is I18n.Resolve for a nullable column: a NULL base stays NULL even
+// when a translation exists, because the field is absent for this dish, not
+// untranslated. A resolved value is returned in a NEW pointer so the domain
+// aggregate is never aliased.
+func resolvePtr(i domain.I18n, lang string, base *string) *string {
+	if base == nil {
+		return nil
+	}
+	v := i.Resolve(lang, *base)
+	return &v
+}
+
+func categoryToResponse(c domain.MenuCategory, lang string) menuCategoryResponse {
 	var parent *string
 	if c.ParentID != nil {
 		s := c.ParentID.String()
 		parent = &s
 	}
-	return menuCategoryResponse{ID: c.ID.String(), Name: c.Name, NameI18n: c.NameI18n, ParentID: parent, DisplayOrder: c.DisplayOrder}
+	return menuCategoryResponse{ID: c.ID.String(), Name: c.NameI18n.Resolve(lang, c.Name), NameI18n: c.NameI18n, ParentID: parent, DisplayOrder: c.DisplayOrder}
 }
 
 // featuredItemResponse is one card of the cross-venue "chef's picks" rail. It
@@ -92,11 +115,11 @@ type featuredItemResponse struct {
 	RestaurantNameI18n map[string]string `json:"restaurant_name_i18n,omitempty"`
 }
 
-func featuredToResponse(f domain.FeaturedMenuItem) featuredItemResponse {
+func featuredToResponse(f domain.FeaturedMenuItem, lang string) featuredItemResponse {
 	item := f.Item
 	return featuredItemResponse{
-		menuItemResponse:   itemToResponse(&item),
-		RestaurantName:     f.RestaurantName,
+		menuItemResponse:   itemToResponse(&item, lang),
+		RestaurantName:     f.RestaurantI18n.Resolve(lang, f.RestaurantName),
 		RestaurantNameI18n: f.RestaurantI18n,
 	}
 }
@@ -115,10 +138,10 @@ func priceMinorOf(price string) *int64 {
 
 // itemsToResponse maps a slice of dishes, preserving order — the rail's order
 // IS the payload here, so no map/sort may happen after the usecase decided it.
-func itemsToResponse(items []domain.MenuItem) []menuItemResponse {
+func itemsToResponse(items []domain.MenuItem, lang string) []menuItemResponse {
 	out := make([]menuItemResponse, 0, len(items))
 	for i := range items {
-		out = append(out, itemToResponse(&items[i]))
+		out = append(out, itemToResponse(&items[i], lang))
 	}
 	return out
 }

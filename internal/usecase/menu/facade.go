@@ -14,7 +14,10 @@ import (
 // Facade exposes menu reads and per-restaurant mutations. Mutating methods take
 // restaurantID (from the route) and enforce that the item belongs to it (IDOR).
 type Facade interface {
-	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error)
+	// ListByRestaurant returns the venue's whole menu. It takes no language:
+	// the dish SET is the same in every language, and the texts are localized
+	// at the transport edge from the *_i18n maps.
+	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error)
 	Get(ctx context.Context, itemID uuid.UUID) (*domain.MenuItem, error)
 	Categories(ctx context.Context) ([]domain.MenuCategory, error)
 
@@ -35,14 +38,14 @@ type Facade interface {
 	// limit is clamped here (not in the repository) because it is a transport
 	// concern: an unbounded rail is a slow query a client can ask for by
 	// accident.
-	ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error)
+	ListFeatured(ctx context.Context, city domain.City, limit int) ([]domain.FeaturedMenuItem, error)
 
 	// ListHighlights resolves the «Лучшие позиции» rail of ONE venue's
 	// storefront: the dishes the venue marked itself, in its own order, and
 	// then — only to fill the rail up to limit — the derived dishes that rail
 	// used to consist of entirely. See resolveHighlights for the rule and why
 	// the fallback exists.
-	ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error)
+	ListHighlights(ctx context.Context, restaurantID uuid.UUID, limit int) ([]domain.MenuItem, error)
 	// SetTopPick marks or unmarks one dish of restaurantID as a «Лучшая
 	// позиция». Marking takes the lowest free slot; the venue's own order is
 	// changed only through ReplaceTopPicks. Marking an already marked dish is a
@@ -103,8 +106,8 @@ type CategoryInput struct {
 	DisplayOrder int
 }
 
-func (f *facade) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error) {
-	return f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID, Language: lang})
+func (f *facade) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
+	return f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID})
 }
 
 func (f *facade) Get(ctx context.Context, itemID uuid.UUID) (*domain.MenuItem, error) {
@@ -194,7 +197,7 @@ const (
 	featuredLimitMax     = 50
 )
 
-func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *string, limit int) ([]domain.FeaturedMenuItem, error) {
+func (f *facade) ListFeatured(ctx context.Context, city domain.City, limit int) ([]domain.FeaturedMenuItem, error) {
 	if !city.Valid() {
 		return nil, domain.WithCode(domain.CodeCityRequired, fmt.Errorf("%w: city is required", domain.ErrValidation))
 	}
@@ -204,7 +207,7 @@ func (f *facade) ListFeatured(ctx context.Context, city domain.City, lang *strin
 	case limit > featuredLimitMax:
 		limit = featuredLimitMax
 	}
-	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Language: lang, Limit: limit})
+	return f.items.ListFeatured(ctx, domain.FeaturedMenuFilter{City: city, Limit: limit})
 }
 
 // highlightLimit bounds a venue's storefront rail. The default is what the app
@@ -222,14 +225,14 @@ const (
 // is what keeps a genuinely full rail from spinning.
 const topPickRetries = 3
 
-func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, lang *string, limit int) ([]domain.MenuItem, error) {
+func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, limit int) ([]domain.MenuItem, error) {
 	switch {
 	case limit <= 0:
 		limit = highlightLimitDefault
 	case limit > highlightLimitMax:
 		limit = highlightLimitMax
 	}
-	items, err := f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID, Language: lang})
+	items, err := f.items.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: restaurantID})
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +475,16 @@ func applyItem(m *domain.MenuItem, in ItemInput) {
 		m.PortionSizeI18n = in.PortionSizeI18n
 	}
 	if in.Language != nil {
-		m.Language = in.Language
+		// Normalize the label so the data stops disagreeing with the code
+		// ('kz' from the old import vs 'kk' everywhere else — see migration
+		// 0100). An unrecognized code is kept verbatim rather than dropped:
+		// losing what the editor typed is worse than storing an odd label,
+		// and the label no longer selects rows for anybody.
+		lang := *in.Language
+		if norm := domain.NormalizeLocale(lang); norm != "" {
+			lang = norm
+		}
+		m.Language = &lang
 	}
 	if in.DisplayOrder != nil {
 		m.DisplayOrder = in.DisplayOrder

@@ -52,7 +52,7 @@ func TestHighlightsPutTheVenuesOwnPicksAheadOfTheDerivedOnes(t *testing.T) {
 	)
 	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
 
-	got, err := f.ListHighlights(context.Background(), rid, nil, 4)
+	got, err := f.ListHighlights(context.Background(), rid, 4)
 	if err != nil {
 		t.Fatalf("list highlights: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestHighlightsFallBackToTheDerivedListWhenNothingIsMarked(t *testing.T) {
 	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
 	ctx := context.Background()
 
-	withMark, err := f.ListHighlights(ctx, rid, nil, 8)
+	withMark, err := f.ListHighlights(ctx, rid, 8)
 	if err != nil {
 		t.Fatalf("list highlights: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestHighlightsFallBackToTheDerivedListWhenNothingIsMarked(t *testing.T) {
 	// snapshot, so refresh it from the store the same way a re-read would.
 	items.list = []domain.MenuItem{*items.store[a.ID], *items.store[b.ID], *items.store[marked.ID]}
 
-	after, err := f.ListHighlights(ctx, rid, nil, 8)
+	after, err := f.ListHighlights(ctx, rid, 8)
 	if err != nil {
 		t.Fatalf("list highlights: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestHighlightsExcludeAMarkedDishThatIsUnavailable(t *testing.T) {
 	)
 	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
 
-	got, err := f.ListHighlights(context.Background(), rid, nil, 8)
+	got, err := f.ListHighlights(context.Background(), rid, 8)
 	if err != nil {
 		t.Fatalf("list highlights: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestHighlightsClampTheRailSize(t *testing.T) {
 		{5, 5},
 		{5000, highlightLimitMax},
 	} {
-		got, err := f.ListHighlights(ctx, rid, nil, tc.in)
+		got, err := f.ListHighlights(ctx, rid, tc.in)
 		if err != nil {
 			t.Fatalf("limit %d: %v", tc.in, err)
 		}

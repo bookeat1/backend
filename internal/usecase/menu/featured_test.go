@@ -18,7 +18,7 @@ func TestListFeaturedRequiresAKnownCity(t *testing.T) {
 	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
 
 	for _, city := range []domain.City{"", "Караганда"} {
-		_, err := f.ListFeatured(context.Background(), city, nil, 0)
+		_, err := f.ListFeatured(context.Background(), city, 0)
 		if err == nil {
 			t.Fatalf("city %q must be rejected", city)
 		}
@@ -49,7 +49,7 @@ func TestListFeaturedClampsLimit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			items := newFakeItems()
 			f := NewFacade(items, &fakeCategories{}, &inlineTx{})
-			if _, err := f.ListFeatured(context.Background(), "Алматы", nil, tc.in); err != nil {
+			if _, err := f.ListFeatured(context.Background(), "Алматы", tc.in); err != nil {
 				t.Fatalf("list featured: %v", err)
 			}
 			if items.featuredArg.Limit != tc.want {
@@ -59,19 +59,15 @@ func TestListFeaturedClampsLimit(t *testing.T) {
 	}
 }
 
-func TestListFeaturedPassesCityAndLanguageThrough(t *testing.T) {
+func TestListFeaturedPassesCityThrough(t *testing.T) {
 	items := newFakeItems()
 	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
-	lang := "kk"
 
-	if _, err := f.ListFeatured(context.Background(), "Астана", &lang, 3); err != nil {
+	if _, err := f.ListFeatured(context.Background(), "Астана", 3); err != nil {
 		t.Fatalf("list featured: %v", err)
 	}
 	if items.featuredArg.City != "Астана" {
 		t.Fatalf("city not passed through: %q", items.featuredArg.City)
-	}
-	if items.featuredArg.Language == nil || *items.featuredArg.Language != "kk" {
-		t.Fatalf("language not passed through: %v", items.featuredArg.Language)
 	}
 }
 
