@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -150,18 +151,88 @@ func (r *Settings) WebPushEnabled(ctx context.Context, restaurantID uuid.UUID) (
 func (r *Settings) TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
 	var chatID *string
 	var enabled bool
+	var readyAt, failedAt *time.Time
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT telegram_chat_id, telegram_enabled FROM restaurant_notification_settings WHERE restaurant_id=$1`,
-		restaurantID).Scan(&chatID, &enabled)
+		`SELECT telegram_chat_id, telegram_enabled,
+		        telegram_new_bot_ready_at, telegram_new_bot_failed_at
+		   FROM restaurant_notification_settings WHERE restaurant_id=$1`,
+		restaurantID).Scan(&chatID, &enabled, &readyAt, &failedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.TelegramSettings{ChatID: "", Enabled: true}, nil
 	}
 	if err != nil {
 		return domain.TelegramSettings{}, fmt.Errorf("read telegram settings: %w", err)
 	}
-	out := domain.TelegramSettings{Enabled: enabled}
+	out := domain.TelegramSettings{Enabled: enabled, NewBotReadyAt: readyAt, NewBotFailedAt: failedAt}
 	if chatID != nil {
 		out.ChatID = *chatID
+	}
+	return out, nil
+}
+
+// MarkTelegramNewBotReady flips this venue onto @book_eat_restaurants_bot. The
+// UPDATE (not an upsert) is deliberate: readiness is only meaningful for a
+// venue that already has a settings row with a chat id, and the caller reached
+// this method BY resolving that chat id — so the row exists by construction.
+// A missing row therefore means the chat was disconnected in between, and
+// creating one here would resurrect it.
+func (r *Settings) MarkTelegramNewBotReady(ctx context.Context, restaurantID uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurant_notification_settings
+		    SET telegram_new_bot_ready_at = now(), updated_at = now()
+		  WHERE restaurant_id = $1`, restaurantID); err != nil {
+		return fmt.Errorf("mark telegram new bot ready: %w", err)
+	}
+	return nil
+}
+
+// MarkTelegramNewBotFailed puts the venue back on the old bot after a refusal.
+// Clearing ready_at in the SAME statement as writing failed_at is what makes
+// the fallback self-healing: there is no window in which the venue is recorded
+// as "ready" while the new bot is known to be refused.
+func (r *Settings) MarkTelegramNewBotFailed(ctx context.Context, restaurantID uuid.UUID) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurant_notification_settings
+		    SET telegram_new_bot_ready_at  = NULL,
+		        telegram_new_bot_failed_at = now(),
+		        updated_at                 = now()
+		  WHERE restaurant_id = $1`, restaurantID); err != nil {
+		return fmt.Errorf("mark telegram new bot failed: %w", err)
+	}
+	return nil
+}
+
+// TelegramMigrationStatus lists every venue with a connected chat, newest
+// laggards first. Venues WITHOUT a chat id are excluded on purpose: they are
+// not behind on the migration, they simply never used Telegram.
+func (r *Settings) TelegramMigrationStatus(ctx context.Context) ([]domain.TelegramMigrationRow, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT s.restaurant_id, COALESCE(r.name, ''), s.telegram_chat_id, s.telegram_enabled,
+		        s.telegram_new_bot_ready_at, s.telegram_new_bot_failed_at
+		   FROM restaurant_notification_settings s
+		   LEFT JOIN restaurants r ON r.id = s.restaurant_id
+		  WHERE s.telegram_chat_id IS NOT NULL AND s.telegram_chat_id <> ''
+		  ORDER BY (s.telegram_new_bot_ready_at IS NOT NULL), COALESCE(r.name, '')`)
+	if err != nil {
+		return nil, fmt.Errorf("list telegram migration status: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]domain.TelegramMigrationRow, 0)
+	for rows.Next() {
+		var row domain.TelegramMigrationRow
+		var chatID *string
+		if err := rows.Scan(&row.RestaurantID, &row.RestaurantName, &chatID,
+			&row.Enabled, &row.NewBotReadyAt, &row.NewBotFailedAt); err != nil {
+			return nil, fmt.Errorf("scan telegram migration row: %w", err)
+		}
+		if chatID != nil {
+			row.ChatID = *chatID
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list telegram migration status: %w", err)
 	}
 	return out, nil
 }

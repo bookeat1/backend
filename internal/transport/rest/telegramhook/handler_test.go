@@ -19,6 +19,9 @@ const secret = "s3cret-header"
 
 type fakeSettings struct {
 	chatToVenue map[string]uuid.UUID
+	readyCalls  []uuid.UUID
+	failedCalls []uuid.UUID
+	markErr     error
 }
 
 func (f *fakeSettings) RestaurantByTelegramChatID(_ context.Context, chatID string) (uuid.UUID, error) {
@@ -32,7 +35,23 @@ func (f *fakeSettings) TelegramSettings(context.Context, uuid.UUID) (domain.Tele
 	return domain.TelegramSettings{}, nil
 }
 func (f *fakeSettings) SetTelegramChatID(context.Context, uuid.UUID, string) error { return nil }
-func (f *fakeSettings) ClearTelegramChatID(context.Context, uuid.UUID) error       { return nil }
+
+// The two migration writes (0098). readyCalls/failedCalls record WHICH venue
+// was moved, so a test can prove an update from the OLD bot never touches them.
+func (f *fakeSettings) MarkTelegramNewBotReady(_ context.Context, id uuid.UUID) error {
+	f.readyCalls = append(f.readyCalls, id)
+	return f.markErr
+}
+
+func (f *fakeSettings) MarkTelegramNewBotFailed(_ context.Context, id uuid.UUID) error {
+	f.failedCalls = append(f.failedCalls, id)
+	return f.markErr
+}
+
+func (f *fakeSettings) TelegramMigrationStatus(context.Context) ([]domain.TelegramMigrationRow, error) {
+	return nil, nil
+}
+func (f *fakeSettings) ClearTelegramChatID(context.Context, uuid.UUID) error { return nil }
 
 // WhatsApp-половина того же порта: этот тест про телеграм, поэтому здесь заглушки.
 func (f *fakeSettings) WhatsAppSettings(context.Context, uuid.UUID) (domain.WhatsAppSettings, error) {

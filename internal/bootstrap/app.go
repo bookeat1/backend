@@ -178,6 +178,18 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		deps.TelegramAnswerer, deps.TelegramWebhookSecret,
 	).RegisterRoutes(api)
 
+	// The SECOND staff bot (@book_eat_restaurants_bot) during the staged
+	// migration of venue alerts (spec §7). Its own path, its own secret and its
+	// own answerer — a press can only be acknowledged with the token of the bot
+	// that sent the message, so the endpoint above stays mounted for as long as
+	// old alerts with buttons are still sitting in venues' chats. This one also
+	// handles /start and my_chat_member, which is how a venue migrates itself.
+	telegramhook.NewStaffHandler(
+		deps.BookingStatus, deps.NotificationSettings,
+		deps.StaffBotAnswerer, deps.StaffBotWebhookSecret,
+		deps.NotificationSettings, deps.StaffBotMessenger,
+	).RegisterRoutes(api)
+
 	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
 	// SAME OptionalAuth group and for the same reason as the catalog: it is a
 	// public screen, but a signed-in guest gets their cuisine preferences folded
@@ -326,6 +338,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// the cuisine/feature/city dictionaries and the gastroguide): only the
 	// superadmin picks who is on the main screen.
 	picksHandler.RegisterAdminGlobal(adminGlobal)
+	// Read-only progress report for the Telegram bot migration (spec §7 step 5):
+	// who still receives alerts from the old bot. Superadmin only — it lists
+	// every venue's chat id, which is a target, not a public fact.
+	notificationsrest.NewTelegramMigrationHandler(deps.NotificationSettings).
+		RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
 	// The cuisine dictionary is the PLATFORM's, not a venue's: only the
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that

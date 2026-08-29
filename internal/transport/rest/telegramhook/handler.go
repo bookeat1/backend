@@ -29,6 +29,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 	"backend-core/internal/logging"
 	uc "backend-core/internal/usecase/bookings"
@@ -42,30 +44,90 @@ type Answerer interface {
 	EditMessageText(ctx context.Context, chatID string, messageID int64, text string) error
 }
 
-// Handler serves POST /telegram/webhook.
+// Messenger sends a plain message into a chat. Only the NEW (restaurants) bot
+// needs it: an inbound /start has no callback query to answer, so the only way
+// to tell staff "you are connected" — or to hand them their chat id when they
+// are not — is an ordinary message back. Same signature as
+// notifications.TelegramSender, which *telegramnotify.Sender already satisfies.
+type Messenger interface {
+	Send(ctx context.Context, chatID, text string) (int, error)
+}
+
+// Handler serves one bot's inbound updates.
+//
+// TWO instances of it run side by side during the migration to
+// @book_eat_restaurants_bot (spec §7), each on its own path, with its own
+// secret and — critically — its own Answerer: a callback query can only be
+// answered with the token of the bot that sent the message it belongs to.
+// Sharing one Answerer between two bots would silently break every button under
+// yesterday's alerts.
 type Handler struct {
 	status   uc.StatusUseCase
 	settings domain.RestaurantNotificationSettingsRepository
 	answer   Answerer
 	secret   string
+	path     string
+	// onboarding is set only for the NEW bot: it is what turns an inbound
+	// /start (or "bot added to the group") into telegram_new_bot_ready_at, so a
+	// venue migrates itself without re-typing a chat id anywhere. Nil for the
+	// old bot, whose updates must never move the migration flag.
+	onboarding OnboardingRepository
+	// replyBot is the new bot's way to talk back after /start. Optional: without it
+	// onboarding still works, the venue just gets no confirmation.
+	replyBot Messenger
 }
 
-// NewHandler wires the webhook. An empty secret DISABLES the endpoint: without
-// it there is nothing separating Telegram from anyone who guesses the URL, and
-// a silently-open confirm endpoint is worse than a missing feature.
+// OnboardingRepository is the slice of the notification settings repository the
+// new bot's webhook writes to. Narrow on purpose: an inbound update may move
+// the migration flag and nothing else.
+type OnboardingRepository interface {
+	MarkTelegramNewBotReady(ctx context.Context, restaurantID uuid.UUID) error
+	MarkTelegramNewBotFailed(ctx context.Context, restaurantID uuid.UUID) error
+}
+
+// NewHandler wires the OLD notifications bot's webhook. An empty secret DISABLES
+// the endpoint: without it there is nothing separating Telegram from anyone who
+// guesses the URL, and a silently-open confirm endpoint is worse than a missing
+// feature.
+//
+// It stays mounted for the whole migration: the buttons under alerts already
+// sitting in venues' chats were sent by the old bot and their presses come back
+// here.
 func NewHandler(
 	status uc.StatusUseCase,
 	settings domain.RestaurantNotificationSettingsRepository,
 	answer Answerer,
 	secret string,
 ) *Handler {
-	return &Handler{status: status, settings: settings, answer: answer, secret: strings.TrimSpace(secret)}
+	return &Handler{
+		status: status, settings: settings, answer: answer,
+		secret: strings.TrimSpace(secret), path: "/telegram/webhook",
+	}
+}
+
+// NewStaffHandler wires the NEW restaurants bot's webhook on its own path with
+// its own secret. On top of button presses it handles the two updates that
+// migrate a venue by themselves: /start in a private chat and my_chat_member in
+// a group.
+func NewStaffHandler(
+	status uc.StatusUseCase,
+	settings domain.RestaurantNotificationSettingsRepository,
+	answer Answerer,
+	secret string,
+	onboarding OnboardingRepository,
+	replyBot Messenger,
+) *Handler {
+	return &Handler{
+		status: status, settings: settings, answer: answer,
+		secret: strings.TrimSpace(secret), path: "/telegram/staff-webhook",
+		onboarding: onboarding, replyBot: replyBot,
+	}
 }
 
 // RegisterRoutes mounts the webhook. Mount it OUTSIDE every auth group: Telegram
 // cannot carry a bearer token.
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
-	rg.POST("/telegram/webhook", h.handle)
+	rg.POST(h.path, h.handle)
 }
 
 // update is the sliver of the Telegram update we act on. Everything else in the
@@ -87,6 +149,28 @@ type update struct {
 			Text string `json:"text"`
 		} `json:"message"`
 	} `json:"callback_query"`
+
+	// Message is read ONLY for the /start of the new bot: the moment staff press
+	// Start, this chat becomes reachable by that bot, which is exactly the fact
+	// the migration flag records.
+	Message *struct {
+		Text string `json:"text"`
+		Chat struct {
+			ID   int64  `json:"id"`
+			Type string `json:"type"`
+		} `json:"chat"`
+	} `json:"message"`
+
+	// MyChatMember is the group half of the same fact: the bot was added to (or
+	// removed from) a group the venue already uses for alerts.
+	MyChatMember *struct {
+		Chat struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+		NewChatMember struct {
+			Status string `json:"status"`
+		} `json:"new_chat_member"`
+	} `json:"my_chat_member"`
 }
 
 func (h *Handler) handle(c *gin.Context) {
@@ -114,8 +198,12 @@ func (h *Handler) handle(c *gin.Context) {
 	}
 	cb := u.CallbackQuery
 	if cb == nil || cb.Message == nil {
-		// Some other update type (a message to the bot, a member change). Not
-		// ours, not an error.
+		// Not a button press. For the NEW bot two of these updates matter — they
+		// are how a venue migrates itself. For the old bot they are ignored, as
+		// before: an update to the old bot must never move the migration flag.
+		if h.onboarding != nil {
+			h.handleOnboarding(c, u)
+		}
 		c.Status(http.StatusOK)
 		return
 	}
@@ -201,4 +289,108 @@ func by(who string) string {
 		return "."
 	}
 	return ": " + who + "."
+}
+
+// --- self-service migration onto the new bot (spec §7, step 2) ---------------
+
+// handleOnboarding turns "staff pressed Start" / "the bot was added to the
+// group" into telegram_new_bot_ready_at, and "the bot was removed" back into
+// not-ready. The chat id is the only credential here, exactly as it is for a
+// button press: a chat that no venue connected can prove nothing, and is told
+// its own id so staff can paste it into the panel once.
+//
+// Every branch answers Telegram with 200 (the caller does it): a non-2xx would
+// make Telegram replay the same update for hours, and none of the failures here
+// is fixable by a retry.
+func (h *Handler) handleOnboarding(c *gin.Context, u update) {
+	ctx := c.Request.Context()
+	log := logging.FromContext(ctx)
+
+	switch {
+	case u.Message != nil && isStartCommand(u.Message.Text):
+		chatID := strconvI64(u.Message.Chat.ID)
+		restaurantID, err := h.settings.RestaurantByTelegramChatID(ctx, chatID)
+		if err != nil {
+			// Nobody connected this chat (or the venue switched Telegram off).
+			// Handing back the chat id is the whole onboarding for a NEW venue:
+			// it is the value the panel asks for.
+			log.Info("telegram staff webhook: /start from a chat that owns no venue",
+				slog.String("chat_id", chatID))
+			h.say(ctx, chatID, "Этот чат пока не привязан к заведению.\n"+
+				"Скопируйте этот ID и вставьте его в кабинете, раздел «Уведомления»: "+chatID)
+			return
+		}
+		if err := h.onboarding.MarkTelegramNewBotReady(ctx, restaurantID); err != nil {
+			log.Error("telegram staff webhook: could not mark the venue ready",
+				slog.String("restaurant_id", restaurantID.String()),
+				slog.String("error", err.Error()))
+			h.say(ctx, chatID, "Не получилось включить уведомления, попробуйте ещё раз чуть позже.")
+			return
+		}
+		log.Info("telegram.new_bot_ready",
+			slog.String("restaurant_id", restaurantID.String()),
+			slog.String("chat_id", chatID))
+		h.say(ctx, chatID, "Готово: уведомления о бронях теперь приходят от этого бота.")
+
+	case u.MyChatMember != nil:
+		chatID := strconvI64(u.MyChatMember.Chat.ID)
+		status := strings.TrimSpace(u.MyChatMember.NewChatMember.Status)
+		restaurantID, err := h.settings.RestaurantByTelegramChatID(ctx, chatID)
+		if err != nil {
+			log.Info("telegram staff webhook: membership change in a chat that owns no venue",
+				slog.String("chat_id", chatID), slog.String("status", status))
+			return
+		}
+		switch status {
+		case "member", "administrator", "creator":
+			if err := h.onboarding.MarkTelegramNewBotReady(ctx, restaurantID); err != nil {
+				log.Error("telegram staff webhook: could not mark the venue ready",
+					slog.String("restaurant_id", restaurantID.String()),
+					slog.String("error", err.Error()))
+				return
+			}
+			log.Info("telegram.new_bot_ready",
+				slog.String("restaurant_id", restaurantID.String()),
+				slog.String("chat_id", chatID))
+			h.say(ctx, chatID, "Готово: уведомления о бронях теперь приходят от этого бота.")
+		case "left", "kicked":
+			// Demote immediately rather than waiting for the next booking to
+			// discover it with a 403: the venue keeps its alerts, from the old
+			// bot, without a single event spent finding out.
+			if err := h.onboarding.MarkTelegramNewBotFailed(ctx, restaurantID); err != nil {
+				log.Error("telegram staff webhook: could not demote the venue",
+					slog.String("restaurant_id", restaurantID.String()),
+					slog.String("error", err.Error()))
+				return
+			}
+			log.Warn("telegram.new_bot_rejected",
+				slog.String("restaurant_id", restaurantID.String()),
+				slog.String("chat_id", chatID),
+				slog.String("reason", "removed_from_chat"))
+		}
+	}
+}
+
+// isStartCommand recognises /start, including the "/start@botname" and
+// "/start <payload>" forms Telegram produces in groups and from deep links.
+func isStartCommand(text string) bool {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "/start") {
+		return false
+	}
+	rest := t[len("/start"):]
+	return rest == "" || strings.HasPrefix(rest, " ") || strings.HasPrefix(rest, "@")
+}
+
+// say is a best-effort reply into the chat. Failure is logged and swallowed:
+// the migration flag is already written, and failing the webhook over a missed
+// confirmation would make Telegram replay the update.
+func (h *Handler) say(ctx context.Context, chatID, text string) {
+	if h.replyBot == nil {
+		return
+	}
+	if _, err := h.replyBot.Send(ctx, chatID, text); err != nil {
+		logging.FromContext(ctx).Warn("telegram staff webhook: could not reply",
+			slog.String("error", err.Error()))
+	}
 }

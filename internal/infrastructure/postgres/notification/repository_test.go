@@ -350,3 +350,121 @@ func TestWhatsAppPhone_IsUniqueAcrossVenues(t *testing.T) {
 		t.Fatal("один номер записался двум заведениям — обратный поиск станет неоднозначным")
 	}
 }
+
+// The two migration writes of 0098 against real SQL. The half that matters is
+// the demotion: MarkTelegramNewBotFailed must CLEAR ready_at in the same
+// statement, because that is what silently returns the venue to the old bot
+// instead of letting its alerts die.
+func TestTelegramNewBotFlags_ReadyAndFailed(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	rid := seedRestaurant(t, pool)
+	repo := NewSettings(pool)
+
+	if err := repo.SetTelegramChatID(ctx, rid, "-1009876"); err != nil {
+		t.Fatalf("set chat id: %v", err)
+	}
+	s, err := repo.TelegramSettings(ctx, rid)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if s.NewBotReady() || s.NewBotFailedAt != nil {
+		t.Fatalf("a freshly connected chat must start unmigrated, got %+v", s)
+	}
+
+	if err := repo.MarkTelegramNewBotReady(ctx, rid); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	s, _ = repo.TelegramSettings(ctx, rid)
+	if !s.NewBotReady() {
+		t.Fatal("ready_at was not written")
+	}
+
+	if err := repo.MarkTelegramNewBotFailed(ctx, rid); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	s, _ = repo.TelegramSettings(ctx, rid)
+	if s.NewBotReady() {
+		t.Fatal("a refusal must clear ready_at, otherwise the venue keeps a dead bot")
+	}
+	if s.NewBotFailedAt == nil {
+		t.Fatal("failed_at was not written")
+	}
+
+	// Idempotent: pressing Start twice just refreshes the timestamp.
+	if err := repo.MarkTelegramNewBotReady(ctx, rid); err != nil {
+		t.Fatalf("re-mark ready: %v", err)
+	}
+	if err := repo.MarkTelegramNewBotReady(ctx, rid); err != nil {
+		t.Fatalf("re-mark ready twice: %v", err)
+	}
+
+	// A venue with no settings row at all is a no-op, not an error.
+	if err := repo.MarkTelegramNewBotReady(ctx, seedRestaurant(t, pool)); err != nil {
+		t.Fatalf("mark ready without a settings row: %v", err)
+	}
+}
+
+// The migration report lists only venues that actually have a chat connected,
+// laggards first, and flags @username targets — those cannot press Start and
+// need the bot added to the channel by hand.
+func TestTelegramMigrationStatus(t *testing.T) {
+	pool := testdb.Connect(t)
+	truncate(t, pool)
+	ctx := context.Background()
+	repo := NewSettings(pool)
+
+	migrated := seedRestaurant(t, pool)
+	pending := seedRestaurant(t, pool)
+	channel := seedRestaurant(t, pool)
+	noChat := seedRestaurant(t, pool)
+
+	if err := repo.SetTelegramChatID(ctx, migrated, "-100111"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := repo.MarkTelegramNewBotReady(ctx, migrated); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := repo.SetTelegramChatID(ctx, pending, "-100222"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := repo.SetTelegramChatID(ctx, channel, "@venue_channel"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// A venue that never connected Telegram is not behind on anything.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_notification_settings (restaurant_id) VALUES ($1)`, noChat); err != nil {
+		t.Fatalf("seed settings without a chat: %v", err)
+	}
+
+	rows, err := repo.TelegramMigrationStatus(ctx)
+	if err != nil {
+		t.Fatalf("migration status: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3 (the venue without a chat must be excluded)", len(rows))
+	}
+	// Laggards first.
+	if rows[len(rows)-1].RestaurantID != migrated {
+		t.Fatalf("the migrated venue must sort last, got %+v", rows)
+	}
+	var sawChannel bool
+	for _, r := range rows {
+		if r.RestaurantID == channel {
+			sawChannel = true
+			if !r.ChatIsUsername() {
+				t.Fatalf("@username target not flagged for manual work: %+v", r)
+			}
+			if r.NewBotReady() {
+				t.Fatal("a channel target cannot be ready — nobody pressed Start")
+			}
+		}
+		if r.RestaurantName == "" {
+			t.Fatalf("row without a restaurant name: %+v", r)
+		}
+	}
+	if !sawChannel {
+		t.Fatal("the @username venue is missing from the report")
+	}
+}

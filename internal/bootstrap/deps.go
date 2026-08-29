@@ -151,6 +151,18 @@ type Deps struct {
 	TelegramAnswerer telegramhook.Answerer
 	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
 	TelegramWebhookSecret string
+	// StaffBotAnswerer is the SECOND bot's own answerer. A callback query can
+	// only be answered with the token of the bot that sent the message, so the
+	// two bots must never share one — during the migration both webhooks are
+	// live at once (spec §7 step 4). Nil when RESTAURANTS_BOT_TOKEN is unset.
+	StaffBotAnswerer telegramhook.Answerer
+	// StaffBotMessenger lets the new bot reply to an inbound /start. Same
+	// object as StaffBotAnswerer in practice; a separate field because the two
+	// roles are separate and either may legitimately be absent.
+	StaffBotMessenger telegramhook.Messenger
+	// StaffBotWebhookSecret gates the new bot's webhook. Its OWN value, never
+	// TelegramWebhookSecret; empty leaves that endpoint answering 404.
+	StaffBotWebhookSecret string
 	BookingUpdate         bookings.UpdateUseCase
 	BookingAvail          bookings.AvailabilityUseCase
 	BookingBlacklist      bookings.BlacklistUseCase
@@ -542,6 +554,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
+		StaffBotAnswerer:      newStaffBotSender(cfg),
+		StaffBotMessenger:     newStaffBotMessenger(cfg),
+		StaffBotWebhookSecret: strings.TrimSpace(cfg.Push.RestaurantsBotWebhookSecret),
 		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingOutbox,
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
 		BookingAvail: bookings.NewAvailabilityUseCase(bookingLinks, bookingCapacity, restRepo,
@@ -608,6 +623,37 @@ func newTelegramAnswerer(cfg Config) telegramhook.Answerer {
 		return nil
 	}
 	return telegramnotify.NewSender(tgCfg)
+}
+
+// newStaffBotSender builds the NEW restaurants bot's client, or nil when it is
+// not fully configured. Same rule as the old bot: both a token (to talk) and a
+// webhook secret (to listen) — a bot that can send buttons nobody can answer is
+// worse than no bot.
+func newStaffBotClient(cfg Config) *telegramnotify.Sender {
+	tgCfg := telegramnotify.Config{BotToken: cfg.Push.RestaurantsBotToken}
+	if !tgCfg.Configured() || strings.TrimSpace(cfg.Push.RestaurantsBotWebhookSecret) == "" {
+		return nil
+	}
+	return telegramnotify.NewSender(tgCfg)
+}
+
+// newStaffBotSender returns the new bot's Answerer, typed nil-safe: returning a
+// typed nil pointer through an interface would produce a non-nil interface that
+// panics on first use.
+func newStaffBotSender(cfg Config) telegramhook.Answerer {
+	if c := newStaffBotClient(cfg); c != nil {
+		return c
+	}
+	return nil
+}
+
+// newStaffBotMessenger returns the new bot's plain-message sender (the reply to
+// an inbound /start), with the same nil-safety.
+func newStaffBotMessenger(cfg Config) telegramhook.Messenger {
+	if c := newStaffBotClient(cfg); c != nil {
+		return c
+	}
+	return nil
 }
 
 func newPayoutPorts(db *pgxpool.Pool, perms permissionCheckerPort, txm domain.TxManager, log *slog.Logger) payouts.Ports {
@@ -1161,14 +1207,25 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	// that needs both the bot token (to send) and the webhook secret (to receive
 	// the press). Buttons that lead nowhere are worse than none — staff press
 	// them and conclude the product is broken.
+	venueActions := func(bookingID uuid.UUID) [][2]string {
+		return [][2]string{
+			{"Подтвердить", telegramhook.CallbackConfirm(bookingID)},
+			{"Отклонить", telegramhook.CallbackReject(bookingID)},
+		}
+	}
 	if tgCfg.Configured() && strings.TrimSpace(cfg.Push.TelegramWebhookSecret) != "" {
 		sender := telegramnotify.NewSender(tgCfg)
-		telegram = telegram.WithActions(sender.SendWithActions, func(bookingID uuid.UUID) [][2]string {
-			return [][2]string{
-				{"Подтвердить", telegramhook.CallbackConfirm(bookingID)},
-				{"Отклонить", telegramhook.CallbackReject(bookingID)},
-			}
-		})
+		telegram = telegram.WithActions(sender.SendWithActions, venueActions)
+	}
+	// Staged migration to @book_eat_restaurants_bot (spec §7). The new bot is
+	// armed for EVERY venue but used only for those whose staff already pressed
+	// Start (telegram_new_bot_ready_at); a 400/403 from it demotes the venue and
+	// the same event goes out through the old bot, so nothing is lost either way.
+	// Absent RESTAURANTS_BOT_TOKEN → this whole block is skipped and the channel
+	// behaves exactly as before the migration.
+	if staff := newStaffBotClient(cfg); staff != nil {
+		telegram = telegram.WithNewBot(staff.Send, staff.SendWithActions, venueActions)
+		log.Info("telegram: staged migration to the restaurants bot is armed")
 	}
 
 	// Guest channel: a THIRD notifier on the same dispatcher — the first one

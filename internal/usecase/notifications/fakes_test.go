@@ -294,6 +294,12 @@ type fakeSettings struct {
 	disabled   map[uuid.UUID]bool
 	tgChat     map[uuid.UUID]string
 	tgDisabled map[uuid.UUID]bool
+	// tgNewBotReady / tgNewBotFailed mirror the two columns of migration 0098:
+	// which venues the new restaurants bot may write to, and when it was last
+	// refused. Kept in the fake so a test can assert the demotion actually
+	// happened, not just that the fallback fired.
+	tgNewBotReady  map[uuid.UUID]*time.Time
+	tgNewBotFailed map[uuid.UUID]*time.Time
 	// waPhone/waDisabled — то же самое для WhatsApp: канал ведёт себя как
 	// телеграм, поэтому и фейк устроен одинаково.
 	waPhone    map[uuid.UUID]string
@@ -305,6 +311,10 @@ func newFakeSettings() *fakeSettings {
 		disabled:   map[uuid.UUID]bool{},
 		tgChat:     map[uuid.UUID]string{},
 		tgDisabled: map[uuid.UUID]bool{},
+
+		tgNewBotReady:  map[uuid.UUID]*time.Time{},
+		tgNewBotFailed: map[uuid.UUID]*time.Time{},
+
 		waPhone:    map[uuid.UUID]string{},
 		waDisabled: map[uuid.UUID]bool{},
 	}
@@ -316,9 +326,41 @@ func (f *fakeSettings) WebPushEnabled(_ context.Context, restaurantID uuid.UUID)
 
 func (f *fakeSettings) TelegramSettings(_ context.Context, restaurantID uuid.UUID) (domain.TelegramSettings, error) {
 	return domain.TelegramSettings{
-		ChatID:  f.tgChat[restaurantID],
-		Enabled: !f.tgDisabled[restaurantID],
+		ChatID:         f.tgChat[restaurantID],
+		Enabled:        !f.tgDisabled[restaurantID],
+		NewBotReadyAt:  f.tgNewBotReady[restaurantID],
+		NewBotFailedAt: f.tgNewBotFailed[restaurantID],
 	}, nil
+}
+
+// MarkTelegramNewBotReady / MarkTelegramNewBotFailed reproduce the SQL of
+// migration 0098 exactly, including the part that matters: a failure CLEARS
+// ready_at in the same step, which is what puts the venue back on the old bot.
+func (f *fakeSettings) MarkTelegramNewBotReady(_ context.Context, restaurantID uuid.UUID) error {
+	now := time.Now()
+	f.tgNewBotReady[restaurantID] = &now
+	return nil
+}
+
+func (f *fakeSettings) MarkTelegramNewBotFailed(_ context.Context, restaurantID uuid.UUID) error {
+	now := time.Now()
+	delete(f.tgNewBotReady, restaurantID)
+	f.tgNewBotFailed[restaurantID] = &now
+	return nil
+}
+
+func (f *fakeSettings) TelegramMigrationStatus(context.Context) ([]domain.TelegramMigrationRow, error) {
+	out := make([]domain.TelegramMigrationRow, 0, len(f.tgChat))
+	for rid, chat := range f.tgChat {
+		out = append(out, domain.TelegramMigrationRow{
+			RestaurantID:   rid,
+			ChatID:         chat,
+			Enabled:        !f.tgDisabled[rid],
+			NewBotReadyAt:  f.tgNewBotReady[rid],
+			NewBotFailedAt: f.tgNewBotFailed[rid],
+		})
+	}
+	return out, nil
 }
 
 func (f *fakeSettings) SetTelegramChatID(_ context.Context, restaurantID uuid.UUID, chatID string) error {
