@@ -16,20 +16,24 @@ import (
 // test — the SQL-level guarantees (atomic reorder, gap closing, slug
 // uniqueness) belong to the integration tests, not here.
 type fakeEditorRepo struct {
+	category     *domain.GuideCategory
 	detail       *domain.GuideCollectionAdminDetail
 	activeVenues int
 	memberIDs    []uuid.UUID
 	err          error
 
-	gotStatus      domain.GuideCollectionStatus
-	gotPublishedAt *time.Time
-	statusCalls    int
-	gotOrder       []uuid.UUID
-	reorderCalls   int
-	writes         int
-	gotWrite       domain.GuideCollectionWrite
-	gotAdminFilter domain.GuideCollectionAdminFilter
-	gotCategoryIDs []uuid.UUID
+	gotStatus        domain.GuideCollectionStatus
+	gotPublishedAt   *time.Time
+	statusCalls      int
+	gotOrder         []uuid.UUID
+	reorderCalls     int
+	writes           int
+	gotWrite         domain.GuideCollectionWrite
+	gotCategoryWrite domain.GuideCategoryWrite
+	gotNote          string
+	gotNoteI18n      domain.I18n
+	gotAdminFilter   domain.GuideCollectionAdminFilter
+	gotCategoryIDs   []uuid.UUID
 }
 
 func (f *fakeEditorRepo) ListAllCategories(context.Context) ([]domain.GuideCategory, error) {
@@ -37,13 +41,25 @@ func (f *fakeEditorRepo) ListAllCategories(context.Context) ([]domain.GuideCateg
 	return nil, f.err
 }
 
-func (f *fakeEditorRepo) CreateCategory(context.Context, domain.GuideCategoryWrite) (*domain.GuideCategory, error) {
+func (f *fakeEditorRepo) GetCategory(context.Context, uuid.UUID) (*domain.GuideCategory, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.category == nil {
+		return nil, domain.ErrNotFound
+	}
+	return f.category, nil
+}
+
+func (f *fakeEditorRepo) CreateCategory(_ context.Context, in domain.GuideCategoryWrite) (*domain.GuideCategory, error) {
 	f.writes++
+	f.gotCategoryWrite = in
 	return &domain.GuideCategory{ID: uuid.New()}, f.err
 }
 
-func (f *fakeEditorRepo) UpdateCategory(context.Context, uuid.UUID, domain.GuideCategoryWrite) (*domain.GuideCategory, error) {
+func (f *fakeEditorRepo) UpdateCategory(_ context.Context, _ uuid.UUID, in domain.GuideCategoryWrite) (*domain.GuideCategory, error) {
 	f.writes++
+	f.gotCategoryWrite = in
 	return &domain.GuideCategory{ID: uuid.New()}, f.err
 }
 
@@ -95,8 +111,9 @@ func (f *fakeEditorRepo) SetCollectionCategories(_ context.Context, _ uuid.UUID,
 	return f.err
 }
 
-func (f *fakeEditorRepo) AttachVenue(context.Context, uuid.UUID, domain.GuideVenueAttachment) error {
+func (f *fakeEditorRepo) AttachVenue(_ context.Context, _ uuid.UUID, in domain.GuideVenueAttachment) error {
 	f.writes++
+	f.gotNote, f.gotNoteI18n = in.Note, in.NoteI18n
 	return f.err
 }
 
@@ -105,8 +122,9 @@ func (f *fakeEditorRepo) DetachVenue(context.Context, uuid.UUID, uuid.UUID) erro
 	return f.err
 }
 
-func (f *fakeEditorRepo) UpdateVenueNote(context.Context, uuid.UUID, uuid.UUID, string, domain.I18n) error {
+func (f *fakeEditorRepo) UpdateVenueNote(_ context.Context, _, _ uuid.UUID, note string, noteI18n domain.I18n) error {
 	f.writes++
+	f.gotNote, f.gotNoteI18n = note, noteI18n
 	return f.err
 }
 
@@ -339,7 +357,7 @@ func TestEditor_RefusesAnUnusableSlugOrAnEmptyTitle(t *testing.T) {
 func TestEditor_EmptyCoverURLBecomesNoCover(t *testing.T) {
 	empty := "   "
 	in := CollectionInput{Slug: "kids", Title: "С детьми", CoverImageURL: &empty}
-	w, err := validateCollection(in)
+	w, err := validateCollection(in, nil)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -350,13 +368,14 @@ func TestEditor_EmptyCoverURLBecomesNoCover(t *testing.T) {
 
 // A blank translation is dropped rather than stored: I18n.Resolve answers with
 // whatever the map holds, so {"kk": ""} makes a kk client see an empty title
-// instead of falling back to the ru one.
+// instead of falling back to the ru one. Under the patch protocol a blank is
+// therefore a REMOVAL, which is the same outcome by a shorter route.
 func TestEditor_BlankTranslationsAreDroppedNotStored(t *testing.T) {
 	w, err := validateCollection(CollectionInput{
 		Slug: "kids", Title: "С детьми",
-		TitleI18n:    domain.I18n{"kk": "  ", "en": "With kids"},
-		SubtitleI18n: domain.I18n{"kk": ""},
-	})
+		TitleI18n:    domain.I18nPatch{"kk": str("  "), "en": str("With kids")},
+		SubtitleI18n: domain.I18nPatch{"kk": str("")},
+	}, nil)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -370,6 +389,10 @@ func TestEditor_BlankTranslationsAreDroppedNotStored(t *testing.T) {
 		t.Errorf("subtitle i18n = %v, want nil once its only entry was blank", w.SubtitleI18n)
 	}
 }
+
+// str is the wire shape of "write this language": a JSON string decodes into a
+// non-nil *string, a JSON null into nil.
+func str(s string) *string { return &s }
 
 // The reorder payload reaches the repository unchanged and in order: the
 // membership check happens once, in SQL, under the collection's row lock. A

@@ -57,6 +57,13 @@ type GuideCollectionAdminDetail struct {
 // and a partial-update protocol would make "clear the subtitle" and "do not
 // touch the subtitle" indistinguishable.
 //
+// The *I18n maps are the ONE exception, and they arrive here ALREADY MERGED:
+// the request carries a partial patch (I18nPatch), the usecase merges it onto
+// what is stored and re-establishes i18n["ru"] == the plain column
+// (ApplyTranslations), and the repository writes the finished map. So this
+// struct still means "replace the column with exactly this" — the merging is
+// simply not the repository's job.
+//
 // Status and PublishedAt are NOT here. Publication is its own set of operations
 // (Publish/Unpublish/Archive) with its own preconditions, so an editor cannot
 // take a collection live as a side effect of fixing a typo.
@@ -120,6 +127,14 @@ type GastroguideEditorRepository interface {
 
 	// ListAllCategories returns every rubric, active or not, in editorial order.
 	ListAllCategories(ctx context.Context) ([]GuideCategory, error)
+	// GetCategory returns one rubric of any state. Unknown id is ErrNotFound.
+	//
+	// It exists because a rubric's translations are written with a PARTIAL
+	// patch (I18nPatch): the stored map is half of the result, so the update
+	// has to read it before it can write it. Listing every rubric to find one
+	// would work — the dictionary is small — but it hides the dependency and
+	// would quietly become an N-row scan the day rubrics stop being few.
+	GetCategory(ctx context.Context, id uuid.UUID) (*GuideCategory, error)
 	// CreateCategory inserts a rubric. A duplicate slug is ErrAlreadyExists
 	// tagged CodeGuideSlugTaken.
 	CreateCategory(ctx context.Context, in GuideCategoryWrite) (*GuideCategory, error)
