@@ -103,7 +103,7 @@ func (f *fakeEditor) DetachVenue(_ context.Context, a uc.EditorActor, _, _ uuid.
 	return f.err
 }
 
-func (f *fakeEditor) SetVenueNote(_ context.Context, a uc.EditorActor, _, _ uuid.UUID, _ string, _ domain.I18n) error {
+func (f *fakeEditor) SetVenueNote(_ context.Context, a uc.EditorActor, _, _ uuid.UUID, _ string, _ domain.I18nPatch) error {
 	f.calls, f.gotActor = f.calls+1, a
 	return f.err
 }
@@ -468,5 +468,63 @@ func TestEditorHandler_KindRefusalsAre422WithTheirCode(t *testing.T) {
 				t.Fatalf("code = %v, want %s", body["code"], tc.code)
 			}
 		})
+	}
+}
+
+// The three states of a translation object have to survive JSON decoding, or
+// the protocol is only true in Go. A null must arrive as a present key with a
+// nil value — decoding it into a plain map[string]string would turn "delete
+// English" into "" and, worse, an ABSENT key into the same thing.
+func TestEditorHandler_TranslationPatchKeepsItsThreeStates(t *testing.T) {
+	f := &fakeEditor{}
+	r := adminRouter(f, domain.RoleAdmin)
+
+	w := send(t, r, http.MethodPost, "/api/v1/admin/gastroguide/collections",
+		map[string]any{
+			"slug": "kids", "title": "С детьми",
+			"title_i18n": map[string]any{"kk": "Балалармен", "en": nil},
+			// subtitle_i18n is absent on purpose: it must reach the usecase as
+			// a nil patch, which is what "do not touch the subtitle's
+			// translations" is spelled as.
+		})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s, want 201", w.Code, w.Body.String())
+	}
+	got := f.gotCollection.TitleI18n
+	if v, ok := got["kk"]; !ok || v == nil || *v != "Балалармен" {
+		t.Errorf("kk = %v, want the written string", v)
+	}
+	v, ok := got["en"]
+	if !ok {
+		t.Fatal("en is absent — a null was decoded away, and a deletion is now indistinguishable from silence")
+	}
+	if v != nil {
+		t.Errorf("en = %q, want nil (the removal)", *v)
+	}
+	if f.gotCollection.SubtitleI18n != nil {
+		t.Errorf("subtitle i18n = %v, want nil for an absent object", f.gotCollection.SubtitleI18n)
+	}
+}
+
+// A venue note takes the same shape on its own endpoint.
+func TestEditorHandler_VenueNotePatchReachesTheUsecase(t *testing.T) {
+	f := &fakeEditor{}
+	r := adminRouter(f, domain.RoleAdmin)
+
+	w := send(t, r, http.MethodPost,
+		"/api/v1/admin/gastroguide/collections/"+uuid.NewString()+"/venues",
+		map[string]any{
+			"restaurant_id": uuid.NewString(),
+			"note":          "Есть детская комната",
+			"note_i18n":     map[string]any{"kk": "Балалар бөлмесі бар", "en": nil},
+		})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body %s, want 204", w.Code, w.Body.String())
+	}
+	if v, ok := f.gotAttach.NoteI18n["kk"]; !ok || v == nil || *v != "Балалар бөлмесі бар" {
+		t.Errorf("kk = %v, want the written string", v)
+	}
+	if v, ok := f.gotAttach.NoteI18n["en"]; !ok || v != nil {
+		t.Errorf("en = %v, want a present nil (the removal)", v)
 	}
 }

@@ -24,6 +24,7 @@ type fakeRouteRepo struct {
 	gotPublishedAt *time.Time
 	statusCalls    int
 	gotPoint       domain.GuideRoutePointWrite
+	gotRoute       domain.GastroRouteWrite
 	writes         int
 }
 
@@ -42,13 +43,15 @@ func (f *fakeRouteRepo) GetRouteAdmin(context.Context, uuid.UUID) (*domain.Gastr
 	return f.detail, nil
 }
 
-func (f *fakeRouteRepo) CreateRoute(context.Context, domain.GastroRouteWrite) (*domain.GastroRoute, error) {
+func (f *fakeRouteRepo) CreateRoute(_ context.Context, in domain.GastroRouteWrite) (*domain.GastroRoute, error) {
 	f.writes++
+	f.gotRoute = in
 	return &domain.GastroRoute{ID: uuid.New()}, f.err
 }
 
-func (f *fakeRouteRepo) UpdateRoute(context.Context, uuid.UUID, domain.GastroRouteWrite) (*domain.GastroRoute, error) {
+func (f *fakeRouteRepo) UpdateRoute(_ context.Context, _ uuid.UUID, in domain.GastroRouteWrite) (*domain.GastroRoute, error) {
 	f.writes++
+	f.gotRoute = in
 	return &domain.GastroRoute{ID: uuid.New()}, f.err
 }
 
@@ -310,7 +313,7 @@ func TestRoutePoint_CoordinatesAreBothOrNeither(t *testing.T) {
 // image.
 func TestRouteInput_BlankCoverBecomesNoCover(t *testing.T) {
 	blank := "   "
-	w, err := validateRoute(RouteInput{Slug: "walk", Title: "Прогулка", CoverImageURL: &blank})
+	w, err := validateRoute(RouteInput{Slug: "walk", Title: "Прогулка", CoverImageURL: &blank}, nil)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}

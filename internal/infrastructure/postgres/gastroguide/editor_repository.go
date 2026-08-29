@@ -80,6 +80,21 @@ func (r *EditorRepository) ListAllCategories(ctx context.Context) ([]domain.Guid
 	return out, nil
 }
 
+// GetCategory returns one rubric of any state. The editor reads it before an
+// update because the translation patch it is about to apply is partial.
+func (r *EditorRepository) GetCategory(ctx context.Context, id uuid.UUID) (*domain.GuideCategory, error) {
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT `+categoryCols+` FROM gastroguide_categories cat WHERE cat.id = $1`, id)
+	c, err := scanCategory(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("get guide category: %w", domain.ErrNotFound)
+		}
+		return nil, fmt.Errorf("get guide category: %w", err)
+	}
+	return c, nil
+}
+
 // CreateCategory inserts a rubric.
 func (r *EditorRepository) CreateCategory(ctx context.Context, in domain.GuideCategoryWrite) (*domain.GuideCategory, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
