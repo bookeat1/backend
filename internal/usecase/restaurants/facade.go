@@ -128,15 +128,25 @@ func NewFacade(
 // even address (kwaaka_restaurant_id, hidden_from_home), which are always
 // carried over from the stored row.
 type SaveInput struct {
-	CategoryID    *uuid.UUID
-	Name          *string
-	NameI18n      domain.I18n
-	Description   *string
-	CuisineType   *string
-	Address       *string
-	OpeningHours  *string
-	City          *string
-	PriceCategory *string
+	CategoryID *uuid.UUID
+	Name       *string
+	// The *I18n fields are PARTIAL updates of the translation maps, never a
+	// full replace: a cabinet editing the Kazakh description must not have to
+	// resend English to keep it (domain.I18nPatch). A `ru` key inside one of
+	// them is routed to the plain column instead — the column IS the Russian
+	// text, and promoteRussianTranslations is what keeps those two from
+	// disagreeing.
+	NameI18n         domain.I18nPatch
+	Description      *string
+	DescriptionI18n  domain.I18nPatch
+	CuisineType      *string
+	CuisineTypeI18n  domain.I18nPatch
+	Address          *string
+	AddressI18n      domain.I18nPatch
+	OpeningHours     *string
+	OpeningHoursI18n domain.I18nPatch
+	City             *string
+	PriceCategory    *string
 	// PriceMin / PriceMax are the average-check range in whole tenge. Applied
 	// independently on Update (read-modify-write); the final merged pair is
 	// validated by validatePriceRange (both-or-neither, 0 <= min <= max).
@@ -479,6 +489,7 @@ func (f *facade) SubmitPartnership(ctx context.Context, in PartnershipInput) err
 // Writing a localized TEXT field also rewrites the ru entry of its i18n map —
 // see syncRussianTranslations, which runs last on purpose.
 func applyRestaurant(m *domain.Restaurant, in SaveInput) {
+	in = promoteRussianTranslations(in)
 	if in.CategoryID != nil {
 		m.CategoryID = in.CategoryID
 	}
@@ -486,19 +497,31 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 		m.Name = *in.Name
 	}
 	if in.NameI18n != nil {
-		m.NameI18n = in.NameI18n
+		m.NameI18n = in.NameI18n.ApplyTo(m.NameI18n)
 	}
 	if in.Description != nil {
 		m.Description = *in.Description
 	}
+	if in.DescriptionI18n != nil {
+		m.DescriptionI18n = in.DescriptionI18n.ApplyTo(m.DescriptionI18n)
+	}
 	if in.CuisineType != nil {
 		m.CuisineType = *in.CuisineType
+	}
+	if in.CuisineTypeI18n != nil {
+		m.CuisineTypeI18n = in.CuisineTypeI18n.ApplyTo(m.CuisineTypeI18n)
 	}
 	if in.Address != nil {
 		m.Address = *in.Address
 	}
+	if in.AddressI18n != nil {
+		m.AddressI18n = in.AddressI18n.ApplyTo(m.AddressI18n)
+	}
 	if in.OpeningHours != nil {
 		m.OpeningHours = *in.OpeningHours
+	}
+	if in.OpeningHoursI18n != nil {
+		m.OpeningHoursI18n = in.OpeningHoursI18n.ApplyTo(m.OpeningHoursI18n)
 	}
 	if in.City != nil {
 		m.City = domain.City(*in.City)
@@ -570,10 +593,13 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 // languages: we are told the Russian text is gone, not that the Kazakh
 // translation is wrong.
 //
-// cuisine_type is deliberately NOT synced here: since migration 0079 it is a
-// derived rendering of the venue's dictionary links (restaurant_cuisines), the
-// public payload re-derives it per language from that set, and the column is
-// rewritten by the cuisine-set writer rather than by this input.
+// cuisine_type is synced here too, even though since migration 0079 the column
+// is a DERIVED rendering of the venue's dictionary links (restaurant_cuisines):
+// while it is derived, it is still a written column, and a write that left a
+// stale `ru` translation behind it would be read back instead of the value just
+// written — the same trap this function exists to close for name. The
+// cuisine-set writer keeps overriding the whole map with a ru-less one
+// (domain.CuisineI18nFromSet), which resolves to the column and stays correct.
 func syncRussianTranslations(m *domain.Restaurant, in SaveInput) {
 	if in.Name != nil {
 		m.NameI18n = m.NameI18n.WithLocale(domain.LocaleRU, *in.Name)
@@ -581,11 +607,43 @@ func syncRussianTranslations(m *domain.Restaurant, in SaveInput) {
 	if in.Description != nil {
 		m.DescriptionI18n = m.DescriptionI18n.WithLocale(domain.LocaleRU, *in.Description)
 	}
+	if in.CuisineType != nil {
+		m.CuisineTypeI18n = m.CuisineTypeI18n.WithLocale(domain.LocaleRU, *in.CuisineType)
+	}
 	if in.Address != nil {
 		m.AddressI18n = m.AddressI18n.WithLocale(domain.LocaleRU, *in.Address)
 	}
 	if in.OpeningHours != nil {
 		m.OpeningHoursI18n = m.OpeningHoursI18n.WithLocale(domain.LocaleRU, *in.OpeningHours)
+	}
+}
+
+// promoteRussianTranslations moves a `ru` entry found inside one of the
+// translation PATCHES onto the plain column it belongs to, unless the request
+// already wrote that column itself (in which case the column wins — the client
+// sent two values for one field, and the answer to which is Russian is fixed:
+// the column is).
+//
+// It runs first, so the value then flows through the normal path: the column is
+// written by applyRestaurant and mirrored back into i18n["ru"] by
+// syncRussianTranslations. Without it, `{"name_i18n": {"ru": "…"}}` would write
+// a translation the reads prefer and leave the column — the venue's name
+// everywhere else in the system — untouched.
+func promoteRussianTranslations(in SaveInput) SaveInput {
+	promoteRussian(&in.Name, in.NameI18n)
+	promoteRussian(&in.Description, in.DescriptionI18n)
+	promoteRussian(&in.CuisineType, in.CuisineTypeI18n)
+	promoteRussian(&in.Address, in.AddressI18n)
+	promoteRussian(&in.OpeningHours, in.OpeningHoursI18n)
+	return in
+}
+
+func promoteRussian(column **string, patch domain.I18nPatch) {
+	if *column != nil {
+		return
+	}
+	if v, ok := patch.Russian(); ok {
+		*column = &v
 	}
 }
 
@@ -596,6 +654,17 @@ func syncRussianTranslations(m *domain.Restaurant, in SaveInput) {
 func validateProvided(in SaveInput) error {
 	if in.Name != nil && strings.TrimSpace(*in.Name) == "" {
 		return domain.ErrValidation
+	}
+	for field, patch := range map[string]domain.I18nPatch{
+		"name_i18n":          in.NameI18n,
+		"description_i18n":   in.DescriptionI18n,
+		"cuisine_type_i18n":  in.CuisineTypeI18n,
+		"address_i18n":       in.AddressI18n,
+		"opening_hours_i18n": in.OpeningHoursI18n,
+	} {
+		if err := patch.Validate(field); err != nil {
+			return err
+		}
 	}
 	// The city is NOT checked here: since migration 0081 the answer lives in
 	// the dictionary and needs a context and a query — see facade.validateCity.

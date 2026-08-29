@@ -414,3 +414,82 @@ func TestUpdateForbiddenPushesNothing(t *testing.T) {
 		t.Fatalf("a refused edit must push nothing, got %d pushes", len(repo.contentSyncs))
 	}
 }
+
+// --- venue translations on the series template (migration 0101) ---
+
+func strPtr(s string) *string { return &s }
+
+// The rule's venue line is the template every generated date inherits, so its
+// translations have to live on the rule too — otherwise a series could only
+// ever be translated one date at a time.
+func TestCreate_WritesVenueTranslations(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.Venue = "Летняя терраса"
+	in.VenueI18n = domain.I18nPatch{"kk": strPtr("Жазғы террасса")}
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if rec.VenueI18n["kk"] != "Жазғы террасса" {
+		t.Errorf("VenueI18n[kk] = %q", rec.VenueI18n["kk"])
+	}
+	if rec.VenueI18n["ru"] != "Летняя терраса" {
+		t.Errorf(`VenueI18n["ru"] = %q, want it equal to the venue column`, rec.VenueI18n["ru"])
+	}
+}
+
+// A Kazakh-only edit keeps the English, and the new map is what gets pushed
+// down onto the dates that have not overridden the field.
+func TestUpdate_VenueTranslationPatchKeepsOtherLanguagesAndSyncsDates(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	rec := &domain.EventRecurrence{
+		ID: uuid.New(), RestaurantID: rid,
+		Title:     "Cocktail Wednesday",
+		Venue:     "Терраса",
+		VenueI18n: domain.I18n{"ru": "Терраса", "en": "Terrace"},
+	}
+	repo.byID[rec.ID] = rec
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.Venue = "Терраса"
+	in.VenueI18n = domain.I18nPatch{"kk": strPtr("Террасса")}
+
+	got, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.VenueI18n["en"] != "Terrace" {
+		t.Errorf("VenueI18n[en] = %q, want the untouched English kept", got.VenueI18n["en"])
+	}
+	if got.VenueI18n["kk"] != "Террасса" {
+		t.Errorf("VenueI18n[kk] = %q", got.VenueI18n["kk"])
+	}
+	if len(repo.contentSyncs) != 1 {
+		t.Fatalf("a translated venue line must be pushed down onto the dates, got %d syncs", len(repo.contentSyncs))
+	}
+	if repo.contentSyncs[0].VenueI18n["kk"] != "Террасса" {
+		t.Errorf("the synced content carries %v, want the new Kazakh venue line", repo.contentSyncs[0].VenueI18n)
+	}
+}
+
+func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	rec := &domain.EventRecurrence{ID: uuid.New(), RestaurantID: rid, Title: "x"}
+	repo.byID[rec.ID] = rec
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.VenueI18n = domain.I18nPatch{"zh": strPtr("文")}
+
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation (→ 422), got %v", err)
+	}
+}

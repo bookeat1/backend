@@ -461,3 +461,81 @@ func TestTags_RoundTrip(t *testing.T) {
 		t.Fatalf("listing tags for untagged event = %#v (present=%v), want empty", tags, ok)
 	}
 }
+
+// The venue line and the button caption gained translation columns in 0101;
+// they must survive create, update and the cross-venue listing read (which
+// scans a different column list — the one bug this test would catch).
+func TestVenueAndActionLabelI18nRoundTrip(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "events", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	e := mkEvent(rid, domain.EventPublished, 24*time.Hour, 2*time.Hour)
+	e.Venue = "Летняя терраса"
+	e.VenueI18n = domain.I18n{"ru": "Летняя терраса", "kk": "Жазғы террасса"}
+	e.Action = &domain.EventAction{
+		Label:     "Купить билет",
+		LabelI18n: domain.I18n{"ru": "Купить билет", "en": "Buy a ticket"},
+	}
+	if err := repo.Create(ctx, e); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.VenueI18n["kk"] != "Жазғы террасса" {
+		t.Fatalf("venue_i18n did not survive the write: %v", got.VenueI18n)
+	}
+	if got.Action == nil || got.Action.LabelI18n["en"] != "Buy a ticket" {
+		t.Fatalf("action_label_i18n did not survive the write: %#v", got.Action)
+	}
+	if v := got.VenueI18n.Resolve(domain.LocaleEN, got.Venue); v != "Летняя терраса" {
+		t.Errorf("en venue = %q, want the Russian fallback", v)
+	}
+
+	got.VenueI18n = domain.I18n{"ru": "Летняя терраса", "en": "Summer terrace"}
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	again, err := repo.GetByID(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if again.VenueI18n["en"] != "Summer terrace" || again.VenueI18n["kk"] != "" {
+		t.Fatalf("update did not replace venue_i18n: %v", again.VenueI18n)
+	}
+
+	items, _, err := repo.ListPublicUpcoming(ctx, domain.PublicEventFilter{Page: 1, PerPage: 20}, time.Now())
+	if err != nil {
+		t.Fatalf("ListPublicUpcoming: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("want the one upcoming event, got %d", len(items))
+	}
+	if items[0].VenueI18n["en"] != "Summer terrace" {
+		t.Errorf("the listing read must carry venue_i18n, got %v", items[0].VenueI18n)
+	}
+	if items[0].Action == nil || items[0].Action.LabelI18n["en"] != "Buy a ticket" {
+		t.Errorf("the listing read must carry action_label_i18n, got %#v", items[0].Action)
+	}
+
+	// No button, no caption translations: the CHECK from 0101 refuses the pair,
+	// and the repository must never offer it one.
+	plain := mkEvent(rid, domain.EventDraft, 24*time.Hour, time.Hour)
+	if err := repo.Create(ctx, plain); err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	var labelNull, venueNull bool
+	if err := pool.QueryRow(ctx,
+		`SELECT action_label_i18n IS NULL, venue_i18n IS NULL FROM events WHERE id = $1`, plain.ID).
+		Scan(&labelNull, &venueNull); err != nil {
+		t.Fatalf("read raw columns: %v", err)
+	}
+	if !labelNull || !venueNull {
+		t.Errorf("an untranslated event must leave both columns NULL, got label=%v venue=%v", labelNull, venueNull)
+	}
+}

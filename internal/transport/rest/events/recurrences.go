@@ -245,17 +245,22 @@ func recurrenceActor(c *gin.Context) (uc.Actor, bool) {
 // rule describes what the clock on the wall says, and accepting an instant here
 // would invite a client to bake its own timezone into the series.
 type recurrenceRequest struct {
-	Title            string            `json:"title"`
-	TitleI18n        map[string]string `json:"title_i18n"`
-	Description      string            `json:"description"`
-	DescriptionI18n  map[string]string `json:"description_i18n"`
-	Venue            string            `json:"venue"`
-	CoverImageURL    *string           `json:"cover_image_url"`
-	Tags             []string          `json:"tags"`
-	OccurrenceStatus string            `json:"occurrence_status"`
-	Ticketed         bool              `json:"ticketed"`
-	TicketPriceMinor *int64            `json:"ticket_price_minor"`
-	Capacity         *int              `json:"capacity"`
+	Title string `json:"title"`
+	// Объекты `*_i18n` — ЧАСТИЧНОЕ обновление переводов, единственное поле
+	// этого payload'а, которое не заменяется целиком: названный язык
+	// записывается, null удаляется, неупомянутый сохраняется. Русский текст
+	// живёт в обычном поле рядом и выигрывает у ключа `ru` в карте.
+	TitleI18n        map[string]*string `json:"title_i18n"`
+	Description      string             `json:"description"`
+	DescriptionI18n  map[string]*string `json:"description_i18n"`
+	Venue            string             `json:"venue"`
+	VenueI18n        map[string]*string `json:"venue_i18n"`
+	CoverImageURL    *string            `json:"cover_image_url"`
+	Tags             []string           `json:"tags"`
+	OccurrenceStatus string             `json:"occurrence_status"`
+	Ticketed         bool               `json:"ticketed"`
+	TicketPriceMinor *int64             `json:"ticket_price_minor"`
+	Capacity         *int               `json:"capacity"`
 	// Refund rules for the tickets of every generated occurrence. Absent means
 	// the conservative platform default, same reading as the event payload.
 	TicketsRefundable         *bool `json:"tickets_refundable"`
@@ -321,10 +326,11 @@ func bindRecurrence(c *gin.Context) (uc.Input, bool) {
 	}
 	return uc.Input{
 		Title:            req.Title,
-		TitleI18n:        domain.I18n(req.TitleI18n),
+		TitleI18n:        domain.I18nPatch(req.TitleI18n),
 		Description:      req.Description,
-		DescriptionI18n:  domain.I18n(req.DescriptionI18n),
+		DescriptionI18n:  domain.I18nPatch(req.DescriptionI18n),
 		Venue:            req.Venue,
+		VenueI18n:        domain.I18nPatch(req.VenueI18n),
 		CoverImageURL:    req.CoverImageURL,
 		Tags:             req.Tags,
 		OccurrenceStatus: domain.EventStatus(req.OccurrenceStatus),
@@ -371,6 +377,7 @@ type recurrenceResponseBody struct {
 	Description      string            `json:"description"`
 	DescriptionI18n  map[string]string `json:"description_i18n,omitempty"`
 	Venue            string            `json:"venue,omitempty"`
+	VenueI18n        map[string]string `json:"venue_i18n,omitempty"`
 	CoverImageURL    *string           `json:"cover_image_url,omitempty"`
 	Tags             []string          `json:"tags"`
 	OccurrenceStatus string            `json:"occurrence_status"`
@@ -425,6 +432,7 @@ func recurrenceResponse(r domain.EventRecurrence) recurrenceResponseBody {
 		Description:      r.Description,
 		DescriptionI18n:  r.DescriptionI18n,
 		Venue:            r.Venue,
+		VenueI18n:        r.VenueI18n,
 		CoverImageURL:    r.CoverImageURL,
 		Tags:             tagsOrEmpty(r.Tags),
 		OccurrenceStatus: string(r.OccurrenceStatus),

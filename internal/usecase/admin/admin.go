@@ -270,13 +270,20 @@ func (u *UseCase) authorize(ctx context.Context, actor Actor, restaurantID uuid.
 // venue premium/popular or reactivate a deactivated venue through the panel.
 // Those stay superadmin-only via the existing restaurants admin routes.
 type ProfileInput struct {
-	Name         *string
-	NameI18n     domain.I18n
-	Description  *string
-	Address      *string
-	Phone        *string
-	Email        *string
-	OpeningHours *string // free-text / JSON working-hours summary shown on the storefront
+	Name *string
+	// The *I18n fields are PARTIAL translation updates with the same three
+	// states as everywhere else (see domain.I18nPatch): a named language is
+	// written, a null one removed, an unmentioned one kept. A `ru` key is
+	// routed to the plain field, because that column IS the Russian text.
+	NameI18n         domain.I18nPatch
+	Description      *string
+	DescriptionI18n  domain.I18nPatch
+	Address          *string
+	AddressI18n      domain.I18nPatch
+	Phone            *string
+	Email            *string
+	OpeningHours     *string // free-text / JSON working-hours summary shown on the storefront
+	OpeningHoursI18n domain.I18nPatch
 }
 
 // GetProfile returns the venue's own profile aggregate. owner/manager.
@@ -295,13 +302,16 @@ func (u *UseCase) UpdateProfile(ctx context.Context, actor Actor, restaurantID u
 		return nil, err
 	}
 	save := restaurants.SaveInput{
-		Name:         in.Name,
-		NameI18n:     in.NameI18n,
-		Description:  in.Description,
-		Address:      in.Address,
-		Phone:        in.Phone,
-		Email:        in.Email,
-		OpeningHours: in.OpeningHours,
+		Name:             in.Name,
+		NameI18n:         in.NameI18n,
+		Description:      in.Description,
+		DescriptionI18n:  in.DescriptionI18n,
+		Address:          in.Address,
+		AddressI18n:      in.AddressI18n,
+		Phone:            in.Phone,
+		Email:            in.Email,
+		OpeningHours:     in.OpeningHours,
+		OpeningHoursI18n: in.OpeningHoursI18n,
 	}
 	return u.restaurants.Update(ctx, restaurantID, save)
 }

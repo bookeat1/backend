@@ -59,6 +59,7 @@ var _ domain.FeedRepository = (*Repository)(nil)
 func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 	table, alias := tableFor(kind), "i"
 	cover, terms, discount := alias+".cover_image_url", alias+".terms", alias+".discount_percent"
+	termsI18n := alias + ".terms_i18n"
 	// Галерея (migration 0070) живёт в дочерней таблице, своей у каждого вида.
 	// Читаем её тем же запросом коррелированным подзапросом: карточка ленты
 	// рисует ленту фотографий, и добор по одному запросу на карточку вернул бы
@@ -72,6 +73,7 @@ func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 	}
 	if kind == domain.FeedItemEvent {
 		terms = "''::text"
+		termsI18n = "NULL::jsonb"
 		discount = "NULL::int"
 	}
 	tail := ""
@@ -91,7 +93,7 @@ func itemSelect(kind domain.FeedItemKind, extra ...string) string {
 		` + alias + `.title, ` + alias + `.title_i18n, ` + alias + `.description, ` + alias + `.description_i18n,
 		` + alias + `.starts_at, ` + alias + `.ends_at,
 		` + cover + ` AS cover_image_url, ` + images + ` AS images,
-		` + terms + ` AS terms, ` + discount + ` AS discount_percent,
+		` + terms + ` AS terms, ` + termsI18n + ` AS terms_i18n, ` + discount + ` AS discount_percent,
 		` + alias + `.status AS item_status,
 		` + alias + `.feed_status, ` + alias + `.feed_submitted_at, ` + alias + `.feed_reviewed_by,
 		` + alias + `.feed_reviewed_at, ` + alias + `.feed_rejection_reason, ` + alias + `.feed_placement_weight,
@@ -111,7 +113,7 @@ const collapsedEventCols = `ev.kind, ev.id, ev.restaurant_id,
 	ev.title, ev.title_i18n, ev.description, ev.description_i18n,
 	ev.starts_at, ev.ends_at,
 	ev.cover_image_url, ev.images,
-	ev.terms, ev.discount_percent,
+	ev.terms, ev.terms_i18n, ev.discount_percent,
 	ev.item_status,
 	ev.feed_status, ev.feed_submitted_at, ev.feed_reviewed_by,
 	ev.feed_reviewed_at, ev.feed_rejection_reason, ev.feed_placement_weight,
@@ -488,14 +490,14 @@ func collect(rows pgx.Rows) ([]domain.FeedItem, error) {
 // branches project it identically, so one scanner serves every query here.
 func scanItem(row pgx.Row) (*domain.FeedItem, error) {
 	var it domain.FeedItem
-	var nameI18n, titleI18n, descI18n []byte
+	var nameI18n, titleI18n, descI18n, termsI18n []byte
 	if err := row.Scan(
 		&it.Kind, &it.ID, &it.RestaurantID,
 		&it.RestaurantName, &nameI18n,
 		&it.City, &it.CategoryID, &it.VenueIsActive, &it.VenueHiddenFromHome,
 		&it.Title, &titleI18n, &it.Description, &descI18n,
 		&it.StartsAt, &it.EndsAt,
-		&it.CoverImageURL, &it.Images, &it.Terms, &it.DiscountPercent,
+		&it.CoverImageURL, &it.Images, &it.Terms, &termsI18n, &it.DiscountPercent,
 		&it.ItemStatus,
 		&it.Placement.Status, &it.Placement.SubmittedAt, &it.Placement.ReviewedBy,
 		&it.Placement.ReviewedAt, &it.Placement.RejectionReason, &it.Placement.PlacementWeight,
@@ -506,6 +508,7 @@ func scanItem(row pgx.Row) (*domain.FeedItem, error) {
 	it.RestaurantNameI18n = i18nFromDB(nameI18n)
 	it.TitleI18n = i18nFromDB(titleI18n)
 	it.DescriptionI18n = i18nFromDB(descI18n)
+	it.TermsI18n = i18nFromDB(termsI18n)
 	return &it, nil
 }
 
@@ -513,14 +516,14 @@ func scanItem(row pgx.Row) (*domain.FeedItem, error) {
 // feed query appends.
 func scanCandidate(row pgx.Row) (*domain.FeedItem, error) {
 	var it domain.FeedItem
-	var nameI18n, titleI18n, descI18n []byte
+	var nameI18n, titleI18n, descI18n, termsI18n []byte
 	if err := row.Scan(
 		&it.Kind, &it.ID, &it.RestaurantID,
 		&it.RestaurantName, &nameI18n,
 		&it.City, &it.CategoryID, &it.VenueIsActive, &it.VenueHiddenFromHome,
 		&it.Title, &titleI18n, &it.Description, &descI18n,
 		&it.StartsAt, &it.EndsAt,
-		&it.CoverImageURL, &it.Images, &it.Terms, &it.DiscountPercent,
+		&it.CoverImageURL, &it.Images, &it.Terms, &termsI18n, &it.DiscountPercent,
 		&it.ItemStatus,
 		&it.Placement.Status, &it.Placement.SubmittedAt, &it.Placement.ReviewedBy,
 		&it.Placement.ReviewedAt, &it.Placement.RejectionReason, &it.Placement.PlacementWeight,
@@ -533,6 +536,7 @@ func scanCandidate(row pgx.Row) (*domain.FeedItem, error) {
 	it.RestaurantNameI18n = i18nFromDB(nameI18n)
 	it.TitleI18n = i18nFromDB(titleI18n)
 	it.DescriptionI18n = i18nFromDB(descI18n)
+	it.TermsI18n = i18nFromDB(termsI18n)
 	return &it, nil
 }
 

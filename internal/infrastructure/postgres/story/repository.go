@@ -4,6 +4,7 @@ package story
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -26,7 +27,7 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.StoryRepository = (*Repository)(nil)
 
 // selCols lists restaurant_stories columns for reads.
-const selCols = `id, restaurant_id, image_url, caption, action_url, sort_order, is_active, created_at`
+const selCols = `id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active, created_at`
 
 func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
 	// id is the final tie-break: now() is constant within a transaction, so a
@@ -103,10 +104,10 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 		s.ID = uuid.New()
 	}
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, action_url, sort_order, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING created_at`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.ActionURL, s.SortOrder, s.IsActive).
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive).
 		Scan(&s.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -124,9 +125,9 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 func (r *Repository) Update(ctx context.Context, s *domain.Story) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE restaurant_stories
-		 SET image_url=$3, caption=$4, action_url=$5, sort_order=$6, is_active=$7
+		 SET image_url=$3, caption=$4, caption_i18n=$5, action_url=$6, sort_order=$7, is_active=$8
 		 WHERE id=$1 AND restaurant_id=$2`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, s.ActionURL, s.SortOrder, s.IsActive)
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive)
 	if err != nil {
 		return fmt.Errorf("update restaurant story: %w", err)
 	}
@@ -179,10 +180,36 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanStory(row scanner) (*domain.Story, error) {
 	var s domain.Story
+	var captionI18n []byte
 	if err := row.Scan(
-		&s.ID, &s.RestaurantID, &s.ImageURL, &s.Caption, &s.ActionURL, &s.SortOrder, &s.IsActive, &s.CreatedAt,
+		&s.ID, &s.RestaurantID, &s.ImageURL, &s.Caption, &captionI18n, &s.ActionURL, &s.SortOrder,
+		&s.IsActive, &s.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
+	s.CaptionI18n = i18nFromDB(captionI18n)
 	return &s, nil
+}
+
+// i18nToDB / i18nFromDB are the same jsonb bridge every other repository in
+// this package family uses: a nil map is written as SQL NULL (never `{}`), and
+// unreadable jsonb reads back as "no translations" rather than failing the
+// whole listing.
+func i18nToDB(m domain.I18n) any {
+	if m == nil {
+		return nil
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+func i18nFromDB(b []byte) domain.I18n {
+	if len(b) == 0 {
+		return nil
+	}
+	var m domain.I18n
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil
+	}
+	return m
 }

@@ -100,14 +100,20 @@ type Facade interface {
 type CreateInput struct {
 	// RestaurantID is the host venue. nil creates a PLATFORM event — one with
 	// no venue at all — which only domain.CanManagePlatformContent roles may do.
-	RestaurantID     *uuid.UUID
-	Title            string
-	TitleI18n        domain.I18n
+	RestaurantID *uuid.UUID
+	Title        string
+	// The *I18n fields are PARTIAL translation updates (domain.I18nPatch): a
+	// named language is written, a null one removed, an unmentioned one kept —
+	// unlike the scalar fields around them, which this payload replaces whole.
+	// The plain field is the Russian text and wins over a `ru` key in the map
+	// (domain.ApplyTranslations).
+	TitleI18n        domain.I18nPatch
 	Description      string
-	DescriptionI18n  domain.I18n
+	DescriptionI18n  domain.I18nPatch
 	StartsAt         time.Time
 	EndsAt           time.Time
 	Venue            string
+	VenueI18n        domain.I18nPatch
 	CoverImageURL    *string
 	Status           domain.EventStatus
 	Ticketed         bool
@@ -136,18 +142,24 @@ type CreateInput struct {
 	// Action with a nil URL is a button onto the event's OWN page; with a URL it
 	// is an external link, validated before it is stored.
 	Action *domain.EventAction
+	// ActionLabelI18n patches the BUTTON's caption translations. Meaningful
+	// only together with Action: a caption that does not exist cannot be
+	// translated (the DB CHECK from migration 0101 says so too).
+	ActionLabelI18n domain.I18nPatch
 }
 
 // UpdateInput carries an event's mutable fields (full replace). Status must be
 // a valid EventStatus.
 type UpdateInput struct {
-	Title            string
-	TitleI18n        domain.I18n
+	Title string
+	// PARTIAL translation updates — see CreateInput.
+	TitleI18n        domain.I18nPatch
 	Description      string
-	DescriptionI18n  domain.I18n
+	DescriptionI18n  domain.I18nPatch
 	StartsAt         time.Time
 	EndsAt           time.Time
 	Venue            string
+	VenueI18n        domain.I18nPatch
 	CoverImageURL    *string
 	Status           domain.EventStatus
 	Ticketed         bool
@@ -181,6 +193,11 @@ type UpdateInput struct {
 	// the safe default for an older cabinet build — it removes a button nobody
 	// could have added from that build, rather than stranding one it cannot see.
 	Action *domain.EventAction
+	// ActionLabelI18n patches the button caption's translations, merged onto
+	// the translations the button ALREADY had. Removing the button removes them
+	// with it: the caption is gone, so a translation of it would be a
+	// translation of nothing.
+	ActionLabelI18n domain.I18nPatch
 }
 
 // occurrenceSkipRecorder tombstones one slot of a recurrence rule so the
@@ -311,20 +328,25 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if err != nil {
 		return nil, err
 	}
+	if err := validateEventTranslations(in.TitleI18n, in.DescriptionI18n, in.VenueI18n, in.ActionLabelI18n); err != nil {
+		return nil, err
+	}
 	action := in.Action
 	if err := domain.ValidateEventAction(action); err != nil {
 		return nil, err
 	}
+	applyActionLabelTranslations(action, nil, in.ActionLabelI18n)
 	e := &domain.Event{
 		RestaurantID:     in.RestaurantID,
 		Action:           action,
 		Title:            strings.TrimSpace(in.Title),
-		TitleI18n:        in.TitleI18n,
+		TitleI18n:        domain.ApplyTranslations(nil, in.TitleI18n, strings.TrimSpace(in.Title)),
 		Description:      in.Description,
-		DescriptionI18n:  in.DescriptionI18n,
+		DescriptionI18n:  domain.ApplyTranslations(nil, in.DescriptionI18n, in.Description),
 		StartsAt:         in.StartsAt,
 		EndsAt:           in.EndsAt,
 		Venue:            in.Venue,
+		VenueI18n:        domain.ApplyTranslations(nil, in.VenueI18n, in.Venue),
 		City:             city,
 		CoverImageURL:    in.CoverImageURL,
 		Status:           status,
@@ -370,6 +392,9 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
 		return nil, err
 	}
+	if err := validateEventTranslations(in.TitleI18n, in.DescriptionI18n, in.VenueI18n, in.ActionLabelI18n); err != nil {
+		return nil, err
+	}
 	// Decided before anything is overwritten: only a change to what a moderator
 	// actually read counts as an edit. Publishing or hiding an event travels
 	// through this same method, and re-queueing a venue for that would punish
@@ -386,8 +411,18 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	// The button is moderated content as much as the words are: it is what a
 	// guest taps, and repointing it at another site after approval is exactly
 	// the substitution moderation exists to catch.
-	contentChanged := eventContentChanged(*e, in) || !cityPtrEqual(city, e.City) ||
-		!actionEqual(in.Action, e.Action)
+	// The translation maps are compared AS THEY WILL BE STORED: a patch is
+	// partial, so "what the request said" and "what the card will read" are two
+	// different objects, and only the second answers whether the approved words
+	// still stand.
+	title := strings.TrimSpace(in.Title)
+	titleI18n := domain.ApplyTranslations(e.TitleI18n, in.TitleI18n, title)
+	descI18n := domain.ApplyTranslations(e.DescriptionI18n, in.DescriptionI18n, in.Description)
+	venueI18n := domain.ApplyTranslations(e.VenueI18n, in.VenueI18n, in.Venue)
+	action := in.Action
+	applyActionLabelTranslations(action, storedActionLabelI18n(e.Action), in.ActionLabelI18n)
+	contentChanged := eventContentChanged(*e, in, titleI18n, descI18n, venueI18n) ||
+		!cityPtrEqual(city, e.City) || !actionEqual(action, e.Action)
 	// Moving a generated occurrence to another time frees its ORIGINAL slot, so
 	// that slot needs the same tombstone a delete leaves — otherwise the next
 	// pass fills the old date back in and the venue ends up with both.
@@ -397,13 +432,14 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		}
 	}
 
-	e.Title = strings.TrimSpace(in.Title)
-	e.TitleI18n = in.TitleI18n
+	e.Title = title
+	e.TitleI18n = titleI18n
 	e.Description = in.Description
-	e.DescriptionI18n = in.DescriptionI18n
+	e.DescriptionI18n = descI18n
 	e.StartsAt = in.StartsAt
 	e.EndsAt = in.EndsAt
 	e.Venue = in.Venue
+	e.VenueI18n = venueI18n
 	e.City = city
 	e.CoverImageURL = in.CoverImageURL
 	e.Status = in.Status
@@ -411,7 +447,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
 	e.Tags = normalizeTags(in.Tags)
-	e.Action = in.Action
+	e.Action = action
 	if err := domain.ValidateEventAction(e.Action); err != nil {
 		return nil, err
 	}
@@ -785,7 +821,7 @@ func cityPtrEqual(a, b *domain.City) bool {
 	return *a == *b
 }
 
-func eventContentChanged(cur domain.Event, in UpdateInput) bool {
+func eventContentChanged(cur domain.Event, in UpdateInput, titleI18n, descI18n, venueI18n domain.I18n) bool {
 	switch {
 	case strings.TrimSpace(in.Title) != cur.Title,
 		in.Description != cur.Description,
@@ -796,8 +832,9 @@ func eventContentChanged(cur domain.Event, in UpdateInput) bool {
 		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL),
 		!int64PtrEqual(in.TicketPriceMinor, cur.TicketPriceMinor),
 		!intPtrEqual(in.Capacity, cur.Capacity),
-		!i18nEqual(in.TitleI18n, cur.TitleI18n),
-		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n),
+		!domain.I18nRenderEqual(strings.TrimSpace(in.Title), titleI18n, cur.Title, cur.TitleI18n),
+		!domain.I18nRenderEqual(in.Description, descI18n, cur.Description, cur.DescriptionI18n),
+		!domain.I18nRenderEqual(in.Venue, venueI18n, cur.Venue, cur.VenueI18n),
 		!tagsEqual(normalizeTags(in.Tags), cur.Tags):
 		return true
 	}
@@ -841,20 +878,6 @@ func tagsEqual(a, b []string) bool {
 	return true
 }
 
-// i18nEqual compares localized maps by content: nil and empty read the same to a
-// guest, so they must not count as an edit.
-func i18nEqual(a, b domain.I18n) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
 // actionEqual compares two call-to-action buttons. Absent equals absent; a
 // button equals another only when both the caption and the destination match,
 // and "the event's own page" (nil url) is a destination like any other.
@@ -862,7 +885,44 @@ func actionEqual(a, b *domain.EventAction) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return strings.TrimSpace(a.Label) == b.Label && strPtrEqual(a.URL, b.URL)
+	return strPtrEqual(a.URL, b.URL) &&
+		domain.I18nRenderEqual(strings.TrimSpace(a.Label), a.LabelI18n, b.Label, b.LabelI18n)
+}
+
+// validateEventTranslations refuses a translation patch nothing could honestly
+// store: an unsupported language, two spellings of the same one, or an attempt
+// to delete `ru` (which lives in the plain column, not in the map).
+func validateEventTranslations(title, description, venue, actionLabel domain.I18nPatch) error {
+	if err := title.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := description.Validate("description_i18n"); err != nil {
+		return err
+	}
+	if err := venue.Validate("venue_i18n"); err != nil {
+		return err
+	}
+	return actionLabel.Validate("action.label_i18n")
+}
+
+// applyActionLabelTranslations writes the button caption's translations onto
+// the action that is about to be stored, merging the patch onto what the button
+// had before. A nil action is left alone: there is no caption to translate, and
+// the DB CHECK from migration 0101 refuses the pair anyway.
+func applyActionLabelTranslations(action *domain.EventAction, stored domain.I18n, patch domain.I18nPatch) {
+	if action == nil {
+		return
+	}
+	action.LabelI18n = domain.ApplyTranslations(stored, patch, strings.TrimSpace(action.Label))
+}
+
+// storedActionLabelI18n is the caption translations the event currently has, or
+// nil when it has no button at all.
+func storedActionLabelI18n(a *domain.EventAction) domain.I18n {
+	if a == nil {
+		return nil
+	}
+	return a.LabelI18n
 }
 
 func strPtrEqual(a, b *string) bool {

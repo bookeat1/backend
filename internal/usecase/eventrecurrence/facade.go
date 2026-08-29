@@ -79,11 +79,17 @@ type Input struct {
 	// RestaurantID is read on CREATE only; on update the rule keeps its venue.
 	RestaurantID uuid.UUID
 
-	Title            string
-	TitleI18n        domain.I18n
+	Title string
+	// The *I18n fields are PARTIAL translation updates (domain.I18nPatch): a
+	// named language is written, a null one removed, an unmentioned one kept.
+	// They are the one part of this otherwise full-replace input that never
+	// wipes what the request did not mention. The plain field is the Russian
+	// text and wins over a `ru` key in the map (domain.ApplyTranslations).
+	TitleI18n        domain.I18nPatch
 	Description      string
-	DescriptionI18n  domain.I18n
+	DescriptionI18n  domain.I18nPatch
 	Venue            string
+	VenueI18n        domain.I18nPatch
 	CoverImageURL    *string
 	Tags             []string
 	OccurrenceStatus domain.EventStatus
@@ -135,6 +141,9 @@ func (f *facade) Create(ctx context.Context, actor Actor, in Input) (*domain.Eve
 	if err := f.authorize(ctx, actor, in.RestaurantID); err != nil {
 		return nil, err
 	}
+	if err := validateTranslations(in); err != nil {
+		return nil, err
+	}
 	rec := &domain.EventRecurrence{RestaurantID: in.RestaurantID}
 	apply(rec, in)
 	if err := validate(rec); err != nil {
@@ -180,10 +189,20 @@ func (f *facade) Update(ctx context.Context, actor Actor, id uuid.UUID, in Input
 	// whether the occurrences need rewriting at all: recurrenceContentChanged
 	// is broader (it counts a schedule change as content, and a schedule change
 	// touches no existing date).
+	if err := validateTranslations(in); err != nil {
+		return nil, err
+	}
 	contentChanged := recurrenceContentChanged(*rec, in)
 	before := rec.Content()
 	apply(rec, in)
 	seriesContentChanged := len(domain.EventContentDiff(before, rec.Content())) > 0
+	// A translation-only edit is an edit: the platform approved the card in
+	// every language it shows, so changing the Kazakh title has to go back for
+	// review exactly like changing the Russian one. The scalar comparison above
+	// cannot see it (it runs on the raw input, and a PATCH tells you nothing
+	// until it is merged), so the content diff — which compares the maps as
+	// they will be stored — is folded in here.
+	contentChanged = contentChanged || seriesContentChanged
 	if err := validate(rec); err != nil {
 		return nil, err
 	}
@@ -424,10 +443,11 @@ func apply(rec *domain.EventRecurrence, in Input) {
 		status = domain.EventDraft
 	}
 	rec.Title = strings.TrimSpace(in.Title)
-	rec.TitleI18n = in.TitleI18n
+	rec.TitleI18n = domain.ApplyTranslations(rec.TitleI18n, in.TitleI18n, rec.Title)
 	rec.Description = in.Description
-	rec.DescriptionI18n = in.DescriptionI18n
+	rec.DescriptionI18n = domain.ApplyTranslations(rec.DescriptionI18n, in.DescriptionI18n, in.Description)
 	rec.Venue = in.Venue
+	rec.VenueI18n = domain.ApplyTranslations(rec.VenueI18n, in.VenueI18n, in.Venue)
 	rec.CoverImageURL = in.CoverImageURL
 	rec.Tags = normalizeTags(in.Tags)
 	rec.OccurrenceStatus = status
@@ -580,6 +600,19 @@ func normalizeTags(tags []string) []string {
 // editorial object (and, before this PR's second half, was exactly what buried
 // the Афиша under 55 identical cards). is_active is deliberately not content —
 // pausing and resuming a rule is not an editorial change.
+// validateTranslations refuses a translation patch nothing could honestly
+// store: an unsupported language, two spellings of the same one, or an attempt
+// to delete `ru` (which lives in the plain column, not in the map).
+func validateTranslations(in Input) error {
+	if err := in.TitleI18n.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := in.DescriptionI18n.Validate("description_i18n"); err != nil {
+		return err
+	}
+	return in.VenueI18n.Validate("venue_i18n")
+}
+
 func recurrenceContentChanged(cur domain.EventRecurrence, in Input) bool {
 	switch {
 	case strings.TrimSpace(in.Title) != cur.Title,

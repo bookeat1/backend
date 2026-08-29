@@ -9,6 +9,7 @@ import (
 
 	"backend-core/internal/domain"
 	"backend-core/internal/transport/rest/middleware"
+	"backend-core/internal/transport/rest/reqlocale"
 	"backend-core/internal/transport/rest/response"
 	uc "backend-core/internal/usecase/stories"
 )
@@ -49,9 +50,13 @@ func (h *Handler) list(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	// The guest read localizes, like every other public content route: the
+	// caption comes back already resolved into the caller's language (or the
+	// Russian column when there is no translation) — see reqlocale.
+	lang := reqlocale.Resolve(c)
 	out := make([]storyResponse, 0, len(items))
 	for i := range items {
-		out = append(out, storyToResponse(&items[i]))
+		out = append(out, storyToResponse(&items[i], lang))
 	}
 	response.OK(c.Writer, out)
 }
@@ -95,6 +100,7 @@ func (h *Handler) create(c *gin.Context) {
 		RestaurantID: rid,
 		ImageURL:     req.ImageURL,
 		Caption:      req.Caption,
+		CaptionI18n:  domain.I18nPatch(req.CaptionI18n),
 		ActionURL:    req.ActionURL,
 		SortOrder:    req.SortOrder,
 		IsActive:     req.IsActive,
@@ -121,11 +127,12 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	s, err := h.facade.UpdateStory(c.Request.Context(), actor, sid, uc.UpdateInput{
-		ImageURL:  req.ImageURL,
-		Caption:   req.Caption,
-		ActionURL: req.ActionURL,
-		SortOrder: req.SortOrder,
-		IsActive:  req.IsActive,
+		ImageURL:    req.ImageURL,
+		Caption:     req.Caption,
+		CaptionI18n: domain.I18nPatch(req.CaptionI18n),
+		ActionURL:   req.ActionURL,
+		SortOrder:   req.SortOrder,
+		IsActive:    req.IsActive,
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)
@@ -208,6 +215,10 @@ func pathUUID(c *gin.Context, param, msg string) (uuid.UUID, bool) {
 type createStoryRequest struct {
 	ImageURL string  `json:"image_url"`
 	Caption  *string `json:"caption"`
+	// CaptionI18n — переводы подписи, ЧАСТИЧНОЕ обновление: названный язык
+	// записывается, null удаляется, неупомянутый сохраняется. Русский текст —
+	// в поле caption; ключ `ru` здесь пишет именно его.
+	CaptionI18n map[string]*string `json:"caption_i18n"`
 	// action_url is where a TAP on the story sends the guest. Not to be
 	// confused with image_url, which is where the picture itself lives.
 	// Optional; when present it must be an http(s) link (validated in the
@@ -222,6 +233,8 @@ type createStoryRequest struct {
 type updateStoryRequest struct {
 	ImageURL *string `json:"image_url"`
 	Caption  *string `json:"caption"`
+	// CaptionI18n — переводы подписи, частичное обновление (см. создание).
+	CaptionI18n map[string]*string `json:"caption_i18n"`
 	// Same three states as caption: omitted ⇒ unchanged, empty ⇒ the link is
 	// removed, otherwise validated and stored.
 	ActionURL *string `json:"action_url"`

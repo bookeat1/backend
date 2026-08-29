@@ -44,6 +44,7 @@ func fullRule(rid uuid.UUID) *domain.EventRecurrence {
 		Description:               "Каждую среду",
 		DescriptionI18n:           domain.I18n{"en": "Every Wednesday"},
 		Venue:                     "rooftop terrace",
+		VenueI18n:                 domain.I18n{"ru": "rooftop terrace", "kk": "шатыр террасасы"},
 		CoverImageURL:             &cover,
 		Tags:                      []string{"Коктейли", "Живая музыка"},
 		OccurrenceStatus:          domain.EventPublished,
@@ -87,6 +88,11 @@ func TestCreateAndGetRoundTrip(t *testing.T) {
 	}
 	if got.TitleI18n["kk"] != "Коктейль сәрсенбі" || got.DescriptionI18n["en"] != "Every Wednesday" {
 		t.Fatalf("i18n lost: %+v / %+v", got.TitleI18n, got.DescriptionI18n)
+	}
+	// The venue line's translations (migration 0101) are part of the template
+	// too: lose them here and every generated date shows an untranslated room.
+	if got.VenueI18n["kk"] != "шатыр террасасы" {
+		t.Fatalf("venue_i18n lost: %+v", got.VenueI18n)
 	}
 	if len(got.Tags) != 2 || got.Tags[0] != "Коктейли" {
 		t.Fatalf("tags lost: %v", got.Tags)

@@ -157,12 +157,14 @@ func (h *Handler) createWithHost(c *gin.Context, rid *uuid.UUID) {
 		RestaurantID:     rid,
 		Action:           req.Action.toDomain(),
 		Title:            req.Title,
-		TitleI18n:        domain.I18n(req.TitleI18n),
+		TitleI18n:        domain.I18nPatch(req.TitleI18n),
 		Description:      req.Description,
-		DescriptionI18n:  domain.I18n(req.DescriptionI18n),
+		DescriptionI18n:  domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		VenueI18n:        domain.I18nPatch(req.VenueI18n),
+		ActionLabelI18n:  req.Action.labelI18n(),
 		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
@@ -206,12 +208,14 @@ func (h *Handler) update(c *gin.Context) {
 	}
 	e, err := h.facade.Update(c.Request.Context(), actor, eid, uc.UpdateInput{
 		Title:            req.Title,
-		TitleI18n:        domain.I18n(req.TitleI18n),
+		TitleI18n:        domain.I18nPatch(req.TitleI18n),
 		Description:      req.Description,
-		DescriptionI18n:  domain.I18n(req.DescriptionI18n),
+		DescriptionI18n:  domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		VenueI18n:        domain.I18nPatch(req.VenueI18n),
+		ActionLabelI18n:  req.Action.labelI18n(),
 		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
@@ -493,15 +497,24 @@ func parseEventStatuses(raw string) []domain.EventStatus {
 // --- DTOs ---
 
 type eventRequest struct {
-	Title           string            `json:"title"`
-	TitleI18n       map[string]string `json:"title_i18n"`
-	Description     string            `json:"description"`
-	DescriptionI18n map[string]string `json:"description_i18n"`
-	StartsAt        string            `json:"starts_at"`
-	EndsAt          string            `json:"ends_at"`
-	Venue           string            `json:"venue"`
-	CoverImageURL   *string           `json:"cover_image_url"`
-	Status          string            `json:"status"`
+	Title string `json:"title"`
+	// The `*_i18n` objects are PARTIAL translation updates, and the ONE thing
+	// in this payload that is not a full replace:
+	//
+	//	{"venue_i18n": {"kk": "Шатыр террасасы", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored. The plain
+	// field next to it is the Russian text and wins over a `ru` key here.
+	TitleI18n       map[string]*string `json:"title_i18n"`
+	Description     string             `json:"description"`
+	DescriptionI18n map[string]*string `json:"description_i18n"`
+	StartsAt        string             `json:"starts_at"`
+	EndsAt          string             `json:"ends_at"`
+	Venue           string             `json:"venue"`
+	VenueI18n       map[string]*string `json:"venue_i18n"`
+	CoverImageURL   *string            `json:"cover_image_url"`
+	Status          string             `json:"status"`
 	// City переопределяет город, в котором показывается событие. Пусто или
 	// отсутствует — обычный случай: событие живёт в городе своего заведения, и
 	// переезжает вместе с ним. Значение резолвится по справочнику городов
@@ -540,6 +553,10 @@ type eventRequest struct {
 // external url, and someone would eventually have to guess which half is a lie.
 type eventActionRequest struct {
 	Label string `json:"label"`
+	// LabelI18n — переводы подписи кнопки, ЧАСТИЧНОЕ обновление, как и все
+	// прочие `*_i18n` здесь: названный язык записывается, null удаляется,
+	// неупомянутый сохраняется. Русский текст живёт в label.
+	LabelI18n map[string]*string `json:"label_i18n"`
 	// URL — внешняя ссылка. Отсутствует или null → кнопка ведёт на страницу
 	// самого события. Значение проверяется в домене: только http/https, с
 	// хостом, без учётных данных и управляющих символов; javascript:, data: и
@@ -547,12 +564,24 @@ type eventActionRequest struct {
 	URL *string `json:"url"`
 }
 
-// toDomain maps the optional button, nil staying nil ("no button").
+// toDomain maps the optional button, nil staying nil ("no button"). The
+// caption's translations travel SEPARATELY (labelI18n below) because they are a
+// patch, not a value: merging them onto what the button already has needs the
+// stored event, which only the usecase has.
 func (r *eventActionRequest) toDomain() *domain.EventAction {
 	if r == nil {
 		return nil
 	}
 	return &domain.EventAction{Label: r.Label, URL: r.URL}
+}
+
+// labelI18n is the button caption's translation patch, nil when there is no
+// button in the request at all.
+func (r *eventActionRequest) labelI18n() domain.I18nPatch {
+	if r == nil {
+		return nil
+	}
+	return domain.I18nPatch(r.LabelI18n)
 }
 
 // refundPolicyRequest is the narrow "just the refund rules" admin payload.
@@ -621,6 +650,7 @@ type eventResponse struct {
 	StartsAt        string            `json:"starts_at"`
 	EndsAt          string            `json:"ends_at"`
 	Venue           string            `json:"venue,omitempty"`
+	VenueI18n       map[string]string `json:"venue_i18n,omitempty"`
 	CoverImageURL   *string           `json:"cover_image_url,omitempty"`
 	Status          string            `json:"status"`
 	// City — переопределение города. Отсутствует, когда его нет: событие тогда
@@ -661,16 +691,31 @@ type eventResponse struct {
 // (see domain.EventAction.Target) and is what the client branches on: "event"
 // → open GET /events/{id} in-app, "external" → open url in a browser.
 type eventActionResponse struct {
-	Label  string  `json:"label"`
-	Target string  `json:"target"`
-	URL    *string `json:"url,omitempty"`
+	Label string `json:"label"`
+	// LabelI18n — сырые переводы подписи: их видит КАБИНЕТ (adminResponse),
+	// гостю карта не нужна, ему уже разрешили подпись в его язык.
+	LabelI18n map[string]string `json:"label_i18n,omitempty"`
+	Target    string            `json:"target"`
+	URL       *string           `json:"url,omitempty"`
 }
 
 func actionResponse(a *domain.EventAction) *eventActionResponse {
 	if a == nil {
 		return nil
 	}
-	return &eventActionResponse{Label: a.Label, Target: string(a.Target()), URL: a.URL}
+	return &eventActionResponse{
+		Label: a.Label, LabelI18n: a.LabelI18n, Target: string(a.Target()), URL: a.URL,
+	}
+}
+
+// localizeAction resolves the button caption into lang and drops the raw map —
+// the guest-facing half of actionResponse. A nil action stays nil.
+func localizeAction(r *eventActionResponse, a *domain.EventAction, lang string) {
+	if r == nil || a == nil {
+		return
+	}
+	r.Label = a.LabelI18n.Resolve(lang, a.Label)
+	r.LabelI18n = nil
 }
 
 // idOrNil renders an optional uuid as an optional string, so an absent owner
@@ -723,6 +768,7 @@ func adminResponse(e domain.Event) eventResponse {
 		StartsAt:         e.StartsAt.Format(time.RFC3339),
 		EndsAt:           e.EndsAt.Format(time.RFC3339),
 		Venue:            e.Venue,
+		VenueI18n:        e.VenueI18n,
 		City:             cityOrNil(e.City),
 		CoverImageURL:    e.CoverImageURL,
 		Status:           string(e.Status),
@@ -778,8 +824,11 @@ func publicResponse(e domain.Event, lang string) eventResponse {
 	r := adminResponse(e)
 	r.Title = e.TitleI18n.Resolve(lang, e.Title)
 	r.Description = e.DescriptionI18n.Resolve(lang, e.Description)
+	r.Venue = e.VenueI18n.Resolve(lang, e.Venue)
+	localizeAction(r.Action, e.Action, lang)
 	r.TitleI18n = nil
 	r.DescriptionI18n = nil
+	r.VenueI18n = nil
 	// Which fields this date inherits from its series is a cabinet's concern,
 	// not a guest's: the guest sees the resolved content, exactly as before
 	// migration 0097, and the response keeps the shape it always had.

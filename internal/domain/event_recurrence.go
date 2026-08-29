@@ -81,8 +81,9 @@ type EventRecurrence struct {
 	Description     string
 	DescriptionI18n I18n
 	// Venue is free-text location detail within the restaurant, same meaning as
-	// Event.Venue ("rooftop terrace").
+	// Event.Venue ("rooftop terrace"), localized the same way.
 	Venue         string
+	VenueI18n     I18n
 	CoverImageURL *string
 	Tags          []string
 	// OccurrenceStatus is the status every generated occurrence is born with.

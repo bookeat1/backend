@@ -29,9 +29,10 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.EventRepository = (*Repository)(nil)
 
 const selectCols = `id, restaurant_id, title, title_i18n, description, description_i18n,
-	starts_at, ends_at, venue, cover_image_url, status, ticketed,
+	starts_at, ends_at, venue, venue_i18n, cover_image_url, status, ticketed,
 	ticket_price_minor, capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes,
-	recurrence_id, created_at, updated_at, city, action_label, action_url, content_overrides`
+	recurrence_id, created_at, updated_at, city, action_label, action_label_i18n, action_url,
+	content_overrides`
 
 // Create inserts a new event. An unknown restaurant_id (FK violation) maps to
 // ErrNotFound, same convention as reviews/favorites.
@@ -41,14 +42,17 @@ func (r *Repository) Create(ctx context.Context, e *domain.Event) error {
 	}
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO events (id, restaurant_id, title, title_i18n, description, description_i18n,
-			starts_at, ends_at, venue, cover_image_url, status, ticketed, ticket_price_minor, capacity,
-			tags, tickets_refundable, ticket_refund_cutoff_minutes, city, action_label, action_url)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			starts_at, ends_at, venue, venue_i18n, cover_image_url, status, ticketed, ticket_price_minor,
+			capacity, tags, tickets_refundable, ticket_refund_cutoff_minutes, city, action_label,
+			action_label_i18n, action_url)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+			$21, $22)
 		 RETURNING created_at, updated_at, city`,
 		e.ID, e.RestaurantID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
-		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
+		e.StartsAt, e.EndsAt, e.Venue, i18nToDB(e.VenueI18n), e.CoverImageURL, e.Status, e.Ticketed,
+		e.TicketPriceMinor, e.Capacity,
 		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City,
-		actionLabelToDB(e.Action), actionURLToDB(e.Action)).
+		actionLabelToDB(e.Action), i18nToDB(actionLabelI18nToDB(e.Action)), actionURLToDB(e.Action)).
 		Scan(&e.CreatedAt, &e.UpdatedAt, &e.City)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -74,15 +78,18 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Event, 
 func (r *Repository) Update(ctx context.Context, e *domain.Event) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE events SET title = $2, title_i18n = $3, description = $4, description_i18n = $5,
-			starts_at = $6, ends_at = $7, venue = $8, cover_image_url = $9, status = $10,
-			ticketed = $11, ticket_price_minor = $12, capacity = $13, tags = $14,
-			tickets_refundable = $15, ticket_refund_cutoff_minutes = $16, city = $17,
-			action_label = $18, action_url = $19, content_overrides = $20, updated_at = now()
+			starts_at = $6, ends_at = $7, venue = $8, venue_i18n = $9, cover_image_url = $10, status = $11,
+			ticketed = $12, ticket_price_minor = $13, capacity = $14, tags = $15,
+			tickets_refundable = $16, ticket_refund_cutoff_minutes = $17, city = $18,
+			action_label = $19, action_label_i18n = $20, action_url = $21, content_overrides = $22,
+			updated_at = now()
 		 WHERE id = $1`,
 		e.ID, e.Title, i18nToDB(e.TitleI18n), e.Description, i18nToDB(e.DescriptionI18n),
-		e.StartsAt, e.EndsAt, e.Venue, e.CoverImageURL, e.Status, e.Ticketed, e.TicketPriceMinor, e.Capacity,
+		e.StartsAt, e.EndsAt, e.Venue, i18nToDB(e.VenueI18n), e.CoverImageURL, e.Status, e.Ticketed,
+		e.TicketPriceMinor, e.Capacity,
 		tagsToDB(e.Tags), e.TicketsRefundable, e.TicketRefundCutoffMinutes, e.City,
-		actionLabelToDB(e.Action), actionURLToDB(e.Action), overridesToDB(e.ContentOverrides))
+		actionLabelToDB(e.Action), i18nToDB(actionLabelI18nToDB(e.Action)), actionURLToDB(e.Action),
+		overridesToDB(e.ContentOverrides))
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
@@ -206,10 +213,10 @@ func (r *Repository) ListPublishedUpcoming(ctx context.Context, restaurantID uui
 // identity, for the cross-venue listing's join. It must stay in the same order
 // as selectCols — scanListItemRow reuses that order.
 const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e.description_i18n,
-	e.starts_at, e.ends_at, e.venue, e.cover_image_url, e.status, e.ticketed,
+	e.starts_at, e.ends_at, e.venue, e.venue_i18n, e.cover_image_url, e.status, e.ticketed,
 	e.ticket_price_minor, e.capacity, e.tags, e.tickets_refundable, e.ticket_refund_cutoff_minutes,
 	e.recurrence_id, e.created_at, e.updated_at, e.city AS event_city,
-	e.action_label, e.action_url, e.content_overrides,
+	e.action_label, e.action_label_i18n, e.action_url, e.content_overrides,
 	r.name, r.name_i18n, r.city`
 
 // collapsedCols reads listCols back out of the derived table the collapse
@@ -220,10 +227,10 @@ const listCols = `e.id, e.restaurant_id, e.title, e.title_i18n, e.description, e
 // table it would otherwise collide with the venue's `city` and every reference
 // to it would be ambiguous. That is why listCols aliases it at the source.
 const collapsedCols = `c.id, c.restaurant_id, c.title, c.title_i18n, c.description, c.description_i18n,
-	c.starts_at, c.ends_at, c.venue, c.cover_image_url, c.status, c.ticketed,
+	c.starts_at, c.ends_at, c.venue, c.venue_i18n, c.cover_image_url, c.status, c.ticketed,
 	c.ticket_price_minor, c.capacity, c.tags, c.tickets_refundable, c.ticket_refund_cutoff_minutes,
 	c.recurrence_id, c.created_at, c.updated_at, c.event_city,
-	c.action_label, c.action_url, c.content_overrides,
+	c.action_label, c.action_label_i18n, c.action_url, c.content_overrides,
 	c.name, c.name_i18n, c.city`
 
 // ListPublicUpcoming implements the cross-venue public listing. Visibility is
@@ -396,20 +403,21 @@ func scanEvent(row pgx.Row, op string) (*domain.Event, error) {
 
 func scanEventRow(row pgx.Row) (*domain.Event, error) {
 	var e domain.Event
-	var titleI18n, descI18n []byte
+	var titleI18n, descI18n, venueI18n, actionLabelI18n []byte
 	var actionLabel, actionURL *string
 	var overrides []string
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
-		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
+		&e.StartsAt, &e.EndsAt, &e.Venue, &venueI18n, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL,
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionLabelI18n, &actionURL,
 		&overrides); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
+	e.VenueI18n = i18nFromDB(venueI18n)
 	e.Tags = tagsFromDB(e.Tags)
-	e.Action = actionFromDB(actionLabel, actionURL)
+	e.Action = actionFromDB(actionLabel, i18nFromDB(actionLabelI18n), actionURL)
 	e.ContentOverrides = overridesFromDB(overrides)
 	return &e, nil
 }
@@ -422,21 +430,22 @@ func scanEventRow(row pgx.Row) (*domain.Event, error) {
 func scanListItemRow(row pgx.Row) (*domain.EventListItem, error) {
 	var it domain.EventListItem
 	e := &it.Event
-	var titleI18n, descI18n, venueNameI18n []byte
+	var titleI18n, descI18n, venueI18n, actionLabelI18n, venueNameI18n []byte
 	var actionLabel, actionURL, venueName *string
 	var venueCity *domain.City
 	var overrides []string
 	if err := row.Scan(&e.ID, &e.RestaurantID, &e.Title, &titleI18n, &e.Description, &descI18n,
-		&e.StartsAt, &e.EndsAt, &e.Venue, &e.CoverImageURL, &e.Status, &e.Ticketed,
+		&e.StartsAt, &e.EndsAt, &e.Venue, &venueI18n, &e.CoverImageURL, &e.Status, &e.Ticketed,
 		&e.TicketPriceMinor, &e.Capacity, &e.Tags, &e.TicketsRefundable, &e.TicketRefundCutoffMinutes,
-		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionURL,
+		&e.RecurrenceID, &e.CreatedAt, &e.UpdatedAt, &e.City, &actionLabel, &actionLabelI18n, &actionURL,
 		&overrides, &venueName, &venueNameI18n, &venueCity); err != nil {
 		return nil, err
 	}
 	e.TitleI18n = i18nFromDB(titleI18n)
 	e.DescriptionI18n = i18nFromDB(descI18n)
+	e.VenueI18n = i18nFromDB(venueI18n)
 	e.Tags = tagsFromDB(e.Tags)
-	e.Action = actionFromDB(actionLabel, actionURL)
+	e.Action = actionFromDB(actionLabel, i18nFromDB(actionLabelI18n), actionURL)
 	e.ContentOverrides = overridesFromDB(overrides)
 	it.Restaurant = venueFromDB(e.RestaurantID, venueName, venueNameI18n, venueCity)
 	return &it, nil
@@ -462,16 +471,26 @@ func venueFromDB(restaurantID *uuid.UUID, name *string, nameI18n []byte, city *d
 // actionFromDB rebuilds the optional call-to-action button. No label = no
 // button, whatever the url column says (a DB CHECK forbids that combination
 // anyway); a label with no url means the button opens the event's own page.
-func actionFromDB(label, actionURL *string) *domain.EventAction {
+func actionFromDB(label *string, labelI18n domain.I18n, actionURL *string) *domain.EventAction {
 	if label == nil {
 		return nil
 	}
-	return &domain.EventAction{Label: *label, URL: actionURL}
+	return &domain.EventAction{Label: *label, LabelI18n: labelI18n, URL: actionURL}
 }
 
 // actionLabelToDB / actionURLToDB write the button back, "no button" being two
 // NULLs rather than empty strings — the CHECK constraints and every read here
 // treat NULL as the single representation of absence.
+// actionLabelI18nToDB is the button caption's translation map, or nil when
+// there is no button at all: the DB CHECK from migration 0101 refuses a
+// translation for a caption that does not exist.
+func actionLabelI18nToDB(a *domain.EventAction) domain.I18n {
+	if a == nil {
+		return nil
+	}
+	return a.LabelI18n
+}
+
 func actionLabelToDB(a *domain.EventAction) *string {
 	if a == nil {
 		return nil
