@@ -233,6 +233,16 @@ const (
 	// request is malformed, the shelf is simply full.
 	CodeMenuTopPicksLimit ErrorCode = "menu_top_picks_limit"
 
+	// CodeMenuItemLanguageNotBase — a menu write tried to label a dish with a
+	// language other than Russian. A dish row is the BASE row of that dish, and
+	// its translations live in the *_i18n maps; a row labelled with another
+	// language is a leftover of the old import that the guest listing has to
+	// hide (it would otherwise show the same dish twice), so accepting one from
+	// the panel would silently create a dish no guest can ever see. Its own 422
+	// code because the panel must say "переводы вносите в поля перевода", not
+	// "validation failed" — nothing else about the request is wrong.
+	CodeMenuItemLanguageNotBase ErrorCode = "menu_item_language_not_base"
+
 	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
 	// against) a venue is not a usable IANA zone name. Kept apart from the
 	// generic validation code because it is the one venue field money decisions

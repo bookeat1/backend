@@ -59,9 +59,14 @@ type menuItemRequest struct {
 	SubcategoryI18n map[string]string `json:"subcategory_i18n"`
 	PortionSize     *string           `json:"portion_size"`
 	PortionSizeI18n map[string]string `json:"portion_size_i18n"`
-	Language        *string           `json:"language"`
-	DisplayOrder    *int              `json:"display_order"`
-	Tags            *[]string         `json:"tags"`
+	// Language: null or "ru" only. A dish row is the base row; translations
+	// live in the *_i18n maps. Any other value is a 422 with code
+	// menu_item_language_not_base, because the guest listing serves base rows
+	// and such a dish would be invisible to every guest while looking normal
+	// here.
+	Language     *string   `json:"language"`
+	DisplayOrder *int      `json:"display_order"`
+	Tags         *[]string `json:"tags"`
 }
 
 func (r menuItemRequest) toInput() menuuc.ItemInput {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -125,6 +126,9 @@ func (f *facade) Create(ctx context.Context, restaurantID uuid.UUID, in ItemInpu
 	if *in.Name == "" || !domain.ValidPrice(*in.Price) {
 		return nil, domain.ErrValidation
 	}
+	if err := checkBaseLanguage(nil, in.Language); err != nil {
+		return nil, err
+	}
 	m := &domain.MenuItem{ID: uuid.New(), RestaurantID: restaurantID, IsAvailable: true}
 	applyItem(m, in)
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
@@ -153,6 +157,9 @@ func (f *facade) Update(ctx context.Context, restaurantID, itemID uuid.UUID, in 
 		}
 		if existing.RestaurantID != restaurantID {
 			return domain.ErrNotFound // IDOR: item belongs to another restaurant
+		}
+		if err := checkBaseLanguage(existing.Language, in.Language); err != nil {
+			return err
 		}
 		applyItem(existing, in)
 		if err := f.items.Update(ctx, existing); err != nil {
@@ -434,6 +441,57 @@ func (f *facade) checkNoCycle(ctx context.Context, id, parentID uuid.UUID) error
 }
 
 // applyItem copies the non-nil fields of in onto m.
+// checkBaseLanguage keeps the panel from creating a dish the guest can never
+// see.
+//
+// Visibility rule (repository.baseRowsPredicate): the guest listing serves a
+// venue's BASE rows — language NULL or 'ru' — because part of the imported data
+// stores a translation as a separate row, and listing those next to their
+// originals is the same dish twice. That rule is per VENUE, so a NEW dish
+// labelled 'en' at a venue that already has base rows would be filtered out of
+// every language at once, while still looking perfectly normal in the cabinet.
+// Nobody would ever get a signal.
+//
+// So the write side enforces what the read side assumes: a dish row IS the base
+// row, and translations go into the *_i18n maps (which is also the only place
+// the panel and the app read them from). A non-base label is refused loudly with
+// its own code instead of being silently rewritten to 'ru' — an editor who typed
+// "en" meant something, and quietly storing the text as Russian would put the
+// wrong words on the guest's screen.
+//
+// The one allowed non-base value is the one the row ALREADY has: the 124
+// imported Kazakh copy rows are visible in the cabinet, and refusing to save an
+// edit of a legacy row would make those dishes uneditable. Such a row is already
+// out of the listing; keeping its label changes nothing for the guest.
+func checkBaseLanguage(existing, in *string) error {
+	if in == nil || isBaseLanguage(*in) {
+		return nil
+	}
+	if existing != nil && canonicalLanguage(*existing) == canonicalLanguage(*in) {
+		return nil
+	}
+	return domain.WithCode(domain.CodeMenuItemLanguageNotBase,
+		fmt.Errorf("%w: a menu item is always the base (ru) row; put translations into name_i18n/description_i18n", domain.ErrValidation))
+}
+
+// isBaseLanguage reports whether the label marks a row the guest listing serves.
+// It mirrors the SQL predicate (NULL or 'ru', case-insensitive) — the two must
+// agree, or the panel would accept a dish the listing hides.
+func isBaseLanguage(l string) bool {
+	l = strings.TrimSpace(l)
+	return l == "" || strings.EqualFold(l, domain.LocaleRU)
+}
+
+// canonicalLanguage folds the historical spellings together so that re-saving a
+// legacy row does not fail on 'kz' vs 'kk' (the panel echoes back whatever it
+// was given, and migration 0100 rewrote the stored value).
+func canonicalLanguage(l string) string {
+	if norm := domain.NormalizeLocale(l); norm != "" {
+		return norm
+	}
+	return strings.ToLower(strings.TrimSpace(l))
+}
+
 func applyItem(m *domain.MenuItem, in ItemInput) {
 	if in.Name != nil {
 		m.Name = *in.Name
