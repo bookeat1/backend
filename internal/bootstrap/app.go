@@ -27,6 +27,7 @@ import (
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
 	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
+	kaspiadminrest "backend-core/internal/transport/rest/kaspiadmin"
 	mediarest "backend-core/internal/transport/rest/media"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
@@ -361,6 +362,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// Same rule for cities (ADR-023): the dictionary is the platform's, a
 	// venue only points at an entry.
 	citiesHandler.RegisterAdminGlobal(adminGlobal)
+	// Read-only list of the companies on our Kaspi payment service, so the
+	// panel can OFFER the acquirer account a venue is bound to instead of
+	// asking someone to retype an id from another panel. Superadmin only: it
+	// names every merchant on the platform's payment service, and it feeds the
+	// one setting that decides whose till a guest's money lands in.
+	kaspiadminrest.NewHandler(deps.KaspiDirectory, log).RegisterAdminGlobal(adminGlobal)
 
 	// Global role management. This is the endpoint that hands out the rights to
 	// every other admin endpoint, so the usecase checks the caller's role again

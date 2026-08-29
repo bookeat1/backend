@@ -192,6 +192,12 @@ type Deps struct {
 	PaymentProvidersRepo domain.PaymentProviderRepository
 	PaymentGateways      *paymentgw.Registry
 
+	// KaspiDirectory is the READ-ONLY view of our Kaspi service's company
+	// registry, behind the superadmin's «Приём оплаты» picker. nil when the
+	// service is not configured for this deployment; the handler answers 503
+	// rather than the process refusing to boot.
+	KaspiDirectory *kaspi.Directory
+
 	// Payments usecases — the guest/staff-facing HTTP surface (transport/rest/payments).
 	PaymentCreate        payments.CreateUseCase
 	PaymentCapture       payments.CaptureUseCase
@@ -392,6 +398,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build payment gateway registry: %w", err)
 	}
+	kaspiDirectory := newKaspiDirectory(log)
 	paymentsCfg := newPaymentsConfig(cfg)
 	paymentSettings := restRepo // *restaurant.Repository now also implements restaurantPaymentSettings (GetPaymentOverride)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: paymentsCfg}
@@ -608,6 +615,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentOutboxRepo:    paymentOutboxRepo,
 		PaymentProvidersRepo: paymentProvidersRepo,
 		PaymentGateways:      paymentGateways,
+		KaspiDirectory:       kaspiDirectory,
 
 		PaymentCreate:         paymentCreate,
 		PaymentCapture:        paymentCapture,
@@ -1086,6 +1094,22 @@ func newPaymentGateways(cfg PaymentsConfig, providers domain.PaymentProviderRepo
 		return nil, fmt.Errorf("build payment registry: %w", err)
 	}
 	return registry, nil
+}
+
+// newKaspiDirectory builds the read-only client for our Kaspi service's company
+// registry (the superadmin's «Приём оплаты» picker).
+//
+// A misconfigured directory must never stop the API from starting: it feeds one
+// admin screen and no money path, so a failure here is logged and the handler
+// answers 503, the same shape as an acquirer whose credentials are absent.
+func newKaspiDirectory(log *slog.Logger) *kaspi.Directory {
+	dir, err := kaspi.NewDirectory(kaspi.DirectoryConfigFromEnv(), nil)
+	if err != nil {
+		log.Warn("kaspi company directory not configured, the panel picker will answer 503",
+			slog.String("reason", err.Error()))
+		return nil
+	}
+	return dir
 }
 
 // NewPaymentsReconciler wires the background payments reconciliation worker
