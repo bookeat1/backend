@@ -10,13 +10,32 @@ import (
 	"backend-core/internal/domain"
 )
 
-// dish builds one menu item of rid. `slot` nil means "the venue did not mark
-// it"; that is the state every existing venue is in.
+// dish builds one menu item of rid WITH a photo — the rail only ever shows
+// dishes that have one, so a fixture without an image would silently test the
+// exclusion rule instead of whatever the case is about. `slot` nil means "the
+// venue did not mark it"; that is the state every existing venue is in.
 func dish(rid uuid.UUID, name string, available bool, slot *int) domain.MenuItem {
+	m := dishNoPhoto(rid, name, available, slot)
+	url := "https://cdn.example/" + name + ".jpg"
+	m.ImageURL = &url
+	return m
+}
+
+// dishNoPhoto is the same dish with no image at all (NULL column).
+func dishNoPhoto(rid uuid.UUID, name string, available bool, slot *int) domain.MenuItem {
 	return domain.MenuItem{
 		ID: uuid.New(), RestaurantID: rid, Name: name, Price: "1000.00",
 		IsAvailable: available, TopPickPosition: slot,
 	}
+}
+
+// dishBlankPhoto is a dish whose image_url is present but empty/whitespace —
+// the imported catalog contains both shapes and a guest cannot tell them apart.
+func dishBlankPhoto(rid uuid.UUID, name string, available bool, slot *int) domain.MenuItem {
+	m := dishNoPhoto(rid, name, available, slot)
+	blank := "   "
+	m.ImageURL = &blank
+	return m
 }
 
 // seed puts the items into the fake in the order the repository would return
@@ -305,6 +324,102 @@ func TestReplaceTopPicksRejectsOverfillAndDuplicates(t *testing.T) {
 
 	if err := f.ReplaceTopPicks(ctx, rid, []uuid.UUID{a.ID, a.ID}); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("duplicate: want ErrValidation, got %v", err)
+	}
+}
+
+// The rail is a shop window: a dish with no photo renders as a grey
+// placeholder, and two of those next to each other is what the owner saw on the
+// Abay venue screen (Айран 1л / Айран 200мл, 2026-09-01). A photo-less dish
+// must not enter the rail — not as a derived filler and not as the venue's own
+// mark either.
+func TestHighlightsExcludeDishesWithoutAPhoto(t *testing.T) {
+	rid := uuid.New()
+	markedNoPhoto := dishNoPhoto(rid, "отмечено, но без фото", true, intp(1))
+	derivedNoPhoto := dishNoPhoto(rid, "выведено, но без фото", true, nil)
+	derivedBlankPhoto := dishBlankPhoto(rid, "выведено, image_url пустой", true, nil)
+	items := seed(
+		markedNoPhoto,
+		dish(rid, "отмечено, с фото", true, intp(2)),
+		derivedNoPhoto,
+		derivedBlankPhoto,
+		dish(rid, "выведено, с фото", true, nil),
+	)
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	got, err := f.ListHighlights(context.Background(), rid, 8)
+	if err != nil {
+		t.Fatalf("list highlights: %v", err)
+	}
+	for _, m := range got {
+		if m.ID == markedNoPhoto.ID || m.ID == derivedNoPhoto.ID || m.ID == derivedBlankPhoto.ID {
+			t.Fatalf("a dish without a photo reached the rail: %v", names(got))
+		}
+	}
+	want := []string{"отмечено, с фото", "выведено, с фото"}
+	if got := names(got); !equal(got, want) {
+		t.Fatalf("rail:\n got %v\nwant %v", got, want)
+	}
+}
+
+// A photo-less dish must not eat a slot of the rail either: with limit 2 and a
+// photo-less dish first in display_order, the rail is the next TWO dishes that
+// do have one, not one card plus a hole.
+func TestHighlightsFillTheRailPastAPhotolessDish(t *testing.T) {
+	rid := uuid.New()
+	items := seed(
+		dishNoPhoto(rid, "без фото", true, nil),
+		dish(rid, "с фото 1", true, nil),
+		dish(rid, "с фото 2", true, nil),
+	)
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	got, err := f.ListHighlights(context.Background(), rid, 2)
+	if err != nil {
+		t.Fatalf("list highlights: %v", err)
+	}
+	if want := []string{"с фото 1", "с фото 2"}; !equal(names(got), want) {
+		t.Fatalf("rail:\n got %v\nwant %v", names(got), want)
+	}
+}
+
+// The whole menu being photo-less is the common case in the imported catalog,
+// so it must be an EMPTY rail, not an error and not a nil slice the transport
+// would render as `null`: the client hides the section on an empty list.
+func TestHighlightsReturnAnEmptyRailNotNilWhenNothingQualifies(t *testing.T) {
+	rid := uuid.New()
+	items := seed(
+		dishNoPhoto(rid, "без фото, отмечено", true, intp(1)),
+		dishNoPhoto(rid, "без фото", true, nil),
+		dish(rid, "с фото, но в стоп-листе", false, nil),
+	)
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	got, err := f.ListHighlights(context.Background(), rid, 8)
+	if err != nil {
+		t.Fatalf("an empty rail is not an error, got %v", err)
+	}
+	if got == nil {
+		t.Fatal("the rail must be an empty slice, never nil: nil serializes as null")
+	}
+	if len(got) != 0 {
+		t.Fatalf("want an empty rail, got %v", names(got))
+	}
+}
+
+// The venue keeps seeing its own mark in the cabinet even while guests do not:
+// otherwise "я отметил, а его нет" has no explanation and no way to fix it.
+func TestListTopPicksStillShowsAMarkedDishWithoutAPhoto(t *testing.T) {
+	rid := uuid.New()
+	marked := dishNoPhoto(rid, "отмечено, без фото", true, intp(1))
+	items := seed(marked)
+	f := NewFacade(items, &fakeCategories{}, &inlineTx{})
+
+	got, err := f.ListTopPicks(context.Background(), rid)
+	if err != nil {
+		t.Fatalf("list top picks: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != marked.ID {
+		t.Fatalf("the cabinet must still list the mark, got %v", names(got))
 	}
 }
 
