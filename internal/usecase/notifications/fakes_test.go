@@ -535,6 +535,10 @@ type fakeDeviceTokens struct {
 	byID   map[uuid.UUID]*domain.DevicePushToken
 	byTok  map[string]uuid.UUID
 	upsert int
+	// deactivateErr makes DeactivateByID fail, so a test can prove the receipt
+	// worker does NOT close a ticket whose whole purpose it just failed to
+	// carry out.
+	deactivateErr error
 }
 
 func newFakeDeviceTokens(rows ...domain.DevicePushToken) *fakeDeviceTokens {
@@ -582,6 +586,9 @@ func (f *fakeDeviceTokens) ListActiveByUser(_ context.Context, userID uuid.UUID)
 func (f *fakeDeviceTokens) DeactivateByID(_ context.Context, id uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deactivateErr != nil {
+		return f.deactivateErr
+	}
 	if r, ok := f.byID[id]; ok {
 		r.IsActive = false
 	}
@@ -659,30 +666,170 @@ type fakeVenues struct{ name string }
 func (f fakeVenues) Name(context.Context, uuid.UUID) (string, error) { return f.name, nil }
 
 // recordingMobileSender captures every device token it was asked to push to and
-// returns a scripted verdict/error per token.
+// returns a scripted verdict/error per token. Every accepted send hands back a
+// ticket id, like a real provider does — that id is what the receipt worker
+// later polls, so a fake that dropped it would hide the very bug this seam was
+// changed for.
 type recordingMobileSender struct {
-	mu      sync.Mutex
-	sent    []string
-	verdict map[string]MobilePushVerdict // default Delivered when absent
-	errFor  map[string]error
+	mu        sync.Mutex
+	sent      []string
+	verdict   map[string]MobilePushVerdict // default Delivered when absent
+	errFor    map[string]error
+	ticketFor map[string]string // token -> ticket id; generated when absent
+	noTicket  bool              // provider answered without a ticket id
 }
 
 func newRecordingMobileSender() *recordingMobileSender {
-	return &recordingMobileSender{verdict: map[string]MobilePushVerdict{}, errFor: map[string]error{}}
+	return &recordingMobileSender{
+		verdict:   map[string]MobilePushVerdict{},
+		errFor:    map[string]error{},
+		ticketFor: map[string]string{},
+	}
 }
 
-func (s *recordingMobileSender) send(_ context.Context, token string, _ MobilePushMessage) (MobilePushVerdict, error) {
+func (s *recordingMobileSender) send(_ context.Context, token string, _ MobilePushMessage) (MobilePushResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sent = append(s.sent, token)
 	if err := s.errFor[token]; err != nil {
-		return MobilePushRejected, err
+		return MobilePushResult{Verdict: MobilePushRejected}, err
 	}
-	if v, ok := s.verdict[token]; ok {
-		return v, nil
+	if v, ok := s.verdict[token]; ok && v != MobilePushDelivered {
+		// Only an accepted message gets a ticket.
+		return MobilePushResult{Verdict: v}, nil
 	}
-	return MobilePushDelivered, nil
+	ticket := ""
+	if !s.noTicket {
+		ticket = s.ticketFor[token]
+		if ticket == "" {
+			ticket = "ticket-" + uuid.NewString()
+			s.ticketFor[token] = ticket
+		}
+	}
+	return MobilePushResult{Verdict: MobilePushDelivered, TicketID: ticket}, nil
 }
+
+// ticketOf returns the ticket id the fake handed out for a token.
+func (s *recordingMobileSender) ticketOf(token string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ticketFor[token]
+}
+
+// fakePushTickets is an in-memory domain.PushTicketRepository.
+type fakePushTickets struct {
+	mu       sync.Mutex
+	rows     map[string]domain.PushTicket
+	order    []string // insertion order, so ListUnresolved is deterministic
+	recErr   error
+	listErr  error
+	resErr   error
+	expErr   error
+	resolved []string // ids passed to Resolve, in call order
+}
+
+func newFakePushTickets() *fakePushTickets {
+	return &fakePushTickets{rows: map[string]domain.PushTicket{}}
+}
+
+func (f *fakePushTickets) Record(_ context.Context, t domain.PushTicket) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.recErr != nil {
+		return f.recErr
+	}
+	if _, ok := f.rows[t.ID]; ok {
+		// Idempotent, like ON CONFLICT DO NOTHING.
+		return nil
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	f.rows[t.ID] = t
+	f.order = append(f.order, t.ID)
+	return nil
+}
+
+func (f *fakePushTickets) ListUnresolved(_ context.Context, createdBefore time.Time, limit int) ([]domain.PushTicket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []domain.PushTicket
+	for _, id := range f.order {
+		t := f.rows[id]
+		// Repeat the SQL predicate, do not simplify it: a fake that returned
+		// everything would pass a test the real query fails.
+		if t.ResolvedAt != nil || t.CreatedAt.After(createdBefore) {
+			continue
+		}
+		out = append(out, t)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (f *fakePushTickets) Resolve(_ context.Context, ids []string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resErr != nil {
+		return f.resErr
+	}
+	f.resolved = append(f.resolved, ids...)
+	for _, id := range ids {
+		t, ok := f.rows[id]
+		if !ok || t.ResolvedAt != nil {
+			continue
+		}
+		stamp := at
+		t.ResolvedAt = &stamp
+		f.rows[id] = t
+	}
+	return nil
+}
+
+func (f *fakePushTickets) ExpireOlderThan(_ context.Context, cutoff time.Time, at time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.expErr != nil {
+		return 0, f.expErr
+	}
+	var n int64
+	for _, id := range f.order {
+		t := f.rows[id]
+		if t.ResolvedAt != nil || !t.CreatedAt.Before(cutoff) {
+			continue
+		}
+		stamp := at
+		t.ResolvedAt = &stamp
+		f.rows[id] = t
+		n++
+	}
+	return n, nil
+}
+
+func (f *fakePushTickets) unresolvedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, id := range f.order {
+		if f.rows[id].ResolvedAt == nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (f *fakePushTickets) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.rows)
+}
+
+var _ domain.PushTicketRepository = (*fakePushTickets)(nil)
 
 func (s *recordingMobileSender) count() int {
 	s.mu.Lock()

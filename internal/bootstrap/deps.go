@@ -1274,25 +1274,15 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	// that consults the guest opt-out gate. Absent GUEST_PUSH_PROVIDER → built
 	// disabled and no-ops (like web push without VAPID keys).
 	var guestSender notifications.MobilePushSender
-	if cfg.Push.GuestPushConfigured() {
-		switch strings.ToLower(strings.TrimSpace(cfg.Push.GuestPushProvider)) {
-		case "expo":
-			guestSender = expopush.NewSender(expopush.Config{
-				AccessToken: cfg.Push.ExpoAccessToken,
-				Endpoint:    cfg.Push.ExpoEndpoint,
-			}).Send
-		default:
-			// An unknown provider name is a config typo, not a reason to crash the
-			// worker: the channel stays a no-op and says so, loudly.
-			log.Error("unknown GUEST_PUSH_PROVIDER — the guest push channel will no-op",
-				slog.String("provider", cfg.Push.GuestPushProvider))
-		}
-	} else {
+	if provider := newGuestPushProvider(cfg, log); provider != nil {
+		guestSender = provider.Send
+	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),
+		notificationrepo.NewPushTickets(db),
 		notifications.NewGuestNotificationGate(consentrepo.NewPreferenceRepository(db)),
 		notificationrepo.NewVenues(db),
 		guestSender,
@@ -1372,6 +1362,61 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 			RetryMaxDelay:  cfg.Push.RetryMaxDelay,
 			MaxAttempts:    cfg.Push.RetryMaxAttempts,
 		}, log, webPush, telegram, guestPush, feedNotifier, whatsAppNotifier)
+}
+
+// newGuestPushProvider builds the mobile push provider client, or nil when none
+// is configured. It is shared by the send path (the guest notifier) and the
+// receipt worker on purpose: those two are the two halves of ONE conversation
+// with the provider, and letting them be configured differently is how you get a
+// service that sends through one project and polls receipts from another.
+func newGuestPushProvider(cfg Config, log *slog.Logger) *expopush.Sender {
+	if !cfg.Push.GuestPushConfigured() {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Push.GuestPushProvider)) {
+	case "expo":
+		return expopush.NewSender(expopush.Config{
+			AccessToken:      cfg.Push.ExpoAccessToken,
+			Endpoint:         cfg.Push.ExpoEndpoint,
+			ReceiptsEndpoint: cfg.Push.ExpoReceiptsEndpoint,
+		})
+	default:
+		// An unknown provider name is a config typo, not a reason to crash the
+		// worker: the channel stays a no-op and says so, loudly.
+		log.Error("unknown GUEST_PUSH_PROVIDER — the guest push channel will no-op",
+			slog.String("provider", cfg.Push.GuestPushProvider))
+		return nil
+	}
+}
+
+// NewPushReceiptWorker wires the guest-push receipt poller, or returns nil when
+// no push provider is configured.
+//
+// Nil rather than a safe-idle loop, which is the OPPOSITE of the rule used for
+// the reconcilers and the dispatcher, and deliberately so: those stay armed
+// because their work exists in the database whether or not a credential is set.
+// Here it cannot — with no provider nothing is ever sent, so push_tickets is
+// permanently empty and the only thing a running loop could produce is a
+// scheduled round-trip to a provider we are not using.
+func NewPushReceiptWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notifications.ReceiptWorker {
+	provider := newGuestPushProvider(cfg, log)
+	if provider == nil {
+		log.Info("push receipt worker not started (no guest push provider configured)")
+		return nil
+	}
+	return notifications.NewReceiptWorker(
+		notificationrepo.NewPushTickets(db),
+		notificationrepo.NewDeviceTokens(db),
+		provider.Receipts,
+		notifications.ReceiptWorkerConfig{
+			TickInterval: cfg.Push.ReceiptsTick,
+			MinAge:       cfg.Push.ReceiptsMinAge,
+			MaxAge:       cfg.Push.ReceiptsMaxAge,
+			BatchSize:    cfg.Push.ReceiptsBatchSize,
+			MaxPerTick:   cfg.Push.ReceiptsMaxPerTick,
+		},
+		log,
+	)
 }
 
 // newOTPSender builds the login-code delivery sender.

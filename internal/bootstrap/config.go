@@ -545,6 +545,30 @@ type PushConfig struct {
 	ExpoAccessToken string // env: EXPO_ACCESS_TOKEN
 	// ExpoEndpoint overrides Expo's push URL (tests / a future relay).
 	ExpoEndpoint string // env: EXPO_PUSH_ENDPOINT
+	// ExpoReceiptsEndpoint overrides Expo's getReceipts URL (tests / a relay).
+	ExpoReceiptsEndpoint string // env: EXPO_RECEIPTS_ENDPOINT
+
+	// --- guest push receipts (the second half of a send) ---
+	//
+	// A provider ticket says "accepted", not "delivered": the per-device outcome
+	// only appears in a receipt fetched later by ticket id. All five knobs have
+	// working defaults — a deploy that sets none of them polls receipts every
+	// 15 minutes, which is what we want.
+
+	// ReceiptsTick is the pause between two polling passes.
+	ReceiptsTick time.Duration // env: PUSH_RECEIPTS_TICK_INTERVAL
+	// ReceiptsMinAge is how long a ticket ages before it is asked about. Expo
+	// suggests ~15 minutes; earlier mostly returns "not ready yet".
+	ReceiptsMinAge time.Duration // env: PUSH_RECEIPTS_MIN_AGE
+	// ReceiptsMaxAge is when an unanswered ticket is force-resolved. Capped at
+	// 24 hours in the worker: past the provider's retention the receipt is gone
+	// and the row would live forever.
+	ReceiptsMaxAge time.Duration // env: PUSH_RECEIPTS_MAX_AGE
+	// ReceiptsBatchSize is how many ticket ids go into ONE provider request
+	// (Expo rejects more than 1000).
+	ReceiptsBatchSize int // env: PUSH_RECEIPTS_BATCH_SIZE
+	// ReceiptsMaxPerTick caps how many tickets one pass reads from the queue.
+	ReceiptsMaxPerTick int // env: PUSH_RECEIPTS_MAX_PER_TICK
 
 	// --- venue WhatsApp booking alerts (Meta Cloud API) ---
 
@@ -776,9 +800,16 @@ func NewConfig() (Config, error) {
 			RestaurantsBotWebhookSecret: getEnv("RESTAURANTS_BOT_WEBHOOK_SECRET", ""),
 			MiniAppInitDataTTL:          getEnvDuration("MINIAPP_INITDATA_TTL", time.Hour),
 
-			GuestPushProvider: getEnv("GUEST_PUSH_PROVIDER", ""),
-			ExpoAccessToken:   getEnv("EXPO_ACCESS_TOKEN", ""),
-			ExpoEndpoint:      getEnv("EXPO_PUSH_ENDPOINT", ""),
+			GuestPushProvider:    getEnv("GUEST_PUSH_PROVIDER", ""),
+			ExpoAccessToken:      getEnv("EXPO_ACCESS_TOKEN", ""),
+			ExpoEndpoint:         getEnv("EXPO_PUSH_ENDPOINT", ""),
+			ExpoReceiptsEndpoint: getEnv("EXPO_RECEIPTS_ENDPOINT", ""),
+
+			ReceiptsTick:       getEnvDuration("PUSH_RECEIPTS_TICK_INTERVAL", 15*time.Minute),
+			ReceiptsMinAge:     getEnvDuration("PUSH_RECEIPTS_MIN_AGE", 15*time.Minute),
+			ReceiptsMaxAge:     getEnvDuration("PUSH_RECEIPTS_MAX_AGE", 24*time.Hour),
+			ReceiptsBatchSize:  getEnvInt("PUSH_RECEIPTS_BATCH_SIZE", 500),
+			ReceiptsMaxPerTick: getEnvInt("PUSH_RECEIPTS_MAX_PER_TICK", 2000),
 
 			WhatsAppNotifyEnabled: getEnvBool("WHATSAPP_NOTIFY_ENABLED", true),
 			// Fall back to the login-code channel's credentials: same business
