@@ -251,7 +251,12 @@ var routeTiers = map[string]RateLimitTier{
 	"GET /api/v1/cuisines": TierSoft,
 	// Same for the venue-feature dictionary: the app's filter sheet fetches it
 	// once when the sheet opens, and it is a handful of rows.
-	"GET /api/v1/venue-features":               TierSoft,
+	"GET /api/v1/venue-features": TierSoft,
+	// The mobile update gate: one tiny read per app launch, and the answer is
+	// cacheable for five minutes, so the browsing tier is the right ceiling. It
+	// is NOT exempt — it is unauthenticated and would otherwise be the cheapest
+	// unmetered route in the API.
+	"GET /api/v1/app/version-check":            TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,

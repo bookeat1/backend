@@ -451,6 +451,17 @@ const (
 	// in. 401. Deliberately ONE code for both, like /auth/login: telling them
 	// apart turns the mini app into an oracle for which emails have an account.
 	CodeInvalidCredentials ErrorCode = "invalid_credentials"
+
+	// --- mobile update gate (GET /api/v1/app/version-check) -----------------
+
+	// CodeAppPlatformUnknown — the launch check was called without a platform,
+	// or with something that is neither ios nor android. 422 and the ONLY
+	// refusal that route has: every other doubtful input (an empty or
+	// unparsable version, a platform with no policy row) answers 200 with
+	// action="none", because a gate that can block the app must fail open.
+	// This one is a client bug worth surfacing rather than hiding behind a
+	// silent "do nothing".
+	CodeAppPlatformUnknown ErrorCode = "app_platform_unknown"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps
