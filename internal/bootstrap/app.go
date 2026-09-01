@@ -15,6 +15,7 @@ import (
 
 	"backend-core/internal/domain"
 	adminrest "backend-core/internal/transport/rest/admin"
+	appversionrest "backend-core/internal/transport/rest/appversion"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	citiesrest "backend-core/internal/transport/rest/cities"
@@ -161,6 +162,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// is exactly why the filter changed nothing at all.
 	venueFeaturesHandler := venuefeaturesrest.NewHandler(deps.VenueFeatures)
 	venueFeaturesHandler.RegisterPublic(api)
+
+	// The mobile update gate. Anonymous and on the plain public group for the
+	// same reason as the dictionaries above — plus one of its own: this is the
+	// FIRST request a cold-started app makes, before any token exists, and its
+	// answer depends only on the query string, so it is cacheable by URL.
+	appVersionHandler := appversionrest.NewHandler(deps.AppVersion)
+	appVersionHandler.RegisterPublic(api)
 
 	// The city dictionary, on the SAME public path the catalog handler used to
 	// serve GET /cities from. Anonymous, like the cuisine list: the app asks
@@ -362,6 +370,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// Same rule for cities (ADR-023): the dictionary is the platform's, a
 	// venue only points at an entry.
 	citiesHandler.RegisterAdminGlobal(adminGlobal)
+	// The mobile update policy: thresholds and wording. Superadmin ONLY, and
+	// for a stronger reason than the dictionaries — min_supported_version puts
+	// a blocking screen in front of every guest on that platform at once. The
+	// usecase re-checks the role.
+	appVersionHandler.RegisterAdminGlobal(adminGlobal)
 	// Read-only list of the companies on our Kaspi payment service, so the
 	// panel can OFFER the acquirer account a venue is bound to instead of
 	// asking someone to retype an id from another panel. Superadmin only: it

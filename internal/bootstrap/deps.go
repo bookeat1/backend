@@ -23,6 +23,7 @@ import (
 	"backend-core/internal/infrastructure/payment/kaspi"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
+	appversionrepo "backend-core/internal/infrastructure/postgres/appversion"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	cityrepo "backend-core/internal/infrastructure/postgres/city"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
@@ -66,6 +67,7 @@ import (
 	"backend-core/internal/transport/rest/telegramhook"
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/analytics"
+	appversionuc "backend-core/internal/usecase/appversion"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
 	citiesuc "backend-core/internal/usecase/cities"
@@ -108,9 +110,12 @@ type Deps struct {
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
 	// AuthMiniApp is sign-in for the Telegram venue mini app. Always built; it
 	// disables its own routes when RESTAURANTS_BOT_TOKEN is unset.
-	AuthMiniApp       *auth.MiniAppUseCase
-	Cities            citiesuc.UseCase
-	Cuisines          cuisinesuc.UseCase
+	AuthMiniApp *auth.MiniAppUseCase
+	Cities      citiesuc.UseCase
+	Cuisines    cuisinesuc.UseCase
+	// AppVersion is the mobile update gate: the public launch check and the
+	// superadmin screen behind it (migration 0103).
+	AppVersion        appversionuc.UseCase
 	VenueFeatures     venuefeaturesuc.UseCase
 	PushSubscriptions *notifications.SubscriptionUseCase
 	DeviceTokens      *notifications.DeviceTokenUseCase
@@ -338,6 +343,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// two one-column writers; neither usecase depends on the other's package.
 	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm,
 		citiesuc.WithEventCityWriter(eventRepo))
+	// The mobile update gate. No transaction manager and no other usecase: one
+	// row per platform, read on the public launch check, written only from the
+	// superadmin screen.
+	appVersionUC := appversionuc.NewUseCase(appversionrepo.New(db), log)
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -549,6 +558,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		MyRestaurants:         myRestaurants,
 		AuthMiniApp:           authMiniApp,
 		Cities:                citiesUC,
+		AppVersion:            appVersionUC,
 		Cuisines:              cuisinesUC,
 		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
