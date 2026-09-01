@@ -129,6 +129,54 @@ type DevicePushTokenRepository interface {
 	DeactivateForUser(ctx context.Context, userID uuid.UUID, token string) error
 }
 
+// PushTicket is ONE accepted mobile push whose real fate is not known yet.
+//
+// The mobile providers answer a send with a TICKET ("queued"), not with a
+// delivery: the per-device outcome shows up later, in a RECEIPT fetched by
+// ticket id. Expo's own wording is that a ticket only means "we accepted it",
+// and the receipt is where DeviceNotRegistered actually appears — observed live
+// on 2026-09-01, when three production android tokens all came back `ok` from
+// the send and two of them came back DeviceNotRegistered from getReceipts.
+//
+// The row is short-lived by construction: providers keep receipts for 24 hours,
+// so a ticket nobody could resolve inside that window is force-resolved rather
+// than kept forever.
+type PushTicket struct {
+	// ID is the provider's ticket id, and the table's primary key: recording
+	// the same ticket twice must be a no-op, not a second poll.
+	ID string
+	// DeviceTokenID is the device the push went to — the row DeactivateByID
+	// silences when the receipt says the device is gone.
+	DeviceTokenID uuid.UUID
+	// OutboxEventID is the booking event the push came from. Forensics only
+	// (nullable, no FK): the ticket's fate must not depend on the outbox row.
+	OutboxEventID *uuid.UUID
+	CreatedAt     time.Time
+	// ResolvedAt is nil while the receipt is still pending.
+	ResolvedAt *time.Time
+}
+
+// PushTicketRepository is the poll queue for mobile push receipts. It is
+// deliberately separate from the delivery ledger: the ledger is a permanent
+// dedupe key on the hot fan-out path, this is a 24-hour work queue only the
+// receipt worker reads.
+type PushTicketRepository interface {
+	// Record stores an accepted ticket. Idempotent on the ticket id: a resend
+	// that repeats a ticket must not enqueue a second poll.
+	Record(ctx context.Context, t PushTicket) error
+	// ListUnresolved returns the oldest tickets still awaiting a receipt that
+	// were created before createdBefore (providers need a grace period before a
+	// receipt exists), capped at limit.
+	ListUnresolved(ctx context.Context, createdBefore time.Time, limit int) ([]PushTicket, error)
+	// Resolve marks the given tickets answered. Ids that do not exist (or are
+	// already resolved) are ignored — it is idempotent.
+	Resolve(ctx context.Context, ticketIDs []string, at time.Time) error
+	// ExpireOlderThan force-resolves every unresolved ticket created before the
+	// cutoff and returns how many it closed. Without it the table would grow
+	// forever with tickets whose receipts the provider has already deleted.
+	ExpireOlderThan(ctx context.Context, cutoff time.Time, at time.Time) (int64, error)
+}
+
 // NotificationDeliveryRepository is the at-least-once dedupe ledger. A row is
 // written only AFTER a successful send, so a crash between send and record
 // re-sends (a tolerated duplicate) rather than dropping a notification; the
