@@ -104,6 +104,14 @@ type MenuItem struct {
 	UpdatedAt    time.Time
 }
 
+// HasImage reports whether the dish has a usable photo. A NULL column and a
+// column holding an empty/whitespace string are the same thing to a guest —
+// the imported catalog contains both — so both read as "no photo" here instead
+// of at every call site.
+func (m MenuItem) HasImage() bool {
+	return m.ImageURL != nil && strings.TrimSpace(*m.ImageURL) != ""
+}
+
 // MenuItemTag is a free-text tag attached to a menu item.
 type MenuItemTag struct {
 	ID         uuid.UUID

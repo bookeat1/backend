@@ -156,6 +156,31 @@ func TestHighlightsEndpointReturnsTheRailWithNumericPrices(t *testing.T) {
 	}
 }
 
+// A venue whose dishes all lack a photo now has an EMPTY rail (see
+// usecase/menu.resolveHighlights). That must reach the app as `"data": []`, not
+// as `null` and not as an error: the section is hidden on an empty list, while
+// `null` is what makes a client blow up on `.map`.
+func TestHighlightsEndpointReturnsAnEmptyArrayNotNull(t *testing.T) {
+	rid := uuid.New()
+	f := &fakeFacade{highlights: nil}
+	w := do(t, router(f), http.MethodGet, "/api/v1/restaurants/"+rid.String()+"/menu-highlights", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("an empty rail is not an error: status %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data *[]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if body.Data == nil {
+		t.Fatalf("data must be [], not null: %s", w.Body.String())
+	}
+	if len(*body.Data) != 0 {
+		t.Fatalf("want an empty rail, got %s", w.Body.String())
+	}
+}
+
 func TestSetTopPickEndpointPassesTheFlagThrough(t *testing.T) {
 	rid, item := uuid.New(), uuid.New()
 	f := &fakeFacade{}

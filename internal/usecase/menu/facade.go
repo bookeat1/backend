@@ -44,8 +44,11 @@ type Facade interface {
 	// ListHighlights resolves the «Лучшие позиции» rail of ONE venue's
 	// storefront: the dishes the venue marked itself, in its own order, and
 	// then — only to fill the rail up to limit — the derived dishes that rail
-	// used to consist of entirely. See resolveHighlights for the rule and why
-	// the fallback exists.
+	// used to consist of entirely. Dishes that are unavailable or have no
+	// photo never appear, marked or not. See resolveHighlights for the rule and
+	// why the fallback exists. The result is always a non-nil slice: a venue
+	// with nothing to show gets an empty rail, not an error, so the client can
+	// hide the section.
 	ListHighlights(ctx context.Context, restaurantID uuid.UUID, limit int) ([]domain.MenuItem, error)
 	// SetTopPick marks or unmarks one dish of restaurantID as a «Лучшая
 	// позиция». Marking takes the lowest free slot; the venue's own order is
@@ -256,6 +259,13 @@ func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, lim
 //     in a "best of" rail is an invitation to order something the kitchen has
 //     run out of. A deleted dish cannot appear at all: the mark lives on the
 //     dish row, so it dies with it.
+//  4. Nothing WITHOUT A PHOTO is ever returned, marked or not (2026-09-01,
+//     owner's call): the rail is a shop window and a row of grey placeholders
+//     is worse than a shorter rail. This applies to the venue's own marks too —
+//     a marked dish keeps its slot in the database and comes back the moment a
+//     photo is uploaded, it is only hidden from guests meanwhile. The cabinet
+//     view (ListTopPicks) still shows it, so the venue can see what it marked
+//     and why it is not on the storefront.
 //
 // Why the fallback and not an empty rail: today NO venue has marked anything,
 // and the rail is part of the storefront layout. Dropping it to nothing for
@@ -263,11 +273,17 @@ func (f *facade) ListHighlights(ctx context.Context, restaurantID uuid.UUID, lim
 // purity nobody asked for. A venue that wants a curated rail marks dishes and
 // the derived tail shrinks to what its marks leave over; a venue that marks 8
 // dishes never sees a derived dish at all.
+//
+// The photo rule does narrow that fallback, and deliberately so: most of the
+// imported catalog has no photo (811 dishes of 2376 on 2026-08-24), so a venue
+// whose available dishes are all photo-less now gets an EMPTY rail instead of a
+// row of grey placeholders. Empty is a valid answer here — the endpoint returns
+// an empty list, never an error and never null, and the app hides the section.
 func resolveHighlights(items []domain.MenuItem, limit int) []domain.MenuItem {
 	picked := make([]domain.MenuItem, 0, domain.MenuTopPickLimit)
 	derived := make([]domain.MenuItem, 0, limit)
 	for _, m := range items {
-		if !m.IsAvailable {
+		if !m.IsAvailable || !m.HasImage() {
 			continue
 		}
 		if m.TopPickPosition != nil {
