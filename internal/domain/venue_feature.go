@@ -96,12 +96,20 @@ type VenueFeatureRepository interface {
 	// with VenueCount filled.
 	List(ctx context.Context, f VenueFeatureFilter) ([]VenueFeature, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*VenueFeature, error)
-	// Create inserts a new entry. A duplicate code or a duplicate normalized
-	// name returns ErrAlreadyExists — the unique indexes are the guard, never a
-	// read-then-write check (two admins can race).
+	// Create inserts a new entry AND its own lookup aliases (normalized name +
+	// code) atomically. The aliases are not decoration: the catalog filter
+	// resolves `?features=` through venue_feature_aliases ONLY — unlike the
+	// cuisine filter it has no legacy-string fallback — so an entry without
+	// them is invisible to the filter completely; see NormalizeFeatureKey.
+	//
+	// A duplicate code or a duplicate normalized name returns ErrAlreadyExists,
+	// and so does a spelling already owned by another feature — the unique
+	// indexes are the guard, never a read-then-write check (two admins can race).
 	Create(ctx context.Context, f *VenueFeature) error
-	// Update writes name/i18n/order/active in place. Same duplicate rule as
-	// Create; ErrNotFound when the id is absent.
+	// Update writes name/i18n/order/active in place and ADDS the aliases of
+	// the current name/code, never removing the previous ones: a former
+	// spelling still means this feature. Same duplicate rule as Create;
+	// ErrNotFound when the id is absent.
 	Update(ctx context.Context, f *VenueFeature) error
 
 	// ListByRestaurants returns each restaurant's features in link order
