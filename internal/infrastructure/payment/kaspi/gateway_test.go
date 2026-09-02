@@ -293,3 +293,23 @@ func TestMinChargeableUnitIsAWholeTenge(t *testing.T) {
 		t.Fatalf("MinChargeableUnitMinor() = %d, want 100", got)
 	}
 }
+
+// TestRequiresMerchantAccountMatchesWhatAuthorizeEnforces: the capability this
+// adapter DECLARES (read ahead of time by usecase/payments to answer the
+// guest's accepts_online_payment) must be the same rule Authorize applies. A
+// declaration that drifted from the enforcement would show a payment button for
+// a venue whose charge this adapter then refuses — the bug the flag exists to
+// prevent, only harder to see.
+func TestRequiresMerchantAccountMatchesWhatAuthorizeEnforces(t *testing.T) {
+	gw, _ := newTestGateway(t, func(http.ResponseWriter, *http.Request) {})
+	if !gw.RequiresMerchantAccount() {
+		t.Fatal("RequiresMerchantAccount() = false, but Authorize refuses a venue without a company")
+	}
+	// The enforcement side, blank rather than empty: an account row somebody
+	// created and never filled in is not an onboarded venue.
+	req := authorizeReq(100)
+	req.MerchantAccountRef = "   "
+	if _, err := gw.Authorize(context.Background(), req); !errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("error = %v, want ErrUnavailable for a blank company reference", err)
+	}
+}

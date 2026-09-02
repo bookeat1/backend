@@ -467,7 +467,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// ONE instance, shared by every endpoint that serves a catalog row (list,
 	// search, detail, favorites). Wiring a second one — or forgetting one
 	// endpoint — makes the same venue read differently on two screens.
-	venueState := restaurants.NewVenueState(restRelated, bookingCfg)
+	//
+	// paymentCreate is passed as the online-payment checker on purpose: it is
+	// the very usecase that would take the money, so the detail read's
+	// accepts_online_payment is answered by the same settings, the same
+	// acquirer registry and the same venue↔account mapping that the charge
+	// itself goes through (usecase/payments.venueGate). Wiring a second object
+	// here would let the flag and the checkout drift apart, which is the bug
+	// the flag exists to close.
+	venueState := restaurants.NewVenueState(restRelated, bookingCfg,
+		restaurants.WithVenuePayments(paymentCreate))
 	favoritesFacade := favorites.NewFacade(favoritesRepo, favorites.WithVenueState(venueState))
 	// The catalog's "гости + дата" filter runs on the SAME engine as the slot
 	// grid on a venue's booking screen (see bookings.AvailabilitySearch), only

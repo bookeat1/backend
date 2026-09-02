@@ -81,6 +81,20 @@ type PublicVenueState struct {
 	//     (without them candidateStarts produces no start times on any date).
 	// It is a static capability flag, NOT "there is a free table tonight".
 	AcceptsOnlineBookings bool
+	// AcceptsOnlinePayment reports whether this venue can take money online at
+	// all — payments enabled for it, an acquirer configured and enabled, and
+	// the venue's account at that acquirer present. The single source of the
+	// answer is the checkout itself (usecase/payments.venueGate), so the flag
+	// cannot promise a payment the checkout would then refuse.
+	//
+	// A POINTER, unlike AcceptsOnlineBookings, because it is not always
+	// computed: only the DETAIL read asks for it (the listing would pay a
+	// per-venue acquirer lookup for a field no card shows), and even there a
+	// failed read leaves it nil. nil means "not computed" and must reach the
+	// client as an ABSENT field — a client that reads a missing flag as false
+	// hides a payment button, which is safe; a client told "false" because we
+	// could not look is being lied to.
+	AcceptsOnlinePayment *bool
 }
 
 // OpenNowKnown reports the venue's server-computed "open right now" answer and
