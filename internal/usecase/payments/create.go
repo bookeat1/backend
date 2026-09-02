@@ -14,9 +14,20 @@ import (
 	"backend-core/internal/logging"
 )
 
-// CreateUseCase starts (or replays) the payment for a booking.
+// CreateUseCase starts (or replays) the payment for a booking, and answers the
+// venue-level precondition that same checkout enforces.
+//
+// The two methods sit on ONE interface — and, in bootstrap, on one instance —
+// deliberately: AcceptsOnlinePayment is the question "would CreateForBooking
+// get as far as an acquirer for this venue", and answering it from a separately
+// wired object is how the two would drift onto different settings, different
+// acquirers, or a different venue↔account mapping. See venuegate.go.
 type CreateUseCase interface {
 	CreateForBooking(ctx context.Context, actor Actor, in CreateInput) (*domain.Payment, error)
+	// AcceptsOnlinePayment reports whether the venue can take an online
+	// payment at all. See the implementation for the (false, nil) vs error
+	// distinction — the caller must not publish "could not compute" as "no".
+	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 }
 
 // CreateInput is a checkout request.
@@ -128,13 +139,14 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		return nil, fmt.Errorf("%w: booking is %s, no payment can be taken", domain.ErrValidation, booking.Status)
 	}
 
-	override, err := u.restaurants.GetPaymentOverride(ctx, booking.RestaurantID)
+	// The venue-level part of "can this be paid at all" — payments enabled for
+	// the venue, an acquirer for a new payment, and the venue's account at that
+	// acquirer — runs through venueGate, the SAME code the guest-facing
+	// accepts_online_payment flag runs (see venuegate.go). The button the guest
+	// sees and the payment this method accepts must not be able to disagree.
+	settings, err := u.gate().settings(ctx, booking.RestaurantID)
 	if err != nil {
 		return nil, err
-	}
-	settings := resolveSettings(override, u.cfg)
-	if !settings.Enabled {
-		return nil, fmt.Errorf("%w: payments are not enabled for this restaurant", domain.ErrValidation)
 	}
 
 	// Paid special day (holidays/events). Bookings are FREE by default; if the
@@ -174,7 +186,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		return nil, err
 	}
 
-	gw, err := u.gateways.Resolve(ctx, settings.Provider)
+	gw, err := u.gate().gateway(ctx, settings.Provider)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +211,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 	// Resolved BEFORE the idempotency replay and before any acquirer call: a
 	// venue nobody finished onboarding must not get as far as a payable link
 	// that credits the wrong till, nor as far as a hold somebody has to void.
-	account, err := u.resolveSplitAccount(ctx, provider, booking.RestaurantID)
+	account, err := u.gate().account(ctx, provider, booking.RestaurantID)
 	if err != nil {
 		return nil, err
 	}
@@ -487,25 +499,4 @@ func roundToGatewayGranularity(gw domain.PaymentGateway, base, fee, total domain
 			"%w: rounding to the acquirer's %d-minor step broke base+fee=total", domain.ErrValidation, unit)
 	}
 	return newFee, newTotal, nil
-}
-
-// resolveSplitAccount reads the venue's identity at this acquirer
-// (restaurant_split_accounts). A venue with no row gets (nil, nil): most
-// acquirers settle onto one platform account and need no per-venue address at
-// all, and whether a missing mapping is fatal is decided by the callers —
-// resolveSplitPlan refuses it when split payments are on, and an adapter that
-// needs an address refuses an empty ref itself, naming the venue (see
-// kaspi.validateAuthorize).
-func (u *createUseCase) resolveSplitAccount(ctx context.Context, provider domain.PaymentProvider, restaurantID uuid.UUID) (*domain.RestaurantSplitAccount, error) {
-	if u.splitAccounts == nil {
-		return nil, nil
-	}
-	account, err := u.splitAccounts.GetActive(ctx, provider, restaurantID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return account, nil
 }

@@ -79,6 +79,18 @@ type restaurantResponse struct {
 	// this venue can be booked through the app at all. Absent only when the
 	// server did not compute the venue state (never guessed).
 	AcceptsOnlineBookings *bool `json:"accepts_online_bookings,omitempty"`
+	// AcceptsOnlinePayment tells the guest whether this venue can take money
+	// online at all (payments enabled for it, an acquirer configured and
+	// enabled, and the venue onboarded at that acquirer) — the server's own
+	// answer, computed by the checkout that would take the payment.
+	//
+	// Served by the DETAIL read only; absent from listing rows, where the
+	// server does not compute it. A pointer with omitempty for the same reason
+	// as its neighbour above: absent means "not computed", and the app treats
+	// anything but an explicit true as "no payment button" — so a venue whose
+	// acquirer lookup failed is never advertised as payable, and never as
+	// definitively unpayable either.
+	AcceptsOnlinePayment *bool `json:"accepts_online_payment,omitempty"`
 }
 
 // scheduleResponse is the venue's regular weekly hours in a shape a client
@@ -146,6 +158,13 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	}
 	accepts := st.AcceptsOnlineBookings
 	resp.AcceptsOnlineBookings = &accepts
+	// Copied, not aliased: the response must not share a pointer with the
+	// domain value. nil stays nil — the field is then absent, which is how
+	// "not computed" travels (see domain.PublicVenueState.AcceptsOnlinePayment).
+	if st.AcceptsOnlinePayment != nil {
+		pay := *st.AcceptsOnlinePayment
+		resp.AcceptsOnlinePayment = &pay
+	}
 	if st.Schedule == nil {
 		return
 	}

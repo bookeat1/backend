@@ -30,6 +30,18 @@ const tiynPerTenge = 100
 // a ledger stops matching a bank statement.
 func (g *Gateway) MinChargeableUnitMinor() int64 { return tiynPerTenge }
 
+// RequiresMerchantAccount reports that this acquirer cannot charge for a venue
+// that has no Kaspi company mapped to it (restaurant_split_accounts): the
+// money belongs to a COMPANY, and there is no default company to fall back on.
+//
+// It is the DECLARATION of the rule validateAuthorize already enforces — same
+// answer, only askable before a payment exists, so the guest app can be told
+// whether this venue takes online payment at all instead of finding out from a
+// refused charge. Another OPTIONAL capability the usecase type-asserts for
+// (usecase/payments.merchantAccountRequirer), for the same reason
+// MinChargeableUnitMinor is one: no other acquirer here needs it.
+func (g *Gateway) RequiresMerchantAccount() bool { return true }
+
 // toTenge converts minor units to the whole tenge the Kaspi service expects.
 // A fractional amount is REFUSED, never rounded: the caller has already
 // promised (via MinChargeableUnitMinor) that the total is whole, and silently

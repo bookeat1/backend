@@ -746,6 +746,10 @@ func (f *fakeItemReader) ListByBooking(_ context.Context, bookingID uuid.UUID) (
 
 type fakeRestaurantSettings struct {
 	byRestaurant map[uuid.UUID]domain.PaymentSettingsOverride
+	// err drives the "we could not read the venue's settings" path, which is
+	// NOT the same as "this venue does not take payments" — see
+	// TestAcceptsOnlinePaymentReportsAnErrorRatherThanADefiniteNo.
+	err error
 }
 
 func newFakeRestaurantSettings() *fakeRestaurantSettings {
@@ -753,6 +757,9 @@ func newFakeRestaurantSettings() *fakeRestaurantSettings {
 }
 
 func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error) {
+	if f.err != nil {
+		return domain.PaymentSettingsOverride{}, f.err
+	}
 	return f.byRestaurant[restaurantID], nil
 }
 

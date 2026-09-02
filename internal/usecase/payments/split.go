@@ -56,7 +56,7 @@ func (u *createUseCase) resolveSplitPlan(
 	if !u.cfg.SplitEnabled || u.splitAccounts == nil {
 		return nil, nil
 	}
-	// account is resolved once by the caller (createUseCase.resolveSplitAccount)
+	// account is resolved once by the caller (venueGate.account, venuegate.go)
 	// and is nil for a venue that was never onboarded, or whose account was
 	// deactivated.
 	if account == nil {

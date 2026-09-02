@@ -447,3 +447,70 @@ func TestListEchoesNormalizedPaging(t *testing.T) {
 		t.Errorf("per_page = %d, want the cap %d", page.PerPage, domain.MaxPerPage)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// accepts_online_payment — the flag the app gates the Kaspi button on
+// ---------------------------------------------------------------------------
+
+// TestDetailPayloadCarriesAcceptsOnlinePayment: the venue detail publishes the
+// server's own answer, both ways round, under exactly the key the merged mobile
+// client reads (bookeat1/frontend#112). The name is a CONTRACT: renaming it
+// silently hides the payment button on every installed build.
+func TestDetailPayloadCarriesAcceptsOnlinePayment(t *testing.T) {
+	for _, accepts := range []bool{true, false} {
+		id := uuid.New()
+		rest := activeVenue(id)
+		st := &domain.PublicVenueState{AcceptsOnlineBookings: true, AcceptsOnlinePayment: &accepts}
+		r := newTestRouter(&fakeFacade{
+			item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+			agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+		})
+
+		raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+		field, ok := raw["accepts_online_payment"]
+		if !ok {
+			t.Fatalf("accepts_online_payment missing from the detail payload (wanted %v)", accepts)
+		}
+		var got bool
+		if err := json.Unmarshal(field, &got); err != nil {
+			t.Fatalf("accepts_online_payment is not a boolean: %v (%s)", err, field)
+		}
+		if got != accepts {
+			t.Fatalf("accepts_online_payment = %v, want %v", got, accepts)
+		}
+	}
+}
+
+// TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed: the field disappears
+// when the server did not compute it — on the listing, which never does, and on
+// a detail read whose acquirer lookup failed. "Not computed" must never reach
+// the client as `false`: the app can safely hide a button on a missing field,
+// but a false is a claim about a venue nobody checked.
+func TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	// The venue state IS computed — only the payment flag is not (nil pointer),
+	// which is exactly what a failed acquirer check leaves behind.
+	st := &domain.PublicVenueState{AcceptsOnlineBookings: true}
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+		"/api/v1/restaurants/" + id.String(),
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["accepts_online_payment"]; ok {
+				t.Fatalf("accepts_online_payment must be omitted when not computed, got %s", v)
+			}
+			// The neighbouring flag is unaffected: this is an additive field.
+			if _, ok := raw["accepts_online_bookings"]; !ok {
+				t.Error("accepts_online_bookings must still be published")
+			}
+		})
+	}
+}
