@@ -73,28 +73,98 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Cuisine
 	return c, err
 }
 
+// selfAliases are the spellings every dictionary entry MUST be findable by:
+// its display name and its machine code. This is the exact pair migrations
+// 0079/0080 seed for the fifteen entries that exist today
+// (`lower(btrim(name))` + `lower(btrim(code))`), reproduced here so a cuisine
+// added through the admin route is born with the same rows instead of being
+// invisible to the catalog filter until someone runs SQL by hand.
+//
+// Normalization goes through domain.NormalizeCuisineKey and NOT through SQL
+// `lower(btrim(...))`: the lookup side (restaurant.cuisineMatchExpr) compares
+// against domain.NormalizeCuisineKeys(f.Cuisines), so the two sides must use
+// one function. NormalizeCuisineKey additionally collapses inner whitespace,
+// which the migration's SQL does not — that is a superset, never a mismatch,
+// and it is pinned by TestAliasNormalizationMatchesTheSearchKey.
+func selfAliases(c *domain.Cuisine) []string {
+	return domain.NormalizeCuisineKeys([]string{c.Name, c.Code})
+}
+
+// aliasInsert is the second half of Create/Update: it writes the entry's own
+// spellings into cuisine_aliases inside the SAME statement as the dictionary
+// write, so a cuisine can never exist without them. One statement is also one
+// transaction even on a bare pool, which is why this needs no TxManager and
+// still cannot half-apply.
+//
+// The NOT EXISTS makes a repeat harmless: an alias this cuisine already owns
+// is skipped instead of raising 23505, so re-saving an entry (or PATCHing one
+// that predates this code and therefore has no aliases yet) is idempotent and
+// self-healing.
+//
+// An alias owned by ANOTHER cuisine is deliberately NOT skipped: the insert
+// then hits the primary key, the whole statement aborts, and the caller gets
+// ErrAlreadyExists. Silently dropping it would leave the new entry unfindable
+// by its own name or code — exactly the failure this code exists to prevent —
+// and silently re-pointing it would steal a search key from a cuisine that
+// already answers to it.
+//
+// KNOWN, ACCEPTED: two admins saving the SAME entry in the same instant can
+// both pass the NOT EXISTS and the loser gets that conflict too — a spurious
+// 409 on a legitimate save, safe (nothing is written) and fixed by retrying,
+// which is why the error text does not claim another cuisine owns the
+// spelling. Making it exact would need a second read inside the statement and
+// would buy nothing at the rate the dictionary is edited.
+const aliasInsert = `INSERT INTO cuisine_aliases (alias, cuisine_id)
+	SELECT a, w.id FROM w CROSS JOIN unnest($8::text[]) AS a
+	 WHERE NOT EXISTS (SELECT 1 FROM cuisine_aliases ca
+	                    WHERE ca.alias = a AND ca.cuisine_id = w.id)`
+
 func (r *Repository) Create(ctx context.Context, c *domain.Cuisine) error {
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`INSERT INTO cuisines (`+cols+`)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now())`,
-		c.ID, c.Code, c.Name, i18nToDB(c.NameI18n), c.ImageURL, c.DisplayOrder, c.IsActive)
+		`WITH w AS (
+			INSERT INTO cuisines (`+cols+`)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now())
+			RETURNING id
+		)
+		`+aliasInsert,
+		c.ID, c.Code, c.Name, i18nToDB(c.NameI18n), c.ImageURL, c.DisplayOrder, c.IsActive,
+		selfAliases(c))
 	if err != nil {
 		return mapWrite(err, "create cuisine")
 	}
 	return nil
 }
 
+// Update rewrites the entry and ADDS the aliases of its current name/code. It
+// never removes the old ones: cuisine_aliases is the set of spellings that MEAN
+// this cuisine, not a projection of its current name. A former name is still a
+// spelling — it sits in the `cuisine_type` string of venues saved before the
+// rename and in the chips an already-installed app scraped out of the catalog,
+// and dropping it would break both. It also holds the hand-curated synonyms
+// migration 0080 seeded («японская (идзакая)» → japanese), which a rename has
+// no business deleting.
 func (r *Repository) Update(ctx context.Context, c *domain.Cuisine) error {
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`UPDATE cuisines SET code=$2, name=$3, name_i18n=$4, image_url=$5,
-		        display_order=$6, is_active=$7, updated_at=now()
-		 WHERE id=$1`,
-		c.ID, c.Code, c.Name, i18nToDB(c.NameI18n), c.ImageURL, c.DisplayOrder, c.IsActive)
+	// The command tag of the statement below counts ALIAS rows, not cuisine
+	// rows (0 is normal — the aliases are usually already there), so "does the
+	// id exist" has to come from the UPDATE's own RETURNING.
+	var id uuid.UUID
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`WITH w AS (
+			UPDATE cuisines SET code=$2, name=$3, name_i18n=$4, image_url=$5,
+			       display_order=$6, is_active=$7, updated_at=now()
+			 WHERE id=$1
+			RETURNING id
+		), a AS (
+			`+aliasInsert+`
+		)
+		SELECT id FROM w`,
+		c.ID, c.Code, c.Name, i18nToDB(c.NameI18n), c.ImageURL, c.DisplayOrder, c.IsActive,
+		selfAliases(c)).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
 	if err != nil {
 		return mapWrite(err, "update cuisine")
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
 	}
 	return nil
 }
@@ -222,12 +292,21 @@ func prefixed(list, alias string) string {
 	return strings.Join(parts, ", ")
 }
 
+// aliasPK is the primary key of cuisine_aliases (one row per spelling). It is
+// named explicitly so a taken spelling can be reported as such instead of as
+// "code or name already used", which would send the admin looking at the wrong
+// table.
+const aliasPK = "cuisine_aliases_pkey"
+
 // mapWrite turns a unique-index violation into domain.ErrAlreadyExists. The
-// two unique indexes (code, normalized name) are the ONLY duplicate guard:
+// unique indexes (code, normalized name, alias) are the ONLY duplicate guard:
 // checking first and inserting after loses the race between two admins.
 func mapWrite(err error, ctxMsg string) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+		if pgErr.ConstraintName == aliasPK {
+			return fmt.Errorf("%w: cuisine spelling already taken", domain.ErrAlreadyExists)
+		}
 		return fmt.Errorf("%w: cuisine code or name already used", domain.ErrAlreadyExists)
 	}
 	return fmt.Errorf("%s: %w", ctxMsg, err)
