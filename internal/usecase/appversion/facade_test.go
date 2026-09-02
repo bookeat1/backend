@@ -437,7 +437,7 @@ func TestSaveRefusesABadStoreURL(t *testing.T) {
 func TestSaveRefusesAnUnsupportedTranslationLanguage(t *testing.T) {
 	u := NewUseCase(seeded(), nil)
 	_, err := u.Save(context.Background(), superadmin(), domain.PlatformIOS,
-		SaveInput{RequiredTitleI18n: domain.I18nPatch{"zh": str("请更新")}})
+		SaveInput{RequiredTitleI18n: domain.I18nPatch{"fr": str("Mise à jour requise")}})
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("Save = %v, want ErrValidation", err)
 	}

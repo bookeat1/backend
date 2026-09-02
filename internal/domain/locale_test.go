@@ -24,9 +24,25 @@ func TestNormalizeLocale(t *testing.T) {
 		{"ru_RU", "ru"},
 		{"kaz", "kk"},
 		{"qaz", "kk"},
+		// ko and zh became servable on 2026-09-02. The script subtag is
+		// dropped like any other: Simplified is the only Chinese we store, so
+		// zh-Hant readers get it rather than falling all the way back to ru.
+		{"ko", "ko"},
+		{"ko-KR", "ko"},
+		{"KO", "ko"},
+		{"kor", "ko"},
+		{"zh", "zh"},
+		{"zh-CN", "zh"},
+		{"zh-Hans", "zh"},
+		{"zh-Hans-CN", "zh"},
+		{"zh-Hant", "zh"},
+		{"zh_TW", "zh"},
+		{"zho", "zh"},
+		{"chi", "zh"},
 		{"", ""},
 		{"fr", ""},
-		{"zh", ""},
+		{"ja", ""},
+		{"cn", ""}, // a country code, not a language: not accepted, unlike the historical kz
 		{"-", ""},
 	}
 	for _, tc := range cases {
@@ -40,7 +56,10 @@ func TestNormalizeLocale(t *testing.T) {
 // normalization but is not in SupportedLocales would resolve to a translation
 // key nobody ever writes.
 func TestNormalizeLocaleOnlyEverProducesSupportedCodes(t *testing.T) {
-	for _, in := range []string{"ru", "kk", "en", "kz", "kaz", "qaz", "rus", "eng", "KK-kz"} {
+	for _, in := range []string{
+		"ru", "kk", "en", "kz", "kaz", "qaz", "rus", "eng", "KK-kz",
+		"ko", "ko-KR", "kor", "zh", "zh-Hans", "zh-Hant", "zho", "chi",
+	} {
 		got := NormalizeLocale(in)
 		if got == "" || !IsSupportedLocale(got) {
 			t.Errorf("NormalizeLocale(%q) = %q, which is not a supported locale", in, got)
@@ -112,7 +131,9 @@ func TestI18nPatchValidate(t *testing.T) {
 		{"russian value is allowed", I18nPatch{"ru": sp("Текст")}, false},
 		{"empty patch", I18nPatch{}, false},
 		{"nil patch", nil, false},
-		{"unsupported language", I18nPatch{"zh": sp("文")}, true},
+		{"korean is a language now", I18nPatch{"ko": sp("한국어")}, false},
+		{"chinese is a language now", I18nPatch{"zh": sp("中文")}, false},
+		{"unsupported language", I18nPatch{"fr": sp("bonjour")}, true},
 		{"two spellings of one language", I18nPatch{"kk": sp("а"), "kk-KZ": sp("б")}, true},
 		{"deleting russian", I18nPatch{"ru": nil}, true},
 		{"blanking russian", I18nPatch{"ru": sp("  ")}, true},

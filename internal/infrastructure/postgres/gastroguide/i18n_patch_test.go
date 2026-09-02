@@ -39,8 +39,10 @@ func superadminActor() uc.EditorActor {
 func str(s string) *string { return &s }
 
 // A partial edit through the real repository keeps every language it did not
-// mention — the supported ones and the strays alike — and leaves title_i18n["ru"]
-// equal to the title column.
+// mention — the supported ones and the ones it cannot even name alike — and
+// leaves title_i18n["ru"] equal to the title column. "ja" plays the part ko and
+// zh played until 2026-09-02: a key the old import left in the column that no
+// read resolves and no write may add.
 func TestCollectionI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	e, pool, ctx := editorUsecase(t)
 
@@ -48,7 +50,7 @@ func TestCollectionI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		`UPDATE gastroguide_collections
 		 SET title = 'С детьми',
-		     title_i18n = '{"ru":"С детьми","kk":"Балалармен","en":"With kids","ko":"아이들과","zh":"带孩子"}'::jsonb,
+		     title_i18n = '{"ru":"С детьми","kk":"Балалармен","en":"With kids","ko":"아이들과","ja":"子供と"}'::jsonb,
 		     description = 'Описание', description_i18n = '{"ru":"Описание","kk":"Сипаттама"}'::jsonb
 		 WHERE id = $1`, id); err != nil {
 		t.Fatalf("seed translations: %v", err)
@@ -71,8 +73,11 @@ func TestCollectionI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if _, ok := got.TitleI18n["kk"]; ok {
 		t.Error("kk survived a null")
 	}
-	if got.TitleI18n["ko"] != "아이들과" || got.TitleI18n["zh"] != "带孩子" {
-		t.Errorf("title i18n = %v, want the stray locales preserved through the column", got.TitleI18n)
+	if got.TitleI18n["ja"] != "子供と" {
+		t.Errorf("title i18n = %v, want the unrecognized locale preserved through the column", got.TitleI18n)
+	}
+	if got.TitleI18n["ko"] != "아이들과" {
+		t.Errorf("title i18n = %v, want the Korean translation kept as well", got.TitleI18n)
 	}
 	if got.TitleI18n["ru"] != got.Title {
 		t.Errorf("title_i18n[ru] = %q, title = %q — the invariant broke", got.TitleI18n["ru"], got.Title)
@@ -99,7 +104,7 @@ func TestCategoryI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 		t.Errorf("ru = %q, want the column on create too", created.TitleI18n["ru"])
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE gastroguide_categories SET title_i18n = title_i18n || '{"ko":"아침"}'::jsonb WHERE id = $1`,
+		`UPDATE gastroguide_categories SET title_i18n = title_i18n || '{"ja":"朝食"}'::jsonb WHERE id = $1`,
 		created.ID); err != nil {
 		t.Fatalf("seed stray locale: %v", err)
 	}
@@ -117,8 +122,8 @@ func TestCategoryI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if updated.TitleI18n["kk"] != "Таңғы ас" {
 		t.Errorf("kk = %q, want the unmentioned translation kept", updated.TitleI18n["kk"])
 	}
-	if updated.TitleI18n["ko"] != "아침" {
-		t.Errorf("title i18n = %v, want the stray locale preserved", updated.TitleI18n)
+	if updated.TitleI18n["ja"] != "朝食" {
+		t.Errorf("title i18n = %v, want the unrecognized locale preserved", updated.TitleI18n)
 	}
 	if updated.TitleI18n["ru"] != "Завтраки и бранчи" {
 		t.Errorf("ru = %q, want the new title", updated.TitleI18n["ru"])
@@ -139,7 +144,7 @@ func TestVenueNoteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 		t.Fatalf("attach venue: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE gastroguide_collection_venues SET note_i18n = note_i18n || '{"zh":"有儿童房"}'::jsonb
+		`UPDATE gastroguide_collection_venues SET note_i18n = note_i18n || '{"ja":"キッズルームあり"}'::jsonb
 		 WHERE collection_id = $1 AND restaurant_id = $2`, col, venue); err != nil {
 		t.Fatalf("seed stray locale: %v", err)
 	}
@@ -163,8 +168,8 @@ func TestVenueNoteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if got.NoteI18n["en"] != "Kids room" {
 		t.Errorf("en = %q, want the written translation", got.NoteI18n["en"])
 	}
-	if got.NoteI18n["zh"] != "有儿童房" {
-		t.Errorf("note i18n = %v, want the stray locale preserved", got.NoteI18n)
+	if got.NoteI18n["ja"] != "キッズルームあり" {
+		t.Errorf("note i18n = %v, want the unrecognized locale preserved", got.NoteI18n)
 	}
 	if got.NoteI18n["ru"] != got.Note {
 		t.Errorf("note_i18n[ru] = %q, note = %q — the invariant broke", got.NoteI18n["ru"], got.Note)
@@ -186,7 +191,7 @@ func TestRouteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 		t.Fatalf("create route: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE gastro_routes SET title_i18n = title_i18n || '{"ko":"클래식 투어"}'::jsonb WHERE id = $1`,
+		`UPDATE gastro_routes SET title_i18n = title_i18n || '{"ja":"クラシックツアー"}'::jsonb WHERE id = $1`,
 		route.ID); err != nil {
 		t.Fatalf("seed stray locale: %v", err)
 	}
@@ -210,8 +215,8 @@ func TestRouteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if updated.TitleI18n["kk"] != "Классикалық тур" || updated.TitleI18n["en"] != "The classic tour" {
 		t.Errorf("title i18n = %v", updated.TitleI18n)
 	}
-	if updated.TitleI18n["ko"] != "클래식 투어" {
-		t.Errorf("title i18n = %v, want the stray locale preserved", updated.TitleI18n)
+	if updated.TitleI18n["ja"] != "クラシックツアー" {
+		t.Errorf("title i18n = %v, want the unrecognized locale preserved", updated.TitleI18n)
 	}
 	if updated.TitleI18n["ru"] != updated.Title {
 		t.Errorf("title_i18n[ru] = %q, title = %q — the invariant broke", updated.TitleI18n["ru"], updated.Title)
@@ -224,9 +229,9 @@ func TestRouteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if _, err := e.UpdatePoint(ctx, superadminActor(), route.ID, point.ID, uc.PointInput{
 		Kind: domain.GuideRoutePointPlace, Title: "Утро: Панфиловцев",
 		Address:     "парк 28 панфиловцев",
-		AddressI18n: domain.I18nPatch{"ko": str("판필로프 공원")},
+		AddressI18n: domain.I18nPatch{"fr": str("Parc Panfilov")},
 	}); err == nil {
-		t.Fatal("a korean address translation was accepted")
+		t.Fatal("a french address translation was accepted")
 	}
 	detail, err := e.GetRoute(ctx, superadminActor(), route.ID)
 	if err != nil {
@@ -235,7 +240,7 @@ func TestRouteI18nPatch_RoundTripsThroughPostgres(t *testing.T) {
 	if len(detail.Points) != 1 || detail.Points[0].AddressI18n["en"] != "Panfilov park" {
 		t.Fatalf("point address i18n = %v, want it untouched by the refused write", detail.Points)
 	}
-	if _, ok := detail.Points[0].AddressI18n["ko"]; ok {
-		t.Error("the refused korean translation was stored anyway")
+	if _, ok := detail.Points[0].AddressI18n["fr"]; ok {
+		t.Error("the refused french translation was stored anyway")
 	}
 }

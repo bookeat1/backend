@@ -24,11 +24,26 @@ var localeAliases = map[string]string{
 	"qaz": LocaleKK,
 	"rus": LocaleRU,
 	"eng": LocaleEN,
+	// Three-letter ISO 639-2 spellings, accepted for the same reason as the
+	// ones above: they cost nothing and a client that sends one would
+	// otherwise be answered in Russian. "chi" is the bibliographic code for
+	// Chinese, "zho" the terminological one; both mean the same language.
+	"kor": LocaleKO,
+	"zho": LocaleZH,
+	"chi": LocaleZH,
 }
 
 // NormalizeLocale reduces a caller- or import-supplied language tag to one of
-// SupportedLocales, or returns "" when it cannot. It lowercases, drops the
-// region subtag ("kk-KZ", "ru_RU" → "kk", "ru") and applies localeAliases.
+// SupportedLocales, or returns "" when it cannot. It lowercases, drops
+// EVERYTHING after the first subtag separator ("kk-KZ", "ru_RU", "zh-Hans-CN",
+// "ko-KR" → "kk", "ru", "zh", "ko") and applies localeAliases.
+//
+// CHINESE IS ONE LOCALE. Dropping the subtag means zh-Hans and zh-Hant both
+// come back as "zh", and the stored zh text is Simplified — so a Traditional
+// reader is served Simplified rather than Russian. That is deliberate: telling
+// the two scripts apart is only worth doing when there is a second set of texts
+// to tell apart, and there is not. Splitting them later means adding a real
+// locale ("zh-Hant") and its own column key, not changing this function.
 //
 // It never invents a locale: an unknown tag comes back as "" so the caller can
 // decide what "unknown" means for it (reqlocale answers ru; a write keeps the
@@ -90,10 +105,10 @@ func (p I18nPatch) Russian() (string, bool) {
 // JSON field in the message so an operator knows which input was refused.
 //
 // Refused: a language outside SupportedLocales (a translation nothing can ever
-// read back — see the ko/zh rows the old import left behind), two keys that
-// normalize to the same language ("kk" and "kk-KZ" in one object, where the
-// winner would depend on Go's map order), and deleting ru (the Russian text is
-// the column; clear it by sending an empty base field, not by deleting a key).
+// read back), two keys that normalize to the same language ("kk" and "kk-KZ",
+// or "zh" and "zh-Hans", in one object — the winner would depend on Go's map
+// order), and deleting ru (the Russian text is the column; clear it by sending
+// an empty base field, not by deleting a key).
 func (p I18nPatch) Validate(field string) error {
 	seen := make(map[string]string, len(p))
 	for k, v := range p {

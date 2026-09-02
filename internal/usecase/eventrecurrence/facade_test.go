@@ -487,7 +487,7 @@ func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
 	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
 
 	in := validInput(rid)
-	in.VenueI18n = domain.I18nPatch{"zh": strPtr("文")}
+	in.VenueI18n = domain.I18nPatch{"fr": strPtr("Terrasse")}
 
 	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("want ErrValidation (→ 422), got %v", err)

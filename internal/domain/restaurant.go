@@ -50,19 +50,37 @@ func (p PriceCategory) Valid() bool {
 	return p == PriceLow || p == PriceMid || p == PriceHigh
 }
 
-// I18n is a localized field of shape {"ru":...,"kk":...,"en":...}. Nil when the
-// column is NULL.
+// I18n is a localized field of shape {"ru":...,"kk":...,"en":...,"ko":...,
+// "zh":...}. Nil when the column is NULL. A map never has to carry every
+// language: I18n.Resolve falls back to the base column for anything missing.
 type I18n map[string]string
 
 // SupportedLocales lists the language codes the catalog can serve translated
 // text in. ru is the permanent default (the base scalar columns, e.g. `name`,
 // are themselves Russian text) — see LocaleRU.
-var SupportedLocales = []string{"ru", "kk", "en"}
+//
+// This slice is the ONLY place the set of languages is written down. Everything
+// else — request resolution (reqlocale.Resolve), write validation
+// (I18nPatch.Validate), the full-object payloads (fullI18n) and the derived
+// cuisine strings (CuisineI18nFromSet) — reads it or reads IsSupportedLocale.
+// Adding a language here is what makes it servable; nothing else enumerates
+// the set, and nothing in the database constrains it (the *_i18n columns are
+// plain jsonb, deliberately — see migration 0101).
+//
+// ko and zh joined on 2026-09-02: their texts had been sitting in the venue
+// description maps since the legacy import, and until then reqlocale answered
+// ru for both, so nobody could read them.
+var SupportedLocales = []string{"ru", "kk", "en", "ko", "zh"}
 
 const (
 	LocaleRU = "ru"
 	LocaleKK = "kk"
 	LocaleEN = "en"
+	LocaleKO = "ko"
+	// LocaleZH is Chinese as ONE locale. Script subtags collapse into it:
+	// see NormalizeLocale for why zh-Hant is served Simplified rather than
+	// pretending to be a locale of its own.
+	LocaleZH = "zh"
 )
 
 // IsSupportedLocale reports whether lang is one of SupportedLocales.

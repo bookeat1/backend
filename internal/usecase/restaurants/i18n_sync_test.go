@@ -355,14 +355,16 @@ func TestUpdateCuisineTypeSyncsItsRussianTranslation(t *testing.T) {
 	}
 }
 
-// A language nothing can serve is refused at the door (422), not stored: the
-// old import already left ko/zh values in production that no read ever returns.
+// A language nothing can serve is refused at the door (422), not stored: a
+// translation no read can ever return is worse than no translation at all.
+// (ko and zh used to be the example here; they are servable since 2026-09-02,
+// so the example is now French, which is not.)
 func TestUpdateRejectsUnsupportedAndAmbiguousLanguages(t *testing.T) {
 	id := uuid.New()
 	f := NewFacade(&fakeRestaurantRepo{agg: storedVenue(id)}, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
 
 	for name, in := range map[string]SaveInput{
-		"unsupported":  {DescriptionI18n: domain.I18nPatch{"zh": strp("文")}},
+		"unsupported":  {DescriptionI18n: domain.I18nPatch{"fr": strp("Joli endroit")}},
 		"ambiguous":    {DescriptionI18n: domain.I18nPatch{"kk": strp("а"), "kk-KZ": strp("б")}},
 		"deleting ru":  {DescriptionI18n: domain.I18nPatch{"ru": nil}},
 		"blanking ru":  {AddressI18n: domain.I18nPatch{"ru": strp(" ")}},

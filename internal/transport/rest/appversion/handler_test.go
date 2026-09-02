@@ -155,14 +155,19 @@ func decodeData(t *testing.T, w *httptest.ResponseRecorder, into any) {
 
 // TestCheckIsPublicAndCarriesTheWholeAnswer. No token, one round trip, and
 // everything the app needs to draw the screen: the mode, where to send the
-// guest, and the wording in all three languages.
+// guest, and the wording in EVERY supported language. The loop below reads
+// domain.SupportedLocales rather than a fixed list, so adding a locale to the
+// domain makes this test demand wording for it — which is how ko and zh got
+// here in the first place.
 func TestCheckIsPublicAndCarriesTheWholeAnswer(t *testing.T) {
 	f := &fakeUC{decision: uc.Decision{
 		Action:              domain.AppUpdateRequired,
 		StoreURL:            "https://apps.apple.com/app/id6757542577",
 		MinSupportedVersion: "1.6",
-		Title:               domain.I18n{"ru": "Нужно обновить", "kk": "Жаңарту қажет", "en": "Update required"},
-		Message:             domain.I18n{"ru": "Обновите", "kk": "Жаңартыңыз", "en": "Please update"},
+		Title: domain.I18n{"ru": "Нужно обновить", "kk": "Жаңарту қажет", "en": "Update required",
+			"ko": "업데이트가 필요합니다", "zh": "需要更新"},
+		Message: domain.I18n{"ru": "Обновите", "kk": "Жаңартыңыз", "en": "Please update",
+			"ko": "앱을 업데이트해 주세요", "zh": "请更新应用"},
 	}}
 	w := send(t, router(f, domain.RoleUser), http.MethodGet, "/api/v1/app/version-check?platform=ios&version=1.5.1", nil, false)
 	if w.Code != http.StatusOK {

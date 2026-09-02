@@ -172,16 +172,19 @@ func TestPatch_LanguageValidation(t *testing.T) {
 		patch   domain.I18nPatch
 		wantErr bool
 	}{
-		"kk":                {domain.I18nPatch{"kk": str("Балалармен")}, false},
-		"kz alias":          {domain.I18nPatch{"kz": str("Балалармен")}, false},
-		"kk-KZ region tag":  {domain.I18nPatch{"kk-KZ": str("Балалармен")}, false},
-		"en":                {domain.I18nPatch{"en": str("With kids")}, false},
-		"korean":            {domain.I18nPatch{"ko": str("아이들과")}, true},
-		"chinese":           {domain.I18nPatch{"zh": str("带孩子")}, true},
-		"kk twice":          {domain.I18nPatch{"kk": str("а"), "kk-KZ": str("б")}, true},
-		"deleting a stray":  {domain.I18nPatch{"ko": nil}, true},
-		"empty object":      {domain.I18nPatch{}, false},
-		"unknown gibberish": {domain.I18nPatch{"xx": str("x")}, true},
+		"kk":                 {domain.I18nPatch{"kk": str("Балалармен")}, false},
+		"kz alias":           {domain.I18nPatch{"kz": str("Балалармен")}, false},
+		"kk-KZ region tag":   {domain.I18nPatch{"kk-KZ": str("Балалармен")}, false},
+		"en":                 {domain.I18nPatch{"en": str("With kids")}, false},
+		"ko":                 {domain.I18nPatch{"ko": str("아이들과")}, false},
+		"zh":                 {domain.I18nPatch{"zh": str("带孩子")}, false},
+		"zh-Hans script tag": {domain.I18nPatch{"zh-Hans": str("带孩子")}, false},
+		"french":             {domain.I18nPatch{"fr": str("Avec enfants")}, true},
+		"kk twice":           {domain.I18nPatch{"kk": str("а"), "kk-KZ": str("б")}, true},
+		"zh twice":           {domain.I18nPatch{"zh": str("а"), "zh-Hant": str("б")}, true},
+		"deleting a stray":   {domain.I18nPatch{"fr": nil}, true},
+		"empty object":       {domain.I18nPatch{}, false},
+		"unknown gibberish":  {domain.I18nPatch{"xx": str("x")}, true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -201,13 +204,17 @@ func TestPatch_LanguageValidation(t *testing.T) {
 	}
 }
 
-// The stray ko/zh rows the old import left behind survive an edit untouched.
-// The merge copies what it does not recognize instead of dropping it: deleting
-// an editor's text because our own import was sloppy is not a fix, and the
-// validation above already guarantees nothing can ADD another one.
+// A locale the code does not recognize survives an edit untouched. The merge
+// copies what it cannot name instead of dropping it: deleting an editor's text
+// because our own import was sloppy is not a fix, and the validation above
+// already guarantees nothing can ADD another one.
+//
+// ja/fr stand in for what ko/zh used to be here — rows the old import left
+// behind that nothing could read. ko and zh are servable since 2026-09-02, so
+// they are asserted alongside as ordinary translations.
 func TestPatch_StrayLocalesSurviveAnEdit(t *testing.T) {
 	repo := &fakeEditorRepo{detail: storedCollection("С детьми", "",
-		domain.I18n{"ru": "С детьми", "ko": "아이들과", "zh": "带孩子"}, nil)}
+		domain.I18n{"ru": "С детьми", "ko": "아이들과", "ja": "子供と", "fr": "Avec enfants"}, nil)}
 
 	if _, err := NewEditor(repo).UpdateCollection(context.Background(), superadmin(), uuid.New(),
 		CollectionInput{
@@ -217,8 +224,11 @@ func TestPatch_StrayLocalesSurviveAnEdit(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 	got := repo.gotWrite.TitleI18n
-	if got["ko"] != "아이들과" || got["zh"] != "带孩子" {
-		t.Errorf("title i18n = %v, want the stray locales preserved", got)
+	if got["ja"] != "子供と" || got["fr"] != "Avec enfants" {
+		t.Errorf("title i18n = %v, want the unrecognized locales preserved", got)
+	}
+	if got["ko"] != "아이들과" {
+		t.Errorf("title i18n = %v, want the Korean translation kept too", got)
 	}
 	if got["kk"] != "Балалармен" {
 		t.Errorf("kk = %q, want the written translation", got["kk"])
@@ -249,9 +259,9 @@ func TestCategoryPatch_MergesAndValidates(t *testing.T) {
 
 	repo = &fakeEditorRepo{category: &domain.GuideCategory{ID: uuid.New()}}
 	_, err := NewEditor(repo).UpdateCategory(context.Background(), superadmin(), uuid.New(), CategoryInput{
-		Slug: "breakfasts", Title: "Завтраки", TitleI18n: domain.I18nPatch{"ko": str("아침")},
+		Slug: "breakfasts", Title: "Завтраки", TitleI18n: domain.I18nPatch{"fr": str("Petits déjeuners")},
 	})
-	assertValidation(t, err, "korean rubric title")
+	assertValidation(t, err, "french rubric title")
 	if repo.writes != 0 {
 		t.Errorf("%d write(s) reached the repository", repo.writes)
 	}
@@ -265,7 +275,7 @@ func TestVenueNotePatch_MergesAndValidates(t *testing.T) {
 	detail := storedCollection("С детьми", "", nil, nil)
 	detail.Venues = []domain.GuideCollectionVenue{{
 		RestaurantID: rid, Note: "Есть детская комната",
-		NoteI18n: domain.I18n{"ru": "Есть детская комната", "kk": "Балалар бөлмесі бар", "ko": "키즈룸"},
+		NoteI18n: domain.I18n{"ru": "Есть детская комната", "kk": "Балалар бөлмесі бар", "ja": "キッズルーム"},
 	}}
 	repo := &fakeEditorRepo{detail: detail}
 
@@ -276,8 +286,8 @@ func TestVenueNotePatch_MergesAndValidates(t *testing.T) {
 	if repo.gotNoteI18n["kk"] != "Балалар бөлмесі бар" {
 		t.Errorf("note i18n = %v, want kk kept", repo.gotNoteI18n)
 	}
-	if repo.gotNoteI18n["ko"] != "키즈룸" {
-		t.Errorf("note i18n = %v, want the stray locale preserved", repo.gotNoteI18n)
+	if repo.gotNoteI18n["ja"] != "キッズルーム" {
+		t.Errorf("note i18n = %v, want the unrecognized locale preserved", repo.gotNoteI18n)
 	}
 	if repo.gotNoteI18n["ru"] != "Есть детская комната" {
 		t.Errorf("ru = %q, want the plain note", repo.gotNoteI18n["ru"])
@@ -314,9 +324,9 @@ func TestAttachVenue_NoteStartsFromAnEmptyMap(t *testing.T) {
 
 	repo = &fakeEditorRepo{}
 	err := NewEditor(repo).AttachVenue(context.Background(), superadmin(), uuid.New(), AttachVenueInput{
-		RestaurantID: uuid.New(), NoteI18n: domain.I18nPatch{"zh": str("有露台")},
+		RestaurantID: uuid.New(), NoteI18n: domain.I18nPatch{"fr": str("Il y a une terrasse")},
 	})
-	assertValidation(t, err, "chinese note")
+	assertValidation(t, err, "french note")
 	if repo.writes != 0 {
 		t.Errorf("%d write(s) reached the repository", repo.writes)
 	}
@@ -342,7 +352,7 @@ func TestRoutePatch_MergesKeepsAndValidates(t *testing.T) {
 			ID: uuid.New(), Slug: "classic-almaty", Title: "Классический тур",
 			TitleI18n:         domain.I18n{"ru": "Классический тур", "kk": "Классикалық тур"},
 			DurationLabel:     "1 день",
-			DurationLabelI18n: domain.I18n{"ru": "1 день", "kk": "1 күн", "zh": "一天"},
+			DurationLabelI18n: domain.I18n{"ru": "1 день", "kk": "1 күн", "ja": "1日"},
 			DescriptionI18n:   domain.I18n{"en": "A classic day"},
 		},
 	}}
@@ -361,8 +371,8 @@ func TestRoutePatch_MergesKeepsAndValidates(t *testing.T) {
 	if got.TitleI18n["ru"] != "Классический тур" {
 		t.Errorf("ru = %q, want the plain column", got.TitleI18n["ru"])
 	}
-	// Untouched objects stay untouched, strays included.
-	if got.DurationLabelI18n["kk"] != "1 күн" || got.DurationLabelI18n["zh"] != "一天" {
+	// Untouched objects stay untouched, unrecognized locales included.
+	if got.DurationLabelI18n["kk"] != "1 күн" || got.DurationLabelI18n["ja"] != "1日" {
 		t.Errorf("duration i18n = %v, want it left alone", got.DurationLabelI18n)
 	}
 	if got.DescriptionI18n["en"] != "A classic day" {
@@ -372,9 +382,9 @@ func TestRoutePatch_MergesKeepsAndValidates(t *testing.T) {
 	repo.writes = 0
 	_, err := e.UpdateRoute(context.Background(), superadmin(), uuid.New(), RouteInput{
 		Slug: "classic-almaty", Title: "Классический тур",
-		DurationLabelI18n: domain.I18nPatch{"ko": str("하루")},
+		DurationLabelI18n: domain.I18nPatch{"fr": str("Une journée")},
 	})
-	assertValidation(t, err, "korean duration label")
+	assertValidation(t, err, "french duration label")
 	if repo.writes != 0 {
 		t.Errorf("%d write(s) reached the repository", repo.writes)
 	}
@@ -414,7 +424,7 @@ func TestRoutePointPatch_MergesAgainstTheStop(t *testing.T) {
 		t.Errorf("ru = %q, want the plain column", got.TitleI18n["ru"])
 	}
 	if got.AddressI18n["ko"] != "판필로프 공원" {
-		t.Errorf("address i18n = %v, want the stray locale preserved", got.AddressI18n)
+		t.Errorf("address i18n = %v, want the untouched field left alone", got.AddressI18n)
 	}
 
 	// A stop that belongs to another route is ErrNotFound, not a write against

@@ -603,7 +603,7 @@ func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
 		StartsAt:  time.Now(),
 		EndsAt:    time.Now().Add(time.Hour),
 		Status:    domain.PromoPublished,
-		TermsI18n: domain.I18nPatch{"zh": strPtr("文")},
+		TermsI18n: domain.I18nPatch{"fr": strPtr("Conditions")},
 	})
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("want ErrValidation (→ 422), got %v", err)
