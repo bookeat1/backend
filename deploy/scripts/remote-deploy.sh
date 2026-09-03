@@ -19,9 +19,17 @@ NEW_TAG="${2:?usage: remote-deploy.sh <image_repo> <image_tag> [actor]}"
 ACTOR="${3:-manual}"
 DEPLOY_DIR="/opt/bookeat/deploy"
 COMPOSE="docker compose --env-file .env"
-HEALTH_URL="http://127.0.0.1/health"
+# Health check target. NOT http://127.0.0.1/health on the host: that hits Caddy,
+# which answers 308 (HTTP->HTTPS redirect) before the request ever reaches the
+# app, and `curl -f` treats 3xx as success. The old check therefore passed with
+# the application completely dead, which made auto-rollback decorative.
+# Fixed 2026-09-02: ask the app itself, inside its own container.
+APP_SERVICE="app"
+APP_HEALTH_URL="http://127.0.0.1:8080/health"
 HEALTH_RETRIES=10
 HEALTH_DELAY=3
+EDGE_RETRIES=8
+EDGE_DELAY=3
 HISTORY_FILE="$DEPLOY_DIR/release-history.log"
 HISTORY_KEEP=3
 IMAGES_KEEP=3
@@ -75,16 +83,61 @@ prune_old_images() {
       done
 }
 
+app_health_once() {
+  # busybox wget: non-zero exit on connection failure AND on any non-2xx
+  # HTTP status. Runs inside the app container, so it depends on neither
+  # Caddy, nor TLS, nor external DNS — it can only succeed if the process we
+  # just deployed is actually serving.
+  local body
+  body="$($COMPOSE exec -T "$APP_SERVICE" wget -q -T 3 -O - "$APP_HEALTH_URL" 2>/dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  return 0
+}
+
 check_health() {
   local n=0
   while [ "$n" -lt "$HEALTH_RETRIES" ]; do
-    if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
+    if app_health_once; then
       return 0
     fi
     n=$((n + 1))
     sleep "$HEALTH_DELAY"
   done
   return 1
+}
+
+check_edge() {
+  # Informational only: does the same /health answer through Caddy on this
+  # box? Pinned to 127.0.0.1 with the real hostname so TLS/SNI works without
+  # depending on public DNS. Deliberately NOT a rollback trigger: a deploy
+  # only swaps app+worker images, so if the app is healthy but the edge is
+  # not, rolling the app back would not fix Caddy/TLS — it would just hide it.
+  local site code
+  site="$(grep -E '^SITE_ADDRESS=' .env | cut -d= -f2- || true)"
+  site="${site#http://}"
+  site="${site#https://}"
+  site="${site%%/*}"
+  case "$site" in
+    ""|:*|*[!a-zA-Z0-9.-]*) echo "-- edge check skipped: SITE_ADDRESS is not a hostname"; return 0 ;;
+  esac
+  # Caddy needs a few seconds to re-resolve the freshly recreated app
+  # container (observed 503 for ~4s on the test box on 2026-09-02), so retry
+  # before complaining.
+  local n=0
+  code=000
+  while [ "$n" -lt "$EDGE_RETRIES" ]; do
+    code="$(curl -sS -o /dev/null --max-time 5 --resolve "${site}:443:127.0.0.1" -w '%{http_code}' "https://${site}/health" 2>/dev/null || echo 000)"
+    [ "$code" = "200" ] && break
+    n=$((n + 1))
+    sleep "$EDGE_DELAY"
+  done
+  if [ "$code" = "200" ]; then
+    echo "-- edge check OK: https://${site}/health -> 200"
+  else
+    echo "!! WARNING: app is healthy inside the container, but the edge"
+    echo "!! https://${site}/health answered ${code}. Not rolling back (the app"
+    echo "!! image is fine) — check Caddy / certificates / firewall."
+  fi
 }
 
 echo "== pulling ${IMAGE_REPO}:${NEW_TAG} =="
@@ -104,6 +157,7 @@ if check_health; then
     set_previous_tag "$PREV_TAG"
   fi
   record_history "healthy: promoted to current, previous was ${PREV_TAG:-<none>}"
+  check_edge
   prune_old_images
   exit 0
 fi
