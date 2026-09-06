@@ -170,9 +170,13 @@ func (u *UseCase) Get(ctx context.Context, actor Actor, bookingID uuid.UUID) (*P
 //
 // Who may still change it:
 //   - pending / waitlist — the guest, the venue's staff and admins;
-//   - confirmed — the venue's staff and admins ONLY. The guest is refused with
-//     domain.CodePreorderLocked (see the block in the body for why the venue
-//     keeps the ability);
+//   - confirmed with an EMPTY pre-order (no non-cancelled booking_items) —
+//     everyone, guest included: this is the guest's first attach, part of the
+//     original checkout at a confirm_on_create venue, not a change to an
+//     accepted order;
+//   - confirmed with an existing pre-order — the venue's staff and admins
+//     ONLY. The guest is refused with domain.CodePreorderLocked (see the block
+//     in the body for why the venue keeps the ability);
 //   - anything else (arrived/completed/cancelled/no_show) — nobody.
 func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID, lines []Line) (*Preorder, error) {
 	b, err := u.bookings.GetByID(ctx, bookingID)
@@ -206,9 +210,28 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 	// their mind. Taking it away would leave a legitimate change with no path at
 	// all except cancelling the booking. The asymmetry is the point — the change
 	// now goes through the party that agreed to it.
+	//
+	// EXCEPTION — the guest's FIRST attach. Both clients call POST /bookings
+	// and PUT .../preorder as two separate requests; at a venue with
+	// confirm_on_create=true the booking is already `confirmed` by the time the
+	// second request lands, even though nothing about the venue's order has
+	// been accepted yet — there is no order to protect. So the lock only bites
+	// once the booking ALREADY has a pre-order: a guest attaching to a
+	// confirmed booking with zero non-cancelled booking_items is finishing their
+	// original checkout, not changing an accepted one, and is let through.
+	// Every subsequent Replace on that same booking (the lines are no longer
+	// empty) is a real change and is locked, same as before. A booking whose
+	// only lines are `cancelled` still counts as empty here — a fully-voided
+	// pre-order is not "an order the venue has accepted".
 	if rel == relationGuest && b.Status == domain.BookingConfirmed {
-		return nil, domain.WithCode(domain.CodePreorderLocked,
-			fmt.Errorf("%w: booking is confirmed, its pre-order can only be changed by the restaurant", domain.ErrValidation))
+		existing, err := u.items.ListByBooking(ctx, bookingID)
+		if err != nil {
+			return nil, err
+		}
+		if hasActivePreorderLines(existing) {
+			return nil, domain.WithCode(domain.CodePreorderLocked,
+				fmt.Errorf("%w: booking is confirmed, its pre-order can only be changed by the restaurant", domain.ErrValidation))
+		}
 	}
 
 	// Frozen while a payment is in flight: any non-terminal payment (including a
@@ -339,6 +362,21 @@ func (u *UseCase) resolveRelation(ctx context.Context, actor Actor, b *domain.Bo
 		return relationGuest, nil
 	}
 	return 0, fmt.Errorf("%w: booking", domain.ErrNotFound)
+}
+
+// hasActivePreorderLines reports whether items contains at least one line that
+// is NOT cancelled. It answers "does this booking already have a pre-order the
+// venue is planning against", which is what the confirmed-guest lock in
+// Replace protects — see the EXCEPTION comment there. A booking whose only
+// lines are cancelled has nothing left for the venue to have accepted, so it
+// counts as empty, same as a booking with zero lines.
+func hasActivePreorderLines(items []domain.BookingItem) bool {
+	for _, it := range items {
+		if it.Status != domain.BookingItemCancelled {
+			return true
+		}
+	}
+	return false
 }
 
 // buildPreorder assembles the result. The total uses the SAME shared helper

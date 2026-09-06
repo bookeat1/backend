@@ -390,13 +390,18 @@ func mustCode(t *testing.T, err error, want domain.ErrorCode) {
 	}
 }
 
-// Once the booking is CONFIRMED the guest may no longer change the pre-order:
-// the venue has accepted the order and plans the kitchen around it. The refusal
-// is a distinguishable code, not a generic validation string.
+// Once the booking is CONFIRMED and already HAS a pre-order, the guest may no
+// longer change it: the venue has accepted the order and plans the kitchen
+// around it. The refusal is a distinguishable code, not a generic validation
+// string.
 func TestReplace_GuestBlockedOnConfirmedBooking(t *testing.T) {
 	owner := uuid.New()
 	h := newHarness(t, &owner, domain.BookingConfirmed, nil)
 	actor := Actor{UserID: owner, Role: domain.RoleUser}
+	// An existing pre-order line is what makes this a CHANGE rather than the
+	// guest's first attach — see TestReplace_GuestFirstAttachOnConfirmedBooking
+	// for the empty-pre-order case, which this lock does NOT cover.
+	seedExistingLine(h)
 
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
@@ -410,6 +415,74 @@ func TestReplace_GuestBlockedOnConfirmedBooking(t *testing.T) {
 	mustCode(t, err, domain.CodePreorderLocked)
 	if h.items.replaceCalls != 0 {
 		t.Errorf("guest cleared the pre-order of a confirmed booking")
+	}
+}
+
+// seedExistingLine puts one non-cancelled booking_item on h.booking, as if the
+// venue had already confirmed a pre-order for it. Used by tests that check the
+// lock's behavior on a booking that already has one — as opposed to the guest's
+// first attach, which the lock does not cover (A-BE-1).
+func seedExistingLine(h *harness) {
+	menuID := h.dishA.ID
+	h.items.byBooking[h.booking.ID] = []domain.BookingItem{
+		{ID: uuid.New(), BookingID: h.booking.ID, MenuItemID: &menuID, ItemName: "Beshbarmak",
+			PriceMinor: 450000, Currency: "KZT", Quantity: 1, Status: domain.BookingItemPending},
+	}
+}
+
+// The guest's FIRST attach to an already-confirmed booking is allowed: at a
+// confirm_on_create venue the booking is `confirmed` by the time the second
+// request (POST /bookings then PUT .../preorder) lands, and there is no
+// accepted order yet to protect. This is the PR #104 × confirm_on_create
+// exception (A18).
+func TestReplace_GuestFirstAttachOnConfirmedBooking(t *testing.T) {
+	owner := uuid.New()
+	h := newHarness(t, &owner, domain.BookingConfirmed, nil)
+	actor := Actor{UserID: owner, Role: domain.RoleUser}
+
+	p, err := h.uc.Replace(context.Background(), actor, h.booking.ID,
+		[]Line{{MenuItemID: h.dishA.ID, Quantity: 2}})
+	if err != nil {
+		t.Fatalf("guest's first attach on a confirmed booking with no pre-order: %v", err)
+	}
+	if p.TotalMinor != 900000 {
+		t.Errorf("total = %d, want 900000", p.TotalMinor)
+	}
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace calls = %d, want 1", h.items.replaceCalls)
+	}
+
+	// Once attached, the pre-order is no longer empty: a SECOND attempt by the
+	// same guest on the same booking is a real change and is locked, exactly
+	// like TestReplace_GuestBlockedOnConfirmedBooking.
+	_, err = h.uc.Replace(context.Background(), actor, h.booking.ID,
+		[]Line{{MenuItemID: h.dishB.ID, Quantity: 1}})
+	mustCode(t, err, domain.CodePreorderLocked)
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace calls = %d, want still 1 (second attempt must not write)", h.items.replaceCalls)
+	}
+}
+
+// A booking whose only pre-order lines are CANCELLED still counts as empty:
+// there is nothing left that the venue accepted. The guest's attach goes
+// through the first-attach path, not the lock.
+func TestReplace_GuestFirstAttachIgnoresCancelledLines(t *testing.T) {
+	owner := uuid.New()
+	h := newHarness(t, &owner, domain.BookingConfirmed, nil)
+	menuID := h.dishA.ID
+	h.items.byBooking[h.booking.ID] = []domain.BookingItem{
+		{ID: uuid.New(), BookingID: h.booking.ID, MenuItemID: &menuID, ItemName: "Beshbarmak",
+			PriceMinor: 450000, Currency: "KZT", Quantity: 1, Status: domain.BookingItemCancelled},
+	}
+	actor := Actor{UserID: owner, Role: domain.RoleUser}
+
+	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID,
+		[]Line{{MenuItemID: h.dishB.ID, Quantity: 1}})
+	if err != nil {
+		t.Fatalf("guest attach on a booking whose only line is cancelled: %v", err)
+	}
+	if h.items.replaceCalls != 1 {
+		t.Errorf("replace calls = %d, want 1", h.items.replaceCalls)
 	}
 }
 
@@ -489,6 +562,7 @@ func TestReplace_RestaurantRoleGuestAtAnotherVenue(t *testing.T) {
 	}
 
 	h = newHarness(t, &owner, domain.BookingConfirmed, nil)
+	seedExistingLine(h) // already has a pre-order — this is a CHANGE, not a first attach
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
 	mustCode(t, err, domain.CodePreorderLocked)
 	if h.items.replaceCalls != 0 {
@@ -541,6 +615,7 @@ func TestReplace_ConfirmedAndPaymentInFlightCodes(t *testing.T) {
 
 	h := newHarness(t, &owner, domain.BookingConfirmed, manages)
 	h.payments.inFlight = true
+	seedExistingLine(h) // already has a pre-order — the guest is locked regardless of payment state
 
 	_, err := h.uc.Replace(context.Background(), Actor{UserID: owner, Role: domain.RoleUser},
 		h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
