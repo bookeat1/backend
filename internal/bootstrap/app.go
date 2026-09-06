@@ -36,6 +36,7 @@ import (
 	notificationsrest "backend-core/internal/transport/rest/notifications"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	payoutsrest "backend-core/internal/transport/rest/payouts"
+	platformpagesrest "backend-core/internal/transport/rest/platformpages"
 	preorderrest "backend-core/internal/transport/rest/preorder"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
@@ -169,6 +170,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// answer depends only on the query string, so it is cacheable by URL.
 	appVersionHandler := appversionrest.NewHandler(deps.AppVersion)
 	appVersionHandler.RegisterPublic(api)
+
+	// The footer's editable text pages (migration 0105): "Как это работает",
+	// "Отмена брони", "Оферта", "Политика данных", "Контакты", "Вакансии", "О
+	// BookEat". Anonymous read, same posture as the dictionaries above — an
+	// unpublished or unknown slug answers 404, never an empty page.
+	platformPagesHandler := platformpagesrest.NewHandler(deps.PlatformPages)
+	platformPagesHandler.RegisterPublic(api)
 
 	// The city dictionary, on the SAME public path the catalog handler used to
 	// serve GET /cities from. Anonymous, like the cuisine list: the app asks
@@ -375,6 +383,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// a blocking screen in front of every guest on that platform at once. The
 	// usecase re-checks the role.
 	appVersionHandler.RegisterAdminGlobal(adminGlobal)
+	// Editing the seven pages above: superadmin only (domain.PlatformContentRoles),
+	// same rule as the platform's promos/events and the gastroguide.
+	platformPagesHandler.RegisterAdminGlobal(adminGlobal)
 	// Read-only list of the companies on our Kaspi payment service, so the
 	// panel can OFFER the acquirer account a venue is bound to instead of
 	// asking someone to retype an id from another panel. Superadmin only: it

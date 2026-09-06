@@ -454,6 +454,15 @@ const (
 
 	// --- mobile update gate (GET /api/v1/app/version-check) -----------------
 
+	// --- platform text pages (migration 0105, internal/usecase/platformpages) ---
+
+	// CodePageBodyEmpty — an admin write tried to set published=true while the
+	// page's Markdown body is empty. A generic validation_failed would leave
+	// the panel unable to say WHICH field is the problem; this one lets it
+	// point at the body editor instead of the "Опубликовано" toggle, which is
+	// the field that actually looks wrong to whoever clicked it.
+	CodePageBodyEmpty ErrorCode = "page_body_empty"
+
 	// CodeAppPlatformUnknown — the launch check was called without a platform,
 	// or with something that is neither ios nor android. 422 and the ONLY
 	// refusal that route has: every other doubtful input (an empty or

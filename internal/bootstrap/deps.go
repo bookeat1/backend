@@ -45,6 +45,7 @@ import (
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	payoutrepo "backend-core/internal/infrastructure/postgres/payout"
+	platformpagesrepo "backend-core/internal/infrastructure/postgres/platformpages"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
@@ -86,6 +87,7 @@ import (
 	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/payouts"
+	platformpagesuc "backend-core/internal/usecase/platformpages"
 	"backend-core/internal/usecase/preorder"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
@@ -115,7 +117,10 @@ type Deps struct {
 	Cuisines    cuisinesuc.UseCase
 	// AppVersion is the mobile update gate: the public launch check and the
 	// superadmin screen behind it (migration 0103).
-	AppVersion        appversionuc.UseCase
+	AppVersion appversionuc.UseCase
+	// PlatformPages is the footer's editable text pages (migration 0105): the
+	// public read + the superadmin editor screen behind it.
+	PlatformPages     platformpagesuc.UseCase
 	VenueFeatures     venuefeaturesuc.UseCase
 	PushSubscriptions *notifications.SubscriptionUseCase
 	DeviceTokens      *notifications.DeviceTokenUseCase
@@ -347,6 +352,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// row per platform, read on the public launch check, written only from the
 	// superadmin screen.
 	appVersionUC := appversionuc.NewUseCase(appversionrepo.New(db), log)
+	// The footer's editable text pages (migration 0105). No transaction
+	// manager and no other usecase: one row per slug, the row set itself is
+	// fixed by the migration's seed.
+	platformPagesUC := platformpagesuc.NewUseCase(platformpagesrepo.New(db))
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -568,6 +577,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		AuthMiniApp:           authMiniApp,
 		Cities:                citiesUC,
 		AppVersion:            appVersionUC,
+		PlatformPages:         platformPagesUC,
 		Cuisines:              cuisinesUC,
 		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
