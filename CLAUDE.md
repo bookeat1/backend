@@ -4,9 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`backend-core` is the core backend service of **BookEat**. It is a fresh Go service scaffolded with a Clean/Hexagonal architecture. The domain is still being defined — treat the sections below as the **authoritative rules for how code must be structured**, not as a description of already-existing entities.
+`backend-core` is the core backend service of **BookEat**. Go, Clean/Hexagonal architecture.
 
 This is a **public** project. Do **not** add any private/internal dependencies (no private module registries, no company-internal libraries). Everything must be buildable from public modules and the Go standard library.
+
+**Full architecture (layers, why they're shaped this way, data flow, decisions) lives in
+`docs/ARCHITECTURE.md`, product requirements in `docs/PRD.md`** — read the relevant one before
+any non-trivial change, especially anything touching a new layer, an external integration, or a
+business rule. This file only holds what must be followed on every edit, kept short on purpose.
+
+**Only `tech-lead` (ARCHITECTURE.md) and `product-manager` (PRD.md) edit those two files.**
+Any other role that makes an architecturally or product-significant change notes what needs
+updating in its PR/report instead of editing the doc directly — `project-manager` checks at
+acceptance whether that update actually landed.
 
 ## Commands
 
@@ -31,44 +41,28 @@ go vet ./... && gofmt -w .
 
 Config is **fully environment-variable based** — there is no config file. All entry points load it via **`bootstrap.NewConfig()`** (`internal/bootstrap/config.go`), which reads env vars with sane defaults and auto-loads a local `.env` when present (real env vars win over `.env`). Copy `.env.example` → `.env` for local development; never commit `.env`. Add new settings as typed fields on `Config` plus a `getEnv*` call in `NewConfig`.
 
-## Architecture
+## Hard rules while editing (details and rationale: ARCHITECTURE.md)
 
-Clean/Hexagonal. Dependencies point **inward**: `transport → usecase → domain ← infrastructure`. The `domain` package is the center and imports nothing from the outer layers (and no frameworks). Wiring happens in **`internal/bootstrap/deps.go`** (`NewDeps`) — the single place where concrete repos, integration clients, usecases, and handlers are constructed and connected. Read it first to understand how anything is assembled.
-
-**Entry points** (`cmd/`): `http/main.go` is the HTTP server. `migrate/migrate.go` runs goose migrations. Add new entry points as thin `main` wrappers that call `bootstrap.NewConfig()` then into `internal/bootstrap`.
-
-**`internal/domain/`** — flat package, **one file per entity** (`user.go`, `<entity>.go`, …). Each file holds the entity struct, its repository interface, and related typed constants. **No business logic, no frameworks** (no gin/sql/http imports). Status/role/state values are Go constants of a named string type (e.g. `type Role string`), and are stored as `VARCHAR` in the DB — **never `CREATE TYPE ... AS ENUM`** in migrations. `errors.go` defines the sentinel errors (`ErrNotFound`, `ErrAlreadyExists`, `ErrForbidden`, `ErrUnauthorized`, `ErrInvalidStatus`, `ErrValidation`) that drive HTTP status mapping. `tx.go` defines the `TxManager` port.
-
-**`internal/usecase/`** — application logic, grouped by actor/context (e.g. `admin/`, `users/`, …). The settled shape (see `usecase/auth`, `usecase/users`):
-- An exported **`Facade` interface** holds the basic CRUD/read operations, implemented by an unexported `facade` struct. Dependencies are passed as **individual positional arguments** to `NewFacade(...)` — **not** a `Deps` bundle and **not** an exported `Service` struct.
-- **Complex operations get their own file + focused interface** next to the facade (e.g. `<pkg>/otp.go` defining a `...UseCase` interface implemented by an unexported struct, constructed by `New...UseCase(...)`). Split by logical concern, not by CRUD verb.
-- Logic **shared** between the facade and the extra usecases (e.g. token issuance in `auth`) is a package-level **free function** over the minimal deps it needs, not a method — so no struct has to own another's state.
-- External-system **port interfaces** are declared where consumed, in the package's `ports.go`. A usecase **never imports another domain's concrete repository** — it declares a minimal local port (Interface Segregation), bound to a concrete impl in `deps.go`. Ports for transactions and external systems live in `domain` (`domain.TxManager`, …).
-
-**`internal/transport/rest/`** — Gin HTTP handlers, grouped like usecases, plus shared `middleware/`, `response/`, `httputil/`. Per resource:
-- `handler.go` — depends on the usecase facade/interfaces, exposes `RegisterRoutes`.
-- `request.go` — input DTOs with `validate:"..."` tags, a `Validate()` method, and a `ToDomain()` mapper.
-- `response.go` — output DTOs with a `fromDomain()` mapper.
-
-Handlers wrap **all** responses in `response.Envelope` (`OK`/`Created`/`Error`) and route **every** error through **`response.HandleError`**, which maps domain sentinels to status codes (404/409/403/401/422/500). Always `return` immediately after writing an error response.
-
-Error responses also carry a machine-readable `code` (`domain.ErrorCode`) next to the human-readable `error` message. Clients branch on `code`, never on the message. The default is the sentinel's generic code (`already_exists`, `not_found`, …); when one status hides two different outcomes, the usecase attaches a narrower one with `domain.WithCode(...)` — e.g. `slot_taken` vs `idempotency_key_reused`, both 409 on `POST /bookings`. Adding a new code is additive; changing or removing one is a breaking API change.
-
-**`internal/infrastructure/`** — implements domain interfaces; depends only on `domain`. `postgres/<entity>/repository.go` per entity; external-service HTTP clients live in their own subpackage; `sqltx/` provides the transaction manager.
-
-**`internal/logger/`** — thin logging wrapper over the standard library `log/slog`. Do **not** pull in a private logging library.
-
-### Transactions
-
-The DB layer uses **pgx** natively: `bootstrap.NewDB` returns a `*pgxpool.Pool`, and repositories take a `sqltx.Querier` (satisfied by both the pool and an active `pgx.Tx`). `bootstrap.NewSQLDB` returns a `database/sql` handle **only** for goose migrations and the one-time ETL. Repositories map the `unique_violation` SQLSTATE (`23505`) to `domain.ErrAlreadyExists`.
-
-`domain.TxManager` (`WithinTx(ctx, fn)`) is implemented by `sqltx.Manager`. It injects the active `pgx.Tx` into the context; nested `WithinTx` calls reuse the existing tx (no double-begin). Postgres repositories must pull the active querier from the context via `sqltx.From(ctx, r.pool)` so that multi-repository operations inside a usecase share one transaction.
-
-### Auth & routing (`bootstrap/app.go`)
-
-- `/health` (liveness), `/health/ready` (readiness — pings the DB), and `/.well-known/jwks.json` are **unauthenticated**. CORS is applied globally via `middleware.CORS` from `APP_CORS_ORIGINS`.
-- `/api/*` runs `middleware.Auth`: strips the `Bearer` token, verifies it, loads the local user, rejects inactive users, and stashes an `AuthUser{ID, Role}` in the request context (read via `middleware.GetAuthUser`).
-- Role-restricted groups use `middleware.RequireRole`.
+- Dependencies point **inward**: `transport → usecase → domain ← infrastructure`. `domain`
+  imports nothing from outer layers and no frameworks. Wiring is assembled in
+  **`internal/bootstrap/deps.go`** (`NewDeps`) — read it first to see how anything connects.
+- `internal/domain/`: one file per entity, struct + repo interface + constants only, **no
+  business logic, no framework imports**. Enumerated values are a named Go string type stored
+  as `VARCHAR` — **never `CREATE TYPE ... AS ENUM`**. Sentinel errors live in `errors.go`.
+- `internal/usecase/<pkg>/`: exported `Facade` interface + unexported `facade`, deps as
+  **positional args** to `NewFacade(...)` (no `Deps` bundle, no exported `Service`). Complex
+  operations get their own file + focused `...UseCase` interface next to the facade. A usecase
+  **never imports another domain's concrete repository** — declare a local port in `ports.go`.
+- `internal/transport/rest/`: `handler.go` + `request.go` (DTO, `Validate()`, `ToDomain()`) +
+  `response.go` (`fromDomain()`). **All** responses go through `response.Envelope`, **all**
+  errors through `response.HandleError` — always `return` right after writing an error.
+  Error `code` is what clients branch on, never the message; a new narrower code
+  (`domain.WithCode(...)`) is additive, changing/removing one is a breaking API change.
+- `internal/infrastructure/`: implements domain interfaces, depends only on `domain`.
+  `postgres/<entity>/repository.go` maps `23505` → `domain.ErrAlreadyExists`.
+- Transactions: pull the active querier via `sqltx.From(ctx, r.pool)` so multi-repo work in a
+  usecase shares one tx; nested `WithinTx` reuse the existing one.
+- No private deps — this repo builds only against public modules + stdlib.
 
 ## Conventions
 
