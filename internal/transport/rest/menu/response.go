@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 )
 
 type menuItemResponse struct {
@@ -25,10 +26,16 @@ type menuItemResponse struct {
 	// so it always converts. The authority on what a guest actually pays stays
 	// the server (see PriceStringToMinor in the pre-order flow) — this field is
 	// for arithmetic the UI shows, not for an amount the client sends back.
-	PriceMinor  *int64  `json:"price_minor"`
-	ImageURL    *string `json:"image_url"`
-	IsAvailable bool    `json:"is_available"`
-	IsFeatured  bool    `json:"is_featured"`
+	PriceMinor *int64  `json:"price_minor"`
+	ImageURL   *string `json:"image_url"`
+	// ImageURLCard / ImageURLDetail are the resized derivatives of ImageURL
+	// (see internal/media.VariantURLs). Additive, nil when there is no image
+	// or the derivative has not been generated yet — ImageURL is unchanged
+	// and stays the field an old client reads.
+	ImageURLCard   *string `json:"image_url_card,omitempty"`
+	ImageURLDetail *string `json:"image_url_detail,omitempty"`
+	IsAvailable    bool    `json:"is_available"`
+	IsFeatured     bool    `json:"is_featured"`
 	// IsTopPick / TopPickPosition — the VENUE's own «Лучшие позиции» mark on its
 	// storefront rail. Not to be confused with IsFeatured, which is the
 	// cross-venue "chef's picks" rail of the main screen.
@@ -68,12 +75,14 @@ func itemToResponse(m *domain.MenuItem, lang string) menuItemResponse {
 	for _, t := range m.Tags {
 		tags = append(tags, t.Tag)
 	}
+	imageCard, imageDetail := imageVariantPtrs(m.ImageURL)
 	return menuItemResponse{
 		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(),
 		Name: m.NameI18n.Resolve(lang, m.Name), NameI18n: m.NameI18n,
 		Description: m.DescriptionI18n.Resolve(lang, m.Description), DescriptionI18n: m.DescriptionI18n,
 		Price:      m.Price,
 		PriceMinor: priceMinorOf(m.Price), ImageURL: m.ImageURL,
+		ImageURLCard: imageCard, ImageURLDetail: imageDetail,
 		IsAvailable: m.IsAvailable, IsFeatured: m.IsFeatured,
 		IsTopPick: m.TopPickPosition != nil, TopPickPosition: m.TopPickPosition,
 		Category: resolvePtr(m.CategoryI18n, lang, m.Category), CategoryI18n: m.CategoryI18n,
@@ -82,6 +91,23 @@ func itemToResponse(m *domain.MenuItem, lang string) menuItemResponse {
 		PortionSizeI18n: m.PortionSizeI18n, Language: m.Language, DisplayOrder: m.DisplayOrder,
 		Tags: tags, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 	}
+}
+
+// imageVariantPtrs returns the card/detail derivative URLs of a nullable
+// image_url column as new pointers, or (nil, nil) when there is no image or
+// no derivative exists yet for it.
+func imageVariantPtrs(imageURL *string) (card, detail *string) {
+	if imageURL == nil {
+		return nil, nil
+	}
+	c, d := media.VariantURLs(*imageURL)
+	if c != "" {
+		card = &c
+	}
+	if d != "" {
+		detail = &d
+	}
+	return card, detail
 }
 
 // resolvePtr is I18n.Resolve for a nullable column: a NULL base stays NULL even
