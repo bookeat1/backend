@@ -98,6 +98,25 @@ func TestDerivedURLMatchesDerivedKey(t *testing.T) {
 	}
 }
 
+func TestVariantURLs(t *testing.T) {
+	const orig = testBase + "restaurants/u/photo.jpg"
+	card, detail := VariantURLs(orig)
+	if want := testBase + DerivedKey("restaurants/u/photo.jpg", WidthSmall); card != want {
+		t.Fatalf("card = %q, want %q", card, want)
+	}
+	if want := testBase + DerivedKey("restaurants/u/photo.jpg", WidthLarge); detail != want {
+		t.Fatalf("detail = %q, want %q", detail, want)
+	}
+}
+
+func TestVariantURLsRejectsJunk(t *testing.T) {
+	for _, u := range []string{"", "   ", "not a url", "/relative/path.jpg", testBase + DerivedKey("restaurants/u/photo.jpg", WidthSmall)} {
+		if card, detail := VariantURLs(u); card != "" || detail != "" {
+			t.Fatalf("VariantURLs(%q) = (%q,%q), want empty", u, card, detail)
+		}
+	}
+}
+
 func TestKeyFromURL(t *testing.T) {
 	const key = "restaurants/u/photo.jpg"
 	if got := KeyFromURL(testBase, testBase+key); got != key {

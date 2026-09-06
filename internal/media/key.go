@@ -23,6 +23,7 @@
 package media
 
 import (
+	"net/url"
 	"path"
 	"strings"
 )
@@ -202,4 +203,35 @@ func KeyFromURL(base, rawURL string) string {
 		key = key[:i]
 	}
 	return path.Clean("/" + key)[1:]
+}
+
+// VariantURLs returns the card (WidthSmall) and detail (WidthLarge)
+// derivative URLs for a stored public image URL, e.g. the `image_url` a
+// response DTO already carries.
+//
+// Unlike DerivedURL it does not need the caller to know the bucket's public
+// base up front: it recovers scheme+host from imageURL itself and treats
+// everything after the host as the object key. That is safe because every
+// image URL a response DTO holds was itself built as `base + "/" + key" by
+// this same package or by mediastore.PublicURL — recovering the base from the
+// URL and rebuilding it is the identity, not a guess.
+//
+// Returns ("", "") for a URL that is empty, unparseable, or already a
+// derivative (see IsDerived) — the second case is what stops a response DTO
+// from ever advertising a "derivative of a derivative".
+func VariantURLs(imageURL string) (card, detail string) {
+	raw := strings.TrimSpace(imageURL)
+	if raw == "" {
+		return "", ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", ""
+	}
+	key := strings.TrimPrefix(u.Path, "/")
+	if key == "" || IsDerived(key) {
+		return "", ""
+	}
+	base := u.Scheme + "://" + u.Host
+	return DerivedURL(base, key, WidthSmall), DerivedURL(base, key, WidthLarge)
 }

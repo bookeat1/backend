@@ -63,6 +63,12 @@ type fakeStore struct {
 	gotBody    []byte
 	gotType    string
 	publicBase string
+
+	// derivedErr, when set, makes Put (derivatives only) fail without
+	// affecting PutOriginal — used to prove a derivative write failure never
+	// turns a successful upload into an error response.
+	derivedErr  error
+	derivedKeys []string
 }
 
 func (f *fakeStore) PutOriginal(_ context.Context, key string, body []byte, contentType string) error {
@@ -73,6 +79,14 @@ func (f *fakeStore) PutOriginal(_ context.Context, key string, body []byte, cont
 	f.gotKey = key
 	f.gotBody = body
 	f.gotType = contentType
+	return nil
+}
+
+func (f *fakeStore) Put(_ context.Context, key string, _ []byte, _ string) error {
+	if f.derivedErr != nil {
+		return f.derivedErr
+	}
+	f.derivedKeys = append(f.derivedKeys, key)
 	return nil
 }
 
