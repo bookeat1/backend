@@ -98,13 +98,18 @@ func run(ctx context.Context, log *slog.Logger, filePath, restaurantIDStr, resta
 		slog.Int("to_insert", len(plan.ToInsert)),
 		slog.Int("to_update", len(plan.ToUpdate)),
 		slog.Int("unchanged", plan.Unchanged),
+		slog.Int("skipped", len(plan.Skipped)),
 		slog.Int("sections_seen", len(plan.Sections)),
 		slog.Int("sections_to_create", len(missingCats)),
 	)
-	fmt.Printf("restaurant: %s (%s)\nfile: %s (%d items)\nto insert: %d\nto update: %d\nunchanged: %d\nsections seen: %d\nsections to create: %s\n",
+	fmt.Printf("restaurant: %s (%s)\nfile: %s (%d items)\nto insert: %d\nto update: %d\nunchanged: %d\nskipped: %d\nsections seen: %d\nsections to create: %s\n",
 		name, restaurantID, filePath, len(parsed),
-		len(plan.ToInsert), len(plan.ToUpdate), plan.Unchanged,
+		len(plan.ToInsert), len(plan.ToUpdate), plan.Unchanged, len(plan.Skipped),
 		len(plan.Sections), strings.Join(missingCats, ", "))
+	for _, s := range plan.Skipped {
+		log.Warn("skipped file row", slog.String("name", s.Name), slog.String("error", s.Err.Error()))
+		fmt.Printf("  skipped %q: %v\n", s.Name, s.Err)
+	}
 
 	if dryRun {
 		fmt.Println("dry-run: no changes written")

@@ -136,14 +136,33 @@ func TestBuildPlanPairsDuplicateNamesInOrderFIFO(t *testing.T) {
 	}
 }
 
-func TestBuildPlanRejectsInvalidPriceAndDoesNotPartiallyApply(t *testing.T) {
+func TestBuildPlanSkipsInvalidPriceWithoutBlockingTheRestOfTheFile(t *testing.T) {
 	parsed := []ParsedItem{
 		{Name: "Good", Price: mkPrice(100)},
-		{Name: "Bad"}, // nil price
+		{Name: "Bad"}, // nil price: e.g. a wine list scan with no printed price
 	}
-	_, err := BuildPlan(nil, parsed)
-	if err == nil {
-		t.Fatal("expected an error for the item with no price")
+	plan, err := BuildPlan(nil, parsed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(plan.ToInsert) != 1 || plan.ToInsert[0].Name != "Good" {
+		t.Fatalf("expected the good item to still be inserted: %+v", plan.ToInsert)
+	}
+	if len(plan.Skipped) != 1 || plan.Skipped[0].Name != "Bad" {
+		t.Fatalf("expected the bad item to be reported as skipped: %+v", plan.Skipped)
+	}
+}
+
+func TestBuildPlanSkipsNegativePriceOnAnExistingMatch(t *testing.T) {
+	existing := []domain.MenuItem{{ID: uuid.New(), Name: "Wine", Price: "1000.00"}}
+	neg := int64(-5)
+	parsed := []ParsedItem{{Name: "Wine", Price: &neg}}
+	plan, err := BuildPlan(existing, parsed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(plan.ToUpdate) != 0 || len(plan.Skipped) != 1 {
+		t.Fatalf("plan = %+v", plan)
 	}
 }
 

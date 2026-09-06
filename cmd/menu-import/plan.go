@@ -22,6 +22,19 @@ type Plan struct {
 	// in first-seen order — the caller uses this to create missing
 	// menu_categories rows.
 	Sections []string
+	// Skipped are file rows BuildPlan refused to turn into a domain.MenuItem
+	// (currently: missing/negative price — money is never guessed). These are
+	// reported, never silently dropped, but they must not block the rest of a
+	// large file: real parsed venue menus contain the odd row the source PDF
+	// genuinely never printed a price for (e.g. a wine list scan), and failing
+	// the whole import over one bad line would be worse than skipping it.
+	Skipped []SkippedItem
+}
+
+// SkippedItem is a file row BuildPlan could not map to a domain.MenuItem.
+type SkippedItem struct {
+	Name string
+	Err  error
 }
 
 // changed reports whether applying the file row onto a copy of the existing
@@ -93,7 +106,8 @@ func BuildPlan(existing []domain.MenuItem, parsed []ParsedItem) (Plan, error) {
 		if len(queue) == 0 {
 			m := domain.MenuItem{IsAvailable: true}
 			if err := p.ToDomainFields(&m); err != nil {
-				return Plan{}, err
+				plan.Skipped = append(plan.Skipped, SkippedItem{Name: p.Name, Err: err})
+				continue
 			}
 			plan.ToInsert = append(plan.ToInsert, m)
 			continue
@@ -104,7 +118,8 @@ func BuildPlan(existing []domain.MenuItem, parsed []ParsedItem) (Plan, error) {
 
 		updated := match
 		if err := p.ToDomainFields(&updated); err != nil {
-			return Plan{}, err
+			plan.Skipped = append(plan.Skipped, SkippedItem{Name: p.Name, Err: err})
+			continue
 		}
 		if changed(match, updated) {
 			plan.ToUpdate = append(plan.ToUpdate, updated)

@@ -12,6 +12,10 @@
 //     NEW/CURRENT data, never a source of removals.
 //   - Section labels are matched to menu_categories by trimmed
 //     case-insensitive name; missing ones are created (flat, no parent).
+//   - A file row with no usable price (missing/negative — money is never
+//     guessed) is SKIPPED and reported, not applied and not treated as a
+//     fatal error for the rest of the file: a wine-list scan the source PDF
+//     genuinely never printed a price for should not block every other dish.
 //
 // Usage:
 //
