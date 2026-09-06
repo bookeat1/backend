@@ -191,6 +191,37 @@ func TestMissingCategoriesSkipsExistingCaseInsensitively(t *testing.T) {
 	}
 }
 
+func TestFinalizeForInsertAssignsDistinctIDsAndRestaurantID(t *testing.T) {
+	rid := uuid.New()
+	parsed := []ParsedItem{
+		{Name: "A", Price: mkPrice(100)},
+		{Name: "B", Price: mkPrice(200)},
+		{Name: "C", Price: mkPrice(300)},
+	}
+	plan, err := BuildPlan(nil, parsed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	FinalizeForInsert(&plan, rid)
+
+	if len(plan.ToInsert) != 3 {
+		t.Fatalf("expected 3 inserts, got %d", len(plan.ToInsert))
+	}
+	seen := make(map[uuid.UUID]bool, len(plan.ToInsert))
+	for _, m := range plan.ToInsert {
+		if m.ID == (uuid.UUID{}) {
+			t.Fatalf("item %q has a zero ID: a real write would collide on the primary key", m.Name)
+		}
+		if seen[m.ID] {
+			t.Fatalf("duplicate ID %s across insert rows", m.ID)
+		}
+		seen[m.ID] = true
+		if m.RestaurantID != rid {
+			t.Errorf("item %q RestaurantID = %s, want %s", m.Name, m.RestaurantID, rid)
+		}
+	}
+}
+
 func TestMissingCategoriesEmptyWhenAllExist(t *testing.T) {
 	existing := []domain.MenuCategory{{Name: "Salads"}, {Name: "Drinks"}}
 	got := missingCategories(existing, []string{"Salads", "drinks"})

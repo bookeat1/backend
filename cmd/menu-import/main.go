@@ -80,9 +80,7 @@ func run(ctx context.Context, log *slog.Logger, filePath, restaurantIDStr, resta
 	if err != nil {
 		return fmt.Errorf("build plan for %s: %w", name, err)
 	}
-	for i := range plan.ToInsert {
-		plan.ToInsert[i].RestaurantID = restaurantID
-	}
+	FinalizeForInsert(&plan, restaurantID)
 
 	existingCats, err := categories.List(ctx)
 	if err != nil {

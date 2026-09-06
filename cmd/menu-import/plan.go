@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 )
 
@@ -143,4 +145,17 @@ func BuildPlan(existing []domain.MenuItem, parsed []ParsedItem) (Plan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// FinalizeForInsert stamps every row in plan.ToInsert with restaurantID and a
+// FRESH random id. BuildPlan itself never touches identity — a MenuItem
+// destined for domain.MenuItemRepository.Create MUST carry a caller-assigned
+// id (the repository writes whatever id.ID it is given, it does not
+// generate one), so every unstamped insert would collide on the same zero
+// uuid.UUID{} primary key after the very first row.
+func FinalizeForInsert(plan *Plan, restaurantID uuid.UUID) {
+	for i := range plan.ToInsert {
+		plan.ToInsert[i].RestaurantID = restaurantID
+		plan.ToInsert[i].ID = uuid.New()
+	}
 }
