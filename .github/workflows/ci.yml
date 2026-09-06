@@ -47,6 +47,15 @@ jobs:
           go-version: "1.25.7"
           cache: true
 
+      # internal/media encodes derivatives with github.com/kolesa-team/go-webp,
+      # a cgo binding over libwebp (see internal/media/key.go for why: the
+      # product owner chose WebP output over a pure-Go/CGO_ENABLED=0 build).
+      # ubuntu-latest ships a C compiler but not libwebp's headers, so `go
+      # vet`/`go build`/`go test` all fail at the cgo compile step without
+      # this. Mirrors the Dockerfile builder stage's `libwebp-dev`.
+      - name: install libwebp headers (cgo dependency of internal/media)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebp-dev
+
       - name: gofmt (must produce no diff)
         run: |
           out="$(gofmt -l .)"
