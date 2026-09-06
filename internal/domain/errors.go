@@ -409,6 +409,38 @@ const (
 	// support for. See docs/payments/tiptoppay-splits.md.
 	CodeSplitFlowUnsupported ErrorCode = "split_flow_unsupported"
 
+	// --- booking pre-order (internal/usecase/preorder) ---
+	//
+	// Three different reasons a PUT /bookings/:id/preorder is refused. All three
+	// are 422 and all three mean "nothing was written", which is exactly why
+	// they need codes: the app has to say ONE true sentence, and the three
+	// sentences are not interchangeable ("позвоните в ресторан" vs "дождитесь
+	// оплаты" vs "бронь уже закрыта").
+
+	// CodePreorderLocked — the booking is CONFIRMED and the caller is the
+	// GUEST. From confirmation on, the venue has accepted the order and plans
+	// the kitchen around it, so the guest may no longer edit it from the app;
+	// the change has to go through the venue, who can still adjust the lines
+	// (see usecase/preorder.Replace). Permanent for this booking: no retry and
+	// no other client of the guest's helps. The app shows "свяжитесь с
+	// рестораном", not a field error.
+	CodePreorderLocked ErrorCode = "preorder_locked"
+
+	// CodePreorderPaymentInFlight — a non-terminal payment exists for this
+	// booking (including one still in `created`, whose amount is already
+	// snapshotted and will be captured by the webhook). Editing the lines now
+	// would move the charged amount away from the ordered food. Unlike
+	// CodePreorderLocked this is TEMPORARY: once the payment reaches a terminal
+	// state the pre-order is editable again, so the app tells the guest to wait
+	// for the payment to finish rather than to phone the venue.
+	CodePreorderPaymentInFlight ErrorCode = "preorder_payment_in_flight"
+
+	// CodePreorderBookingClosed — the booking is in a status that can no longer
+	// be prepared for at all (arrived, completed, cancelled, no_show). Nobody —
+	// guest, venue or admin — may change the pre-order of a booking that is
+	// over. Permanent.
+	CodePreorderBookingClosed ErrorCode = "preorder_booking_closed"
+
 	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
 	// number. Nothing to verify and nothing to change; a plain validation_failed
 	// would make the app show a field error with no actionable reason. 422.
