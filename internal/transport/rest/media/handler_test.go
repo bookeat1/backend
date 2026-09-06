@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 	"backend-core/internal/transport/rest/middleware"
 )
 
@@ -63,6 +68,12 @@ type fakeStore struct {
 	gotBody    []byte
 	gotType    string
 	publicBase string
+
+	// derivedErr, when set, makes Put (derivatives only) fail without
+	// affecting PutOriginal — used to prove a derivative write failure never
+	// turns a successful upload into an error response.
+	derivedErr  error
+	derivedKeys []string
 }
 
 func (f *fakeStore) PutOriginal(_ context.Context, key string, body []byte, contentType string) error {
@@ -73,6 +84,14 @@ func (f *fakeStore) PutOriginal(_ context.Context, key string, body []byte, cont
 	f.gotKey = key
 	f.gotBody = body
 	f.gotType = contentType
+	return nil
+}
+
+func (f *fakeStore) Put(_ context.Context, key string, _ []byte, _ string) error {
+	if f.derivedErr != nil {
+		return f.derivedErr
+	}
+	f.derivedKeys = append(f.derivedKeys, key)
 	return nil
 }
 
@@ -173,6 +192,103 @@ func TestUploadHappyPath(t *testing.T) {
 	wantURL := "https://public.example/" + store.gotKey
 	if env.Data.URL != wantURL {
 		t.Errorf("url = %q, want %q", env.Data.URL, wantURL)
+	}
+}
+
+// realJPEG returns bytes of a genuinely decodable, solid-colour JPEG of the
+// given size, so media.Render can actually resize it — unlike jpegBytes,
+// which is only sniffable magic-number padding.
+func realJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(img, img.Bounds(), image.NewUniform(color.RGBA{200, 120, 60, 255}), image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatalf("encode fixture jpeg: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestUploadGeneratesDerivatives: a wide-enough JPEG upload gets both a card
+// (640) and a detail (1280) derivative written next to the original, and the
+// response carries their URLs additively alongside the untouched `url` field.
+func TestUploadGeneratesDerivatives(t *testing.T) {
+	store := &fakeStore{}
+	r := newRouter(store, domain.RoleRestaurant)
+	content := realJPEG(t, 2000, 1000)
+	body, ct := multipartBody("file", "cover.jpg", content)
+
+	w := doUpload(r, uuid.NewString(), body, ct)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	var env struct {
+		Data struct {
+			URL       string `json:"url"`
+			CardURL   string `json:"card_url"`
+			DetailURL string `json:"detail_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Data.URL != "https://public.example/"+store.gotKey {
+		t.Errorf("url = %q, unexpectedly changed", env.Data.URL)
+	}
+	wantCard := "https://public.example/" + media.DerivedKey(store.gotKey, media.WidthSmall)
+	wantDetail := "https://public.example/" + media.DerivedKey(store.gotKey, media.WidthLarge)
+	if env.Data.CardURL != wantCard {
+		t.Errorf("card_url = %q, want %q", env.Data.CardURL, wantCard)
+	}
+	if env.Data.DetailURL != wantDetail {
+		t.Errorf("detail_url = %q, want %q", env.Data.DetailURL, wantDetail)
+	}
+	if len(store.derivedKeys) != 2 {
+		t.Fatalf("derived writes = %d, want 2 (got %v)", len(store.derivedKeys), store.derivedKeys)
+	}
+}
+
+// TestUploadSurvivesDerivativeFailure: the original is already saved by the
+// time derivatives are attempted, so a store.Put error for the derivative
+// must not turn a successful upload into an error response — it just omits
+// the derivative URLs, and the nightly backfill fills the gap later.
+func TestUploadSurvivesDerivativeFailure(t *testing.T) {
+	store := &fakeStore{derivedErr: errors.New("r2 exploded on the derivative")}
+	r := newRouter(store, domain.RoleRestaurant)
+	body, ct := multipartBody("file", "cover.jpg", realJPEG(t, 2000, 1000))
+
+	w := doUpload(r, uuid.NewString(), body, ct)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 despite the derivative failure (body %s)", w.Code, w.Body)
+	}
+	if !store.putCalled {
+		t.Fatal("original was not stored")
+	}
+	var env struct {
+		Data struct {
+			CardURL string `json:"card_url"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Data.CardURL != "" {
+		t.Errorf("card_url = %q, want empty when the derivative write failed", env.Data.CardURL)
+	}
+}
+
+// TestUploadSkipsDerivativesForSmallSource: a source narrower than the card
+// width produces no derivatives and no error — ErrTooSmall is an expected
+// outcome, not a failure to surface.
+func TestUploadSkipsDerivativesForSmallSource(t *testing.T) {
+	store := &fakeStore{}
+	r := newRouter(store, domain.RoleRestaurant)
+	body, ct := multipartBody("file", "tiny.jpg", realJPEG(t, 100, 80))
+
+	w := doUpload(r, uuid.NewString(), body, ct)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	if len(store.derivedKeys) != 0 {
+		t.Errorf("derived writes = %v, want none for a too-small source", store.derivedKeys)
 	}
 }
 

@@ -12,7 +12,9 @@ import (
 // It guards a decoder that was genuinely missing: the first dry run over the
 // live bucket reported 6 "unsupported" results, which was the 3 .webp
 // originals times the 2 sizes. Delete the golang.org/x/image/webp import and
-// this test goes red.
+// this test goes red — that import decodes pre-existing .webp originals, a
+// separate concern from the encoder (github.com/kolesa-team/go-webp) this
+// package now uses to WRITE derivatives.
 const webpFixtureB64 = "" +
 	"UklGRogEAABXRUJQVlA4IHwEAAAweACdASqEA1gCPrVaqlCnJSOioAgA4BaJaW7hd2Eaw9iAAAKzdrxcnIe+2TkPfbJy" +
 	"Hvtk5D32ych77ZOQ+1V9snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPf" +
@@ -49,7 +51,7 @@ func TestRenderDecodesWebPSources(t *testing.T) {
 	if got.Height != 427 {
 		t.Fatalf("height = %d, want 427", got.Height)
 	}
-	if got.ContentType != "image/jpeg" {
-		t.Fatalf("content type = %q, want image/jpeg", got.ContentType)
+	if got.ContentType != "image/webp" {
+		t.Fatalf("content type = %q, want image/webp", got.ContentType)
 	}
 }

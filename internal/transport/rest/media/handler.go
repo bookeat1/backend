@@ -17,9 +17,13 @@ import (
 	"net/http"
 	"time"
 
+	"errors"
+	"log/slog"
+
 	"github.com/gin-gonic/gin"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 	"backend-core/internal/transport/rest/middleware"
 	"backend-core/internal/transport/rest/response"
 )
@@ -48,6 +52,10 @@ var extByType = map[string]string{
 type Store interface {
 	PutOriginal(ctx context.Context, key string, body []byte, contentType string) error
 	PublicURL(key string) string
+	// Put writes a derivative (see internal/media.DerivedKey). Same method the
+	// backfill CLI uses; a real implementation refuses any key outside
+	// media.DerivedPrefix, so a bug here cannot land bytes over an original.
+	Put(ctx context.Context, key string, body []byte, contentType string) error
 }
 
 // Handler serves the admin media endpoints. store is nil when R2 is not
@@ -107,6 +115,13 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 
 type uploadResponse struct {
 	URL string `json:"url"`
+	// CardURL / DetailURL are the resized derivatives (see internal/media),
+	// present when this upload's source was wide enough to shrink and the
+	// write to the bucket succeeded. Additive: URL keeps naming the original,
+	// exactly as it did before these fields existed, so a caller that has not
+	// been taught about them yet sees byte-identical behaviour.
+	CardURL   string `json:"card_url,omitempty"`
+	DetailURL string `json:"detail_url,omitempty"`
 }
 
 func (h *Handler) upload(c *gin.Context) {
@@ -131,7 +146,46 @@ func (h *Handler) upload(c *gin.Context) {
 		return
 	}
 
-	response.OK(c.Writer, uploadResponse{URL: h.store.PublicURL(key)})
+	resp := uploadResponse{URL: h.store.PublicURL(key)}
+	cardURL, detailURL := h.generateDerivatives(c.Request.Context(), key, data)
+	resp.CardURL = cardURL
+	resp.DetailURL = detailURL
+
+	response.OK(c.Writer, resp)
+}
+
+// generateDerivatives resizes the just-uploaded original down to the card
+// (WidthSmall) and detail (WidthLarge) sizes and writes them next to it.
+//
+// Best-effort, deliberately: the original is already safely in the bucket by
+// the time this runs, so a resize/encode/PUT failure here must not turn a
+// successful upload into a 500 for the caller — the nightly media-backfill
+// CLI walks the bucket and fills in any derivative a request-time failure
+// left missing. ErrTooSmall is not logged as a failure: a source narrower
+// than a target width legitimately has no derivative at that size.
+func (h *Handler) generateDerivatives(ctx context.Context, originalKey string, data []byte) (cardURL, detailURL string) {
+	urls := make([]string, len(media.Widths))
+	for i, width := range media.Widths {
+		rendered, err := media.Render(data, width)
+		if err != nil {
+			if !errors.Is(err, media.ErrTooSmall) {
+				slog.Default().Warn("media: on-upload resize failed",
+					"key", originalKey, "width", width, "err", err)
+			}
+			continue
+		}
+		derivedKey := media.DerivedKey(originalKey, width)
+		if derivedKey == "" {
+			continue
+		}
+		if err := h.store.Put(ctx, derivedKey, rendered.Bytes, rendered.ContentType); err != nil {
+			slog.Default().Warn("media: on-upload derivative write failed",
+				"key", derivedKey, "width", width, "err", err)
+			continue
+		}
+		urls[i] = h.store.PublicURL(derivedKey)
+	}
+	return urls[0], urls[1]
 }
 
 // readImage reads, bounds and SNIFFS one multipart image, answering the client

@@ -8,14 +8,14 @@ func TestDerivedKeyIsDeterministicAndNamespaced(t *testing.T) {
 	const orig = "restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg"
 
 	got := DerivedKey(orig, WidthSmall)
-	want := "derived/w640/restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg.jpg"
+	want := "derived/w640/restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg.webp"
 	if got != want {
 		t.Fatalf("DerivedKey small = %q, want %q", got, want)
 	}
 	if again := DerivedKey(orig, WidthSmall); again != got {
 		t.Fatalf("DerivedKey is not deterministic: %q then %q", got, again)
 	}
-	if large := DerivedKey(orig, WidthLarge); large != "derived/w1280/"+orig+".jpg" {
+	if large := DerivedKey(orig, WidthLarge); large != "derived/w1280/"+orig+".webp" {
 		t.Fatalf("DerivedKey large = %q", large)
 	}
 }
@@ -95,6 +95,25 @@ func TestDerivedURLMatchesDerivedKey(t *testing.T) {
 	}
 	if got := DerivedURL(testBase, "", WidthSmall); got != "" {
 		t.Fatalf("DerivedURL of empty key = %q, want empty", got)
+	}
+}
+
+func TestVariantURLs(t *testing.T) {
+	const orig = testBase + "restaurants/u/photo.jpg"
+	card, detail := VariantURLs(orig)
+	if want := testBase + DerivedKey("restaurants/u/photo.jpg", WidthSmall); card != want {
+		t.Fatalf("card = %q, want %q", card, want)
+	}
+	if want := testBase + DerivedKey("restaurants/u/photo.jpg", WidthLarge); detail != want {
+		t.Fatalf("detail = %q, want %q", detail, want)
+	}
+}
+
+func TestVariantURLsRejectsJunk(t *testing.T) {
+	for _, u := range []string{"", "   ", "not a url", "/relative/path.jpg", testBase + DerivedKey("restaurants/u/photo.jpg", WidthSmall)} {
+		if card, detail := VariantURLs(u); card != "" || detail != "" {
+			t.Fatalf("VariantURLs(%q) = (%q,%q), want empty", u, card, detail)
+		}
 	}
 }
 
