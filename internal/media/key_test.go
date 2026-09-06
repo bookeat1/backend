@@ -8,14 +8,14 @@ func TestDerivedKeyIsDeterministicAndNamespaced(t *testing.T) {
 	const orig = "restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg"
 
 	got := DerivedKey(orig, WidthSmall)
-	want := "derived/w640/restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg.jpg"
+	want := "derived/w640/restaurants/d2f0e053-61b9-407a-8816-ceb370d65d22/1751414713631-va1ag209cl.jpg.webp"
 	if got != want {
 		t.Fatalf("DerivedKey small = %q, want %q", got, want)
 	}
 	if again := DerivedKey(orig, WidthSmall); again != got {
 		t.Fatalf("DerivedKey is not deterministic: %q then %q", got, again)
 	}
-	if large := DerivedKey(orig, WidthLarge); large != "derived/w1280/"+orig+".jpg" {
+	if large := DerivedKey(orig, WidthLarge); large != "derived/w1280/"+orig+".webp" {
 		t.Fatalf("DerivedKey large = %q", large)
 	}
 }

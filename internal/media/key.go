@@ -80,31 +80,31 @@ var Widths = []int{WidthSmall, WidthLarge}
 
 // Ext is the extension — and therefore the format — of every derivative.
 //
-// JPEG, not WebP, even though three of the objects in the bucket happen to be
-// .webp already. Reasons, in order of weight:
+// WebP, decided by the product owner on 2026-09-06: this is a photo-heavy
+// app ("контент — основная фича"), so the extra visual quality and smaller
+// payload per byte outweigh the build-simplicity cost of a cgo dependency.
+// This supersedes an earlier decision to ship JPEG derivatives, made because
+// Go's standard library cannot encode WebP at all (golang.org/x/image/webp
+// is a decoder only) and a cgo binding felt like too much for what was then
+// a one-off batch job. The encoder now used is github.com/kolesa-team/go-webp,
+// a cgo binding over libwebp — see Render in render.go — which is why
+// CGO_ENABLED=1 and libwebp(-dev) are required to build and run this service
+// (see the top-level Dockerfile).
 //
-//  1. The sources are not WebP. Measured: 714 .jpg + 8 .jpeg + 47 .png + 3
-//     .webp. The premise that "everything is already WebP" does not survive a
-//     listing of the bucket.
-//  2. Go's standard library encodes JPEG and cannot encode WebP
-//     (golang.org/x/image/webp is a decoder only). Shipping WebP output means
-//     adding either a cgo binding or a third-party pure-Go encoder to a
-//     dependency list that is currently very short, for a one-off batch job.
-//  3. At these sizes the win would be small in absolute terms. WebP typically
-//     saves 25-30% over JPEG at equal quality; 30% of a 45 KB thumbnail is
-//     13 KB, against the 1.2 MB we are removing. The interesting order of
-//     magnitude is already captured.
-//
-// If WebP is wanted later it costs nothing to add: it is a new width-like
-// constant and a second `derived/` sub-prefix, with the same fallback chain
-// on the client. Nothing here has to be undone.
-const Ext = ".jpg"
+// Practical effect measured on this package's own JPEG test fixtures
+// (gradient photos, not flat colour, at Quality 82 both before and after):
+// WebP derivatives came out meaningfully smaller than the JPEG ones they
+// replace at the same pixel dimensions — see the "original -> webp w640 ->
+// webp w1280" t.Logf output in TestRenderIsDramaticallySmallerThanTheOriginal
+// for the exact bytes on the current fixtures; take that log output over any
+// percentage quoted in a comment, because it is measured, not guessed.
+const Ext = ".webp"
 
 // DerivedKey returns the object key of the `width`-pixel derivative of
 // `originalKey`.
 //
 //	restaurants/<uuid>/1751414713631-va1ag209cl.jpg
-//	  → derived/w640/restaurants/<uuid>/1751414713631-va1ag209cl.jpg.jpg
+//	  → derived/w640/restaurants/<uuid>/1751414713631-va1ag209cl.jpg.webp
 //
 // The original key is kept WHOLE, extension included, and the derivative's own
 // extension is appended rather than substituted. It looks odd and it is
