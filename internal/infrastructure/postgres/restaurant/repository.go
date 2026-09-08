@@ -46,6 +46,14 @@ const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 	confirm_sla_minutes, max_guests_per_booking, auto_confirm, confirm_on_create,
 	booking_capacity_mode, booking_capacity_seats`
 
+// preorderCols is the venue's optional pre-order minimum
+// (restaurants.preorder_min_amount_minor, migration 0042), read only by
+// GetByID for the same reason policyCols is: the public DETAIL payload
+// publishes it (see transport/rest/restaurants.aggregateToResponse), the
+// catalog listing does not compute it at all, and it is deliberately absent
+// from cols so Create/Update's placeholder numbering stays untouched.
+const preorderCols = `preorder_min_amount_minor`
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -257,7 +265,7 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
-	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+`, `+policyCols+` FROM restaurants WHERE id=$1`, id)
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+`, `+policyCols+`, `+preorderCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -776,6 +784,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
 		&capacityMode, &p.BookingCapacitySeats,
+		&m.PreorderMinAmountMinor,
 	); err != nil {
 		return nil, err
 	}

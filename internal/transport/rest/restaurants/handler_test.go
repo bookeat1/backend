@@ -514,3 +514,86 @@ func TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// preorder_min_amount_minor — the web pre-order minimum (spec D1)
+// ---------------------------------------------------------------------------
+
+// TestDetailPayloadCarriesPreorderMinAmountMinor: the venue detail publishes
+// restaurants.preorder_min_amount_minor verbatim, in minor units, when the
+// venue has set one.
+func TestDetailPayloadCarriesPreorderMinAmountMinor(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	var min int64 = 10_000_00
+	rest.PreorderMinAmountMinor = &min
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+	field, ok := raw["preorder_min_amount_minor"]
+	if !ok {
+		t.Fatalf("preorder_min_amount_minor missing from the detail payload (wanted %d)", min)
+	}
+	var got int64
+	if err := json.Unmarshal(field, &got); err != nil {
+		t.Fatalf("preorder_min_amount_minor is not a number: %v (%s)", err, field)
+	}
+	if got != min {
+		t.Fatalf("preorder_min_amount_minor = %d, want %d", got, min)
+	}
+}
+
+// TestPayloadOmitsPreorderMinAmountMinorWhenNotSet: the field disappears on
+// the listing (which never reads the column at all) and on a detail read for
+// a venue with no minimum set — never a false floor of 0.
+func TestPayloadOmitsPreorderMinAmountMinorWhenNotSet(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+		"/api/v1/restaurants/" + id.String(),
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["preorder_min_amount_minor"]; ok {
+				t.Fatalf("preorder_min_amount_minor must be omitted when not set, got %s", v)
+			}
+		})
+	}
+}
+
+// TestListingPayloadOmitsPreorderMinAmountMinorEvenWhenSet: the minimum is a
+// DETAIL-only field, same rule as accepts_online_payment — a listing row must
+// not leak it even if the domain value happens to be populated (e.g. a future
+// caller that reuses the same domain.Restaurant for both reads).
+func TestListingPayloadOmitsPreorderMinAmountMinorEvenWhenSet(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	var min int64 = 5_000_00
+	rest.PreorderMinAmountMinor = &min
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["preorder_min_amount_minor"]; ok {
+				t.Fatalf("preorder_min_amount_minor must be listing-absent, got %s", v)
+			}
+		})
+	}
+}

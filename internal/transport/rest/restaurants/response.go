@@ -100,6 +100,13 @@ type restaurantResponse struct {
 	// acquirer lookup failed is never advertised as payable, and never as
 	// definitively unpayable either.
 	AcceptsOnlinePayment *bool `json:"accepts_online_payment,omitempty"`
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total,
+	// in int64 MINOR units (restaurants.preorder_min_amount_minor). Served by
+	// the DETAIL read only, same rule as AcceptsOnlinePayment above: a listing
+	// row never carries it, because the guest cannot act on a minimum before
+	// they have opened the venue's menu. nil/omitted means "no minimum set" —
+	// the client must not read absence as a floor of zero.
+	PreorderMinAmountMinor *int64 `json:"preorder_min_amount_minor,omitempty"`
 }
 
 // scheduleResponse is the venue's regular weekly hours in a shape a client
@@ -403,6 +410,7 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 	if lang == "" {
 		attachRawTranslations(&resp, a.Restaurant)
 	}
+	resp.PreorderMinAmountMinor = a.Restaurant.PreorderMinAmountMinor
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
