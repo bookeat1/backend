@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 )
 
 type restaurantResponse struct {
@@ -54,6 +55,14 @@ type restaurantResponse struct {
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
 	PrimaryImage *string             `json:"primary_image,omitempty"`
+	// PrimaryImageCard / PrimaryImageDetail are the resized derivatives of
+	// PrimaryImage (see internal/media). Additive: PrimaryImage keeps naming
+	// the original exactly as before, so an app build that has not been
+	// taught about these fields sees byte-identical output. Empty/omitted
+	// when the derivative has not been generated yet (fresh upload, backfill
+	// not yet run) — the client's contract is to fall back to PrimaryImage.
+	PrimaryImageCard   *string `json:"primary_image_card,omitempty"`
+	PrimaryImageDetail *string `json:"primary_image_detail,omitempty"`
 	// MatchedDish is set ONLY by the search endpoint, and only when the venue
 	// was pulled in by a menu item. Absent from the JSON otherwise — a pointer
 	// so "no dish matched" and "this response has no notion of a query" are
@@ -216,6 +225,16 @@ type imageResponse struct {
 	ID        string `json:"id"`
 	ImageURL  string `json:"image_url"`
 	IsPrimary bool   `json:"is_primary"`
+	// CardURL / DetailURL are the resized derivatives of ImageURL (see
+	// internal/media.VariantURLs). Additive, empty when not yet generated —
+	// ImageURL is unchanged and remains the field every client already reads.
+	CardURL   string `json:"card_url,omitempty"`
+	DetailURL string `json:"detail_url,omitempty"`
+}
+
+func newImageResponse(id, imageURL string, isPrimary bool) imageResponse {
+	card, detail := media.VariantURLs(imageURL)
+	return imageResponse{ID: id, ImageURL: imageURL, IsPrimary: isPrimary, CardURL: card, DetailURL: detail}
 }
 
 // featureResponse is one of the venue's features. The shape is unchanged from
@@ -387,10 +406,17 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
-		resp.Images = append(resp.Images, imageResponse{ID: i.ID.String(), ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
+		resp.Images = append(resp.Images, newImageResponse(i.ID.String(), i.ImageURL, i.IsPrimary))
 		if i.IsPrimary && resp.PrimaryImage == nil {
 			u := i.ImageURL
 			resp.PrimaryImage = &u
+			card, detail := media.VariantURLs(i.ImageURL)
+			if card != "" {
+				resp.PrimaryImageCard = &card
+			}
+			if detail != "" {
+				resp.PrimaryImageDetail = &detail
+			}
 		}
 	}
 	resp.Features = featuresToResponse(a.Features, lang)

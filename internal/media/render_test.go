@@ -5,6 +5,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"testing"
@@ -48,7 +49,7 @@ func TestRenderProducesRequestedWidthAndKeepsAspectRatio(t *testing.T) {
 	if got.Height != 427 {
 		t.Fatalf("height = %d, want 427", got.Height)
 	}
-	if got.ContentType != "image/jpeg" {
+	if got.ContentType != "image/webp" {
 		t.Fatalf("content type = %q", got.ContentType)
 	}
 
@@ -56,8 +57,8 @@ func TestRenderProducesRequestedWidthAndKeepsAspectRatio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("output is not a decodable image: %v", err)
 	}
-	if format != "jpeg" {
-		t.Fatalf("output format = %q, want jpeg", format)
+	if format != "webp" {
+		t.Fatalf("output format = %q, want webp", format)
 	}
 	if cfg.Width != got.Width || cfg.Height != got.Height {
 		t.Fatalf("declared %dx%d, actual %dx%d", got.Width, got.Height, cfg.Width, cfg.Height)
@@ -104,12 +105,20 @@ func TestRenderRefusesToUpscale(t *testing.T) {
 	}
 }
 
-// A transparent PNG encoded straight to JPEG comes out with a BLACK
-// background. The bucket holds 47 PNGs.
-func TestRenderFlattensTransparencyOntoWhiteNotBlack(t *testing.T) {
+// Unlike the old JPEG output (which had no alpha channel and had to flatten
+// every source onto an opaque background), WebP carries transparency
+// natively — so this package no longer flattens it away. A PNG with a
+// transparent corner and an opaque, coloured centre must come out of Render
+// with both halves of that claim intact: still see-through where it was
+// transparent, and still the right colour where it was not.
+func TestRenderPreservesTransparencyInWebP(t *testing.T) {
 	const w, h = 1600, 1200
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	// Fully transparent everywhere: whatever colour comes out IS the background.
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	// Zero-value NRGBA is fully transparent everywhere; paint an opaque red
+	// square in the middle so the test also confirts colour survives.
+	square := image.Rect(w/2-200, h/2-200, w/2+200, h/2+200)
+	draw.Draw(img, square, image.NewUniform(color.RGBA{R: 220, G: 20, B: 20, A: 255}), image.Point{}, draw.Src)
+
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		t.Fatalf("fixture encode: %v", err)
@@ -119,14 +128,26 @@ func TestRenderFlattensTransparencyOntoWhiteNotBlack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	out, err := jpeg.Decode(bytes.NewReader(got.Bytes))
+
+	out, format, err := image.Decode(bytes.NewReader(got.Bytes))
 	if err != nil {
 		t.Fatalf("decode output: %v", err)
 	}
-	r, g, b, _ := out.At(got.Width/2, got.Height/2).RGBA()
-	// JPEG is lossy, so allow a little drift, but black (0) must be nowhere near.
-	if r>>8 < 240 || g>>8 < 240 || b>>8 < 240 {
-		t.Fatalf("transparent source flattened to rgb(%d,%d,%d), want near-white", r>>8, g>>8, b>>8)
+	if format != "webp" {
+		t.Fatalf("output format = %q, want webp", format)
+	}
+
+	// A corner, far from the painted square, must still read as transparent.
+	if _, _, _, a := out.At(5, 5).RGBA(); a>>8 > 5 {
+		t.Fatalf("corner alpha = %d, want near 0 (transparent)", a>>8)
+	}
+	// The centre, deep inside the painted square, must be opaque and red.
+	r, g, b, a := out.At(got.Width/2, got.Height/2).RGBA()
+	if a>>8 < 250 {
+		t.Fatalf("centre alpha = %d, want near 255 (opaque)", a>>8)
+	}
+	if r>>8 < 180 || g>>8 > 70 || b>>8 > 70 {
+		t.Fatalf("centre colour = rgb(%d,%d,%d), want a shade of red", r>>8, g>>8, b>>8)
 	}
 }
 
