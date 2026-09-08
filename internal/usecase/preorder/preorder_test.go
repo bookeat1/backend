@@ -192,6 +192,7 @@ func TestReplace_ItemFromAnotherRestaurant(t *testing.T) {
 
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: foreign.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
+	mustCode(t, err, domain.CodePreorderItemUnavailable)
 	if h.items.replaceCalls != 0 {
 		t.Errorf("replace was called despite cross-tenant item")
 	}
@@ -206,6 +207,7 @@ func TestReplace_UnavailableItem(t *testing.T) {
 
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
+	mustCode(t, err, domain.CodePreorderItemUnavailable)
 	if h.items.replaceCalls != 0 {
 		t.Errorf("replace was called for an unavailable item")
 	}
@@ -217,6 +219,37 @@ func TestReplace_UnknownItem(t *testing.T) {
 	actor := Actor{UserID: owner, Role: domain.RoleUser}
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: uuid.New(), Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
+	mustCode(t, err, domain.CodePreorderItemUnavailable)
+}
+
+// TestReplace_ItemUnavailableCodeCoversAllThreeReasons proves the SAME code
+// (domain.CodePreorderItemUnavailable) is attached whichever of the three
+// "this line cannot be ordered" reasons fires — a missing id, a cross-tenant
+// id, and is_available=false — because the client's remedy is identical in
+// all three (spec web-preorder-menu-20260908 §D2): drop the line, resubmit.
+func TestReplace_ItemUnavailableCodeCoversAllThreeReasons(t *testing.T) {
+	owner := uuid.New()
+	actor := Actor{UserID: owner, Role: domain.RoleUser}
+
+	t.Run("unknown", func(t *testing.T) {
+		h := newHarness(t, &owner, domain.BookingPending, nil)
+		_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: uuid.New(), Quantity: 1}})
+		mustCode(t, err, domain.CodePreorderItemUnavailable)
+	})
+	t.Run("cross-tenant", func(t *testing.T) {
+		h := newHarness(t, &owner, domain.BookingPending, nil)
+		foreign := domain.MenuItem{ID: uuid.New(), RestaurantID: restB, Name: "Sushi", Price: "3000.00", IsAvailable: true}
+		h.uc.menu = fakeMenu{items: map[uuid.UUID]domain.MenuItem{foreign.ID: foreign}}
+		_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: foreign.ID, Quantity: 1}})
+		mustCode(t, err, domain.CodePreorderItemUnavailable)
+	})
+	t.Run("not-available", func(t *testing.T) {
+		h := newHarness(t, &owner, domain.BookingPending, nil)
+		h.dishA.IsAvailable = false
+		h.uc.menu = fakeMenu{items: map[uuid.UUID]domain.MenuItem{h.dishA.ID: h.dishA}}
+		_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishA.ID, Quantity: 1}})
+		mustCode(t, err, domain.CodePreorderItemUnavailable)
+	})
 }
 
 func TestReplace_QuantityBounds(t *testing.T) {
@@ -239,6 +272,7 @@ func TestReplace_MinimumEnforced(t *testing.T) {
 	// dishB * 1 = 100000 < 500000 → rejected.
 	_, err := h.uc.Replace(context.Background(), actor, h.booking.ID, []Line{{MenuItemID: h.dishB.ID, Quantity: 1}})
 	mustErr(t, err, domain.ErrValidation)
+	mustCode(t, err, domain.CodePreorderBelowMinimum)
 	if h.items.replaceCalls != 0 {
 		t.Errorf("replace was called below the minimum")
 	}

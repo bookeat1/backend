@@ -181,8 +181,16 @@ type Restaurant struct {
 	// policy (Wave 3). Nil fields fall back to the BOOKING_DEFAULT_* env values;
 	// resolution lives in usecase/bookings.
 	BookingPolicy BookingPolicyOverride
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total in
+	// int64 MINOR units (restaurants.preorder_min_amount_minor, migration 0042;
+	// the same value PaymentSettingsOverride.PreorderMinAmountMinor carries for
+	// the payment flow, read here directly for the public payload). nil = no
+	// minimum set. Scanned only by the detail read (GetByID, see policyCols'
+	// neighbour preorderCols) — a catalog listing row leaves it nil, which is
+	// what keeps it absent from the listing JSON without a second mechanism.
+	PreorderMinAmountMinor *int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // RestaurantAggregate is a restaurant with its inline collections, matching the

@@ -260,15 +260,18 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 		mi, err := u.menu.GetByID(ctx, ln.MenuItemID)
 		if err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				return nil, fmt.Errorf("%w: menu item %s does not exist", domain.ErrValidation, ln.MenuItemID)
+				return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+					fmt.Errorf("%w: menu item %s does not exist", domain.ErrValidation, ln.MenuItemID))
 			}
 			return nil, err
 		}
 		if mi.RestaurantID != b.RestaurantID {
-			return nil, fmt.Errorf("%w: menu item %s does not belong to this booking's restaurant", domain.ErrValidation, ln.MenuItemID)
+			return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+				fmt.Errorf("%w: menu item %s does not belong to this booking's restaurant", domain.ErrValidation, ln.MenuItemID))
 		}
 		if !mi.IsAvailable {
-			return nil, fmt.Errorf("%w: menu item %q is not available", domain.ErrValidation, mi.Name)
+			return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+				fmt.Errorf("%w: menu item %q is not available", domain.ErrValidation, mi.Name))
 		}
 		priceMinor, err := domain.PriceStringToMinor(mi.Price)
 		if err != nil {
@@ -302,7 +305,8 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 			return nil, err
 		}
 		if min := override.PreorderMinAmountMinor; min != nil && total < *min {
-			return nil, fmt.Errorf("%w: pre-order total %d is below this restaurant's minimum of %d", domain.ErrValidation, total, *min)
+			return nil, domain.WithCode(domain.CodePreorderBelowMinimum,
+				fmt.Errorf("%w: pre-order total %d is below this restaurant's minimum of %d", domain.ErrValidation, total, *min))
 		}
 	}
 
