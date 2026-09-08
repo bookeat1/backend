@@ -156,7 +156,9 @@ NEXT_PUBLIC_API_URL=http://127.0.0.1:8080/api/v1 pnpm --filter @bookeat/admin de
 
 Автоматический: push в `develop` запускает `.github/workflows/deploy.yml`, тот
 собирает образ в GHCR и катит на test. Прод — только руками через `workflow_dispatch`
-с вводом подтверждения `deploy-to-prod`.
+**с ветки `main`** (Run workflow → «Use workflow from: main», `environment=prod`)
+с вводом подтверждения `deploy-to-prod`. С 2026-09-08 `main` = merge `develop`;
+джоба `preflight` отказывает в прод-выкате с любой другой ветки ещё до сборки образа.
 
 Руками на сервере:
 
