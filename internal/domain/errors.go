@@ -411,11 +411,14 @@ const (
 
 	// --- booking pre-order (internal/usecase/preorder) ---
 	//
-	// Three different reasons a PUT /bookings/:id/preorder is refused. All three
-	// are 422 and all three mean "nothing was written", which is exactly why
-	// they need codes: the app has to say ONE true sentence, and the three
-	// sentences are not interchangeable ("позвоните в ресторан" vs "дождитесь
-	// оплаты" vs "бронь уже закрыта").
+	// Several different reasons a PUT /bookings/:id/preorder is refused. All are
+	// 422 and all mean "nothing was written", which is exactly why they need
+	// codes: the app has to say ONE true sentence, and the sentences are not
+	// interchangeable ("позвоните в ресторан" vs "дождитесь оплаты" vs "бронь
+	// уже закрыта" vs "добавьте ещё на N ₸" vs "уберите недоступное блюдо").
+	// CodePreorderLocked / CodePreorderPaymentInFlight / CodePreorderBookingClosed
+	// are about WHO may change the pre-order and WHEN; CodePreorderBelowMinimum
+	// / CodePreorderItemUnavailable (added 2026-09-08) are about WHAT was sent.
 
 	// CodePreorderLocked — the booking is CONFIRMED and the caller is the
 	// GUEST. From confirmation on, the venue has accepted the order and plans
@@ -440,6 +443,23 @@ const (
 	// guest, venue or admin — may change the pre-order of a booking that is
 	// over. Permanent.
 	CodePreorderBookingClosed ErrorCode = "preorder_booking_closed"
+
+	// CodePreorderBelowMinimum — the submitted lines price out below the
+	// venue's optional restaurants.preorder_min_amount_minor (checked only when
+	// the total is non-zero — an empty pre-order always clears cleanly). Added
+	// 2026-09-08 (spec web-preorder-menu-20260908 §D2) so a client can show
+	// "добавьте ещё на N ₸" instead of a generic refusal; additive, the message
+	// text is unchanged from before this code existed.
+	CodePreorderBelowMinimum ErrorCode = "preorder_below_minimum"
+
+	// CodePreorderItemUnavailable — a submitted line's menu_item_id does not
+	// exist, belongs to a different restaurant than this booking's, or is
+	// currently is_available=false. All three collapse to one code because the
+	// guest's remedy is the same in every case: drop that line and resubmit: a
+	// crafted/stale id and a dish the kitchen just 86'd both mean "this item
+	// cannot be ordered right now". Added 2026-09-08 (spec
+	// web-preorder-menu-20260908 §D2); additive, the message text is unchanged.
+	CodePreorderItemUnavailable ErrorCode = "preorder_item_unavailable"
 
 	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
 	// number. Nothing to verify and nothing to change; a plain validation_failed
