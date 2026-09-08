@@ -1,0 +1,157 @@
+package domain
+
+// StaffRole is a user's role within ONE restaurant's staff roster, stored on
+// RestaurantManager.Role (migration 0012). It is orthogonal to the global
+// User.Role: RoleAdmin ("superadmin") is a global role with no restaurant
+// scope at all — every call site checks actor.Role == RoleAdmin FIRST and
+// bypasses this matrix entirely (spec: "суперадмин — может всё", see
+// restaurants.ManagerUseCase.authorizeStaffManage and
+// usecase/payments.authorizeStaffPermission for the two call sites).
+type StaffRole string
+
+const (
+	StaffRoleOwner   StaffRole = "owner"
+	StaffRoleManager StaffRole = "manager"
+	StaffRoleHostess StaffRole = "hostess"
+)
+
+// Valid reports whether s is one of the three known staff roles.
+func (s StaffRole) Valid() bool {
+	switch s {
+	case StaffRoleOwner, StaffRoleManager, StaffRoleHostess:
+		return true
+	}
+	return false
+}
+
+// rank orders staff roles from least to most privileged. An unknown role
+// ranks below every real one (0), so Outranks against it is always false —
+// there is no privilege to compare.
+func (s StaffRole) rank() int {
+	switch s {
+	case StaffRoleHostess:
+		return 1
+	case StaffRoleManager:
+		return 2
+	case StaffRoleOwner:
+		return 3
+	default:
+		return 0
+	}
+}
+
+// Outranks reports whether s is STRICTLY more privileged than other. Used
+// only to enforce "cannot grant a role at or above your own" when a
+// restaurant's own owner manages their staff roster (spec: "нельзя повысить
+// роль выше своей") — a superadmin bypasses this check entirely, same as
+// every other restaurant-scoped rule here.
+func (s StaffRole) Outranks(other StaffRole) bool { return s.rank() > other.rank() }
+
+// Permission is a single, concrete action gated by the RBAC matrix — e.g.
+// "refund a payment" — never a role name. Every call site asks
+// StaffRole.HasPermission(perm), which keeps the actual role→action mapping
+// in exactly ONE place (staffPermissions below) instead of scattered role
+// comparisons across usecases (spec: "матрица роль→права — в коде, не в БД,
+// чтобы нельзя было случайно выдать лишнее через запись в таблицу").
+type Permission string
+
+const (
+	// PermBookingManage covers every staff-side booking transition: accept /
+	// confirm, reject, seat (Arrive), mark a no-show, cancel, waitlist —
+	// the venue's everyday booking operations (spec: "принимает/подтверждает
+	// бронь, посадка, неявка"). Granted to every staff role.
+	PermBookingManage Permission = "booking.manage"
+
+	// PermPaymentCapture covers charging a hold on seating (CaptureOnSeating)
+	// and releasing a hold on rejection (VoidOnRejection) — the payment side
+	// effect of the same everyday booking flow above, not an independent
+	// money decision. Granted to every staff role, same as PermBookingManage.
+	PermPaymentCapture Permission = "payment.capture"
+
+	// PermPaymentRefund covers settling a cancellation or a no-show into its
+	// final refund/forfeit split (RefundUseCase.Settle) — an explicit,
+	// standalone money-moving decision (spec: "оформляет возврат платежа").
+	// Manager and owner only — a hostess must NOT be able to do this.
+	PermPaymentRefund Permission = "payment.refund"
+
+	// PermStaffManage covers creating, re-role-ing and removing a
+	// restaurant's own manager/hostess accounts (spec: "создаёт и удаляет
+	// менеджеров и хостес"). Owner only among restaurant staff roles.
+	PermStaffManage Permission = "staff.manage"
+
+	// PermRestaurantManage covers the venue's own back-office cabinet
+	// configuration: editing the restaurant profile (name/description/address/
+	// contacts/opening hours), managing its menu items, setting regular working
+	// hours + special-day overrides, and reading its guest list. It is the
+	// "run my venue's settings" permission (admin panel, Ф1). Owner and manager
+	// hold it; a hostess does NOT — a hostess works the floor (bookings + the
+	// fast stop list) but does not reconfigure the venue.
+	PermRestaurantManage Permission = "restaurant.manage"
+
+	// PermMenuStopList covers ONLY the fast "we ran out" bulk availability
+	// toggle over a set of menu items — the one menu action a hostess on the
+	// floor legitimately needs mid-service, without granting the full menu-edit
+	// surface (PermRestaurantManage). Granted to every staff role, same reach as
+	// PermBookingManage: it is an operational, non-destructive flag flip, never
+	// a change to what the menu contains.
+	PermMenuStopList Permission = "menu.stoplist"
+)
+
+// staffPermissions is the ENTIRE role→permission matrix. Deliberately a Go
+// literal, not a database table, per the spec's data-integrity requirement
+// above — there is no write path that can widen it at runtime.
+var staffPermissions = map[StaffRole]map[Permission]bool{
+	StaffRoleHostess: {
+		PermBookingManage:  true,
+		PermPaymentCapture: true,
+		PermMenuStopList:   true,
+	},
+	StaffRoleManager: {
+		PermBookingManage:    true,
+		PermPaymentCapture:   true,
+		PermPaymentRefund:    true,
+		PermRestaurantManage: true,
+		PermMenuStopList:     true,
+	},
+	StaffRoleOwner: {
+		PermBookingManage:    true,
+		PermPaymentCapture:   true,
+		PermPaymentRefund:    true,
+		PermStaffManage:      true,
+		PermRestaurantManage: true,
+		PermMenuStopList:     true,
+	},
+}
+
+// HasPermission reports whether staff role s may perform perm. An unknown or
+// empty role has no permissions — there is no implicit allow.
+func (s StaffRole) HasPermission(perm Permission) bool {
+	return staffPermissions[s][perm]
+}
+
+// PlatformContentRoles is the ENTIRE list of global roles allowed to create and
+// edit content that belongs to the platform itself rather than to a venue —
+// «акции и афиши без привязки к ресторану» (migration 0085). Venue-bound
+// content is unaffected: it keeps going through PermRestaurantManage AT its own
+// restaurant, which a platform item has none of.
+//
+// It is a separate, tiny list on purpose. The RBAC matrix above is
+// restaurant-SCOPED (StaffRole lives on a roster row for one venue), and there
+// is no venue here to scope anything to, so a permission in that matrix could
+// not have expressed this without inventing a fake restaurant to hang it on.
+//
+// TODAY: superadmin only, per the owner's interim decision. Granting it to a
+// marketer role later is meant to be an edit to THIS map plus a User.Role that
+// exists — every call site already asks CanManagePlatformContent and nothing
+// else, so no usecase, handler or route has to change. What a marketer role
+// additionally needs is a global Role value of its own (User.Role today is
+// user / restaurant / admin) and a login that carries it; the platform-content
+// gate itself is one line here.
+var PlatformContentRoles = map[Role]bool{
+	RoleAdmin: true,
+}
+
+// CanManagePlatformContent reports whether a global role may manage the
+// platform's own promos and events. Unknown/empty roles may not — there is no
+// implicit allow, same posture as StaffRole.HasPermission.
+func CanManagePlatformContent(role Role) bool { return PlatformContentRoles[role] }

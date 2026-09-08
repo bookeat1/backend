@@ -15,6 +15,7 @@ type updateHarness struct {
 	uc       UpdateUseCase
 	bookings *fakeBookings
 	links    *fakeLinks
+	capacity *fakeCapacity
 	outbox   *fakeOutbox
 	tx       *fakeTx
 
@@ -40,6 +41,7 @@ func newUpdateHarness(t *testing.T, status domain.BookingStatus) *updateHarness 
 	h := &updateHarness{
 		bookings:     newFakeBookings(b),
 		links:        &fakeLinks{},
+		capacity:     newFakeCapacity(),
 		outbox:       &fakeOutbox{},
 		tx:           &fakeTx{},
 		booking:      b,
@@ -50,7 +52,7 @@ func newUpdateHarness(t *testing.T, status domain.BookingStatus) *updateHarness 
 		otherManager: Actor{UserID: uuid.New(), Role: domain.RoleRestaurant},
 	}
 	h.uc = NewUpdateUseCase(
-		h.bookings, h.links, h.outbox,
+		h.bookings, h.links, h.capacity, h.outbox,
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
 		&fakeSchedule{tables: []domain.RestaurantTable{table}},
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, rid}),

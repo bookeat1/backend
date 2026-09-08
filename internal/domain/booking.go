@@ -33,6 +33,13 @@ func (s BookingStatus) HoldsTable() bool {
 	return s == BookingPending || s == BookingConfirmed || s == BookingArrived
 }
 
+// StatusesHoldingTable lists the statuses HoldsTable reports true for, for
+// callers that need them as a filter value rather than as a predicate (e.g.
+// "every booking of this venue that still occupies a seat").
+func StatusesHoldingTable() []BookingStatus {
+	return []BookingStatus{BookingPending, BookingConfirmed, BookingArrived}
+}
+
 // Terminal reports whether no further transition is allowed from s.
 func (s BookingStatus) Terminal() bool { return len(bookingTransitions[s]) == 0 }
 
@@ -141,7 +148,25 @@ type BookingPolicy struct {
 	CancelDeadline      time.Duration // guest may cancel until starts_at - CancelDeadline
 	ConfirmSLA          time.Duration // pending → auto-confirm / escalation after this
 	MaxGuestsPerBooking int
-	AutoConfirm         bool
+	// AutoConfirm decides what happens when ConfirmSLA elapses on a booking the
+	// venue never answered: true confirms it, false escalates once and leaves
+	// the decision with the venue.
+	AutoConfirm bool
+	// ConfirmOnCreate decides whether a NEW booking is confirmed the moment it
+	// is made, without the venue ever seeing it as a request.
+	//
+	// It is deliberately a SEPARATE flag from AutoConfirm, which used to carry
+	// both meanings. One field could not express the arrangement venues
+	// actually want — "let me answer first, but do not leave the guest hanging
+	// if I am busy" — because turning instant confirmation off also turned the
+	// safety net off, and a silent venue left the guest pending forever.
+	ConfirmOnCreate bool
+	// CapacityMode selects the availability engine for this venue; see
+	// CapacityMode. Always a valid value after resolution (never empty).
+	CapacityMode CapacityMode
+	// CapacitySeats is the guests the venue can seat at once. Meaningful only
+	// when CapacityMode is CapacityModeSeats; zero otherwise.
+	CapacitySeats int
 }
 
 // BookingPolicyOverride is a restaurant's optional per-field override of the
@@ -156,6 +181,14 @@ type BookingPolicyOverride struct {
 	ConfirmSLAMinutes      *int
 	MaxGuestsPerBooking    *int
 	AutoConfirm            *bool
+	ConfirmOnCreate        *bool
+	// BookingCapacityMode / BookingCapacitySeats are the table-less switch
+	// (migration 0054). They follow the same PATCH semantics as the fields
+	// above — nil means "leave this column alone" — but a NULL
+	// booking_capacity_mode is not an env-backed default: it simply means
+	// CapacityModeTables, the behaviour every venue had before 0054.
+	BookingCapacityMode  *CapacityMode
+	BookingCapacitySeats *int
 }
 
 // Booking is a table reservation. ID equals the original Supabase id for
@@ -202,8 +235,15 @@ type BookingFilter struct {
 	Statuses     []BookingStatus
 	From         *time.Time // starts_at >= From
 	To           *time.Time // starts_at <  To
-	Page         int        // 1-based; <=0 means 1
-	PerPage      int        // <=0 means default (20), capped at 100
+	// CalendarDate is "the venue's day", still unresolved: a date carries no
+	// zone, so only the usecase — which knows WHOSE calendar is being asked
+	// about — may turn it into From/To. It never reaches a repository; the
+	// usecase replaces it with the resolved window first, and
+	// BookingRepository.List refuses a filter that still carries one rather
+	// than quietly listing a day that is nobody's.
+	CalendarDate *CalendarDate
+	Page         int // 1-based; <=0 means 1
+	PerPage      int // <=0 means default (20), capped at 100
 }
 
 // BookingRepository persists bookings. Get* return ErrNotFound when absent.
@@ -223,6 +263,75 @@ type BookingRepository interface {
 	// first, so a batch smaller than the candidate set never starves the rows
 	// that have been waiting longest.
 	ClaimDue(ctx context.Context, statuses []BookingStatus, by ClaimColumn, before time.Time, limit int) ([]Booking, error)
+	// ListLiveForReconcile returns, in ONE statement, every booking of the venue
+	// in the given statuses whose starts_at >= from, ordered by starts_at then
+	// id, capped at limit (and at ReconcileProbeLimit whatever the caller asks
+	// for — one row past MaxReconcileBookings, so the caller can tell "exactly
+	// at the cap" from "truncated"; see ReconcileProbeLimit).
+	//
+	// It exists because List's OFFSET pagination cannot be used to read a set
+	// that must be reconciled as a whole: the enclosing transaction is READ
+	// COMMITTED, so every page is a fresh snapshot, and a status change that
+	// commits between two pages (a guest cancelling — status.go takes no venue
+	// lock) shifts the window and one row is never returned at all. A single
+	// statement sees a single snapshot, which is the property the caller needs.
+	//
+	// The order is ascending and total (starts_at, then id) because the caller
+	// makes decisions whose outcome depends on the order it walks the set in,
+	// and a retry of the same operation must reach the same answer.
+	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []BookingStatus, limit int) ([]Booking, error)
+}
+
+// MaxReconcileBookings is the hard cap on how many bookings one whole-set
+// reconciliation (a capacity-mode switch) may load and rewrite.
+//
+// It is a real product limit, not a paging size: the switch runs 4-5 statements
+// per booking under the venue's advisory lock, inside an HTTP request whose
+// write timeout is 15s (bootstrap/app.go). Past some size the switch cannot
+// finish in time — and the failure mode without a cap is the worst one
+// available: the request dies on timeout, the transaction rolls back, and the
+// venue lock is held meanwhile so ordinary booking creates block behind a
+// switch that will never succeed. With the cap the switch is refused
+// immediately, loudly, and with something staff can act on.
+const MaxReconcileBookings = 300
+
+// ReconcileProbeLimit is what a caller actually asks ListLiveForReconcile for:
+// one row MORE than it is allowed to process.
+//
+// Without the extra row "I got exactly MaxReconcileBookings" is ambiguous — it
+// means either "the venue has exactly that many" (safe to reconcile) or "it has
+// more and the set is truncated" (unsafe, nothing about it can be trusted). The
+// caller has to assume the unsafe reading, so a venue sitting on exactly 300
+// live bookings is locked out of switching modes until one of them goes
+// inactive, for no real reason.
+//
+// Reading one row past the cap removes the ambiguity at the cost of a single
+// row: at most MaxReconcileBookings rows means the set is COMPLETE, and more
+// than that is a genuine, honest truncation signal.
+const ReconcileProbeLimit = MaxReconcileBookings + 1
+
+// BookingReminderRepository backs the pre-visit guest reminder pass. It is a
+// port of its own, separate from BookingRepository, because the reminder marker
+// (bookings.guest_reminder_sent_at) is deliberately NOT a field of Booking: it
+// is worker bookkeeping written through these two methods only, so a full-row
+// Update from any other path can never clobber it.
+type BookingReminderRepository interface {
+	// ClaimDueReminders locks up to limit bookings whose visit starts inside
+	// (from, to] and that have not been reminded yet, with FOR UPDATE SKIP
+	// LOCKED. It returns only bookings that are still LIVE (pending / confirmed
+	// / waitlist) and belong to a guest ACCOUNT (user_id NOT NULL) — a cancelled
+	// visit is never reminded, and a phone booking has no device to remind.
+	//
+	// A booking created after its own reminder point (the guest booked less than
+	// the reminder lead before the visit) is skipped: they just made it, a
+	// "don't forget" a minute later is noise.
+	ClaimDueReminders(ctx context.Context, from, to time.Time, limit int) ([]Booking, error)
+	// MarkReminderSent stamps the reminder marker and reports whether THIS call
+	// is the one that stamped it. It is the idempotency arbiter: false means the
+	// booking was already reminded or is no longer live, and the caller must not
+	// emit the event. Call it inside the same transaction as the outbox insert,
+	// so the stamp and the event commit together or not at all.
+	MarkReminderSent(ctx context.Context, bookingID uuid.UUID, at time.Time) (bool, error)
 }
 
 // ClaimColumn names the timestamp ClaimDue compares against its cutoff. It is a

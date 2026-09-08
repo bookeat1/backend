@@ -3,6 +3,7 @@ package bookings
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ type createHarness struct {
 	uc        CreateUseCase
 	bookings  *fakeBookings
 	links     *fakeLinks
+	capacity  *fakeCapacity
 	items     *fakeItems
 	history   *fakeHistory
 	outbox    *fakeOutbox
@@ -42,6 +44,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 	h := &createHarness{
 		bookings:  newFakeBookings(),
 		links:     &fakeLinks{},
+		capacity:  newFakeCapacity(),
 		items:     &fakeItems{},
 		history:   &fakeHistory{},
 		outbox:    &fakeOutbox{},
@@ -62,7 +65,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 	h.startsAt = time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
 
 	h.uc = NewCreateUseCase(
-		h.bookings, h.links, h.items, h.history, h.outbox, h.blacklist, h.rateLog,
+		h.bookings, h.links, h.capacity, h.items, h.history, h.outbox, h.blacklist, h.rateLog,
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
 			ID: rid, IsActive: true, BookingPolicy: override,
 		}}},
@@ -82,8 +85,13 @@ func (h *createHarness) input() CreateInput {
 	}
 }
 
+// Instant confirmation is no longer the default (a venue answers its own
+// bookings — see confirm_on_create_test.go), so this test asks for it
+// explicitly. Everything else it checks — contact normalisation, duration,
+// table choice, the buffer around the slot — is unchanged.
 func TestCreateAutoConfirm(t *testing.T) {
-	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	confirmOnCreate := true
+	h := newCreateHarness(t, domain.BookingPolicyOverride{ConfirmOnCreate: &confirmOnCreate})
 
 	got, err := h.uc.Create(context.Background(), h.guest, h.input())
 	if err != nil {
@@ -433,7 +441,7 @@ func TestCreateLosesRace(t *testing.T) {
 func TestCreateInactiveRestaurant(t *testing.T) {
 	rid := uuid.New()
 	uc := NewCreateUseCase(
-		newFakeBookings(), &fakeLinks{}, &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
+		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
 		&fakeBlacklist{}, &fakeRateLog{},
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid}}},
 		&fakeSchedule{}, newFakeManagers(), &fakeTx{}, testConfig(),
@@ -468,4 +476,42 @@ func TestCreateStaffWindowIsRelaxed(t *testing.T) {
 	if _, err := h2.uc.Create(context.Background(), h2.manager, in2); err != nil {
 		t.Fatalf("staff off-grid = %v, want success", err)
 	}
+}
+
+// TestCreateConflictCodes pins the machine-readable identity of the two 409s
+// this usecase can produce. Both wrap ErrAlreadyExists, so the status and the
+// message cannot tell them apart — only the code can, and a client that
+// mistakes "the slot went to somebody else" for "you already booked this" sends
+// the guest to a reservation that does not exist.
+func TestCreateConflictCodes(t *testing.T) {
+	t.Run("lost exclusion race", func(t *testing.T) {
+		h := newCreateHarness(t, domain.BookingPolicyOverride{})
+		// What Postgres returns when the GiST exclusion constraint on
+		// booking_tables rejects the insert.
+		h.links.createErr = fmt.Errorf("%w: booking tables", domain.ErrAlreadyExists)
+
+		_, err := h.uc.Create(context.Background(), h.guest, h.input())
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			t.Fatalf("Create = %v, want ErrAlreadyExists", err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok || code != domain.CodeSlotTaken {
+			t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeSlotTaken)
+		}
+	})
+
+	t.Run("no table fits the party", func(t *testing.T) {
+		h := newCreateHarness(t, domain.BookingPolicyOverride{})
+		in := h.input()
+		in.Guests = 7 // the venue seats 4 + 2 — seven never fits
+
+		_, err := h.uc.Create(context.Background(), h.guest, in)
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			t.Fatalf("Create = %v, want ErrAlreadyExists", err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok || code != domain.CodeNoTableAvailable {
+			t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeNoTableAvailable)
+		}
+	})
 }

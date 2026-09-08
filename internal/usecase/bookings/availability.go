@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,19 +17,34 @@ const DateLayout = "2006-01-02"
 // Reasons a slot is not bookable. Returned to the client so the UI can explain
 // itself instead of showing an unexplained greyed-out slot.
 const (
-	ReasonTooSoon  = "too_soon"       // closer than policy.Lead
-	ReasonHorizon  = "beyond_horizon" // further than policy.HorizonDays
-	ReasonOccupied = "occupied"       // no free table (or combination) left
-	ReasonCapacity = "capacity"       // venue has no tables that can seat the party at all
+	ReasonTooSoon = "too_soon"       // closer than policy.Lead
+	ReasonHorizon = "beyond_horizon" // further than policy.HorizonDays
+	// ReasonOccupied — the venue could seat the party, but not now: no free
+	// table (or combination) left in table mode, no free seats in capacity mode.
+	ReasonOccupied = "occupied"
+	// ReasonCapacity — the venue could never seat this party: no table or
+	// combination is big enough in table mode, the declared total capacity is
+	// smaller than the request in capacity mode.
+	ReasonCapacity = "capacity"
 )
 
 // Slot is one bookable start time of a day.
 type Slot struct {
-	StartsAt   time.Time
-	EndsAt     time.Time
-	Available  bool
-	FreeTables int    // tables free for the whole slot (incl. buffer)
-	Reason     string // empty when Available
+	StartsAt  time.Time
+	EndsAt    time.Time
+	Available bool
+	// FreeTables is, in table mode, the tables free for the whole slot
+	// (buffer included). In capacity mode the venue HAS no tables, so it
+	// carries how many further parties OF THIS SIZE still fit — a number with
+	// the same two properties the field always had (zero exactly when the slot
+	// is unavailable, larger when there is more room) and without claiming a
+	// table that does not exist. Read RemainingSeats for the honest figure.
+	FreeTables int
+	// RemainingSeats is the guests that still fit in this slot. Set only in
+	// capacity mode; nil in table mode, where "seats left" is not a number the
+	// venue's table layout can answer.
+	RemainingSeats *int
+	Reason         string // empty when Available
 }
 
 // DayAvailability is the answer of GET /api/restaurants/{id}/availability.
@@ -41,7 +54,15 @@ type DayAvailability struct {
 	Timezone        string
 	Guests          int
 	DurationMinutes int
-	Slots           []Slot
+	// CapacityMode tells the client HOW to read the slots below: "tables" =
+	// FreeTables is a table count, "seats" = the venue is table-less and
+	// RemainingSeats is the meaningful figure.
+	CapacityMode domain.CapacityMode
+	// CapacitySeats is the venue's declared total capacity, non-zero only in
+	// capacity mode. It lets the client render "5 of 40 seats left" without a
+	// second request.
+	CapacitySeats int
+	Slots         []Slot
 }
 
 // AvailabilityUseCase computes bookable slots for one calendar day (spec §6).
@@ -52,19 +73,26 @@ type AvailabilityUseCase interface {
 
 type availabilityUseCase struct {
 	links       domain.BookingTableRepository
+	capacity    capacityReader
 	restaurants restaurantReader
 	schedule    scheduleReader
 	cfg         Config
 }
 
-// NewAvailabilityUseCase constructs the availability engine.
+// NewAvailabilityUseCase constructs the availability engine. capacity may be
+// nil, in which case a venue configured for table-less mode simply reports no
+// bookable slot — the engine never guesses at occupancy it cannot read.
 func NewAvailabilityUseCase(
 	links domain.BookingTableRepository,
+	capacity capacityReader,
 	restaurants restaurantReader,
 	schedule scheduleReader,
 	cfg Config,
 ) AvailabilityUseCase {
-	return &availabilityUseCase{links: links, restaurants: restaurants, schedule: schedule, cfg: cfg.withDefaults()}
+	return &availabilityUseCase{
+		links: links, capacity: capacity, restaurants: restaurants,
+		schedule: schedule, cfg: cfg.withDefaults(),
+	}
 }
 
 func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, date string, guests int) (*DayAvailability, error) {
@@ -82,7 +110,7 @@ func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, d
 		return nil, fmt.Errorf("%w: date must be YYYY-MM-DD", domain.ErrValidation)
 	}
 
-	sched, err := u.loadSchedule(ctx, restaurantID)
+	sched, err := u.loadSchedule(ctx, restaurantID, day)
 	if err != nil {
 		return nil, err
 	}
@@ -94,43 +122,115 @@ func (u *availabilityUseCase) Day(ctx context.Context, restaurantID uuid.UUID, d
 		Timezone:        policy.Timezone,
 		Guests:          guests,
 		DurationMinutes: int(policy.Duration / time.Minute),
+		CapacityMode:    policy.CapacityMode,
+		CapacitySeats:   policy.CapacitySeats,
 		Slots:           make([]Slot, 0, len(starts)),
 	}
 	if len(starts) == 0 {
 		return out, nil
 	}
 
-	// One busy query for the whole day, widened by the occupancy window so a
-	// booking starting the previous evening still shows up.
+	// One occupancy query for the whole day, widened by the occupancy window so
+	// a booking starting the previous evening still shows up.
 	span := policy.Duration + 2*policy.Buffer
-	busy, err := u.links.ListBusy(ctx, restaurantID,
-		starts[0].Add(-span), starts[len(starts)-1].Add(span))
+	from, to := starts[0].Add(-span), starts[len(starts)-1].Add(span)
+	now := time.Now()
+
+	if policy.CapacityMode == domain.CapacityModeSeats {
+		usage, err := u.loadUsage(ctx, restaurantID, from, to)
+		if err != nil {
+			return nil, err
+		}
+		for _, start := range starts {
+			out.Slots = append(out.Slots, evaluateSeatsSlot(start, guests, policy, usage, now))
+		}
+		return out, nil
+	}
+
+	busy, err := u.links.ListBusy(ctx, restaurantID, from, to)
 	if err != nil {
 		return nil, err
 	}
-
-	now := time.Now()
 	for _, start := range starts {
 		out.Slots = append(out.Slots, evaluateSlot(start, guests, policy, sched.tables, busy, now))
 	}
 	return out, nil
 }
 
+// loadUsage reads the venue's sold seats for the day. With no capacity
+// repository wired the engine refuses to answer rather than report an empty —
+// i.e. wide open — day for a venue whose occupancy it cannot see.
+func (u *availabilityUseCase) loadUsage(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) (map[time.Time]domain.CapacityUsage, error) {
+	if u.capacity == nil {
+		return nil, fmt.Errorf("%w: capacity availability is not configured", domain.ErrValidation)
+	}
+	rows, err := u.capacity.ListUsage(ctx, restaurantID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return usageIndex(rows), nil
+}
+
 // schedule is the venue's day-shape inputs, loaded once per request.
 type schedule struct {
-	hours  []domain.WorkingHours
-	slots  []domain.TimeSlot
-	tables []domain.RestaurantTable
+	hours []domain.WorkingHours
+	// overrides are the venue's special-day exceptions
+	// (restaurant_schedule_overrides). They live HERE, next to the weekly
+	// hours, because every consumer of a venue's day shape — availability,
+	// create, update — reads this struct through loadSchedule: a caller cannot
+	// get the hours without also getting the exceptions to them.
+	overrides []domain.ScheduleOverride
+	slots     []domain.TimeSlot
+	tables    []domain.RestaurantTable
 }
 
-func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uuid.UUID) (schedule, error) {
-	return loadSchedule(ctx, u.schedule, restaurantID)
+func (u *availabilityUseCase) loadSchedule(ctx context.Context, restaurantID uuid.UUID, day time.Time) (schedule, error) {
+	return loadSchedule(ctx, u.schedule, restaurantID, day, day)
 }
 
-// loadSchedule reads opening hours, bookable slots and the active tables of a
-// venue. Inactive tables are dropped here so no caller can forget to.
-func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID) (schedule, error) {
+// overrideLookaround is how many calendar days on each side of the dates a
+// request is about the engine loads special-day overrides for.
+//
+// Two, and here is the arithmetic, because the obvious answer is zero and it is
+// wrong:
+//   - the engine also evaluates the PREVIOUS calendar day, so a venue closing
+//     past midnight still answers for a 01:00 start (withinOpeningHours,
+//     isBookableStart, domain.IsOpenAt) — that is one day back;
+//   - an override window that starts on day D can run into D+1 — one day
+//     forward;
+//   - the from/to handed to the repository are instants, turned into bare
+//     calendar dates in whatever location they carry, while override_date is
+//     the VENUE's local date. Venues sit up to 14 hours off UTC, so the date
+//     can be off by one in either direction.
+//
+// One day covers each of those alone; two covers them together, and the extra
+// row or two it may read costs nothing. It is a safety margin, not a semantic
+// boundary — the engine still matches overrides by exact date.
+const overrideLookaround = 2
+
+// loadSchedule reads opening hours, special-day overrides, bookable slots and
+// the active tables of a venue. Inactive tables are dropped here so no caller
+// can forget to.
+//
+// [from, to] are the instants the caller is going to ask the schedule about —
+// one date for availability and create, two for an update that moves a booking.
+// Overrides are loaded only around them: the whole history is never needed, and
+// reading it on every request made the cost of an availability call grow with
+// the number of holidays the venue had ever entered.
+//
+// Anchoring on the REQUESTED instants, not on time.Now(), is what preserves the
+// property the unbounded query used to give for free: availability for a date
+// in the past resolves its override exactly like one in the future.
+func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID, from, to time.Time) (schedule, error) {
+	if to.Before(from) {
+		from, to = to, from
+	}
 	hours, err := r.ListWorkingHours(ctx, restaurantID)
+	if err != nil {
+		return schedule{}, err
+	}
+	overrides, err := r.ListScheduleOverrides(ctx, restaurantID,
+		from.AddDate(0, 0, -overrideLookaround), to.AddDate(0, 0, overrideLookaround))
 	if err != nil {
 		return schedule{}, err
 	}
@@ -148,7 +248,7 @@ func loadSchedule(ctx context.Context, r scheduleReader, restaurantID uuid.UUID)
 			active = append(active, t)
 		}
 	}
-	return schedule{hours: hours, slots: slots, tables: active}, nil
+	return schedule{hours: hours, overrides: overrides, slots: slots, tables: active}, nil
 }
 
 // evaluateSlot decides whether one start time can seat the party.
@@ -272,7 +372,10 @@ func totalCapacity(tables []domain.RestaurantTable) int {
 func candidateStarts(s schedule, day time.Time, policy domain.BookingPolicy, step time.Duration) []time.Time {
 	loc := day.Location()
 	dow := int(day.Weekday())
-	open, close_, ok := openingWindow(s.hours, dow, day, loc)
+	// The window already has the venue's special-day override applied: a date
+	// closed by an override has no window, so it produces NO start times at
+	// all, whatever the weekly hours and the explicit time-slot rows say.
+	open, close_, ok := openingWindow(s, day, loc)
 	if !ok {
 		return nil
 	}
@@ -306,59 +409,25 @@ func candidateStarts(s schedule, day time.Time, policy domain.BookingPolicy, ste
 	return out
 }
 
-// openingWindow returns [open, close) for the weekday in the venue's timezone.
-// A close time that is not after the open time is treated as past midnight
-// (e.g. 18:00–02:00) and rolls into the next day.
-func openingWindow(hours []domain.WorkingHours, dow int, day time.Time, loc *time.Location) (time.Time, time.Time, bool) {
-	for _, h := range hours {
-		if h.DayOfWeek != dow {
-			continue
-		}
-		if !h.IsOpen || h.OpenTime == nil || h.CloseTime == nil {
-			return time.Time{}, time.Time{}, false
-		}
-		openMin, err := parseClock(*h.OpenTime)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-		closeMin, err := parseClock(*h.CloseTime)
-		if err != nil {
-			return time.Time{}, time.Time{}, false
-		}
-		base := startOfDay(day, loc)
-		open := base.Add(time.Duration(openMin) * time.Minute)
-		close_ := base.Add(time.Duration(closeMin) * time.Minute)
-		if !close_.After(open) {
-			close_ = close_.AddDate(0, 0, 1)
-		}
-		return open, close_, true
-	}
-	return time.Time{}, time.Time{}, false
+// openingWindow returns [open, close) for one calendar day in the venue's
+// timezone, with the venue's special-day overrides applied. A close time that
+// is not after the open time is treated as past midnight (e.g. 18:00–02:00) and
+// rolls into the next day.
+//
+// It delegates to domain.OpeningWindow and takes the whole schedule (hours AND
+// overrides) rather than the hours alone: the public catalog payload reports the
+// same days to guests through the same function, and the two must never drift
+// apart again.
+func openingWindow(s schedule, day time.Time, loc *time.Location) (time.Time, time.Time, bool) {
+	return domain.OpeningWindow(s.hours, s.overrides, day, loc)
 }
 
-// startOfDay returns midnight of t's calendar day in loc. Built from the date
-// parts (not by truncation) so DST transitions are handled by the location.
+// startOfDay returns midnight of t's calendar day in loc.
 func startOfDay(t time.Time, loc *time.Location) time.Time {
-	y, m, d := t.In(loc).Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, loc)
+	return domain.StartOfDay(t, loc)
 }
 
 // parseClock parses "HH:MM" or "HH:MM:SS" into minutes since midnight.
 func parseClock(v string) (int, error) {
-	parts := strings.Split(strings.TrimSpace(v), ":")
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	h, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	m, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	if h < 0 || h > 47 || m < 0 || m > 59 {
-		return 0, fmt.Errorf("%w: bad clock value %q", domain.ErrValidation, v)
-	}
-	return h*60 + m, nil
+	return domain.ParseClockMinutes(v)
 }

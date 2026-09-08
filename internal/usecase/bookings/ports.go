@@ -34,11 +34,43 @@ type policyWriter interface {
 }
 
 // scheduleReader is the minimal slice of the restaurant "related" repository
-// used by the availability engine (opening hours, bookable slots, tables).
+// used by the availability engine (opening hours, special-day overrides,
+// bookable slots, tables).
+//
+// ListScheduleOverrides is part of THIS port rather than a separate optional
+// dependency on purpose: a venue's exceptions are not an enhancement of its
+// hours, they are part of them, and an engine that can be wired without them
+// is an engine that will one day sell a table on a holiday again.
 type scheduleReader interface {
 	ListWorkingHours(ctx context.Context, restaurantID uuid.UUID) ([]domain.WorkingHours, error)
+	// ListScheduleOverrides returns the venue's special-day exceptions
+	// (restaurant_schedule_overrides) for the calendar dates in [from, to].
+	//
+	// The window is part of the port rather than an implementation detail: this
+	// call happens on every availability, create and update request, and the
+	// engine resolves overrides by EXACT date, so anything outside a couple of
+	// days around the requested one can never change an answer. Without the
+	// bound the read grows with every holiday a venue has ever entered.
+	//
+	// [from, to] is anchored on the requested date, never on "now" — a past
+	// date must resolve its override exactly like a future one. Callers widen
+	// it by overrideLookaround days; see loadSchedule.
+	ListScheduleOverrides(ctx context.Context, restaurantID uuid.UUID, from, to time.Time) ([]domain.ScheduleOverride, error)
 	ListTimeSlots(ctx context.Context, restaurantID uuid.UUID) ([]domain.TimeSlot, error)
 	ListTables(ctx context.Context, restaurantID uuid.UUID) ([]domain.RestaurantTable, error)
+}
+
+// bookingLister is the read slice of the booking repository needed to walk a
+// venue's future bookings when its capacity mode changes. Declared separately
+// from domain.BookingRepository so the policy usecase cannot write bookings.
+//
+// Only the single-statement read is exposed, deliberately: the paginated List is
+// unusable for this job (see the port doc on domain.BookingRepository — a
+// cancellation committing between two pages hides a booking from the
+// reconciliation entirely), and a port that does not offer it cannot be misused
+// for it again.
+type bookingLister interface {
+	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []domain.BookingStatus, limit int) ([]domain.Booking, error)
 }
 
 // managerChecker answers whether a user manages a restaurant. Bound to
@@ -58,7 +90,10 @@ type Config struct {
 	DefaultConfirmSLA     time.Duration
 	DefaultMaxGuests      int
 	DefaultAutoConfirm    bool
-	TimezoneFallback      string
+	// DefaultConfirmOnCreate: confirm a new booking immediately, without the
+	// venue seeing it as a request. Off by default — see BookingPolicy.
+	DefaultConfirmOnCreate bool
+	TimezoneFallback       string
 
 	// RateWindow / RateLimit throttle booking attempts per normalized phone
 	// (booking_rate_log). Zero values fall back to the constants below.

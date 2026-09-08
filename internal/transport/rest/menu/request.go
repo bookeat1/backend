@@ -23,9 +23,13 @@ type menuItemRequest struct {
 	SubcategoryI18n map[string]string `json:"subcategory_i18n"`
 	PortionSize     *string           `json:"portion_size"`
 	PortionSizeI18n map[string]string `json:"portion_size_i18n"`
-	Language        *string           `json:"language"`
-	DisplayOrder    *int              `json:"display_order"`
-	Tags            *[]string         `json:"tags"`
+	// Language labels the row's own text. The only values a write accepts are
+	// null and "ru": a dish row IS the base row, translations go into the
+	// *_i18n maps. Anything else is refused with code
+	// menu_item_language_not_base — see checkBaseLanguage in usecase/menu.
+	Language     *string   `json:"language"`
+	DisplayOrder *int      `json:"display_order"`
+	Tags         *[]string `json:"tags"`
 }
 
 func (r menuItemRequest) toInput() uc.ItemInput {
@@ -41,6 +45,36 @@ func (r menuItemRequest) toInput() uc.ItemInput {
 
 type availabilityRequest struct {
 	IsAvailable bool `json:"is_available"`
+}
+
+type featuredRequest struct {
+	IsFeatured bool `json:"is_featured"`
+}
+
+// topPickRequest is the body of PATCH .../menu-items/:itemId/top-pick.
+type topPickRequest struct {
+	IsTopPick bool `json:"is_top_pick"`
+}
+
+// topPicksOrderRequest is the body of PUT /restaurants/:id/menu-highlights:
+// the venue's whole rail, in order. An empty (but present) list clears it.
+type topPicksOrderRequest struct {
+	ItemIDs []string `json:"item_ids"`
+}
+
+// toUUIDs parses the ordered ids, keeping the order. A malformed id is a 422
+// for the whole request: partially applying an ordering nobody asked for would
+// leave the rail in a state the panel never described.
+func (r topPicksOrderRequest) toUUIDs() ([]uuid.UUID, error) {
+	out := make([]uuid.UUID, 0, len(r.ItemIDs))
+	for _, raw := range r.ItemIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid item id %q", domain.ErrValidation, raw)
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 type menuCategoryRequest struct {

@@ -67,6 +67,10 @@ func (f fakeManagerChecker) Manages(context.Context, uuid.UUID, uuid.UUID) (bool
 	return f.manages, nil
 }
 
+func (f fakeManagerChecker) HasPermission(context.Context, uuid.UUID, uuid.UUID, domain.Permission) (bool, error) {
+	return f.manages, nil
+}
+
 // fakeCancelDeadline is the tiny cancelDeadlineResolver port: a booking may
 // always be cancelled up to deadline, regardless of its own StartsAt — good
 // enough for handler-level tests, which never assert on the exact settlement
@@ -75,6 +79,15 @@ type fakeCancelDeadline struct{ deadline time.Time }
 
 func (f fakeCancelDeadline) CancelDeadlineFor(context.Context, domain.Booking) (time.Time, error) {
 	return f.deadline, nil
+}
+
+// noSpecialDays is a specialDayResolver that never reports a paid special day —
+// these handler tests exercise the ordinary (default) deposit/preorder path;
+// the paid-special-day decision has its own unit tests in usecase/payments.
+type noSpecialDays struct{}
+
+func (noSpecialDays) PaidSpecialDayFor(context.Context, uuid.UUID, time.Time) (bool, int64, error) {
+	return false, 0, nil
 }
 
 // testEnv wires the real Postgres repositories and real usecases behind the
@@ -138,7 +151,7 @@ func newTestEnvWithConfigSamePool(t *testing.T, pool *pgxpool.Pool, mutate func(
 		mutate(&cfg)
 	}
 
-	create := uc.NewCreateUseCase(paymentsRepo, outboxRepo, bookingRepo, bookingItems, restRepo, registry, managers, txm, cfg)
+	create := uc.NewCreateUseCase(paymentsRepo, outboxRepo, bookingRepo, bookingItems, restRepo, noSpecialDays{}, registry, managers, txm, cfg)
 	capture := uc.NewCaptureUseCase(paymentsRepo, ledgerRepo, outboxRepo, registry, managers, txm)
 	void := uc.NewVoidUseCase(paymentsRepo, outboxRepo, registry, managers, txm)
 	refund := uc.NewRefundUseCase(paymentsRepo, refundsRepo, ledgerRepo, outboxRepo, registry, managers, bookingRepo, deadline, txm, cfg)
@@ -271,8 +284,14 @@ func TestCreatePayment_GuestAnonymousCheckout(t *testing.T) {
 	if resp.PaymentURL == nil || *resp.PaymentURL == "" {
 		t.Error("expected a payment_url to redirect the guest to")
 	}
-	if resp.AmountMinor != 10350 { // 10000 deposit + 3.5% fee, rounded up
-		t.Errorf("amount_minor = %d, want 10350", resp.AmountMinor)
+	// 10000 deposit grossed up for a 3.5% acquirer cut: ceil(10000×10000/9650)
+	// = 10363, so the venue nets the full 10000 after the acquirer's cut.
+	if resp.AmountMinor != 10363 {
+		t.Errorf("amount_minor = %d, want 10363 (gross-up for 3.5%% acquirer)", resp.AmountMinor)
+	}
+	// Worst-case acquirer cut (ceiling): the venue still nets the full deposit.
+	if net := resp.AmountMinor - (resp.AmountMinor*350+9_999)/10_000; net < 10000 {
+		t.Errorf("net to venue %d < deposit 10000 — venue is short", net)
 	}
 }
 

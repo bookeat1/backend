@@ -36,8 +36,14 @@ type bookingResponse struct {
 
 type bookingDetailsResponse struct {
 	bookingResponse
-	Items  []bookingItemResponse  `json:"items"`
-	Tables []bookingTableResponse `json:"tables"`
+	// FreeCancelDeadline is the absolute moment free cancellation ends
+	// (starts_at − the venue's free_cancel_window_minutes). The client renders
+	// a live countdown from it. Null for a booking that can no longer be
+	// cancelled; still present (in the past) once the window has elapsed so the
+	// app can show the "paid cancellation" state. Additive, backward-compatible.
+	FreeCancelDeadline *time.Time             `json:"free_cancel_deadline"`
+	Items              []bookingItemResponse  `json:"items"`
+	Tables             []bookingTableResponse `json:"tables"`
 }
 
 type bookingItemResponse struct {
@@ -88,20 +94,34 @@ type surveyResponse struct {
 }
 
 type slotResponse struct {
-	StartsAt   time.Time `json:"starts_at"`
-	EndsAt     time.Time `json:"ends_at"`
-	Available  bool      `json:"available"`
-	FreeTables int       `json:"free_tables"`
-	Reason     string    `json:"reason,omitempty"`
+	StartsAt  time.Time `json:"starts_at"`
+	EndsAt    time.Time `json:"ends_at"`
+	Available bool      `json:"available"`
+	// FreeTables keeps its name for the clients already shipped. In capacity
+	// mode the venue has no tables and this is how many further parties of the
+	// requested size still fit — zero exactly when the slot is unavailable, as
+	// it has always been. New clients should branch on capacity_mode and render
+	// remaining_seats instead.
+	FreeTables int `json:"free_tables"`
+	// RemainingSeats is present only in capacity mode: the guests that still
+	// fit in this slot. Absent (null) for a venue booking by tables, where the
+	// number would be a fabrication.
+	RemainingSeats *int   `json:"remaining_seats,omitempty"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 type availabilityResponse struct {
-	RestaurantID    string         `json:"restaurant_id"`
-	Date            string         `json:"date"`
-	Timezone        string         `json:"timezone"`
-	Guests          int            `json:"guests"`
-	DurationMinutes int            `json:"duration_minutes"`
-	Slots           []slotResponse `json:"slots"`
+	RestaurantID    string `json:"restaurant_id"`
+	Date            string `json:"date"`
+	Timezone        string `json:"timezone"`
+	Guests          int    `json:"guests"`
+	DurationMinutes int    `json:"duration_minutes"`
+	// CapacityMode is "tables" or "seats" and tells the client how to read the
+	// slots: which of free_tables / remaining_seats is the meaningful figure.
+	CapacityMode string `json:"capacity_mode"`
+	// CapacitySeats is the venue's declared total capacity, 0 in table mode.
+	CapacitySeats int            `json:"capacity_seats"`
+	Slots         []slotResponse `json:"slots"`
 }
 
 type blacklistResponse struct {
@@ -146,9 +166,10 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 
 func detailsToResponse(d *uc.BookingDetails) bookingDetailsResponse {
 	out := bookingDetailsResponse{
-		bookingResponse: bookingToResponse(d.Booking),
-		Items:           make([]bookingItemResponse, 0, len(d.Items)),
-		Tables:          make([]bookingTableResponse, 0, len(d.Tables)),
+		bookingResponse:    bookingToResponse(d.Booking),
+		FreeCancelDeadline: d.FreeCancelDeadline,
+		Items:              make([]bookingItemResponse, 0, len(d.Items)),
+		Tables:             make([]bookingTableResponse, 0, len(d.Tables)),
 	}
 	for _, it := range d.Items {
 		out.Items = append(out.Items, bookingItemResponse{
@@ -183,16 +204,24 @@ func surveyToResponse(s *domain.RestaurantSurvey) surveyResponse {
 	}
 }
 
+// availabilityToResponse maps the engine's answer to the wire DTO.
+//
+// CapacityMode/CapacitySeats are copied here and not derived from the slots:
+// they are the summary a client reads INSTEAD of scanning the slots, so the two
+// must come from the same source. Leaving them out (as this mapper once did)
+// published `"capacity_mode":"", "capacity_seats":0` next to slots carrying
+// remaining_seats — a payload that contradicted itself.
 func availabilityToResponse(d *uc.DayAvailability) availabilityResponse {
 	out := availabilityResponse{
 		RestaurantID: d.RestaurantID.String(), Date: d.Date, Timezone: d.Timezone,
 		Guests: d.Guests, DurationMinutes: d.DurationMinutes,
+		CapacityMode: string(d.CapacityMode), CapacitySeats: d.CapacitySeats,
 		Slots: make([]slotResponse, 0, len(d.Slots)),
 	}
 	for _, s := range d.Slots {
 		out.Slots = append(out.Slots, slotResponse{
 			StartsAt: s.StartsAt, EndsAt: s.EndsAt, Available: s.Available,
-			FreeTables: s.FreeTables, Reason: s.Reason,
+			FreeTables: s.FreeTables, RemainingSeats: s.RemainingSeats, Reason: s.Reason,
 		})
 	}
 	return out
@@ -248,6 +277,9 @@ type effectiveBookingPolicy struct {
 	ConfirmSLAMinutes     int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking   int    `json:"max_guests_per_booking"`
 	AutoConfirm           bool   `json:"auto_confirm"`
+	ConfirmOnCreate       bool   `json:"confirm_on_create"`
+	CapacityMode          string `json:"capacity_mode"`
+	CapacitySeats         int    `json:"capacity_seats"`
 }
 
 type bookingPolicyOverrideBlock struct {
@@ -260,6 +292,9 @@ type bookingPolicyOverrideBlock struct {
 	ConfirmSLAMinutes      *int    `json:"confirm_sla_minutes"`
 	MaxGuestsPerBooking    *int    `json:"max_guests_per_booking"`
 	AutoConfirm            *bool   `json:"auto_confirm"`
+	ConfirmOnCreate        *bool   `json:"confirm_on_create"`
+	BookingCapacityMode    *string `json:"booking_capacity_mode"`
+	BookingCapacitySeats   *int    `json:"booking_capacity_seats"`
 }
 
 func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyResponse {
@@ -276,6 +311,9 @@ func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyRespon
 			ConfirmSLAMinutes:     int(e.ConfirmSLA / time.Minute),
 			MaxGuestsPerBooking:   e.MaxGuestsPerBooking,
 			AutoConfirm:           e.AutoConfirm,
+			ConfirmOnCreate:       e.ConfirmOnCreate,
+			CapacityMode:          string(e.CapacityMode),
+			CapacitySeats:         e.CapacitySeats,
 		},
 		Overrides: bookingPolicyOverrideBlock{
 			Timezone:               o.Timezone,
@@ -287,6 +325,19 @@ func policyToResponse(restaurantID string, v *uc.PolicyView) bookingPolicyRespon
 			ConfirmSLAMinutes:      o.ConfirmSLAMinutes,
 			MaxGuestsPerBooking:    o.MaxGuestsPerBooking,
 			AutoConfirm:            o.AutoConfirm,
+			ConfirmOnCreate:        o.ConfirmOnCreate,
+			BookingCapacityMode:    capacityModePtr(o.BookingCapacityMode),
+			BookingCapacitySeats:   o.BookingCapacitySeats,
 		},
 	}
+}
+
+// capacityModePtr renders a stored capacity mode as a plain string pointer,
+// keeping null = "this venue never chose, it books by tables".
+func capacityModePtr(m *domain.CapacityMode) *string {
+	if m == nil {
+		return nil
+	}
+	s := string(*m)
+	return &s
 }

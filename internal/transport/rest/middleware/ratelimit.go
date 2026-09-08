@@ -207,19 +207,56 @@ var exemptRoutes = map[string]bool{
 // regardless of the concrete id in the URL.
 var routeTiers = map[string]RateLimitTier{
 	// Public sensitive: booking/OTP/payment/checkout creation. See TierStrict's doc.
-	"POST /api/v1/auth/signup":                 TierStrict,
-	"POST /api/v1/auth/login":                  TierStrict,
-	"POST /api/v1/auth/otp/request":            TierStrict,
-	"POST /api/v1/auth/otp/verify":             TierStrict,
+	"POST /api/v1/auth/signup":      TierStrict,
+	"POST /api/v1/auth/login":       TierStrict,
+	"POST /api/v1/auth/otp/request": TierStrict,
+	"POST /api/v1/auth/otp/verify":  TierStrict,
+	// The Telegram mini app's FIRST sign-in checks the very same email+password
+	// as /auth/login above. On TierDefault it would be a MORE generous door to
+	// the same secret, which is the whole point of listing it here (spec
+	// criterion 14). The passwordless open (/auth/telegram/miniapp) is
+	// deliberately NOT strict: it verifies an HMAC and guesses nothing, and a
+	// venue whose staff share one NAT would trip a 5/min IP budget on an
+	// ordinary shift.
+	"POST /api/v1/auth/telegram/link": TierStrict,
+	// Signed-in phone change is an OTP flow: same money/enumeration profile as
+	// the login OTP routes (a code send costs, and 409 phone_in_use /
+	// 422 phone_unchanged are an account-enumeration oracle worth throttling).
+	"POST /api/v1/users/me/phone/otp/request":  TierStrict,
+	"POST /api/v1/users/me/phone/otp/verify":   TierStrict,
 	"POST /api/v1/partnership-requests":        TierStrict,
 	"POST /api/v1/bookings":                    TierStrict,
 	"POST /api/v1/bookings/:id/payment":        TierStrict,
 	"POST /api/v1/bookings/:id/payment/settle": TierStrict,
+	// Admin image upload: an authed multipart write that lands up to 8 MiB in R2
+	// per request. TierDefault (the authed floor) is far too generous for a
+	// storage-cost/DoS vector — strict-throttle it like the other side-effecting
+	// writes above, even though it sits behind Auth+RequireRole.
+	"POST /api/v1/admin/media/images": TierStrict,
+	// A guest's own avatar: same multipart storage write, and reachable by ANY
+	// signed-in account rather than by staff only. If anything it deserves the
+	// strict tier more than the admin route does.
+	"POST /api/v1/users/me/avatar": TierStrict,
 
 	// Public reading: browsing traffic.
-	"GET /api/v1/restaurants":                  TierSoft,
-	"GET /api/v1/restaurants/:id":              TierSoft,
-	"GET /api/v1/restaurant-categories":        TierSoft,
+	"GET /api/v1/restaurants":     TierSoft,
+	"GET /api/v1/restaurants/:id": TierSoft,
+	// The map proxy costs a paid provider request on a cache miss, so it sits
+	// in the browsing tier rather than being unlimited — the cache absorbs the
+	// repeats, the tier bounds a caller trying to walk the catalog.
+	"GET /api/v1/restaurants/:id/map":   TierSoft,
+	"GET /api/v1/restaurant-categories": TierSoft,
+	// The cuisine dictionary is fetched once per app launch and is tiny;
+	// browsing tier, same as the other public reference reads.
+	"GET /api/v1/cuisines": TierSoft,
+	// Same for the venue-feature dictionary: the app's filter sheet fetches it
+	// once when the sheet opens, and it is a handful of rows.
+	"GET /api/v1/venue-features": TierSoft,
+	// The mobile update gate: one tiny read per app launch, and the answer is
+	// cacheable for five minutes, so the browsing tier is the right ceiling. It
+	// is NOT exempt — it is unauthenticated and would otherwise be the cheapest
+	// unmetered route in the API.
+	"GET /api/v1/app/version-check":            TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,

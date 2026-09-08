@@ -119,3 +119,35 @@ func insertLinks(links []domain.BookingTable) (string, []any) {
 	}
 	return sb.String(), args
 }
+
+// ListBusyFor is ListBusy for many venues in one query, for the catalog's
+// availability filter. The rows carry restaurant_id so the caller can split
+// them per venue without a second lookup; a venue with nothing booked is simply
+// absent from the map, which reads the same as "no busy tables".
+func (r *Tables) ListBusyFor(ctx context.Context, ids []uuid.UUID, from, to time.Time) (map[uuid.UUID][]domain.TableBusyInterval, error) {
+	out := make(map[uuid.UUID][]domain.TableBusyInterval, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT t.restaurant_id, bt.table_id, lower(bt.slot), upper(bt.slot)
+		 FROM booking_tables bt
+		 JOIN restaurant_tables t ON t.id = bt.table_id
+		 WHERE t.restaurant_id = ANY($1)
+		   AND bt.active
+		   AND bt.slot && tstzrange($2, $3, '[)')
+		 ORDER BY t.restaurant_id, bt.table_id, lower(bt.slot)`, ids, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("list busy intervals for venues: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rid uuid.UUID
+		var b domain.TableBusyInterval
+		if err := rows.Scan(&rid, &b.TableID, &b.From, &b.To); err != nil {
+			return nil, fmt.Errorf("scan busy interval: %w", err)
+		}
+		out[rid] = append(out[rid], b)
+	}
+	return out, rows.Err()
+}

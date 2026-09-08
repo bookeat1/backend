@@ -368,7 +368,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 	var claimed []domain.BookingOutboxEvent
 	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
 		var err error
-		claimed, err = outbox.ClaimUnpublished(ctx, 10)
+		claimed, err = outbox.ClaimDue(ctx, 10, time.Now())
 		if err != nil {
 			return err
 		}
@@ -385,7 +385,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 			t.Errorf("claimed event mismatch: %+v", claimed[0])
 		}
 		// A parallel worker must skip the locked row.
-		parallel, err := outbox.ClaimUnpublished(context.Background(), 10)
+		parallel, err := outbox.ClaimDue(context.Background(), 10, time.Now())
 		if err != nil {
 			return err
 		}
@@ -398,7 +398,7 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 	}
 
 	if err := txm.WithinTx(ctx, func(ctx context.Context) error {
-		left, err := outbox.ClaimUnpublished(ctx, 10)
+		left, err := outbox.ClaimDue(ctx, 10, time.Now())
 		if err != nil {
 			return err
 		}
@@ -411,5 +411,56 @@ func TestBookingStatusHistoryAndOutboxShareTx(t *testing.T) {
 	}
 	if err := outbox.MarkPublished(ctx, nil, time.Now()); err != nil {
 		t.Errorf("mark published(nil) = %v, want nil", err)
+	}
+}
+
+// Состав предзаказа сразу для СПИСКА броней — то, что рисует кабинет заведения.
+//
+// Проверяется главное, что ломается тихо: строки раскладываются по своим
+// броням и не перетекают между ними. Перепутанный заказ хуже отсутствующего:
+// по нему приготовят не то и не тому.
+func TestBookingItemsListByBookings(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	repo := NewItems(pool)
+	bookings := New(pool)
+
+	first := newBooking(rid, time.Now().Add(24*time.Hour))
+	second := newBooking(rid, time.Now().Add(25*time.Hour))
+	empty := newBooking(rid, time.Now().Add(26*time.Hour))
+	for _, b := range []*domain.Booking{first, second, empty} {
+		if err := bookings.Create(ctx, b); err != nil {
+			t.Fatalf("create booking: %v", err)
+		}
+	}
+
+	if err := repo.Create(ctx, []domain.BookingItem{
+		{BookingID: first.ID, ItemName: "Плов", PriceMinor: 350000, Quantity: 2},
+		{BookingID: first.ID, ItemName: "Хумус", PriceMinor: 245000, Quantity: 1},
+		{BookingID: second.ID, ItemName: "Окрошка", PriceMinor: 195000, Quantity: 1},
+	}); err != nil {
+		t.Fatalf("create items: %v", err)
+	}
+
+	got, err := repo.ListByBookings(ctx, []uuid.UUID{first.ID, second.ID, empty.ID})
+	if err != nil {
+		t.Fatalf("list by bookings: %v", err)
+	}
+	if len(got[first.ID]) != 2 {
+		t.Fatalf("у первой брони ожидалось 2 позиции, получено %d", len(got[first.ID]))
+	}
+	if len(got[second.ID]) != 1 || got[second.ID][0].ItemName != "Окрошка" {
+		t.Fatalf("вторая бронь получила чужой состав: %+v", got[second.ID])
+	}
+	// Бронь без предзаказа просто отсутствует в карте — это то же самое, что
+	// пустой список, и отдельного запроса за ней не нужно.
+	if len(got[empty.ID]) != 0 {
+		t.Fatalf("у брони без предзаказа не должно быть позиций: %+v", got[empty.ID])
+	}
+
+	// Пустой список идентификаторов не должен идти в базу вовсе.
+	none, err := repo.ListByBookings(ctx, nil)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("пустой запрос: %v, %d", err, len(none))
 	}
 }

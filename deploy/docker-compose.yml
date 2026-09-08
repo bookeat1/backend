@@ -140,6 +140,10 @@ services:
       - "80:80"
       - "443:443"
     volumes:
+      # Static previews (guest app web build, venue panel static export).
+      # Read-only: Caddy serves these files, the deploy pipelines write them
+      # over SSH as the `ubuntu` user on the host, never through this container.
+      - /opt/bookeat/preview:/srv/preview:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config

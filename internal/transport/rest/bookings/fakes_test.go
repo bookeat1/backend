@@ -48,6 +48,7 @@ func (f fakeUsers) GetByPhone(context.Context, string) (*domain.User, error) {
 	return nil, domain.ErrNotFound
 }
 func (f fakeUsers) Update(context.Context, *domain.User) error { return nil }
+func (f fakeUsers) Delete(context.Context, uuid.UUID) error    { return nil }
 
 type fakeManagers struct{ manages bool }
 
@@ -207,11 +208,20 @@ func (f *fakeUpdate) Update(context.Context, uc.Actor, uuid.UUID, uc.UpdateInput
 	return &uc.BookingDetails{Booking: domain.Booking{ID: uuid.New()}}, nil
 }
 
-type fakeAvail struct{ err error }
+// fakeAvail stands in for the availability engine. day, when set, is returned
+// verbatim so a transport test can pin the EXACT usecase value the mapper is
+// handed — the only way to catch a field the mapper silently drops.
+type fakeAvail struct {
+	err error
+	day *uc.DayAvailability
+}
 
 func (f *fakeAvail) Day(_ context.Context, id uuid.UUID, date string, guests int) (*uc.DayAvailability, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.day != nil {
+		return f.day, nil
 	}
 	return &uc.DayAvailability{RestaurantID: id, Date: date, Guests: guests, Timezone: "Asia/Almaty"}, nil
 }
@@ -273,4 +283,57 @@ func (f *fakePolicy) viewOrDefault() *uc.PolicyView {
 		return f.view
 	}
 	return &uc.PolicyView{Effective: domain.BookingPolicy{Timezone: "Asia/Almaty"}}
+}
+
+// fakeExternal is a stub ExternalReservationUseCase for the handler tests.
+type fakeExternal struct {
+	err    error
+	create *domain.ExternalReservation
+	list   []domain.ExternalReservation
+}
+
+func (f *fakeExternal) Create(_ context.Context, _ uc.Actor, restaurantID uuid.UUID, in uc.ExternalHoldInput) (*domain.ExternalReservation, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.create != nil {
+		return f.create, nil
+	}
+	source := in.Source
+	if source == "" {
+		source = domain.ExtSourceManual
+	}
+	return &domain.ExternalReservation{
+		ID: uuid.New(), RestaurantID: restaurantID, TableID: in.TableID,
+		StartsAt: in.StartsAt, EndsAt: in.EndsAt, Source: source, Active: true,
+	}, nil
+}
+
+func (f *fakeExternal) Delete(_ context.Context, _ uc.Actor, _, _ uuid.UUID) error { return f.err }
+
+func (f *fakeExternal) List(_ context.Context, _ uc.Actor, _ uuid.UUID, _, _ time.Time) ([]domain.ExternalReservation, error) {
+	return f.list, f.err
+}
+
+// fakeCapacityOverrides is the read-only overbooking audit usecase. It records
+// the window it was asked for, so a test can prove the handler passes the query
+// through instead of inventing one.
+type fakeCapacityOverrides struct {
+	err      error
+	list     []domain.BookingCapacityOverride
+	from, to time.Time
+}
+
+func (f *fakeCapacityOverrides) List(_ context.Context, _ uc.Actor, _ uuid.UUID, from, to time.Time) ([]domain.BookingCapacityOverride, error) {
+	f.from, f.to = from, to
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.list, nil
+}
+
+// DecideAsVenue is part of StatusUseCase but is exercised by the Telegram
+// webhook's own tests, not through this handler.
+func (f *fakeStatus) DecideAsVenue(context.Context, uuid.UUID, uuid.UUID, uc.VenueDecision) (uc.VenueDecisionResult, error) {
+	return uc.VenueDecisionResult{}, nil
 }

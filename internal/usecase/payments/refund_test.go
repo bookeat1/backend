@@ -193,6 +193,65 @@ func TestSettle_PartialRefundAmountMatchesPolicy(t *testing.T) {
 	}
 }
 
+// TestSettle_AcquiringRateFollowsThePaymentsProvider is the owner's decision of
+// 2026-07-25: what is kept on a reversal is the ACQUIRER's rule, so the rate is
+// per provider. The same timely guest cancellation must withhold nothing on the
+// acquirer that returns its fee (global 0) and the configured rate on the one
+// that keeps it — driven by the payment's own Provider, not by a single number.
+func TestSettle_AcquiringRateFollowsThePaymentsProvider(t *testing.T) {
+	cfg := Config{
+		RefundAcquiringBps: 0, // global: withhold nothing
+		RefundAcquiringBpsByProvider: map[domain.PaymentProvider]int{
+			domain.ProviderTipTopPay: 290, // this acquirer keeps 2.9%
+		},
+	}
+
+	cases := []struct {
+		provider     domain.PaymentProvider
+		wantGuest    int64
+		wantAcquirer int64
+	}{
+		{domain.ProviderFreedomPay, 1_035_000, 0},
+		// 2.9% of 1,035,000 = 30,015 withheld; the guest gets the rest back.
+		{domain.ProviderTipTopPay, 1_004_985, -30_015},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.provider), func(t *testing.T) {
+			p := &domain.Payment{
+				ID: uuid.New(), BookingID: uuid.New(), RestaurantID: uuid.New(),
+				Provider: tc.provider, ProviderPaymentID: strPtrTest("gw-1"),
+				Purpose: domain.PurposeDeposit, Status: domain.PaymentCaptured,
+				AmountMinor: 1_035_000, BaseAmountMinor: 1_000_000, FeeMinor: 35_000,
+				Currency: domain.CurrencyKZT, IdempotencyKey: "k",
+				CreatedAt: time.Now(), UpdatedAt: time.Now(),
+			}
+			h := newRefundHarness(p, 0)
+			gw := newFakeGateway(tc.provider)
+			h.gw = gw
+			h.u = NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox,
+				newFakeGatewayResolver(gw), newFakeManagerChecker(), h.bookings, h.deadline,
+				&fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds},
+				cfg)
+			h.setCancelledAt(p.BookingID, time.Now())
+
+			if _, err := h.u.Settle(context.Background(), Actor{}, p.BookingID, SettleInput{
+				Trigger: domain.RefundTriggerGuestCancel, IdempotencyKey: "settle-1",
+			}); err != nil {
+				t.Fatalf("Settle() error = %v", err)
+			}
+
+			bal, _ := h.ledger.BalanceByAccount(context.Background(), p.ID)
+			if got := -bal[domain.AccountGuest]; got != tc.wantGuest {
+				t.Fatalf("guest refund = %d, want %d", got, tc.wantGuest)
+			}
+			if got := bal[domain.AccountAcquirer]; got != tc.wantAcquirer {
+				t.Fatalf("acquirer = %d, want %d", got, tc.wantAcquirer)
+			}
+		})
+	}
+}
+
 func TestSettle_IdempotentReplayNoSecondRefund(t *testing.T) {
 	p := capturedTestPayment(uuid.New())
 	h := newRefundHarness(p, 100)
@@ -624,6 +683,53 @@ func TestSettle_CrossTenantStaffIsRejected(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("error = %v, want ErrForbidden (staff of a different restaurant)", err)
+	}
+}
+
+// TestSettle_HostessCannotRefund is the hard rule named explicitly by the
+// owner: a hostess is staff of the restaurant (Manages == true, so capture
+// and booking actions work for them) but must never be able to settle a
+// refund — only a manager or an owner may.
+func TestSettle_HostessCannotRefund(t *testing.T) {
+	p := capturedTestPayment(uuid.New())
+	h := newRefundHarness(p, 100)
+	hostessID := uuid.New()
+	managers := newFakeManagerChecker()
+	managers.set(hostessID, p.RestaurantID, true) // staff of this restaurant
+	managers.setPermission(hostessID, p.RestaurantID, domain.PermPaymentRefund, false)
+	h.u = NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox,
+		newFakeGatewayResolver(h.gw), managers, h.bookings, h.deadline,
+		&fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds},
+		Config{RefundAcquiringBps: 100})
+
+	_, err := h.u.Settle(context.Background(), Actor{UserID: &hostessID, Role: domain.RoleRestaurant}, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerNoShow, IdempotencyKey: "settle-1",
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess Settle error = %v, want ErrForbidden", err)
+	}
+}
+
+// TestSettle_ManagerCanRefund is the same setup as the hostess test above but
+// with the refund permission granted, confirming the permission check (not
+// just the restaurant-membership check) actually gates the call.
+func TestSettle_ManagerCanRefund(t *testing.T) {
+	p := capturedTestPayment(uuid.New())
+	h := newRefundHarness(p, 100)
+	managerID := uuid.New()
+	managers := newFakeManagerChecker()
+	managers.set(managerID, p.RestaurantID, true)
+	managers.setPermission(managerID, p.RestaurantID, domain.PermPaymentRefund, true)
+	h.u = NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox,
+		newFakeGatewayResolver(h.gw), managers, h.bookings, h.deadline,
+		&fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds},
+		Config{RefundAcquiringBps: 100})
+
+	_, err := h.u.Settle(context.Background(), Actor{UserID: &managerID, Role: domain.RoleRestaurant}, p.BookingID, SettleInput{
+		Trigger: domain.RefundTriggerNoShow, IdempotencyKey: "settle-1",
+	})
+	if err != nil {
+		t.Fatalf("manager Settle error = %v, want nil", err)
 	}
 }
 

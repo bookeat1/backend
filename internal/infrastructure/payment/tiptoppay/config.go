@@ -67,6 +67,37 @@ type Config struct {
 	// TestMode only affects the description we send; TipTopPay decides test vs
 	// live by the terminal the Public ID belongs to.
 	TestMode bool // TIPTOPPAY_TEST_MODE
+
+	// SplitsEnabled says this terminal is set up for split payments
+	// («Сплитование платежей» — it is switched on by TipTop Pay's manager on
+	// request, it is not something an integration can turn on for itself).
+	//
+	// It is a hard switch, not a hint. With it OFF the adapter REFUSES an
+	// AuthorizeRequest that carries splits instead of dropping them: a request
+	// whose Splits are silently ignored still charges the guest the right
+	// amount and pays it all to the marketplace terminal, i.e. the venue's
+	// money lands on ours. It also decides whether Capture/Refund read the
+	// original shares back before confirming or returning money — the one
+	// extra request per money movement is only worth making on a terminal that
+	// can have splits at all.
+	SplitsEnabled bool // TIPTOPPAY_SPLITS_ENABLED
+
+	// SplitViaOrders permits sending the Splits array on /orders/create, the
+	// hosted-order method this adapter's Authorize uses.
+	//
+	// THIS IS AN UNVERIFIED GUESS AND IT DEFAULTS TO FALSE. TipTop Pay's
+	// documentation lists Splits on /payments/cards/{charge,auth} and
+	// /payments/tokens/{charge,auth} only; the /orders/create parameter table
+	// does not mention it. An unknown field may be accepted, or ignored — and
+	// "ignored" means every split payment quietly pays the platform the venue's
+	// share, which is the single most expensive way this integration can fail.
+	// So splits through the order flow stay off until somebody confirms them on
+	// the sandbox.
+	//
+	// TODO(verify): проверить на песочнице — принимает ли /orders/create массив
+	// Splits и действительно ли деньги расходятся по саб мерчам (а не молча
+	// уходят на терминал маркетплейса). См. docs/payments/tiptoppay-splits.md.
+	SplitViaOrders bool // TIPTOPPAY_SPLIT_VIA_ORDERS
 }
 
 // ConfigFromEnv reads the adapter's configuration from the environment. It is
@@ -78,6 +109,9 @@ func ConfigFromEnv() Config {
 		PublicID:  os.Getenv("TIPTOPPAY_PUBLIC_ID"),
 		APISecret: os.Getenv("TIPTOPPAY_API_SECRET"),
 		TestMode:  strings.EqualFold(os.Getenv("TIPTOPPAY_TEST_MODE"), "true"),
+
+		SplitsEnabled:  strings.EqualFold(os.Getenv("TIPTOPPAY_SPLITS_ENABLED"), "true"),
+		SplitViaOrders: strings.EqualFold(os.Getenv("TIPTOPPAY_SPLIT_VIA_ORDERS"), "true"),
 	}
 }
 

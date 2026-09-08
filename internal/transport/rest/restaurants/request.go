@@ -14,28 +14,49 @@ import (
 // Update the facade preserves omitted fields (read-modify-write) instead of
 // wiping them.
 type saveRestaurantRequest struct {
-	CategoryID    *string           `json:"category_id"`
-	Name          *string           `json:"name"`
-	NameI18n      map[string]string `json:"name_i18n"`
-	Description   *string           `json:"description"`
-	CuisineType   *string           `json:"cuisine_type"`
-	Address       *string           `json:"address"`
-	OpeningHours  *string           `json:"opening_hours"`
-	City          *string           `json:"city"`
-	PriceCategory *string           `json:"price_category"`
-	Email         *string           `json:"email"`
-	Phone         *string           `json:"phone"`
-	Latitude      *float64          `json:"latitude"`
-	Longitude     *float64          `json:"longitude"`
-	IsActive      *bool             `json:"is_active"`
-	IsNew         *bool             `json:"is_new"`
-	IsPopular     *bool             `json:"is_popular"`
-	IsPremium     *bool             `json:"is_premium"`
-	DisplayOrder  *int              `json:"display_order"`
-	Images        []imageInput      `json:"images"`
-	Features      []featureInput    `json:"features"`
-	Tags          []tagInput        `json:"tags"`
-	SocialLinks   []socialInput     `json:"social_links"`
+	CategoryID *string `json:"category_id"`
+	Name       *string `json:"name"`
+	// The `*_i18n` objects are PARTIAL updates of the translation maps:
+	//
+	//	{"description_i18n": {"kk": "Жайлы орын", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored. Sending a
+	// `ru` key writes the plain field instead — the Russian text lives in the
+	// column, and the two are never allowed to disagree. See domain.I18nPatch.
+	NameI18n         map[string]*string `json:"name_i18n"`
+	Description      *string            `json:"description"`
+	DescriptionI18n  map[string]*string `json:"description_i18n"`
+	CuisineType      *string            `json:"cuisine_type"`
+	CuisineTypeI18n  map[string]*string `json:"cuisine_type_i18n"`
+	Address          *string            `json:"address"`
+	AddressI18n      map[string]*string `json:"address_i18n"`
+	OpeningHours     *string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]*string `json:"opening_hours_i18n"`
+	City             *string            `json:"city"`
+	PriceCategory    *string            `json:"price_category"`
+	PriceMin         *int               `json:"price_min"`
+	PriceMax         *int               `json:"price_max"`
+	Email            *string            `json:"email"`
+	Phone            *string            `json:"phone"`
+	Latitude         *float64           `json:"latitude"`
+	Longitude        *float64           `json:"longitude"`
+	IsActive         *bool              `json:"is_active"`
+	IsNew            *bool              `json:"is_new"`
+	IsPopular        *bool              `json:"is_popular"`
+	IsPremium        *bool              `json:"is_premium"`
+	DisplayOrder     *int               `json:"display_order"`
+	Images           []imageInput       `json:"images"`
+	// Features is still PARSED, but only so that a client which still sends the
+	// old free-text array gets a clear 422 instead of a silent no-op. The
+	// free-text table behind it was dropped in migration 0082; a venue's
+	// features are now set through PUT /restaurants/:id/features by dictionary
+	// id. Nothing in this repo has ever sent this field (the admin panel does
+	// not), so refusing it breaks no known caller — and refusing beats
+	// accepting a write that would go nowhere.
+	Features    []featureInput `json:"features"`
+	Tags        []tagInput     `json:"tags"`
+	SocialLinks []socialInput  `json:"social_links"`
 }
 
 type imageInput struct {
@@ -62,9 +83,13 @@ type socialInput struct {
 // silently dropped, so a typo can't slip through as "field omitted".
 func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 	in := uc.SaveInput{
-		Name: r.Name, NameI18n: domain.I18n(r.NameI18n), Description: r.Description,
-		CuisineType: r.CuisineType, Address: r.Address, OpeningHours: r.OpeningHours,
-		City: r.City, PriceCategory: r.PriceCategory, Email: r.Email, Phone: r.Phone,
+		Name: r.Name, NameI18n: domain.I18nPatch(r.NameI18n),
+		Description: r.Description, DescriptionI18n: domain.I18nPatch(r.DescriptionI18n),
+		CuisineType: r.CuisineType, CuisineTypeI18n: domain.I18nPatch(r.CuisineTypeI18n),
+		Address: r.Address, AddressI18n: domain.I18nPatch(r.AddressI18n),
+		OpeningHours: r.OpeningHours, OpeningHoursI18n: domain.I18nPatch(r.OpeningHoursI18n),
+		City: r.City, PriceCategory: r.PriceCategory, PriceMin: r.PriceMin, PriceMax: r.PriceMax,
+		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
 	}
@@ -82,12 +107,10 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 		}
 		in.Images = &imgs
 	}
-	if r.Features != nil {
-		feats := make([]domain.Feature, 0, len(r.Features))
-		for _, f := range r.Features {
-			feats = append(feats, domain.Feature{Name: f.Name, NameI18n: f.NameI18n})
-		}
-		in.Features = &feats
+	if len(r.Features) > 0 {
+		return uc.SaveInput{}, fmt.Errorf(
+			"%w: free-text `features` is no longer accepted; set them with PUT /restaurants/{id}/features using venue feature ids",
+			domain.ErrValidation)
 	}
 	if r.Tags != nil {
 		tags := make([]domain.Tag, 0, len(r.Tags))
@@ -127,6 +150,33 @@ func (r partnershipRequest) toInput() uc.PartnershipInput {
 
 type assignManagerRequest struct {
 	UserID        string  `json:"user_id"`
+	Role          string  `json:"role"` // one of: owner, manager, hostess
 	WhatsappOptIn bool    `json:"whatsapp_opt_in"`
 	WhatsappPhone *string `json:"whatsapp_phone"`
+}
+
+// setManagerRequest is the PATCH body for one staff row. Every field is
+// OPTIONAL and absent means "leave it alone" — the route used to take a role
+// and nothing else, so a venue could never switch a staff member's WhatsApp
+// alerts on after the row was created.
+//
+// The two groups are authorized differently in the usecase (a role change is an
+// owner's prerogative; consent to be messaged on a personal number is the
+// person's own), which is why they are applied by two separate calls rather
+// than one blanket update.
+type setManagerRequest struct {
+	// Role is one of: owner, manager, hostess. Absent = unchanged.
+	Role *string `json:"role"`
+	// WhatsappOptIn is the consent to receive booking alerts on WhatsApp.
+	// Absent = unchanged.
+	WhatsappOptIn *bool `json:"whatsapp_opt_in"`
+	// WhatsappPhone is the number those alerts go to, in any writing (it is
+	// normalized to E.164 server-side). An EMPTY STRING clears it; absent =
+	// unchanged.
+	WhatsappPhone *string `json:"whatsapp_phone"`
+}
+
+// touchesWhatsApp reports whether the body asks for a WhatsApp change at all.
+func (r setManagerRequest) touchesWhatsApp() bool {
+	return r.WhatsappOptIn != nil || r.WhatsappPhone != nil
 }

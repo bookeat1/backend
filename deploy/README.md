@@ -312,7 +312,9 @@ docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
 docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
   -c "ALTER DATABASE bookeat_restored RENAME TO bookeat;"
 docker compose restart app worker   # they hold a connection pool to the old name
-curl -fsS http://127.0.0.1/health
+# NB: http://127.0.0.1/health on the host is Caddy's 308 redirect, not the app.
+# Ask the app itself:
+docker compose exec -T app wget -q -T 3 -O - http://127.0.0.1:8080/health; echo
 #   Only drop bookeat_old_broken once you're sure — keep it a day, not a minute.
 
 # 6b. If this was just a drill/verification, clean up instead:
@@ -336,3 +338,15 @@ on both servers, regenerate `/opt/bookeat/backups/rclone.conf` from the new
 values (same file, `access_key_id`/`secret_access_key`/`endpoint` lines), and
 run the backup script once by hand to confirm the new credentials work
 end-to-end before leaving it to cron.
+
+## Внимание: воркер запускать в ОДНОМ экземпляре
+
+Сервис `worker` (cmd/worker) должен работать строго в ОДНОМ экземпляре.
+Внутри него три цикла: автоподтверждение/неявки броней, сверка платежей и
+рассыльщик уведомлений. Все три используют `FOR UPDATE SKIP LOCKED` внутри
+короткой транзакции — это защищает от гонок между тиками ОДНОГО процесса, но
+не между двумя процессами. Если поднять `worker` в двух экземплярах
+(`docker compose up --scale worker=2`, k8s HPA и т.п.), два рассыльщика могут
+разослать одно и то же уведомление дважды, а сверка — дважды дёрнуть банк.
+НЕ масштабировать `worker` выше одной реплики, пока в claim не добавлена
+колонка-владелец (lease). Приложение (`app`) масштабируется свободно.

@@ -78,6 +78,41 @@ func (r *Repository) Update(ctx context.Context, b *domain.Booking) error {
 	return nil
 }
 
+// AttachOrphanedByPhone gives every account-less booking of phoneNormalized to
+// userID and reports how many rows changed. It is how a guest who booked by
+// phone (or was booked in by a hostess) finds that history waiting for them the
+// first time they log in — see usecase/auth.OTPUseCase.VerifyOTP.
+//
+// The WHERE clause is the entire safety argument, so it must stay exactly this
+// narrow:
+//
+//   - `user_id IS NULL` — an owned booking is never re-assigned. Ownership only
+//     ever moves from nobody to somebody, so no login can take another guest's
+//     booking away, and running this twice is a no-op rather than a rewrite.
+//   - an EXACT phone match, no LIKE/trim/lower: both columns are written by the
+//     same internal/auth/phone.Normalize (+7XXXXXXXXXX), and any fuzziness here
+//     would be fuzziness about whose booking this is.
+//   - an empty phone matches nothing. phone_normalized is NOT NULL but legacy
+//     rows can carry ” (see infrastructure/postgres/dashboard/guests.go), and
+//     ” = ” would hand a pile of unrelated strangers' bookings to one caller.
+//
+// Runs on the caller's transaction when there is one (sqltx.From): the OTP
+// usecase needs "this user exists" and "this user owns their history" to commit
+// or fail as one fact.
+func (r *Repository) AttachOrphanedByPhone(ctx context.Context, userID uuid.UUID, phoneNormalized string) (int64, error) {
+	if phoneNormalized == "" {
+		return 0, nil
+	}
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE bookings SET user_id=$1, updated_at=$2
+		 WHERE user_id IS NULL AND phone_normalized=$3`,
+		userID, time.Now(), phoneNormalized)
+	if err != nil {
+		return 0, fmt.Errorf("attach orphaned bookings: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Booking, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+` FROM bookings WHERE id=$1`, id)
 	b, err := scanBooking(row)
@@ -91,6 +126,14 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Booking
 }
 
 func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain.Booking, int, error) {
+	// A calendar date is not an instant: turning it into one needs a zone, and
+	// this layer does not know whose. Reaching here with one unresolved means a
+	// usecase forgot to resolve it — and the damage would be a silently
+	// UNFILTERED day (the whole history returned as "today"), so it is an error,
+	// not a fallback.
+	if f.CalendarDate != nil {
+		return nil, 0, fmt.Errorf("list bookings: calendar date %s reached the repository unresolved", f.CalendarDate)
+	}
 	where := []string{"true"}
 	args := []any{}
 	add := func(cond string, val any) {
@@ -140,6 +183,54 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 	return out, total, nil
 }
 
+// ListLiveForReconcile reads the venue's live bookings in ONE statement — no
+// LIMIT/OFFSET walk. See the port doc on domain.BookingRepository for why that
+// matters: List pages under READ COMMITTED, every page is a fresh snapshot, and
+// a cancellation committing between two pages shifts the offset window so that
+// one booking is never seen. A reconciliation that misses a booking leaves it
+// with no capacity hold and no booking_tables row, i.e. invisible to both
+// engines that are supposed to keep its seats sold exactly once.
+//
+// The ceiling is domain.ReconcileProbeLimit (one row past
+// domain.MaxReconcileBookings), and it is applied here as well as by the caller:
+// this query has no offset, so an unbounded venue would otherwise stream its
+// whole horizon into memory. The ceiling is the PROBE limit rather than the
+// processing cap so the caller can distinguish a venue sitting exactly at the
+// cap from a truncated set — clamping to the cap here would silently destroy
+// that signal.
+func (r *Repository) ListLiveForReconcile(
+	ctx context.Context,
+	restaurantID uuid.UUID,
+	from time.Time,
+	statuses []domain.BookingStatus,
+	limit int,
+) ([]domain.Booking, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > domain.ReconcileProbeLimit {
+		limit = domain.ReconcileProbeLimit
+	}
+	// Ascending, ties broken by id: a total order, so the caller's placement
+	// decisions are reproducible across retries.
+	q := `SELECT ` + cols + ` FROM bookings
+		WHERE restaurant_id = $1
+		  AND status = ANY($2)
+		  AND starts_at >= $3
+		ORDER BY starts_at, id
+		LIMIT $4`
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, restaurantID, statusStrings(statuses), from, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list live bookings for reconcile: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanBookings(rows)
+	if err != nil {
+		return nil, fmt.Errorf("list live bookings for reconcile: %w", err)
+	}
+	return out, nil
+}
+
 // UpdateStatus writes the new status together with the timestamp column that
 // belongs to it. booking_tables.active is NOT touched here — the DB trigger on
 // bookings.status owns that column.
@@ -156,7 +247,11 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	q := `UPDATE bookings SET ` + strings.Join(set, ", ") + ` WHERE id=$1`
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id, string(status), at)
 	if err != nil {
-		return fmt.Errorf("update booking status: %w", err)
+		// A status write is not an innocent UPDATE: the triggers of 0004/0054
+		// re-claim the booking's tables or its capacity holds. Moving a
+		// waitlisted booking back into an active status can therefore lose the
+		// race for a seat the venue has meanwhile sold — a conflict, not a 500.
+		return mapCapacityWrite(err, "update booking status")
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound

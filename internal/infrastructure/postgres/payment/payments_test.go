@@ -168,6 +168,51 @@ func TestGetSettleableByBookingID_FindsRefundedWhereLiveDoesNot(t *testing.T) {
 	}
 }
 
+// TestHasInFlightForBooking proves the pre-order freeze predicate: a payment in
+// ANY non-terminal status (crucially INCLUDING `created`, which GetLiveByBookingID
+// does NOT see) reports in-flight; only a terminal payment
+// (failed/expired/voided/refunded) reports not-in-flight, so a guest may re-order
+// after a failed attempt.
+func TestHasInFlightForBooking(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	bid := seedBooking(t, pool, rid)
+	repo := New(pool)
+
+	// No payment at all → not in flight.
+	if got, err := repo.HasInFlightForBooking(ctx, bid); err != nil || got {
+		t.Fatalf("no payment: got %v, err=%v; want false", got, err)
+	}
+
+	p := newPayment(bid, rid)
+	if err := repo.Create(ctx, p); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// `created` is the blocking case GetLiveByBookingID misses — must be in flight.
+	if got, err := repo.HasInFlightForBooking(ctx, bid); err != nil || !got {
+		t.Fatalf("created: got %v, err=%v; want true", got, err)
+	}
+	if _, err := repo.GetLiveByBookingID(ctx, bid); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("sanity: GetLiveByBookingID should NOT see a created payment, got err=%v", err)
+	}
+
+	// Authorized (live) → still in flight.
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCreated, domain.PaymentAuthorized, time.Now()); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if got, err := repo.HasInFlightForBooking(ctx, bid); err != nil || !got {
+		t.Fatalf("authorized: got %v, err=%v; want true", got, err)
+	}
+
+	// Terminal (failed) → no longer in flight; the guest may re-order.
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentAuthorized, domain.PaymentFailed, time.Now()); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	if got, err := repo.HasInFlightForBooking(ctx, bid); err != nil || got {
+		t.Fatalf("failed: got %v, err=%v; want false", got, err)
+	}
+}
+
 // TestPaymentLiveHoldUniquePerBookingConflicts proves the money-safety
 // invariant idx_payments_live_per_booking exists to guard: two payments for
 // the SAME booking can never both be authorized/capturing/voiding/captured

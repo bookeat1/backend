@@ -19,11 +19,19 @@ const (
 	// "not implemented until the API contract is known" — see that package's
 	// doc comment for what is still missing.
 	ProviderPartnersPay PaymentProvider = "partnerspay"
+	// ProviderKaspi is Kaspi Pay, reached through OUR OWN multi-tenant Kaspi
+	// service rather than directly (infrastructure/payment/kaspi). It is the
+	// first ONE-STAGE acquirer here: there is no hold to capture or void, the
+	// guest either pays a pay.kaspi.kz link or does not. Which company's
+	// account a venue's money lands on is stored per venue in
+	// restaurant_split_accounts (account_ref = the Kaspi-service company id);
+	// the keys themselves live in env only.
+	ProviderKaspi PaymentProvider = "kaspi"
 )
 
 // Valid reports whether p is a known provider code.
 func (p PaymentProvider) Valid() bool {
-	return p == ProviderFreedomPay || p == ProviderTipTopPay || p == ProviderPartnersPay
+	return p == ProviderFreedomPay || p == ProviderTipTopPay || p == ProviderPartnersPay || p == ProviderKaspi
 }
 
 // PaymentProviderSetting is a row of the acquirer registry, managed from the

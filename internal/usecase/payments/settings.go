@@ -24,22 +24,60 @@ import (
 // fields close that: they are the same env-driven global default every other
 // Config field already has.
 type Config struct {
-	Enabled                 bool
-	DefaultProvider         domain.PaymentProvider
-	ServiceFeeBps           int
-	RefundAcquiringBps      int
+	Enabled            bool
+	DefaultProvider    domain.PaymentProvider
+	ServiceFeeBps      int
+	RefundAcquiringBps int
+	// RefundAcquiringBpsByProvider overrides RefundAcquiringBps for a specific
+	// acquirer: what is kept when money travels back is the acquirer's rule,
+	// not ours, and it differs between them. A provider that is absent from the
+	// map uses RefundAcquiringBps. Read through refundAcquiringBpsFor, never
+	// directly — a missing key and a stored 0 mean different things.
+	RefundAcquiringBpsByProvider map[domain.PaymentProvider]int
+	// AcquirerMinFeeMinor is the acquirer's per-operation floor (see
+	// domain.GrossUpForAcquirerWithMinimum). 0 means the tariff is pure percent.
+	AcquirerMinFeeMinor     int64
 	DepositDefaultMinor     int64
 	DepositRequired         bool
 	PreorderPaymentRequired bool
 	HoldTTL                 time.Duration
+	// FreeCancelWindow is the global default free-cancellation window for the
+	// money path, applied to any restaurant that has not overridden
+	// free_cancel_window_minutes. Owner-confirmed default 120 minutes (see
+	// withDefaults / migration 0034).
+	FreeCancelWindow time.Duration
+	// SplitEnabled turns split payments on for this deployment: the guest's one
+	// charge is divided at the acquirer between the venue's own sub-merchant
+	// account and the platform's, instead of landing whole on ours and being
+	// settled later by a payout.
+	//
+	// OFF by default, and it must stay off until venues actually have
+	// sub-merchant accounts: with it on, a venue that has none cannot take a
+	// payment at all (that is the point — see resolveSplitPlan).
+	SplitEnabled bool
+	// PlatformSplitAccountRef is the platform's OWN sub-merchant account at the
+	// acquirer, which its commission share is paid to. Required whenever
+	// SplitEnabled is on and the fee is non-zero: the acquirer requires the
+	// shares to add up to the whole charge, so the platform's cut must be
+	// addressed just like the venue's.
+	//
+	// It is an identifier, not a credential — it authorises nothing — which is
+	// why it lives here, next to the commission logic that decides the share,
+	// rather than in the adapter's secret configuration.
+	PlatformSplitAccountRef string
 }
 
 // Package-level fallbacks, applied to any zero-valued Config field — same
 // pattern as bookings.Config.withDefaults.
 const (
-	defaultServiceFeeBps      = 350            // 3.5%
-	defaultRefundAcquiringBps = 100            // 1%
-	defaultHoldTTL            = 96 * time.Hour // stays below FreedomPay's 5-day auto-clear
+	defaultServiceFeeBps = 350 // 3.5%
+	// Owner decision (2026-07-25): nothing is withheld from a guest's refund —
+	// a timely cancellation returns the full charged amount and the acquirer's
+	// cost is absorbed off the guest's side. Kept configurable for the day that
+	// changes, but 0 is the default and an explicit 0 must survive withDefaults.
+	defaultRefundAcquiringBps = 0
+	defaultHoldTTL            = 96 * time.Hour    // stays below FreedomPay's 5-day auto-clear
+	defaultFreeCancelWindow   = 120 * time.Minute // owner-confirmed default (migration 0034)
 )
 
 func (c Config) withDefaults() Config {
@@ -49,13 +87,44 @@ func (c Config) withDefaults() Config {
 	if c.ServiceFeeBps <= 0 {
 		c.ServiceFeeBps = defaultServiceFeeBps
 	}
-	if c.RefundAcquiringBps <= 0 {
+	// Only a NEGATIVE value is nonsense here: 0 is the intended production
+	// setting ("withhold nothing"), so it must not be replaced by a fallback.
+	if c.RefundAcquiringBps < 0 {
 		c.RefundAcquiringBps = defaultRefundAcquiringBps
 	}
 	if c.HoldTTL <= 0 {
 		c.HoldTTL = defaultHoldTTL
 	}
+	if c.FreeCancelWindow <= 0 {
+		c.FreeCancelWindow = defaultFreeCancelWindow
+	}
+	// A per-provider rate that is negative is dropped rather than clamped: the
+	// provider then falls back to the global rate, which is what an
+	// unconfigured provider gets anyway. Filtered into a NEW map — Config is a
+	// value, but a map inside it is shared, and withDefaults must not mutate
+	// what the caller handed us.
+	if len(c.RefundAcquiringBpsByProvider) > 0 {
+		clean := make(map[domain.PaymentProvider]int, len(c.RefundAcquiringBpsByProvider))
+		for p, bps := range c.RefundAcquiringBpsByProvider {
+			if bps >= 0 {
+				clean[p] = bps
+			}
+		}
+		c.RefundAcquiringBpsByProvider = clean
+	}
 	return c
+}
+
+// refundAcquiringBpsFor is the rate withheld from a refund on THIS payment's
+// acquirer: the provider's own entry when it has one, otherwise the global
+// rate. Callers must never read RefundAcquiringBpsByProvider directly — a
+// provider with an explicit 0 and a provider that was never configured look
+// identical in the map otherwise.
+func (c Config) refundAcquiringBpsFor(p domain.PaymentProvider) int {
+	if bps, ok := c.RefundAcquiringBpsByProvider[p]; ok {
+		return bps
+	}
+	return c.RefundAcquiringBps
 }
 
 // GlobalOnlySettings is a restaurantPaymentSettings that never has a venue
@@ -71,6 +140,18 @@ func (GlobalOnlySettings) GetPaymentOverride(context.Context, uuid.UUID) (domain
 	return domain.PaymentSettingsOverride{}, nil
 }
 
+// FreeCancelDeadlineFor is the money-path free-cancellation deadline for a
+// booking: starts_at minus the restaurant's resolved free-cancel window
+// (restaurants.free_cancel_window_minutes, else the global default). It is
+// exported so bootstrap's cancelDeadlineResolver adapter derives the exact same
+// value BOTH settlement flows (RefundUseCase.Settle and
+// DepositCancellationUseCase) read, instead of each recomputing the window and
+// risking drift — the same reason usecase/bookings.CancelDeadlineFor is
+// exported.
+func FreeCancelDeadlineFor(o domain.PaymentSettingsOverride, cfg Config, startsAt time.Time) time.Time {
+	return startsAt.Add(-resolveSettings(o, cfg.withDefaults()).FreeCancelWindow)
+}
+
 // resolveSettings applies a venue's non-nil override fields on top of the
 // global config — same resolution shape as bookings.resolvePolicy.
 func resolveSettings(o domain.PaymentSettingsOverride, cfg Config) domain.PaymentSettings {
@@ -81,6 +162,13 @@ func resolveSettings(o domain.PaymentSettingsOverride, cfg Config) domain.Paymen
 		PreorderPaymentRequired: cfg.PreorderPaymentRequired,
 		ServiceFeeBps:           cfg.ServiceFeeBps,
 		Provider:                cfg.DefaultProvider,
+		FreeCancelWindow:        cfg.FreeCancelWindow,
+	}
+	// A venue override of the money-path free-cancellation window. Guard against
+	// a negative stored value (the DB CHECK forbids it, but this layer must not
+	// trust the column blindly, same defensive posture as the other overrides).
+	if o.FreeCancelWindowMinutes != nil && *o.FreeCancelWindowMinutes >= 0 {
+		s.FreeCancelWindow = time.Duration(*o.FreeCancelWindowMinutes) * time.Minute
 	}
 	if o.PaymentsEnabled != nil {
 		s.Enabled = *o.PaymentsEnabled

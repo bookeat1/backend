@@ -48,15 +48,10 @@ func TestMenuItemCRUDListTagsAvailability(t *testing.T) {
 		t.Errorf("roundtrip mismatch: price=%q tags=%d", got.Price, len(got.Tags))
 	}
 
-	// language filter: nil → ru or null; "en" → none
+	// The listing is language-independent: one venue, one set of dishes.
 	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid})
 	if err != nil || len(items) != 1 || len(items[0].Tags) != 2 {
 		t.Fatalf("list(default) = %d items err=%v", len(items), err)
-	}
-	en := "en"
-	items, _ = repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid, Language: &en})
-	if len(items) != 0 {
-		t.Errorf("list(en) = %d, want 0", len(items))
 	}
 
 	if err := repo.SetAvailable(ctx, m.ID, false); err != nil {
@@ -121,7 +116,9 @@ func TestMenuItemUpdate(t *testing.T) {
 		t.Errorf("created_at changed: got %v, want %v", got.CreatedAt, created.CreatedAt)
 	}
 
-	// positive language filter: item with Language="en" must be returned by ListByRestaurant(Language: "en").
+	// A translation row (a separate row labelled with another language, which is
+	// how part of the imported data stores translations) must NOT appear next to
+	// the venue's base rows: that would be the same dish twice in the menu.
 	en := "en"
 	enOrder := 2
 	enItem := &domain.MenuItem{
@@ -131,12 +128,12 @@ func TestMenuItemUpdate(t *testing.T) {
 	if err := repo.Create(ctx, enItem); err != nil {
 		t.Fatalf("create en item: %v", err)
 	}
-	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid, Language: &en})
+	items, err := repo.ListByRestaurant(ctx, domain.MenuItemFilter{RestaurantID: rid})
 	if err != nil {
-		t.Fatalf("list(en): %v", err)
+		t.Fatalf("list: %v", err)
 	}
-	if len(items) != 1 || items[0].ID != enItem.ID {
-		t.Fatalf("list(en) = %d items, want 1 matching enItem.ID", len(items))
+	if len(items) != 1 || items[0].ID != m.ID {
+		t.Fatalf("list = %d items, want only the base row %v", len(items), m.ID)
 	}
 }
 
@@ -164,6 +161,55 @@ func TestMenuCategoryCRUD(t *testing.T) {
 	}
 	if err := repo.Delete(ctx, child.ID); err != nil {
 		t.Fatalf("delete: %v", err)
+	}
+}
+
+// TestSetAvailableBulk exercises the stop-list fast path AND its tenant guard:
+// an item id belonging to another restaurant must be silently skipped, never
+// flipped, so a caller cannot stop-list a competitor's menu.
+func TestSetAvailableBulk(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "menu_items", "restaurants")
+	ctx := context.Background()
+
+	ridA, ridB := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category) VALUES ($1,'A','Алматы','₸'),($2,'B','Алматы','₸')`,
+		ridA, ridB); err != nil {
+		t.Fatalf("seed restaurants: %v", err)
+	}
+	repo := New(pool)
+	a1 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridA, Name: "a1", Price: "1", IsAvailable: true}
+	a2 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridA, Name: "a2", Price: "1", IsAvailable: true}
+	b1 := &domain.MenuItem{ID: uuid.New(), RestaurantID: ridB, Name: "b1", Price: "1", IsAvailable: true}
+	for _, m := range []*domain.MenuItem{a1, a2, b1} {
+		if err := repo.Create(ctx, m); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+
+	// Stop-list a1 + a2 + b1, but scoped to restaurant A: b1 (another venue)
+	// must be ignored.
+	n, err := repo.SetAvailableBulk(ctx, ridA, []uuid.UUID{a1.ID, a2.ID, b1.ID}, false)
+	if err != nil {
+		t.Fatalf("bulk: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("rows changed = %d, want 2 (b1 belongs to another venue)", n)
+	}
+	for _, id := range []uuid.UUID{a1.ID, a2.ID} {
+		got, _ := repo.GetByID(ctx, id)
+		if got.IsAvailable {
+			t.Errorf("item %s still available after stop-list", id)
+		}
+	}
+	if got, _ := repo.GetByID(ctx, b1.ID); !got.IsAvailable {
+		t.Error("cross-tenant item b1 was wrongly stop-listed")
+	}
+
+	// Empty ids is a no-op.
+	if n, err := repo.SetAvailableBulk(ctx, ridA, nil, true); err != nil || n != 0 {
+		t.Fatalf("empty bulk = (%d,%v), want (0,nil)", n, err)
 	}
 }
 

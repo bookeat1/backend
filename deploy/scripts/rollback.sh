@@ -11,7 +11,12 @@ set -euo pipefail
 
 DEPLOY_DIR="/opt/bookeat/deploy"
 COMPOSE="docker compose --env-file .env"
-HEALTH_URL="http://127.0.0.1/health"
+# See remote-deploy.sh: http://127.0.0.1/health on the host is answered by
+# Caddy with a 308 redirect that `curl -f` counts as success, so it can never
+# tell a live app from a dead one. Ask the app inside its own container.
+# Fixed 2026-09-02.
+APP_SERVICE="app"
+APP_HEALTH_URL="http://127.0.0.1:8080/health"
 HEALTH_RETRIES=10
 HEALTH_DELAY=3
 HISTORY_FILE="$DEPLOY_DIR/release-history.log"
@@ -38,8 +43,16 @@ $COMPOSE up -d app worker
 
 n=0
 ok=0
+app_health_once() {
+  # busybox wget exits non-zero on connection failure and on any non-2xx status.
+  local body
+  body="$($COMPOSE exec -T "$APP_SERVICE" wget -q -T 3 -O - "$APP_HEALTH_URL" 2>/dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  return 0
+}
+
 while [ "$n" -lt "$HEALTH_RETRIES" ]; do
-  if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
+  if app_health_once; then
     ok=1
     break
   fi

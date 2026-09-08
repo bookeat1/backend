@@ -80,6 +80,10 @@ type createOrderRequest struct {
 	SuccessRedirectURL  string            `json:"SuccessRedirectUrl,omitempty"`
 	FailRedirectURL     string            `json:"FailRedirectUrl,omitempty"`
 	JSONData            map[string]string `json:"JsonData,omitempty"`
+	// Splits divides the charge between sub-merchants. Omitted entirely for an
+	// ordinary payment — see Config.SplitViaOrders for why sending it here at
+	// all is gated behind an explicit, default-off flag.
+	Splits []splitEntry `json:"Splits,omitempty"`
 }
 
 // Authorize creates a hosted payment page with RequireConfirmation=true, i.e.
@@ -99,6 +103,11 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 		return nil, err
 	}
 
+	splits, err := g.authorizeSplits(req)
+	if err != nil {
+		return nil, err
+	}
+
 	body := createOrderRequest{
 		Amount:              json.Number(payment.FormatMinor(req.Amount.AmountMinor)),
 		Currency:            string(req.Amount.Currency),
@@ -108,6 +117,7 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 		InvoiceID:           req.PaymentID.String(),
 		RequireConfirmation: true,
 		JSONData:            metadata(req),
+		Splits:              splits,
 	}
 	if req.ReturnURL != "" {
 		body.SuccessRedirectURL = req.ReturnURL
@@ -123,6 +133,9 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 	g.log.Info("tiptoppay order created",
 		slog.String("payment_id", req.PaymentID.String()),
 		slog.String("provider_order_id", model.ID),
+		// The COUNT of shares only. A sub-merchant Public ID addresses
+		// somebody's money and never goes into a log line.
+		slog.Int("split_shares", len(splits)),
 	)
 
 	return &domain.GatewayPayment{
@@ -138,6 +151,11 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 type confirmRequest struct {
 	TransactionID int64       `json:"TransactionId"`
 	Amount        json.Number `json:"Amount"`
+	// Splits must repeat the shares being confirmed for a SPLIT payment. A
+	// share left out of this array is cancelled in full, so it is never omitted
+	// by accident: it is either absent because the payment has no splits, or it
+	// lists every share that is getting anything.
+	Splits []splitEntry `json:"Splits,omitempty"`
 }
 
 // Capture confirms a two-stage payment, optionally for less than the held
@@ -156,7 +174,16 @@ func (g *Gateway) Capture(ctx context.Context, providerPaymentID string, amount 
 		return nil, fmt.Errorf("tiptoppay: capture amount must be positive: %w", domain.ErrValidation)
 	}
 
-	body := confirmRequest{TransactionID: txID, Amount: json.Number(payment.FormatMinor(amount.AmountMinor))}
+	splits, err := g.splitsFor(ctx, txID, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	body := confirmRequest{
+		TransactionID: txID,
+		Amount:        json.Number(payment.FormatMinor(amount.AmountMinor)),
+		Splits:        splits,
+	}
 	key := derivedKey("confirm", providerPaymentID, amount)
 
 	// /payments/confirm answers {"Success":true,"Message":null} with no Model.
@@ -169,6 +196,7 @@ func (g *Gateway) Capture(ctx context.Context, providerPaymentID string, amount 
 	g.log.Info("tiptoppay payment captured",
 		slog.String("provider_payment_id", providerPaymentID),
 		slog.String("amount", amount.String()),
+		slog.Int("split_shares", len(splits)),
 	)
 	return &domain.GatewayPayment{
 		ProviderPaymentID: providerPaymentID,
@@ -202,6 +230,10 @@ func (g *Gateway) Void(ctx context.Context, providerPaymentID string) error {
 type refundRequest struct {
 	TransactionID int64       `json:"TransactionId"`
 	Amount        json.Number `json:"Amount"`
+	// Splits is REQUIRED for a split payment, full refund or partial —
+	// TipTopPay answers `Field "Splits" is required` without it. For a partial
+	// refund it lists only the shares money comes back from.
+	Splits []splitEntry `json:"Splits,omitempty"`
 }
 
 // Refund sends money back from a captured payment; partial refunds are the
@@ -216,7 +248,16 @@ func (g *Gateway) Refund(ctx context.Context, providerPaymentID string, amount d
 		return nil, fmt.Errorf("tiptoppay: refund amount must be positive: %w", domain.ErrValidation)
 	}
 
-	body := refundRequest{TransactionID: txID, Amount: json.Number(payment.FormatMinor(amount.AmountMinor))}
+	splits, err := g.splitsFor(ctx, txID, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	body := refundRequest{
+		TransactionID: txID,
+		Amount:        json.Number(payment.FormatMinor(amount.AmountMinor)),
+		Splits:        splits,
+	}
 	key := derivedKey("refund", providerPaymentID, amount)
 
 	var model refundModel
@@ -228,6 +269,7 @@ func (g *Gateway) Refund(ctx context.Context, providerPaymentID string, amount d
 	g.log.Info("tiptoppay refund accepted",
 		slog.String("provider_payment_id", providerPaymentID),
 		slog.String("amount", amount.String()),
+		slog.Int("split_shares", len(splits)),
 	)
 	return &domain.GatewayRefund{
 		ProviderRefundID: strconv.FormatInt(model.TransactionID, 10),
@@ -371,7 +413,15 @@ func (g *Gateway) call(ctx context.Context, op, path, idempotencyKey string, bod
 		if env.Message != nil {
 			msg = *env.Message
 		}
-		return env.Model, fmt.Errorf("tiptoppay %s: %s: %w", op, sanitise(msg), payment.ErrProviderRejected)
+		rejected := fmt.Errorf("tiptoppay %s: %s: %w", op, sanitise(msg), payment.ErrProviderRejected)
+		// A split refusal names something an operator can act on — a terminal
+		// that was never switched on for splits, a sub-merchant id nobody
+		// recognises, shares that do not add up. Tag it so that action does not
+		// depend on somebody reading the sentence.
+		if code, ok := splitErrorCode(msg); ok {
+			return env.Model, domain.WithCode(code, rejected)
+		}
+		return env.Model, rejected
 	}
 	if out != nil && len(env.Model) > 0 {
 		if err := json.Unmarshal(env.Model, out); err != nil {

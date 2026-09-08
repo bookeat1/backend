@@ -1,6 +1,10 @@
-// Package otpsender delivers OTP codes. The stub stands in for the real
-// provider waterfall (Telegram / Gateway / WhatsApp / SMS), which is a later
-// phase.
+// Package otpsender delivers OTP codes.
+//
+// It holds two things: the Waterfall (Telegram Gateway → WhatsApp → SMS, in
+// waterfall.go) with one adapter per provider, and this Stub — the sender used
+// when NO channel has credentials yet. Which of the two the application runs is
+// decided in bootstrap purely by whether any provider is configured; there is no
+// "OTP enabled" switch to forget to flip.
 //
 // # Why the code is not logged outside development
 //
@@ -22,6 +26,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"backend-core/internal/domain"
 	"backend-core/internal/logging"
 )
 
@@ -45,8 +50,9 @@ func NewStub(log *slog.Logger, environment string) *Stub {
 	}
 }
 
-// Send reports the "stub" channel and never errors.
-func (s *Stub) Send(ctx context.Context, phone, code string) (string, error) {
+// Send reports the "stub" channel and never errors. The delivery hint is
+// accepted and ignored: with no channels configured there is nothing to order.
+func (s *Stub) Send(ctx context.Context, phone, code string, _ domain.OTPSendHint) (string, error) {
 	// Prefer the request-scoped logger so the line carries the request id.
 	// FromContext falls back to slog.Default() when a context never went
 	// through the middleware; in that case use the logger this stub was built
@@ -60,17 +66,17 @@ func (s *Stub) Send(ctx context.Context, phone, code string) (string, error) {
 		log.Info("otp.stub_send",
 			slog.String("phone", phone),
 			slog.String("code", code),
-			slog.String("channel", "stub"),
+			slog.String("channel", domain.OTPChannelStub),
 		)
-		return "stub", nil
+		return domain.OTPChannelStub, nil
 	}
 
 	// Not development: the code stays out of the log, and a stub sender
 	// answering at all is a configuration problem worth shouting about.
 	log.Warn("otp.stub_send_outside_development",
 		slog.String("phone_masked", logging.MaskPhone(phone)),
-		slog.String("channel", "stub"),
+		slog.String("channel", domain.OTPChannelStub),
 		slog.String("detail", "OTP code withheld from logs; configure a real OTP provider"),
 	)
-	return "stub", nil
+	return domain.OTPChannelStub, nil
 }

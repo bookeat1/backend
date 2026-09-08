@@ -115,6 +115,19 @@ func (u *captureVoidUseCase) CaptureOnSeating(ctx context.Context, actor Actor, 
 	if err := authorizeStaffForRestaurant(ctx, u.managers, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
+	return u.captureHold(ctx, p)
+}
+
+// captureHold is the CAS-guarded "convert an authorized hold into a charge"
+// mechanic shared by CaptureOnSeating and by the deposit cancellation
+// settlement (cancel.go): the venue keeps the deposit on a late cancellation
+// or a no-show by CAPTURING the hold rather than voiding it. It assumes the
+// caller has already fetched p and authorized the action — it performs only
+// the status precondition, the race-safe claim, the acquirer call and the
+// ledger/status commit. Every hazard and its fix is documented on
+// CaptureOnSeating above; this is the same code, factored out so the two
+// callers share one implementation instead of drifting.
+func (u *captureVoidUseCase) captureHold(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
 	if p.Status == domain.PaymentCaptured {
 		return p, nil
 	}
@@ -273,6 +286,16 @@ func (u *captureVoidUseCase) VoidOnRejection(ctx context.Context, actor Actor, b
 	if err := authorizeStaffForRestaurant(ctx, u.managers, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
+	return u.voidHold(ctx, p, reason)
+}
+
+// voidHold is the CAS-guarded "release an authorized hold" mechanic shared by
+// VoidOnRejection and by the deposit cancellation settlement (cancel.go): a
+// guest who cancels in time, or a venue-side cancellation, releases the hold
+// so the guest is never charged. It assumes the caller already fetched p and
+// authorized the action. Every hazard is documented on VoidOnRejection above;
+// this is the same code, factored out for reuse.
+func (u *captureVoidUseCase) voidHold(ctx context.Context, p *domain.Payment, reason string) (*domain.Payment, error) {
 	if p.Status == domain.PaymentVoided {
 		return p, nil
 	}

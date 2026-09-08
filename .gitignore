@@ -16,3 +16,8 @@ coverage.*
 
 # stray go build artifacts from `go build ./cmd/...`
 /etl
+
+# swag's Go wrapper is generated but never imported: the spec we commit is
+# swagger.json/yaml. Keeping docs.go would drag swaggo into go.mod for nothing —
+# and it broke the build once already (dd12d80).
+docs/docs.go

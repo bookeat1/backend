@@ -55,3 +55,12 @@ func (r *Repository) Revoke(ctx context.Context, id uuid.UUID) error {
 		`UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1`, id)
 	return err
 }
+
+func (r *Repository) RevokeAllByUser(ctx context.Context, userID uuid.UUID) error {
+	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	if err != nil {
+		return fmt.Errorf("revoke all refresh tokens: %w", err)
+	}
+	return nil
+}

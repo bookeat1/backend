@@ -143,12 +143,20 @@ type bookingPayload struct {
 	EndsAt       time.Time            `json:"ends_at"`
 	Status       domain.BookingStatus `json:"status"`
 	Source       domain.BookingSource `json:"source"`
+	// CancelledBy is carried so a consumer can tell a venue/system cancellation
+	// from one the guest performed themselves — the guest-facing notifier does
+	// not echo the latter back at them. Empty on every non-cancel event.
+	CancelledBy domain.CancelledBy `json:"cancelled_by,omitempty"`
 }
 
 func newBookingPayload(b *domain.Booking) bookingPayload {
-	return bookingPayload{
+	p := bookingPayload{
 		ID: b.ID, RestaurantID: b.RestaurantID, UserID: b.UserID, Name: b.Name,
 		Phone: b.PhoneNormalized, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: b.Status, Source: b.Source,
 	}
+	if b.CancelledBy != nil {
+		p.CancelledBy = *b.CancelledBy
+	}
+	return p
 }

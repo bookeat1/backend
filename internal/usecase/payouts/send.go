@@ -1,0 +1,260 @@
+package payouts
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+
+	"backend-core/internal/domain"
+)
+
+// SendPayout dispatches one pending payout to the acquirer. Superadmin only.
+//
+// Money-safety, identical in shape to CaptureOnSeating:
+//
+//  1. CAS pending→sent is claimed BEFORE the acquirer is ever called. A second
+//     concurrent send finds the row no longer `pending`, gets ErrAlreadyExists,
+//     and returns the current payout without calling the acquirer a second time
+//     — the double-send guard.
+//  2. The acquirer call carries pg_order_id = payout.ID and our idempotency
+//     key, so even if step 1 somehow raced at two processes, the acquirer
+//     itself resolves the repeated order id to ONE payout — a second guarantee.
+//  3. A definite success → CAS sent→paid. A definite decline
+//     (ErrProviderDeclined) → CAS sent→failed AND release the claimed ledger
+//     entries in the same tx (so the money is owed again). A timeout/unknown
+//     (ErrProviderOutcomeUnknown) leaves the payout `sent`, NEVER marked paid or
+//     failed — the reconciler resolves it. Money is never guessed.
+func (u *UseCase) SendPayout(ctx context.Context, actor Actor, payoutID uuid.UUID) (*domain.Payout, error) {
+	if err := u.authorizeSuperadmin(actor); err != nil {
+		return nil, err
+	}
+	return u.sendPayout(ctx, payoutID)
+}
+
+// sendPayout is SendPayout without the RBAC gate — the body shared with the
+// scheduled daily pass, which runs as the platform itself and has no Actor to
+// check. Every caller outside this package goes through SendPayout.
+func (u *UseCase) sendPayout(ctx context.Context, payoutID uuid.UUID) (*domain.Payout, error) {
+	p, err := u.payouts.GetByID(ctx, payoutID)
+	if err != nil {
+		return nil, err
+	}
+	// Idempotent replay: an already-sent/paid/failed payout is returned as-is,
+	// no second dispatch.
+	if p.Status != domain.PayoutPending {
+		return p, nil
+	}
+
+	// Ownership gate #2, and the reason it is here and not only at generation:
+	// a payout carries a FROZEN card snapshot, and the venue can change its
+	// destination between generation and dispatch. Money may only leave to the
+	// card the venue owns at THIS moment, so the snapshot is re-proven against
+	// the live destination before anything is claimed or dispatched.
+	//
+	// A failure is terminal on purpose: the payout is failed and its ledger
+	// entries released in one transaction, so the money becomes owed again and
+	// the next generation builds a payout against the card that is actually
+	// registered. Re-pointing this payout at the new card automatically is
+	// exactly what must NOT happen.
+	if err := u.verifyDestinationOwnership(ctx, p); err != nil {
+		if failErr := u.markFailedAndRelease(ctx, payoutID, domain.PayoutPending, "destination_unverified", err.Error()); failErr != nil {
+			if !errors.Is(failErr, domain.ErrAlreadyExists) {
+				return nil, fmt.Errorf("payout %s destination refused (%v) and could not be failed: %w", payoutID, err, failErr)
+			}
+			// Somebody else moved the payout out of `pending` first; the
+			// refusal still stands and the acquirer is still not called.
+		}
+		u.log.Warn("payout refused: destination does not belong to the venue being paid",
+			"payout_id", payoutID, "restaurant_id", p.RestaurantID, "err", err.Error())
+		return nil, err
+	}
+
+	now := u.now()
+	// Claim the send BEFORE calling the acquirer.
+	if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, domain.PayoutPending, domain.PayoutSent, domain.PayoutStatusPatch{}, now); err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			// Someone else won the claim; return the current state.
+			return u.payouts.GetByID(ctx, payoutID)
+		}
+		return nil, err
+	}
+
+	if u.gateway == nil {
+		return nil, fmt.Errorf("%w: no payout gateway configured", domain.ErrProviderOutcomeUnknown)
+	}
+	if u.gateway.Name() != domain.ProviderFreedomPay {
+		return nil, fmt.Errorf("%w: unsupported payout provider %q", domain.ErrValidation, u.gateway.Name())
+	}
+
+	resp, gwErr := u.gateway.Payout(ctx, domain.PayoutRequest{
+		PayoutID:               payoutID,
+		IdempotencyKey:         p.IdempotencyKey,
+		Amount:                 p.Amount(),
+		Method:                 p.Method,
+		DestinationToken:       p.DestinationToken,
+		DestinationCustomerRef: p.DestinationCustomerRef,
+	})
+	if gwErr != nil {
+		return u.resolveSendError(ctx, payoutID, gwErr)
+	}
+	return u.resolveSendSuccess(ctx, payoutID, resp)
+}
+
+// resolveSendSuccess applies a definite acquirer answer.
+func (u *UseCase) resolveSendSuccess(ctx context.Context, payoutID uuid.UUID, resp *domain.GatewayPayout) (*domain.Payout, error) {
+	now := u.now()
+	switch resp.Status {
+	case domain.PayoutPaid:
+		ref := resp.ProviderRef
+		patch := domain.PayoutStatusPatch{}
+		if ref != "" {
+			patch.ProviderRef = &ref
+		}
+		p, err := u.payouts.GetByID(ctx, payoutID)
+		if err != nil {
+			return nil, err
+		}
+		if err := bookPaid(ctx, u.payouts, u.ledger, u.tx, *p, patch, now, u.log); err != nil {
+			// A reconciler pass may have resolved it first — not a conflict.
+			if errors.Is(err, domain.ErrAlreadyExists) {
+				return u.payouts.GetByID(ctx, payoutID)
+			}
+			return nil, err
+		}
+	case domain.PayoutSent:
+		// Accepted, still processing: persist the ref so the reconciler can
+		// resolve it, leave the status `sent`.
+		if resp.ProviderRef != "" {
+			if err := u.payouts.SetProviderRef(ctx, payoutID, resp.ProviderRef); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		// The adapter should never return paid/sent-only here, but if it hands
+		// back anything else we treat it as unknown and leave the payout `sent`.
+		u.log.Warn("payout gateway returned an unexpected success status, leaving sent for reconciliation",
+			"payout_id", payoutID, "status", string(resp.Status))
+	}
+	return u.payouts.GetByID(ctx, payoutID)
+}
+
+// resolveSendError applies an acquirer error. Only an explicit decline is
+// recorded as failure; everything else is left `sent` for the reconciler.
+func (u *UseCase) resolveSendError(ctx context.Context, payoutID uuid.UUID, gwErr error) (*domain.Payout, error) {
+	if errors.Is(gwErr, domain.ErrProviderDeclined) {
+		if err := u.markFailedAndRelease(ctx, payoutID, domain.PayoutSent, "declined", gwErr.Error()); err != nil {
+			return nil, err
+		}
+		return u.payouts.GetByID(ctx, payoutID)
+	}
+	// Unknown outcome (timeout, malformed, transport): the money may already be
+	// moving. Leave it `sent`; the reconciler will ask the acquirer.
+	u.log.Warn("payout send outcome unknown, left sent for reconciliation",
+		"payout_id", payoutID, "err", gwErr.Error())
+	return nil, fmt.Errorf("payout %s dispatched, outcome unknown: %w", payoutID, gwErr)
+}
+
+// bookPaid moves a payout sent→paid AND appends its double-entry ledger lines
+// (the money and the acquirer's fee) in ONE transaction, so a confirmed payout
+// and the record of what it cost can never disagree.
+//
+// Shared by SendPayout's success path and by the reconciler, because a payout
+// can reach `paid` down either route and the cost must be booked exactly once
+// either way. The CAS admits a single winner; the ledger's
+// UNIQUE(payout_id, account, direction, entry_type) is the DB-level second
+// line of defence against a replay booking the fee twice.
+//
+// A nil ledger port degrades to "fee recorded on the payout row only" with a
+// loud warning — never a silent loss of the cost record.
+func bookPaid(ctx context.Context, repo domain.PayoutRepository, ledger domain.PayoutLedgerRepository, tx domain.TxManager, p domain.Payout, patch domain.PayoutStatusPatch, at time.Time, log *slog.Logger) error {
+	entries := domain.PayoutLedgerEntries(p, at)
+	return tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PayoutSent, domain.PayoutPaid, patch, at); err != nil {
+			return err
+		}
+		if ledger == nil {
+			log.Warn("no payout ledger wired: this payout's fee is recorded on the payout row only",
+				"payout_id", p.ID, "fee_minor", p.FeeMinor)
+			return nil
+		}
+		if err := domain.ValidatePayoutLedgerBalance(entries); err != nil {
+			return fmt.Errorf("payout ledger batch for %s: %w", p.ID, err)
+		}
+		return ledger.CreateBatch(ctx, entries)
+	})
+}
+
+// verifyDestinationOwnership reads the restaurant's CURRENT payout destination
+// and proves the card frozen on p is still that card. A missing destination is
+// not a repository error here: it is the ownership answer "this venue has no
+// card on file any more", which the domain turns into its own code.
+func (u *UseCase) verifyDestinationOwnership(ctx context.Context, p *domain.Payout) error {
+	current, err := u.destinations.Get(ctx, p.RestaurantID)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return err
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		current = nil
+	}
+	return domain.VerifyPayoutDestination(*p, current)
+}
+
+// markFailedAndRelease moves a payout from→failed and releases its claimed
+// ledger entries in ONE transaction, so the money becomes owed again atomically
+// with the failure. CAS-guarded: if a reconciler already resolved this payout,
+// the CAS loses and the release is skipped.
+//
+// `from` is `sent` for an acquirer decline (the payout was dispatched and
+// refused) and `pending` for a refusal that happens BEFORE dispatch (the
+// destination ownership check). Both end in the same place — failed, entries
+// released — because in both cases no money moved and the balance must be
+// payable again.
+func (u *UseCase) markFailedAndRelease(ctx context.Context, payoutID uuid.UUID, from domain.PayoutStatus, code, reason string) error {
+	now := u.now()
+	patch := domain.PayoutStatusPatch{FailureCode: &code, FailureReason: &reason}
+	return u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := u.payouts.CompareAndSwapStatus(ctx, payoutID, from, domain.PayoutFailed, patch, now); err != nil {
+			return err
+		}
+		return u.items.DeleteByPayout(ctx, payoutID)
+	})
+}
+
+// GenerateAndSendForRestaurant is the manual "generate + send for a period"
+// trigger (increment 1). It generates the pending payouts, then sends each. An
+// individual send that ends in an unknown outcome is logged and does not abort
+// the others — that payout is safely left `sent` for the reconciler.
+func (u *UseCase) GenerateAndSendForRestaurant(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.Payout, error) {
+	generated, err := u.GenerateForRestaurant(ctx, actor, restaurantID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.Payout, 0, len(generated))
+	for i := range generated {
+		sent, err := u.SendPayout(ctx, actor, generated[i].ID)
+		if err != nil {
+			// Unknown outcome: keep going, the payout is `sent` and reconcilable.
+			u.log.Warn("payout send did not complete synchronously", "payout_id", generated[i].ID, "err", err.Error())
+			cur, getErr := u.payouts.GetByID(ctx, generated[i].ID)
+			if getErr == nil {
+				out = append(out, *cur)
+			}
+			continue
+		}
+		out = append(out, *sent)
+	}
+	return out, nil
+}
+
+// ListForRestaurant returns a restaurant's payout history. RBAC:
+// restaurant.manage (the venue may read its own statement) or superadmin.
+func (u *UseCase) ListForRestaurant(ctx context.Context, actor Actor, restaurantID uuid.UUID, limit int) ([]domain.Payout, error) {
+	if err := u.authorizeRestaurant(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
+		return nil, err
+	}
+	return u.payouts.List(ctx, restaurantID, limit)
+}

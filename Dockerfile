@@ -5,7 +5,14 @@
 # and a local build produce the same binary. Bump both together.
 FROM golang:1.25.7-alpine3.22 AS builder
 
-RUN apk add --no-cache git ca-certificates
+# build-base (gcc + musl-dev + friends) and libwebp-dev are here for exactly
+# one reason: internal/media encodes derivatives with
+# github.com/kolesa-team/go-webp, a cgo binding over libwebp. There is no
+# pure-Go WebP encoder of acceptable quality, and the product owner decided
+# (2026-09-06) that photo quality/size matters more than keeping this a
+# CGO_ENABLED=0 build — see internal/media/key.go. That is also why
+# CGO_ENABLED is 1 below, not 0 as it used to be.
+RUN apk add --no-cache git ca-certificates build-base libwebp-dev
 
 WORKDIR /src
 
@@ -16,7 +23,7 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+ENV CGO_ENABLED=1 GOOS=linux GOARCH=amd64
 
 # Three binaries out of one module: the HTTP API, the background booking
 # worker, and the goose-based migrator. Same image, different ENTRYPOINT
@@ -31,7 +38,11 @@ RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/http 
 # final image, non-root user, no build toolchain.
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates tzdata wget \
+# libwebp (the runtime shared library, not -dev) is required at startup: the
+# http/worker binaries were dynamically linked against it once CGO_ENABLED=1
+# turned on for the WebP encoder in internal/media (see the builder stage
+# comment). Without it the binary fails to even start, not just to resize.
+RUN apk add --no-cache ca-certificates tzdata wget libwebp \
  && addgroup -S -g 10001 app \
  && adduser  -S -u 10001 -G app -h /app -s /sbin/nologin app
 

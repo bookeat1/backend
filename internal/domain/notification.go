@@ -1,0 +1,312 @@
+package domain
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NotificationChannel names an outbound notification channel. Increment 1 ships
+// only web push; Telegram / CRM / Calendar channels register additional names
+// here later without touching the dispatcher.
+type NotificationChannel string
+
+const (
+	ChannelWebPush  NotificationChannel = "web_push"
+	ChannelTelegram NotificationChannel = "telegram"
+	// ChannelMobilePush is the GUEST-facing channel: a push to the signed-in
+	// guest's own phone (device_push_tokens). Unlike the two above it is not a
+	// staff alert, so every send through it must first pass the guest's opt-out
+	// (see notifications.GuestNotificationGate).
+	ChannelMobilePush NotificationChannel = "mobile_push"
+	// ChannelInApp is the GUEST-facing DURABLE feed: instead of firing a message
+	// at a device it appends a row to the notifications table the mobile app's
+	// «Уведомления» screen reads back. It shares the dispatcher and the booking
+	// outbox with the push channels but not the notification_deliveries ledger —
+	// its idempotency is the notifications table's own (outbox_event_id, user_id)
+	// unique key.
+	ChannelInApp NotificationChannel = "in_app"
+	// ChannelWhatsApp is the VENUE-facing WhatsApp Cloud API channel: an
+	// approved template sent to the staff who opted in on their own
+	// restaurant_managers row. Its delivery ledger target is that staff row's
+	// id — a venue can have several people on the alert, unlike Telegram where
+	// the target is the venue's single chat.
+	ChannelWhatsApp NotificationChannel = "whatsapp"
+)
+
+// PushSubscription is a staff member's browser Web Push subscription, as handed
+// to the backend by the frontend service worker (PushSubscription.toJSON()).
+// It is scoped to BOTH the staff user_id (who owns the device) and a
+// restaurant_id (which venue's bookings this device wants alerts for): a staff
+// member working two venues registers two subscriptions from the same browser,
+// one per venue, and only ever sees the bookings of a venue they are staff of.
+type PushSubscription struct {
+	ID           uuid.UUID
+	UserID       uuid.UUID
+	RestaurantID uuid.UUID
+	Endpoint     string
+	P256dh       string
+	Auth         string
+}
+
+// PushSubscriptionRepository persists browser push subscriptions.
+type PushSubscriptionRepository interface {
+	// Upsert stores a subscription, keyed on its unique endpoint: re-registering
+	// the same endpoint (e.g. after the browser rotates its keys, or the same
+	// device re-subscribes) overwrites the row in place instead of duplicating.
+	Upsert(ctx context.Context, s *PushSubscription) error
+	// DeleteByEndpointForUser removes ONE subscription, but only if it belongs to
+	// userID — a staff member can only unregister their own device, never
+	// someone else's endpoint. Absent / not-owned is not an error (idempotent).
+	DeleteByEndpointForUser(ctx context.Context, userID uuid.UUID, endpoint string) error
+	// ListByRestaurant returns every push subscription registered for a venue —
+	// the fan-out target set for that venue's new-booking event.
+	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]PushSubscription, error)
+	// DeleteByID removes a subscription the push service reported as gone (HTTP
+	// 404/410): the endpoint is dead, keeping it only wastes future sends.
+	DeleteByID(ctx context.Context, id uuid.UUID) error
+}
+
+// DevicePlatform names the mobile platform a push token belongs to. Stored as
+// VARCHAR and validated in app code — never a DB enum.
+type DevicePlatform string
+
+const (
+	PlatformIOS     DevicePlatform = "ios"
+	PlatformAndroid DevicePlatform = "android"
+	// PlatformWeb covers an Expo web build. It is a distinct concept from the
+	// staff PushSubscription (browser Web Push): this is still a token handed
+	// to the same provider, not a VAPID-encrypted endpoint.
+	PlatformWeb DevicePlatform = "web"
+)
+
+// ValidDevicePlatform reports whether p is a known device platform.
+func ValidDevicePlatform(p DevicePlatform) bool {
+	return p == PlatformIOS || p == PlatformAndroid || p == PlatformWeb
+}
+
+// DevicePushToken is ONE mobile device a signed-in guest wants notifications
+// on. The app is Expo/React Native, so Token is an Expo push token in practice,
+// but nothing here assumes that: the value is opaque to the domain, so an
+// FCM/APNs token fits the same row once the sender behind
+// notifications.MobilePushSender is swapped.
+//
+// It is scoped to the guest ONLY — no restaurant_id. A staff PushSubscription
+// answers "alert this device about THIS venue's bookings"; a guest device is
+// notified about the guest's OWN bookings, wherever they booked. One guest may
+// hold several rows (phone + tablet); the unique key is the token itself.
+type DevicePushToken struct {
+	ID        uuid.UUID
+	UserID    uuid.UUID
+	Token     string
+	Platform  DevicePlatform
+	IsActive  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// DevicePushTokenRepository persists guest mobile push tokens.
+type DevicePushTokenRepository interface {
+	// Upsert stores a token keyed on the token value itself. Re-registering an
+	// existing token RE-POINTS it to the calling user and reactivates it,
+	// instead of inserting a duplicate — a device changing hands (or a guest
+	// signing in on a friend's phone) must never keep delivering to the
+	// previous owner.
+	Upsert(ctx context.Context, t *DevicePushToken) error
+	// ListActiveByUser returns the guest's live devices — the fan-out target set
+	// for their own booking events. Deactivated rows are never returned.
+	ListActiveByUser(ctx context.Context, userID uuid.UUID) ([]DevicePushToken, error)
+	// DeactivateByID marks a token the push provider reported as gone
+	// (Expo "DeviceNotRegistered") inactive. The row is kept, not deleted: the
+	// delivery ledger references it as a target. Idempotent.
+	DeactivateByID(ctx context.Context, id uuid.UUID) error
+	// DeactivateForUser is the guest's own "stop notifying this device" (sign
+	// out / permission revoked in the OS). The userID predicate is the tenant
+	// guard: it is impossible to silence someone else's device even knowing its
+	// exact token. Absent / not-owned is not an error (idempotent).
+	DeactivateForUser(ctx context.Context, userID uuid.UUID, token string) error
+}
+
+// PushTicket is ONE accepted mobile push whose real fate is not known yet.
+//
+// The mobile providers answer a send with a TICKET ("queued"), not with a
+// delivery: the per-device outcome shows up later, in a RECEIPT fetched by
+// ticket id. Expo's own wording is that a ticket only means "we accepted it",
+// and the receipt is where DeviceNotRegistered actually appears — observed live
+// on 2026-09-01, when three production android tokens all came back `ok` from
+// the send and two of them came back DeviceNotRegistered from getReceipts.
+//
+// The row is short-lived by construction: providers keep receipts for 24 hours,
+// so a ticket nobody could resolve inside that window is force-resolved rather
+// than kept forever.
+type PushTicket struct {
+	// ID is the provider's ticket id, and the table's primary key: recording
+	// the same ticket twice must be a no-op, not a second poll.
+	ID string
+	// DeviceTokenID is the device the push went to — the row DeactivateByID
+	// silences when the receipt says the device is gone.
+	DeviceTokenID uuid.UUID
+	// OutboxEventID is the booking event the push came from. Forensics only
+	// (nullable, no FK): the ticket's fate must not depend on the outbox row.
+	OutboxEventID *uuid.UUID
+	CreatedAt     time.Time
+	// ResolvedAt is nil while the receipt is still pending.
+	ResolvedAt *time.Time
+}
+
+// PushTicketRepository is the poll queue for mobile push receipts. It is
+// deliberately separate from the delivery ledger: the ledger is a permanent
+// dedupe key on the hot fan-out path, this is a 24-hour work queue only the
+// receipt worker reads.
+type PushTicketRepository interface {
+	// Record stores an accepted ticket. Idempotent on the ticket id: a resend
+	// that repeats a ticket must not enqueue a second poll.
+	Record(ctx context.Context, t PushTicket) error
+	// ListUnresolved returns the oldest tickets still awaiting a receipt that
+	// were created before createdBefore (providers need a grace period before a
+	// receipt exists), capped at limit.
+	ListUnresolved(ctx context.Context, createdBefore time.Time, limit int) ([]PushTicket, error)
+	// Resolve marks the given tickets answered. Ids that do not exist (or are
+	// already resolved) are ignored — it is idempotent.
+	Resolve(ctx context.Context, ticketIDs []string, at time.Time) error
+	// ExpireOlderThan force-resolves every unresolved ticket created before the
+	// cutoff and returns how many it closed. Without it the table would grow
+	// forever with tickets whose receipts the provider has already deleted.
+	ExpireOlderThan(ctx context.Context, cutoff time.Time, at time.Time) (int64, error)
+}
+
+// NotificationDeliveryRepository is the at-least-once dedupe ledger. A row is
+// written only AFTER a successful send, so a crash between send and record
+// re-sends (a tolerated duplicate) rather than dropping a notification; the
+// AlreadyDelivered pre-check then stops a redelivery of the same outbox event
+// from re-notifying the same target that already got it.
+//
+// targetID is the channel-specific fan-out target: a push subscription id for
+// web push, the restaurant id for telegram (a venue has one chat). The ledger's
+// (outbox_event_id, channel, target_id) unique key makes the dedupe scoped per
+// channel, so the same booking event can still notify web push AND telegram.
+type NotificationDeliveryRepository interface {
+	AlreadyDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, targetID uuid.UUID) (bool, error)
+	RecordDelivered(ctx context.Context, outboxEventID uuid.UUID, channel NotificationChannel, targetID uuid.UUID) error
+}
+
+// TelegramSettings is a venue's Telegram channel state: the chat id staff
+// connected (empty when unset) and whether the channel is enabled. The notifier
+// sends only when Enabled is true AND ChatID is non-empty.
+type TelegramSettings struct {
+	ChatID  string
+	Enabled bool
+	// NewBotReadyAt is set once @book_eat_restaurants_bot has proved it can
+	// write to ChatID (staff pressed /start, or the bot was added to the group).
+	// NIL means "not migrated yet" and is what keeps the OLD notifications bot
+	// in charge for this venue — see the staged migration in
+	// specs/telegram-miniapp-restaurant.md §7. It is never inferred: only an
+	// inbound update from the new bot sets it.
+	NewBotReadyAt *time.Time
+	// NewBotFailedAt records the last time the new bot was refused by this chat
+	// (Bot API 400/403). It is written together with clearing NewBotReadyAt, so
+	// a venue that kicks the new bot out silently falls back to the old one
+	// instead of losing its alerts.
+	NewBotFailedAt *time.Time
+}
+
+// NewBotReady reports whether the new restaurants bot may be used for this
+// venue. Chat id and channel toggle are checked separately by the notifier;
+// this answers only the "which bot" question.
+func (s TelegramSettings) NewBotReady() bool { return s.NewBotReadyAt != nil }
+
+// TelegramMigrationRow is one venue's line in the bot-migration report: does it
+// have a chat connected at all, and has the new bot reached it yet. Read-only,
+// built for the superadmin's "who is still behind" view.
+type TelegramMigrationRow struct {
+	RestaurantID   uuid.UUID
+	RestaurantName string
+	ChatID         string
+	Enabled        bool
+	NewBotReadyAt  *time.Time
+	NewBotFailedAt *time.Time
+}
+
+// ChatIsUsername reports whether the connected target is an @username / channel
+// handle rather than a numeric chat id. Those venues cannot self-migrate:
+// there is no "Start" to press in a channel — the new bot has to be added as an
+// administrator by hand. They are called out separately in the report for
+// exactly that reason.
+func (r TelegramMigrationRow) ChatIsUsername() bool {
+	return strings.HasPrefix(strings.TrimSpace(r.ChatID), "@")
+}
+
+// NewBotReady reports whether this venue already receives alerts from the new
+// bot.
+func (r TelegramMigrationRow) NewBotReady() bool { return r.NewBotReadyAt != nil }
+
+// WhatsAppSettings is a venue's WhatsApp channel state: the number staff
+// asked us to notify (empty when unset) and whether the channel is enabled.
+// Deliberately NOT the venue's public phone: that number is for guests, while
+// this one may be the manager's personal number, and merging the two would one
+// day show a guest a private number.
+type WhatsAppSettings struct {
+	Phone   string
+	Enabled bool
+}
+
+// RestaurantNotificationSettingsRepository backs the per-restaurant channel
+// toggles. Web push defaults to ON: a MISSING settings row means enabled, so
+// WebPushEnabled returns true when the venue has never touched its settings.
+// Telegram defaults to enabled too, but has no target until a chat id is
+// connected, so a missing row leaves the telegram channel silent by default.
+type RestaurantNotificationSettingsRepository interface {
+	WebPushEnabled(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+	// TelegramSettings returns the venue's telegram target + toggle. A missing
+	// settings row is TelegramSettings{ChatID: "", Enabled: true}.
+	TelegramSettings(ctx context.Context, restaurantID uuid.UUID) (TelegramSettings, error)
+	// SetTelegramChatID upserts the venue's telegram chat id (creating the
+	// settings row on first use) and marks the channel enabled.
+	SetTelegramChatID(ctx context.Context, restaurantID uuid.UUID, chatID string) error
+	// ClearTelegramChatID unsets the chat id, silencing the channel while
+	// preserving the rest of the venue's notification settings.
+	ClearTelegramChatID(ctx context.Context, restaurantID uuid.UUID) error
+	// RestaurantByTelegramChatID resolves a chat back to the venue that
+	// connected it. This is the reverse of SetTelegramChatID and it is what
+	// AUTHORISES an inbound button press: the press carries no account, so the
+	// chat it came from is the only credential, and this lookup turns that
+	// credential into a restaurant. Only an ENABLED channel resolves — a venue
+	// that switched Telegram off must not still be able to act through it.
+	// ErrNotFound when no venue owns the chat.
+	RestaurantByTelegramChatID(ctx context.Context, chatID string) (uuid.UUID, error)
+
+	// MarkTelegramNewBotReady records that @book_eat_restaurants_bot can write
+	// to this venue's chat: ready_at = now(). Called ONLY from the new bot's own
+	// webhook (an inbound /start or my_chat_member), never guessed from a send.
+	// Idempotent — a second /start just refreshes the timestamp. A venue with no
+	// settings row is a no-op: there is no chat to migrate.
+	MarkTelegramNewBotReady(ctx context.Context, restaurantID uuid.UUID) error
+	// MarkTelegramNewBotFailed records a refusal by the new bot: ready_at is
+	// CLEARED and failed_at = now(). Clearing is the important half — it is what
+	// puts the venue back on the old bot on the very next event instead of
+	// letting alerts die quietly.
+	MarkTelegramNewBotFailed(ctx context.Context, restaurantID uuid.UUID) error
+	// TelegramMigrationStatus lists every venue that has a Telegram chat
+	// connected, with its new-bot state. Platform-wide and read-only: it is the
+	// superadmin's answer to "who is still on the old bot", and the only way to
+	// know the staged migration is finished.
+	TelegramMigrationStatus(ctx context.Context) ([]TelegramMigrationRow, error)
+
+	// WhatsAppSettings mirrors TelegramSettings for the WhatsApp channel: a
+	// missing row is WhatsAppSettings{Phone: "", Enabled: true} — enabled, but
+	// silent until a number is set.
+	WhatsAppSettings(ctx context.Context, restaurantID uuid.UUID) (WhatsAppSettings, error)
+	// SetWhatsAppPhone upserts the venue's notification number (E.164) and marks
+	// the channel enabled.
+	SetWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID, phone string) error
+	// ClearWhatsAppPhone unsets the number, silencing the channel.
+	ClearWhatsAppPhone(ctx context.Context, restaurantID uuid.UUID) error
+	// RestaurantByWhatsAppPhone is what AUTHORISES an inbound button press from
+	// WhatsApp, exactly as RestaurantByTelegramChatID does for Telegram: the
+	// press carries no account, so the number it came from is the only
+	// credential. Only an ENABLED channel resolves. ErrNotFound when no venue
+	// owns the number.
+	RestaurantByWhatsAppPhone(ctx context.Context, phone string) (uuid.UUID, error)
+}

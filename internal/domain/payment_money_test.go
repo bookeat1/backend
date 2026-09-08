@@ -170,3 +170,130 @@ func TestTotalWithFee(t *testing.T) {
 		t.Errorf("TotalWithFee() overflow error = %v, want ErrMoneyOverflow", err)
 	}
 }
+
+func TestGrossUpForAcquirer_VenueMadeWhole(t *testing.T) {
+	// For a range of bases and acquirer rates, the venue must always net at
+	// least the base after the acquirer withholds its cut of the total, and the
+	// shortfall-in-its-favour (dust) must never exceed one tiyn.
+	rates := []int{0, 100, 290, 350, 500, 1000, 9900}
+	bases := []int64{0, 1, 99, 100, 12_345, 1_000_000, 999_999_999}
+	for _, bps := range rates {
+		for _, baseMinor := range bases {
+			base := KZT(baseMinor)
+			fee, total, err := GrossUpForAcquirer(base, bps)
+			if err != nil {
+				t.Fatalf("GrossUpForAcquirer(%d, %d) error = %v", baseMinor, bps, err)
+			}
+			if total.AmountMinor != base.AmountMinor+fee.AmountMinor {
+				t.Fatalf("bps=%d base=%d: total %d != base+fee %d", bps, baseMinor, total.AmountMinor, base.AmountMinor+fee.AmountMinor)
+			}
+			// Net after the acquirer's cut of the TOTAL (acquirer floors its fee,
+			// which only helps the venue; we model the worst case with a ceil cut).
+			acquirerCut := (total.AmountMinor*int64(bps) + BasisPointsDenominator - 1) / BasisPointsDenominator
+			net := total.AmountMinor - acquirerCut
+			if net < base.AmountMinor {
+				t.Fatalf("bps=%d base=%d: net to venue %d < base %d", bps, baseMinor, net, base.AmountMinor)
+			}
+			if net-base.AmountMinor > 1 {
+				t.Fatalf("bps=%d base=%d: dust %d exceeds 1 tiyn (net %d, base %d)", bps, baseMinor, net-base.AmountMinor, net, base.AmountMinor)
+			}
+		}
+	}
+}
+
+func TestGrossUpForAcquirer_KnownValues(t *testing.T) {
+	// 3.5% acquirer on 10,000.00 ₸ (1,000,000 tiyn): total = ceil(1e6*1e4/9650)
+	// = 1,036,270; fee = 36,270. A plain additive 3.5% (35,000) would be short.
+	fee, total, err := GrossUpForAcquirer(KZT(1_000_000), 350)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if total.AmountMinor != 1_036_270 || fee.AmountMinor != 36_270 {
+		t.Fatalf("got total=%d fee=%d, want total=1036270 fee=36270", total.AmountMinor, fee.AmountMinor)
+	}
+	// Zero rate → no markup.
+	fee, total, err = GrossUpForAcquirer(KZT(500), 0)
+	if err != nil || fee.AmountMinor != 0 || total.AmountMinor != 500 {
+		t.Fatalf("zero-rate: got total=%d fee=%d err=%v, want 500/0/nil", total.AmountMinor, fee.AmountMinor, err)
+	}
+}
+
+func TestGrossUpForAcquirer_Errors(t *testing.T) {
+	if _, _, err := GrossUpForAcquirer(KZT(100), 10000); !errors.Is(err, ErrValidation) {
+		t.Errorf("bps=10000 (100%%) error = %v, want ErrValidation", err)
+	}
+	if _, _, err := GrossUpForAcquirer(KZT(100), -1); !errors.Is(err, ErrValidation) {
+		t.Errorf("bps=-1 error = %v, want ErrValidation", err)
+	}
+	if _, _, err := GrossUpForAcquirer(Money{AmountMinor: -5, Currency: "KZT"}, 350); !errors.Is(err, ErrNegativeAmount) {
+		t.Errorf("negative base error = %v, want ErrNegativeAmount", err)
+	}
+	if _, _, err := GrossUpForAcquirer(KZT(math.MaxInt64-1), 350); !errors.Is(err, ErrMoneyOverflow) {
+		t.Errorf("overflow error = %v, want ErrMoneyOverflow", err)
+	}
+}
+
+// FreedomPay's tariff is "3.5%, minimum 25 ₸ per operation" (merchant
+// questionnaire, 14.07.2026). The floor is what protects a SMALL deposit: 3.5%
+// of 500 ₸ is 17.5 ₸, but the acquirer still takes 25 ₸, and without the floor
+// that difference comes out of the venue's base.
+func TestGrossUpForAcquirerWithMinimum(t *testing.T) {
+	const bps, minFee = 350, 2500 // 3.5%, 25 ₸ in tiyn
+
+	cases := []struct {
+		name      string
+		baseMinor int64
+		wantTotal int64
+		wantFee   int64
+	}{
+		{"floor binds on a small deposit", 50_000, 52_500, 2_500},
+		// The real crossover for 350 bps / 2500 tiyn: below it the floor wins,
+		// at and above it the percentage does. Pinned to the tiyn, because a
+		// boundary that is only "about right" is a boundary nobody checked.
+		{"floor still binds one tiyn below the crossover", 68_928, 71_428, 2_500},
+		{"rate takes over at the crossover", 68_929, 71_430, 2_501},
+		{"rate binds on a large deposit", 1_000_000, 1_036_270, 36_270},
+		{"zero base is not an operation", 0, 0, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fee, total, err := GrossUpForAcquirerWithMinimum(KZT(tc.baseMinor), bps, minFee)
+			if err != nil {
+				t.Fatalf("GrossUpForAcquirerWithMinimum: %v", err)
+			}
+			if total.AmountMinor != tc.wantTotal || fee.AmountMinor != tc.wantFee {
+				t.Fatalf("total=%d fee=%d, want total=%d fee=%d",
+					total.AmountMinor, fee.AmountMinor, tc.wantTotal, tc.wantFee)
+			}
+			// The invariant that matters: whatever the acquirer takes — its
+			// percentage or its floor, whichever is larger — the venue still
+			// nets its base.
+			acquirerTakes := total.AmountMinor * bps / 10000
+			if acquirerTakes < minFee {
+				acquirerTakes = minFee
+			}
+			if tc.baseMinor > 0 && total.AmountMinor-acquirerTakes < tc.baseMinor {
+				t.Fatalf("venue nets %d, less than its base %d", total.AmountMinor-acquirerTakes, tc.baseMinor)
+			}
+		})
+	}
+}
+
+// The floor must never be charged on top of a percentage that already exceeds
+// it — the guest pays one fee, not two.
+func TestGrossUpForAcquirerWithMinimum_NoDoubleCharge(t *testing.T) {
+	withFloor, totalFloor, err := GrossUpForAcquirerWithMinimum(KZT(1_000_000), 350, 2500)
+	if err != nil {
+		t.Fatalf("with floor: %v", err)
+	}
+	withoutFloor, totalPlain, err := GrossUpForAcquirer(KZT(1_000_000), 350)
+	_ = withoutFloor
+	if err != nil {
+		t.Fatalf("without floor: %v", err)
+	}
+	if totalFloor != totalPlain {
+		t.Fatalf("floor changed a total the rate already covers: %d vs %d", totalFloor.AmountMinor, totalPlain.AmountMinor)
+	}
+	_ = withFloor
+}

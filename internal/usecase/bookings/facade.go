@@ -16,6 +16,23 @@ type BookingDetails struct {
 	Booking domain.Booking
 	Items   []domain.BookingItem
 	Tables  []domain.BookingTable
+	// FreeCancelDeadline is the absolute moment free cancellation ends for this
+	// booking: starts_at − the venue's free_cancel_window_minutes (the SAME
+	// per-restaurant window the money path uses — single source of truth). The
+	// client renders a live countdown from it. It is nil for a booking that can
+	// no longer be cancelled (a terminal status); when the deadline has already
+	// PASSED it is still returned (non-nil) so the app can show the "paid
+	// cancellation" state — the client compares it to now, this layer does not
+	// null it out. See the facade Get doc for the free-booking judgement.
+	FreeCancelDeadline *time.Time
+}
+
+// freeCancelDeadlineResolver derives starts_at − free_cancel_window_minutes for
+// a booking. Bound in bootstrap to the SAME adapter the payment settlement uses
+// (payments.FreeCancelDeadlineFor over restaurants.free_cancel_window_minutes),
+// so the countdown the guest sees and the money decision can never disagree.
+type freeCancelDeadlineResolver interface {
+	CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error)
 }
 
 // Facade exposes booking reads plus the chat and survey side-channels.
@@ -46,16 +63,52 @@ type SurveyInput struct {
 	Dismissed      bool
 }
 
+// venueLocationResolver turns "the venue's calendar day" into real instants.
+//
+// It is a port rather than a direct read of the restaurant so this facade does
+// not grow the whole catalog repository, and so the zone a listing is bucketed
+// by is the SAME one the availability engine and the payout pass use.
+type venueLocationResolver interface {
+	// VenueLocation is the zone the venue's own day is measured in. It returns
+	// an error — never a substituted zone — when the venue's stored timezone is
+	// unusable.
+	VenueLocation(ctx context.Context, restaurantID uuid.UUID) (*time.Location, error)
+	// PlatformLocation is the zone the platform itself operates in
+	// (BOOKING_TIMEZONE_FALLBACK). Used only where no single venue defines the
+	// day — see ListMine.
+	PlatformLocation() (*time.Location, error)
+}
+
 type facade struct {
-	bookings domain.BookingRepository
-	links    domain.BookingTableRepository
-	items    domain.BookingItemRepository
-	messages domain.BookingMessageRepository
-	surveys  domain.RestaurantSurveyRepository
-	history  domain.BookingStatusHistoryRepository
-	outbox   domain.BookingOutboxRepository
-	managers managerChecker
-	tx       domain.TxManager
+	bookings   domain.BookingRepository
+	links      domain.BookingTableRepository
+	items      domain.BookingItemRepository
+	messages   domain.BookingMessageRepository
+	surveys    domain.RestaurantSurveyRepository
+	history    domain.BookingStatusHistoryRepository
+	outbox     domain.BookingOutboxRepository
+	managers   managerChecker
+	tx         domain.TxManager
+	freeCancel freeCancelDeadlineResolver
+	venueZone  venueLocationResolver
+}
+
+// FacadeOption configures optional facade dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type FacadeOption func(*facade)
+
+// WithFreeCancelDeadlineResolver wires the per-restaurant free-cancel deadline
+// used to populate BookingDetails.FreeCancelDeadline. Left nil in tests / when
+// payments are not wired, in which case the field is simply omitted (nil).
+func WithFreeCancelDeadlineResolver(r freeCancelDeadlineResolver) FacadeOption {
+	return func(f *facade) { f.freeCancel = r }
+}
+
+// WithVenueLocationResolver wires the zone a ?date= filter is resolved in.
+// Without it a filter that carries a calendar date is REFUSED rather than
+// silently answered for a UTC day — see resolveCalendarDate.
+func WithVenueLocationResolver(r venueLocationResolver) FacadeOption {
+	return func(f *facade) { f.venueZone = r }
 }
 
 // NewFacade constructs the bookings Facade.
@@ -69,11 +122,16 @@ func NewFacade(
 	outbox domain.BookingOutboxRepository,
 	managers managerChecker,
 	tx domain.TxManager,
+	opts ...FacadeOption,
 ) Facade {
-	return &facade{
+	f := &facade{
 		bookings: bookings, links: links, items: items, messages: messages,
 		surveys: surveys, history: history, outbox: outbox, managers: managers, tx: tx,
 	}
+	for _, o := range opts {
+		o(f)
+	}
+	return f
 }
 
 func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDetails, error) {
@@ -88,7 +146,42 @@ func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDe
 	if out.Tables, err = f.links.ListByBooking(ctx, id); err != nil {
 		return nil, err
 	}
+	out.FreeCancelDeadline = f.freeCancelDeadline(ctx, b)
 	return out, nil
+}
+
+// freeCancelDeadline computes the booking's free-cancellation deadline for the
+// client countdown, or nil.
+//
+// It is returned only for a booking that can still be cancelled (a pending /
+// confirmed / waitlisted booking); a terminal booking (arrived, completed,
+// cancelled, no-show, rejected) is past cancellation, so the countdown is
+// meaningless and the field is omitted.
+//
+// JUDGEMENT (free vs paid booking): a booking with NO prepayment has no money
+// at stake, so the deadline is arguably irrelevant there. This facade does not
+// carry the payment repository, and adding it only to null out a timestamp
+// would couple the read path to payments for no functional gain — so the
+// deadline IS returned for any active booking, and the client (which already
+// knows the booking's payment state) renders the countdown only when money is
+// at stake. Documented rather than silently coupled.
+//
+// A resolver error is swallowed (nil) on purpose: a booking read must not fail
+// because a per-restaurant policy lookup hiccuped; the countdown is auxiliary.
+func (f *facade) freeCancelDeadline(ctx context.Context, b *domain.Booking) *time.Time {
+	if f.freeCancel == nil {
+		return nil
+	}
+	switch b.Status {
+	case domain.BookingPending, domain.BookingConfirmed, domain.BookingWaitlist:
+	default:
+		return nil
+	}
+	deadline, err := f.freeCancel.CancelDeadlineFor(ctx, *b)
+	if err != nil {
+		return nil
+	}
+	return &deadline
 }
 
 // ListMine returns the caller's own bookings. The user filter is overwritten
@@ -104,6 +197,21 @@ func (f *facade) ListMine(ctx context.Context, actor Actor, flt domain.BookingFi
 	uid := actor.UserID
 	flt.UserID = &uid
 	flt.RestaurantID = nil
+	// A guest's bookings can span venues in different zones, so no single
+	// venue's day applies. The platform zone is used — the zone this business
+	// actually runs in — rather than UTC, which belongs to nobody and would put
+	// an 01:00 Almaty booking on the previous day for every guest.
+	//
+	// OPEN QUESTION for the owner (listed in the PR, not decided here): whether
+	// a guest's "?date=" should instead follow the device's zone, in which case
+	// the client should send from/to and this filter can be dropped.
+	if flt.CalendarDate != nil {
+		loc, err := f.platformLocation()
+		if err != nil {
+			return nil, 0, err
+		}
+		flt = applyCalendarDate(flt, loc)
+	}
 	return f.bookings.List(ctx, flt)
 }
 
@@ -119,7 +227,42 @@ func (f *facade) ListByRestaurant(ctx context.Context, actor Actor, restaurantID
 	rid := restaurantID
 	flt.RestaurantID = &rid
 	flt.UserID = nil
+	// "Today" on the venue calendar is the VENUE's today. Resolved here, where
+	// the venue is known; parsing the date at the edge produced a UTC midnight
+	// and the hostess's day started at 05:00 for an Almaty venue — the last five
+	// hours of every evening service showed up on the next day's screen.
+	if flt.CalendarDate != nil {
+		loc, err := f.venueLocation(ctx, restaurantID)
+		if err != nil {
+			return nil, 0, err
+		}
+		flt = applyCalendarDate(flt, loc)
+	}
 	return f.bookings.List(ctx, flt)
+}
+
+// applyCalendarDate replaces the unresolved calendar date with the real
+// half-open instant window it means in loc. An explicit from/to always wins:
+// the transport layer only sets a calendar date when neither was given.
+func applyCalendarDate(f domain.BookingFilter, loc *time.Location) domain.BookingFilter {
+	from, to := f.CalendarDate.Bounds(loc)
+	f.From, f.To = &from, &to
+	f.CalendarDate = nil
+	return f
+}
+
+func (f *facade) venueLocation(ctx context.Context, restaurantID uuid.UUID) (*time.Location, error) {
+	if f.venueZone == nil {
+		return nil, fmt.Errorf("filtering by a calendar date needs a venue timezone resolver, which is not wired")
+	}
+	return f.venueZone.VenueLocation(ctx, restaurantID)
+}
+
+func (f *facade) platformLocation() (*time.Location, error) {
+	if f.venueZone == nil {
+		return nil, fmt.Errorf("filtering by a calendar date needs a venue timezone resolver, which is not wired")
+	}
+	return f.venueZone.PlatformLocation()
 }
 
 func (f *facade) History(ctx context.Context, actor Actor, bookingID uuid.UUID) ([]domain.BookingStatusChange, error) {

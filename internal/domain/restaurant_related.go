@@ -8,13 +8,9 @@ import (
 	"github.com/google/uuid"
 )
 
-type Feature struct {
-	ID           uuid.UUID
-	RestaurantID uuid.UUID
-	Name         string
-	NameI18n     I18n
-	CreatedAt    time.Time
-}
+// NOTE: the free-text `Feature` type and the `restaurant_features` table it
+// mapped were removed by migration 0082. A venue's features now come from the
+// platform dictionary — see VenueFeature in venue_feature.go.
 
 type Image struct {
 	ID           uuid.UUID
@@ -83,14 +79,33 @@ type FloorPlan struct {
 	UpdatedAt    time.Time
 }
 
+// RestaurantManager is one row of a restaurant's staff roster: a user with a
+// StaffRole (owner/manager/hostess) at this specific restaurant (migration
+// 0012 added Role; older rows were backfilled to StaffRoleManager, see the
+// migration's comment for why that default is safe).
 type RestaurantManager struct {
 	ID            uuid.UUID
 	RestaurantID  uuid.UUID
 	UserID        uuid.UUID
+	Role          StaffRole
 	CreatedBy     *uuid.UUID
 	WhatsappOptIn bool
 	WhatsappPhone *string
 	CreatedAt     time.Time
+}
+
+// StaffMembership is one restaurant the caller is a staff member of, carrying
+// the venue's display name (localizable) and the caller's StaffRole there. It
+// is the read model behind GET /admin/my-restaurants — the post-login "which
+// restaurants do I manage" picker, so the admin panel never asks staff to type
+// a restaurant UUID. It is produced by a single join of restaurant_managers to
+// restaurants scoped to the caller's own user id; a caller only ever sees rows
+// they have a membership in.
+type StaffMembership struct {
+	RestaurantID uuid.UUID
+	Name         string
+	NameI18n     I18n
+	Role         StaffRole
 }
 
 type RestaurantCategory struct {
@@ -123,7 +138,6 @@ type PartnershipRequest struct {
 // given set (call inside a TxManager for the parent mutation).
 type RestaurantRelatedRepository interface {
 	ListImages(ctx context.Context, restaurantID uuid.UUID) ([]Image, error)
-	ListFeatures(ctx context.Context, restaurantID uuid.UUID) ([]Feature, error)
 	ListTags(ctx context.Context, restaurantID uuid.UUID) ([]Tag, error)
 	ListSocialLinks(ctx context.Context, restaurantID uuid.UUID) ([]SocialLink, error)
 	ListWorkingHours(ctx context.Context, restaurantID uuid.UUID) ([]WorkingHours, error)
@@ -132,7 +146,6 @@ type RestaurantRelatedRepository interface {
 	GetFloorPlan(ctx context.Context, restaurantID uuid.UUID) (*FloorPlan, error)
 
 	ReplaceImages(ctx context.Context, restaurantID uuid.UUID, items []Image) error
-	ReplaceFeatures(ctx context.Context, restaurantID uuid.UUID, items []Feature) error
 	ReplaceTags(ctx context.Context, restaurantID uuid.UUID, items []Tag) error
 	ReplaceSocialLinks(ctx context.Context, restaurantID uuid.UUID, items []SocialLink) error
 	ReplaceWorkingHours(ctx context.Context, restaurantID uuid.UUID, items []WorkingHours) error
@@ -149,7 +162,24 @@ type RestaurantCategoryRepository interface {
 type RestaurantManagerRepository interface {
 	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]RestaurantManager, error)
 	ListByUser(ctx context.Context, userID uuid.UUID) ([]RestaurantManager, error)
+	// GetByID returns ErrNotFound when absent. It exists so a caller acting
+	// on a manager row by id alone (SetRole, Remove) can first resolve WHICH
+	// restaurant that row belongs to and authorize against THAT restaurant —
+	// never trust a path parameter for the restaurant id when the mutation
+	// target is identified by its own id (avoids the cross-tenant IDOR the
+	// old admin-only gate on these routes used to rely on entirely).
+	GetByID(ctx context.Context, id uuid.UUID) (*RestaurantManager, error)
 	Create(ctx context.Context, m *RestaurantManager) error
+	// UpdateRole changes an existing staff member's role in place. Returns
+	// ErrNotFound when id is absent.
+	UpdateRole(ctx context.Context, id uuid.UUID, role StaffRole) error
+	// UpdateWhatsApp sets a staff member's WhatsApp alert consent and number in
+	// place. Both are written together because they are one decision: a
+	// consent without a number silences the channel just as surely as no
+	// consent, and storing half of it is how a venue ends up believing it
+	// switched alerts on. phone == nil clears the number. Returns ErrNotFound
+	// when id is absent.
+	UpdateWhatsApp(ctx context.Context, id uuid.UUID, optIn bool, phone *string) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

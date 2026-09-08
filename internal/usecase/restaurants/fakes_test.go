@@ -19,6 +19,17 @@ type fakeRestaurantRepo struct {
 	active   bool
 	policyID uuid.UUID
 	policy   domain.BookingPolicyOverride
+
+	// lastList / lastSearch record the filter the facade actually handed the
+	// repository. The venue-state filter is evaluated above the repository, so
+	// the only thing that proves the facade asked for the WHOLE matching set
+	// (and not one page it would then filter page-locally) is Unpaginated on
+	// the recorded filter.
+	lastList   domain.RestaurantFilter
+	lastSearch domain.RestaurantSearchFilter
+	// matchedOverride, when > 0, is returned as the SQL-matched count instead
+	// of total, so a test can simulate a scan truncated by CatalogScanLimit.
+	matchedOverride int
 }
 
 func (f *fakeRestaurantRepo) Create(_ context.Context, r *domain.Restaurant) error {
@@ -42,8 +53,20 @@ func (f *fakeRestaurantRepo) UpdateBookingPolicy(_ context.Context, id uuid.UUID
 	f.policyID, f.policy = id, o
 	return nil
 }
-func (f *fakeRestaurantRepo) ListActive(_ context.Context, _ domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
-	return f.list, f.total, nil
+func (f *fakeRestaurantRepo) ListActive(_ context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
+	f.lastList = flt
+	return f.list, f.matched(), nil
+}
+func (f *fakeRestaurantRepo) Search(_ context.Context, flt domain.RestaurantSearchFilter) ([]domain.RestaurantListItem, int, error) {
+	f.lastSearch = flt
+	return f.list, f.matched(), nil
+}
+
+func (f *fakeRestaurantRepo) matched() int {
+	if f.matchedOverride > 0 {
+		return f.matchedOverride
+	}
+	return f.total
 }
 func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) error {
 	f.activeID, f.active = id, a
@@ -58,16 +81,12 @@ type fakeRelated struct {
 	replaced int
 
 	imagesReplaced      bool
-	featuresReplaced    bool
 	tagsReplaced        bool
 	socialLinksReplaced bool
 }
 
 func (f *fakeRelated) ListImages(context.Context, uuid.UUID) ([]domain.Image, error) { return nil, nil }
-func (f *fakeRelated) ListFeatures(context.Context, uuid.UUID) ([]domain.Feature, error) {
-	return nil, nil
-}
-func (f *fakeRelated) ListTags(context.Context, uuid.UUID) ([]domain.Tag, error) { return nil, nil }
+func (f *fakeRelated) ListTags(context.Context, uuid.UUID) ([]domain.Tag, error)     { return nil, nil }
 func (f *fakeRelated) ListSocialLinks(context.Context, uuid.UUID) ([]domain.SocialLink, error) {
 	return nil, nil
 }
@@ -86,11 +105,6 @@ func (f *fakeRelated) GetFloorPlan(context.Context, uuid.UUID) (*domain.FloorPla
 func (f *fakeRelated) ReplaceImages(context.Context, uuid.UUID, []domain.Image) error {
 	f.replaced++
 	f.imagesReplaced = true
-	return nil
-}
-func (f *fakeRelated) ReplaceFeatures(context.Context, uuid.UUID, []domain.Feature) error {
-	f.replaced++
-	f.featuresReplaced = true
 	return nil
 }
 func (f *fakeRelated) ReplaceTags(context.Context, uuid.UUID, []domain.Tag) error {
@@ -128,31 +142,128 @@ func (f *fakePartners) Create(_ context.Context, p *domain.PartnershipRequest) e
 	return nil
 }
 
+// fakeManagers is a hand-written domain.RestaurantManagerRepository backed by
+// a single mutable slice, close enough to the real table to exercise
+// ManagerUseCase's authorization logic (List/Assign/SetRole/Remove all
+// resolve a row by id or filter by user/restaurant, same as Postgres would).
 type fakeManagers struct {
-	byUser  []domain.RestaurantManager
-	created *domain.RestaurantManager
-	delErr  error
+	rows           []domain.RestaurantManager
+	created        *domain.RestaurantManager
+	getErr         error
+	createErr      error
+	updRoleErr     error
+	updWhatsAppErr error
+	delErr         error
 }
 
-func (f *fakeManagers) ListByRestaurant(context.Context, uuid.UUID) ([]domain.RestaurantManager, error) {
-	return nil, nil
+func (f *fakeManagers) ListByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.RestaurantManager, error) {
+	var out []domain.RestaurantManager
+	for _, m := range f.rows {
+		if m.RestaurantID == rid {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
-func (f *fakeManagers) ListByUser(context.Context, uuid.UUID) ([]domain.RestaurantManager, error) {
-	return f.byUser, nil
+
+func (f *fakeManagers) ListByUser(_ context.Context, uid uuid.UUID) ([]domain.RestaurantManager, error) {
+	var out []domain.RestaurantManager
+	for _, m := range f.rows {
+		if m.UserID == uid {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
+
+func (f *fakeManagers) GetByID(_ context.Context, id uuid.UUID) (*domain.RestaurantManager, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			m := f.rows[i]
+			return &m, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
 func (f *fakeManagers) Create(_ context.Context, m *domain.RestaurantManager) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	if m.ID == uuid.Nil {
+		m.ID = uuid.New()
+	}
 	f.created = m
+	f.rows = append(f.rows, *m)
 	return nil
 }
-func (f *fakeManagers) Delete(context.Context, uuid.UUID) error { return f.delErr }
 
-type fakeUsers struct{ err error }
+func (f *fakeManagers) UpdateRole(_ context.Context, id uuid.UUID, role domain.StaffRole) error {
+	if f.updRoleErr != nil {
+		return f.updRoleErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			f.rows[i].Role = role
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+func (f *fakeManagers) UpdateWhatsApp(_ context.Context, id uuid.UUID, optIn bool, phone *string) error {
+	if f.updWhatsAppErr != nil {
+		return f.updWhatsAppErr
+	}
+	for i := range f.rows {
+		if f.rows[i].ID == id {
+			f.rows[i].WhatsappOptIn, f.rows[i].WhatsappPhone = optIn, phone
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+func (f *fakeManagers) Delete(_ context.Context, id uuid.UUID) error {
+	if f.delErr != nil {
+		return f.delErr
+	}
+	for i, m := range f.rows {
+		if m.ID == id {
+			f.rows = append(f.rows[:i], f.rows[i+1:]...)
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+// fakeUsers is a hand-written userRepo.
+type fakeUsers struct {
+	err       error
+	updateErr error
+	user      *domain.User // optional override for GetByID's result
+	updated   *domain.User
+}
 
 func (f *fakeUsers) GetByID(_ context.Context, id uuid.UUID) (*domain.User, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &domain.User{ID: id}, nil
+	if f.user != nil {
+		return f.user, nil
+	}
+	return &domain.User{ID: id, Role: domain.RoleUser}, nil
+}
+
+func (f *fakeUsers) Update(_ context.Context, u *domain.User) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.updated = u
+	return nil
 }
 
 // inlineTx runs fn directly (no real transaction) for unit tests.

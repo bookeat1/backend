@@ -133,6 +133,26 @@ func (s PaymentStatus) Valid() bool {
 // Terminal reports whether no further transition is allowed from s.
 func (s PaymentStatus) Terminal() bool { return len(paymentTransitions[s]) == 0 }
 
+// NonTerminalPaymentStatuses returns every payment status from which a further
+// transition is still possible (i.e. !Terminal): a payment in one of these is
+// still "in flight" for its booking — money is being taken, is held, has been
+// taken (captured, which can still be refunded), or only partially returned.
+// The terminal complement is {voided, expired, failed, refunded}. Derived from
+// the transition table so it can never drift from Terminal(); order is
+// unspecified (callers use it as a set). Used to freeze a booking's pre-order
+// while any payment for it is in flight (usecase/preorder), which must include
+// the `created` window (amount already snapshotted at POST /payments, captured
+// later by the webhook) — NOT just the money-holding statuses.
+func NonTerminalPaymentStatuses() []PaymentStatus {
+	out := make([]PaymentStatus, 0, len(paymentTransitions))
+	for s := range paymentTransitions {
+		if !s.Terminal() {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // HoldsMoney reports whether a payment in this status is holding or has taken
 // the guest's money. Used to decide whether a cancellation has to reach the
 // acquirer at all, and mirrors the partial unique index
@@ -191,11 +211,25 @@ const (
 	PurposeDeposit PaymentPurpose = "deposit"
 	// PurposePreorder is payment for pre-ordered menu items.
 	PurposePreorder PaymentPurpose = "preorder"
+	// PurposeTicket is payment for event tickets. Like a pre-order it is
+	// captured immediately on authorization (a ticket is paid-for-good, not a
+	// refundable hold) — see CapturesImmediately.
+	PurposeTicket PaymentPurpose = "ticket"
 )
 
 // Valid reports whether p is a known payment purpose.
 func (p PaymentPurpose) Valid() bool {
-	return p == PurposeDeposit || p == PurposePreorder
+	return p == PurposeDeposit || p == PurposePreorder || p == PurposeTicket
+}
+
+// CapturesImmediately reports whether a payment for this purpose is captured
+// the moment it is authorized (the webhook's applyAuthorized path), rather than
+// held until seating. A pre-order (the kitchen must cook) and a ticket (paid
+// for good) both capture immediately; a deposit stays a hold. This is the
+// single predicate the webhook branches on, so adding a new immediate-capture
+// purpose never means touching the state machine in more than one place.
+func (p PaymentPurpose) CapturesImmediately() bool {
+	return p == PurposePreorder || p == PurposeTicket
 }
 
 // Payment is one attempt to take money for a booking. RestaurantID and UserID
@@ -206,8 +240,17 @@ func (p PaymentPurpose) Valid() bool {
 // it too (chk_payments_amount_split). The server is the only party that ever
 // computes these numbers (spec §8).
 type Payment struct {
-	ID                uuid.UUID
-	BookingID         uuid.UUID
+	ID uuid.UUID
+	// BookingID is the booking this payment pays for, or uuid.Nil for a payment
+	// whose subject is an event ticket instead (EventTicketID set). Exactly one
+	// of BookingID / EventTicketID is set — enforced by chk_payments_subject.
+	// It stays a non-pointer uuid.UUID (uuid.Nil ⇔ SQL NULL, mapped in the
+	// postgres repo) so the whole booking-payment codebase is untouched; only
+	// the ticket path reads EventTicketID.
+	BookingID uuid.UUID
+	// EventTicketID is the event ticket this payment pays for, nil for a booking
+	// payment. See BookingID.
+	EventTicketID     *uuid.UUID
 	RestaurantID      uuid.UUID
 	UserID            *uuid.UUID // nil = guest checkout without an account
 	Provider          PaymentProvider
@@ -405,6 +448,13 @@ type PaymentSettings struct {
 	PreorderPaymentRequired bool
 	ServiceFeeBps           int             // 350 = 3.5%
 	Provider                PaymentProvider // must be an enabled one, else the default
+	// FreeCancelWindow is the per-restaurant free-cancellation window used by
+	// the MONEY path (migration 0034/0035, restaurants.free_cancel_window_minutes):
+	// a deposit HOLD is released to the guest (voided) only when the booking is
+	// cancelled EARLIER than this before starts_at; a later cancellation or a
+	// no-show forfeits the deposit to the venue (the hold is captured). Always
+	// present (the column is NOT NULL, owner-confirmed default 120m).
+	FreeCancelWindow time.Duration
 }
 
 // PaymentSettingsOverride is a restaurant's optional per-field override of the
@@ -416,6 +466,21 @@ type PaymentSettingsOverride struct {
 	PreorderPaymentRequired *bool
 	ServiceFeeBps           *int
 	Provider                *PaymentProvider
+	// FreeCancelWindowMinutes overrides the money-path free-cancellation
+	// window per restaurant (restaurants.free_cancel_window_minutes). Unlike
+	// the other fields it maps to a NOT NULL column, so in practice it is
+	// never nil once read from Postgres; it stays a pointer only to keep this
+	// struct a uniform "nil = use the global default" override shape and so an
+	// in-memory / test override can still say "inherit the default".
+	FreeCancelWindowMinutes *int
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total in
+	// int64 MINOR units (restaurants.preorder_min_amount_minor, migration 0042).
+	// nil = the venue set no minimum. It is NOT a global-fallback field (unlike
+	// the others, there is no env default): a NULL column simply means "no floor",
+	// which is why it stays only on the override and is absent from
+	// PaymentSettings. Enforced when a guest attaches a pre-order (usecase/preorder),
+	// not in the payment amount resolution.
+	PreorderMinAmountMinor *int64
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +540,33 @@ type AuthorizeRequest struct {
 	// Metadata is passed through to the acquirer and echoed back in webhooks.
 	// It must never contain card data or anything secret (spec §8).
 	Metadata map[string]string
+	// MerchantAccountRef is the venue's identity AT THIS ACQUIRER: the
+	// acquirer-side account this charge is routed to
+	// (restaurant_split_accounts.account_ref for the resolved provider). It is
+	// an ADDRESS, never a credential — keys stay in each adapter's env
+	// configuration.
+	//
+	// It exists because not every acquirer settles onto one platform account.
+	// Kaspi Pay is reached through our own multi-tenant service where a
+	// venue's money belongs to a COMPANY, and which company is a per-venue
+	// setting the adapter cannot look up for itself. Adapters that do not need
+	// it ignore it; an adapter that DOES need it must refuse an empty value
+	// rather than fall back to a default account, because "the default
+	// account" means crediting somebody else's money.
+	//
+	// It is deliberately separate from Splits: a split DIVIDES one charge
+	// between recipients, this only says whose till the charge lands in.
+	MerchantAccountRef string
+	// Splits divides this one charge between its recipients at the acquirer —
+	// the venue's share and the platform's commission — instead of landing the
+	// whole amount on our merchant account and settling it later by payout. It
+	// is optional and provider-neutral: an empty plan (PaymentSplitPlan.IsZero)
+	// means an ordinary single-recipient payment, and an adapter for an
+	// acquirer without split support must REFUSE a non-empty plan rather than
+	// drop it — silently ignoring it charges the guest correctly and pays the
+	// wrong account. The shares are validated against Amount before the call
+	// (see PaymentSplitPlan.Validate).
+	Splits PaymentSplitPlan
 }
 
 // GatewayPayment is the acquirer's view of a payment, already translated into

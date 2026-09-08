@@ -50,6 +50,8 @@ type Handler struct {
 	avail      uc.AvailabilityUseCase
 	blacklist  uc.BlacklistUseCase
 	policy     uc.PolicyUseCase
+	external   uc.ExternalReservationUseCase
+	overrides  uc.CapacityOverrideUseCase
 }
 
 // NewHandler wires the booking usecases into a handler.
@@ -62,10 +64,13 @@ func NewHandler(
 	avail uc.AvailabilityUseCase,
 	blacklist uc.BlacklistUseCase,
 	policy uc.PolicyUseCase,
+	external uc.ExternalReservationUseCase,
+	overrides uc.CapacityOverrideUseCase,
 ) *Handler {
 	return &Handler{
 		facade: facade, create: create, idempotent: idempotent, status: status,
 		update: update, avail: avail, blacklist: blacklist, policy: policy,
+		external: external, overrides: overrides,
 	}
 }
 
@@ -112,6 +117,18 @@ func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
 	rg.DELETE("/restaurants/:id/blacklist/:entryID", h.removeBlacklist)
 	rg.GET("/restaurants/:id/booking-policy", h.getBookingPolicy)
 	rg.PATCH("/restaurants/:id/booking-policy", h.patchBookingPolicy)
+
+	// External occupancy holds: slots taken through the venue's OTHER funnels
+	// (phone, walk-in, POS/Kwaaka). Staff-facing today, the same seam a future
+	// POS webhook writes into. Enforced by booking.manage inside the usecase.
+	rg.GET("/restaurants/:id/external-reservations", h.listExternalHolds)
+	rg.POST("/restaurants/:id/external-reservations", h.createExternalHold)
+	rg.DELETE("/restaurants/:id/external-reservations/:holdID", h.removeExternalHold)
+
+	// The overbooking audit (migration 0056). Read-only: the rows are written
+	// only as part of creating the booking, and the database refuses to let
+	// anyone rewrite them.
+	rg.GET("/restaurants/:id/capacity-overrides", h.listCapacityOverrides)
 }
 
 // getBookingPolicy returns the venue's stored policy overrides plus the
@@ -200,6 +217,10 @@ func (h *Handler) createMine(c *gin.Context) {
 	in.Source = domain.SourceApp
 	in.TableIDs = nil
 	in.Force = false
+	// A guest must never be able to ask for a deliberate overbooking. Blanked
+	// here as well as refused in the usecase: two independent layers, because
+	// this one is the one a new route could forget.
+	in.Overbook = false
 
 	details, err := h.idempotent.CreateIdempotent(c.Request.Context(), actor, uc.IdempotencyKey{
 		Key:         c.GetHeader(idempotencyHeader),

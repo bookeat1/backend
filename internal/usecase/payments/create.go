@@ -14,9 +14,20 @@ import (
 	"backend-core/internal/logging"
 )
 
-// CreateUseCase starts (or replays) the payment for a booking.
+// CreateUseCase starts (or replays) the payment for a booking, and answers the
+// venue-level precondition that same checkout enforces.
+//
+// The two methods sit on ONE interface — and, in bootstrap, on one instance —
+// deliberately: AcceptsOnlinePayment is the question "would CreateForBooking
+// get as far as an acquirer for this venue", and answering it from a separately
+// wired object is how the two would drift onto different settings, different
+// acquirers, or a different venue↔account mapping. See venuegate.go.
 type CreateUseCase interface {
 	CreateForBooking(ctx context.Context, actor Actor, in CreateInput) (*domain.Payment, error)
+	// AcceptsOnlinePayment reports whether the venue can take an online
+	// payment at all. See the implementation for the (false, nil) vs error
+	// distinction — the caller must not publish "could not compute" as "no".
+	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 }
 
 // CreateInput is a checkout request.
@@ -42,10 +53,28 @@ type createUseCase struct {
 	bookings    bookingReader
 	items       bookingItemReader
 	restaurants restaurantPaymentSettings
+	specialDays specialDayResolver
 	gateways    gatewayResolver
 	managers    managerChecker
 	tx          domain.TxManager
 	cfg         Config
+	// splitAccounts is optional (see CreateOption / WithSplitAccounts): nil
+	// means this deployment does not do split payments at all, which is the
+	// state every deployment is in until venues are onboarded as sub-merchants.
+	splitAccounts splitAccountReader
+}
+
+// CreateOption is an optional dependency of the payment-creation usecase. The
+// same shape as bookings.StatusOption: it keeps a capability that not every
+// deployment has out of the constructor's required arguments, so wiring it is a
+// deliberate act rather than a nil somebody passed to satisfy a signature.
+type CreateOption func(*createUseCase)
+
+// WithSplitAccounts wires the venue↔sub-merchant mapping that split payments
+// are addressed by. Without it (and without Config.SplitEnabled) payments are
+// created exactly as before, with no Splits array.
+func WithSplitAccounts(r splitAccountReader) CreateOption {
+	return func(u *createUseCase) { u.splitAccounts = r }
 }
 
 // NewCreateUseCase constructs the payment-creation usecase.
@@ -55,15 +84,22 @@ func NewCreateUseCase(
 	bookings bookingReader,
 	items bookingItemReader,
 	restaurants restaurantPaymentSettings,
+	specialDays specialDayResolver,
 	gateways gatewayResolver,
 	managers managerChecker,
 	tx domain.TxManager,
 	cfg Config,
+	opts ...CreateOption,
 ) CreateUseCase {
-	return &createUseCase{
+	u := &createUseCase{
 		payments: payments, outbox: outbox, bookings: bookings, items: items,
-		restaurants: restaurants, gateways: gateways, managers: managers, tx: tx, cfg: cfg.withDefaults(),
+		restaurants: restaurants, specialDays: specialDays, gateways: gateways,
+		managers: managers, tx: tx, cfg: cfg.withDefaults(),
 	}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // CreateForBooking computes the amount, resolves an acquirer, places a hold
@@ -103,29 +139,91 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		return nil, fmt.Errorf("%w: booking is %s, no payment can be taken", domain.ErrValidation, booking.Status)
 	}
 
-	override, err := u.restaurants.GetPaymentOverride(ctx, booking.RestaurantID)
+	// The venue-level part of "can this be paid at all" — payments enabled for
+	// the venue, an acquirer for a new payment, and the venue's account at that
+	// acquirer — runs through venueGate, the SAME code the guest-facing
+	// accepts_online_payment flag runs (see venuegate.go). The button the guest
+	// sees and the payment this method accepts must not be able to disagree.
+	settings, err := u.gate().settings(ctx, booking.RestaurantID)
 	if err != nil {
 		return nil, err
 	}
-	settings := resolveSettings(override, u.cfg)
-	if !settings.Enabled {
-		return nil, fmt.Errorf("%w: payments are not enabled for this restaurant", domain.ErrValidation)
+
+	// Paid special day (holidays/events). Bookings are FREE by default; if the
+	// restaurant marked the booking's calendar DATE as a paid special day
+	// (schedule override, booking_payment_required = true, migration 0036), a
+	// deposit of the override's amount is required to book that date. This is
+	// the single place the special-day decision is applied: it forces a deposit
+	// for THIS booking, overriding the venue's default free-booking behaviour,
+	// while leaving the ordinary deposit/preorder settings untouched for every
+	// normal day. The resulting deposit flows through the SAME hold/capture/void
+	// machinery as any other deposit (resolveAmount → PurposeDeposit).
+	specialPaid, specialDeposit, err := u.specialDays.PaidSpecialDayFor(ctx, booking.RestaurantID, booking.StartsAt)
+	if err != nil {
+		return nil, err
+	}
+	if specialPaid {
+		// The special-day deposit is authoritative for this date: the guest must
+		// prepay exactly the amount the venue set for that day. Forcing a deposit
+		// AND clearing any preorder-required flag makes resolveAmount
+		// deterministic here (PurposeDeposit, specialDeposit), so the charged
+		// amount is always the override's deposit — never a preorder total that
+		// happens to be configured on the same venue.
+		settings.DepositRequired = true
+		settings.DepositAmountMinor = specialDeposit
+		settings.PreorderPaymentRequired = false
 	}
 
 	purpose, base, err := u.resolveAmount(ctx, *booking, settings)
 	if err != nil {
 		return nil, err
 	}
-	fee, total, err := domain.TotalWithFee(base, settings.ServiceFeeBps)
+	// Gross up so the venue nets the full base after the acquirer withholds its
+	// cut of the total (ServiceFeeBps is that acquirer rate). A plain additive
+	// markup would leave the venue short; see domain.GrossUpForAcquirer.
+	fee, total, err := domain.GrossUpForAcquirerWithMinimum(base, settings.ServiceFeeBps, u.cfg.AcquirerMinFeeMinor)
 	if err != nil {
 		return nil, err
 	}
 
-	gw, err := u.gateways.Resolve(ctx, settings.Provider)
+	gw, err := u.gate().gateway(ctx, settings.Provider)
 	if err != nil {
 		return nil, err
 	}
 	provider := gw.Name()
+
+	// An acquirer that cannot charge a fraction of its currency unit (Kaspi
+	// takes whole tenge) needs the total adjusted BEFORE the payment row is
+	// written, so the amount we record, the amount we charge and the amount its
+	// webhook reports back are one number. Done here rather than inside the
+	// adapter on purpose: an adapter that rounded silently would charge a
+	// number the ledger never saw.
+	fee, total, err = roundToGatewayGranularity(gw, base, fee, total)
+	if err != nil {
+		return nil, err
+	}
+
+	// The venue's identity at this acquirer, read exactly ONCE and then used
+	// for both things that need it: where the charge lands
+	// (MerchantAccountRef) and how it is divided (the split plan). One read,
+	// because two reads of the same row inside one checkout can disagree.
+	//
+	// Resolved BEFORE the idempotency replay and before any acquirer call: a
+	// venue nobody finished onboarding must not get as far as a payable link
+	// that credits the wrong till, nor as far as a hold somebody has to void.
+	account, err := u.gate().account(ctx, provider, booking.RestaurantID)
+	if err != nil {
+		return nil, err
+	}
+	var accountRef string
+	if account != nil {
+		accountRef = account.AccountRef
+	}
+
+	splits, err := u.resolveSplitPlan(ctx, provider, booking.RestaurantID, account, base, fee, total)
+	if err != nil {
+		return nil, err
+	}
 
 	// Scoped to the booking AND the actor (report item, minor): scoping to
 	// the booking alone caught a collision across two different bookings,
@@ -162,9 +260,21 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		CallbackURL:    in.CallbackURL,
 		CustomerPhone:  booking.PhoneNormalized,
 		CustomerEmail:  booking.Email,
+		Splits:         splits,
+
+		MerchantAccountRef: accountRef,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("authorize with %s: %w", provider, err)
+	}
+	// The acquirer's own deadline wins over our configured HoldTTL whenever it
+	// gave one. A Kaspi payment link lives MINUTES, not hours: showing the
+	// guest our own longer guess would put a live countdown on a dead link and
+	// tell the venue a table is still being paid for when it is not. Only a
+	// deadline in the future is taken — a clock skew or a stale answer must
+	// not create a payment that is already expired the moment it is stored.
+	if gwResp.ExpiresAt != nil && gwResp.ExpiresAt.After(now) {
+		expiresAt = *gwResp.ExpiresAt
 	}
 
 	p := &domain.Payment{
@@ -231,12 +341,12 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 		if err != nil {
 			return "", domain.Money{}, err
 		}
-		var total int64
-		for _, it := range items {
-			if it.Status == domain.BookingItemCancelled {
-				continue
-			}
-			total += it.TotalMinor()
+		// The pre-order amount is the ONE shared definition (domain.SumPreorderItems),
+		// the same helper usecase/preorder shows the guest — the charged amount can
+		// never drift from the displayed total. Overflow-guarded.
+		total, err := domain.SumPreorderItems(items)
+		if err != nil {
+			return "", domain.Money{}, err
 		}
 		if total > 0 {
 			m, err := domain.NewMoney(total, domain.CurrencyKZT)
@@ -337,4 +447,56 @@ func nullableStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// amountGranularity is an OPTIONAL acquirer capability: the smallest amount
+// step it is able to charge, in minor units.
+//
+// It is not part of domain.PaymentGateway because almost no acquirer needs it
+// — FreedomPay and TipTopPay both charge tiyn — and the domain must not carry
+// a method half its adapters would have to answer "1" to. Kaspi Pay charges
+// whole tenge (100 minor units) and implements it; callers type-assert, the
+// same pattern as payment.MerchantIDFinder.
+type amountGranularity interface {
+	MinChargeableUnitMinor() int64
+}
+
+// roundToGatewayGranularity raises the total to the acquirer's next chargeable
+// step and puts the difference on the PLATFORM's side of the split.
+//
+// Which side absorbs the rounding is the whole decision here, and it is not
+// arbitrary: BaseAmountMinor is what the venue is owed (a pre-order total the
+// guest was shown, or a deposit the venue set) and must not move — a guest who
+// saw 2 538 ₸ of food must not be charged for 2 539 ₸ of food. The service fee
+// is ours and can absorb up to 99 tiyn. The invariant amount = base + fee
+// (chk_payments_amount_split) is preserved by construction.
+func roundToGatewayGranularity(gw domain.PaymentGateway, base, fee, total domain.Money) (domain.Money, domain.Money, error) {
+	g, ok := gw.(amountGranularity)
+	if !ok {
+		return fee, total, nil
+	}
+	unit := g.MinChargeableUnitMinor()
+	if unit <= 1 || total.AmountMinor <= 0 {
+		return fee, total, nil
+	}
+	remainder := total.AmountMinor % unit
+	if remainder == 0 {
+		return fee, total, nil
+	}
+	bump := unit - remainder
+	newTotal, err := domain.NewMoney(total.AmountMinor+bump, total.Currency)
+	if err != nil {
+		return domain.Money{}, domain.Money{}, err
+	}
+	newFee, err := domain.NewMoney(fee.AmountMinor+bump, fee.Currency)
+	if err != nil {
+		return domain.Money{}, domain.Money{}, err
+	}
+	if newFee.AmountMinor+base.AmountMinor != newTotal.AmountMinor {
+		// Unreachable by construction; asserted because a silent break here
+		// would be a payment whose parts do not add up to its total.
+		return domain.Money{}, domain.Money{}, fmt.Errorf(
+			"%w: rounding to the acquirer's %d-minor step broke base+fee=total", domain.ErrValidation, unit)
+	}
+	return newFee, newTotal, nil
 }

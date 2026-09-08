@@ -26,12 +26,67 @@ type WebhookUseCase interface {
 }
 
 type webhookUseCase struct {
-	payments domain.PaymentRepository
-	events   domain.PaymentEventRepository
-	ledger   domain.PaymentLedgerRepository
-	outbox   domain.PaymentOutboxRepository
-	gateways gatewayResolver
-	tx       domain.TxManager
+	payments       domain.PaymentRepository
+	events         domain.PaymentEventRepository
+	ledger         domain.PaymentLedgerRepository
+	outbox         domain.PaymentOutboxRepository
+	gateways       gatewayResolver
+	tx             domain.TxManager
+	ticketObserver PaymentSubjectObserver
+	// bookings / lateSettler are the OPTIONAL late-payment guard, wired
+	// together by WithLateCancelSettlement. Both nil = the previous behaviour.
+	bookings    bookingReader
+	lateSettler DepositCancellationUseCase
+}
+
+// PaymentSubjectObserver is notified after a webhook has successfully applied a
+// status change to a payment whose subject is NOT a booking (EventTicketID set).
+// It exists so the ticket layer can project the payment's new status onto its
+// ticket (pending→paid on capture, pending→cancelled on fail/expire/void,
+// paid→refunded) WITHOUT this package ever importing usecase/tickets and
+// WITHOUT forking the webhook. A booking payment (EventTicketID == nil) never
+// invokes it. It is an OPTIONAL dependency (WithPaymentSubjectObserver) —
+// existing callers pass none and behave exactly as before.
+type PaymentSubjectObserver interface {
+	// OnPaymentApplied projects p's current status onto its subject. Returning
+	// an error leaves the webhook event unprocessed so it is retried (the
+	// projection must not be silently lost), same contract as any other apply
+	// failure.
+	OnPaymentApplied(ctx context.Context, p *domain.Payment) error
+}
+
+// WebhookOption configures the webhook usecase without breaking positional
+// callers — same backward-compatible variadic-option pattern as
+// bookings.NewStatusUseCase's WithDepositSettler.
+type WebhookOption func(*webhookUseCase)
+
+// WithPaymentSubjectObserver wires a non-booking subject projection (tickets).
+func WithPaymentSubjectObserver(obs PaymentSubjectObserver) WebhookOption {
+	return func(u *webhookUseCase) { u.ticketObserver = obs }
+}
+
+// WithLateCancelSettlement closes the "the guest paid AFTER the booking was
+// cancelled" hole.
+//
+// It is reachable for every acquirer, but a payment LINK makes it ordinary
+// rather than exotic: a Kaspi link is created in status `created`, and a
+// `created` payment is deliberately NOT "live" (idx_payments_live_per_booking
+// — a guest may abandon a checkout), so a cancellation that happens while the
+// link is still unpaid finds nothing to settle and returns a clean no-op.
+// If the guest then opens the link and pays, the callback arrives against a
+// booking that no longer exists as far as the venue is concerned, and without
+// this the money is simply taken and nobody is told.
+//
+// Wiring it makes the webhook re-run the SAME settlement the cancellation
+// itself would have run (SettleDepositOnCancel), with the trigger derived from
+// who cancelled — so an early guest cancel or a venue cancel refunds in full,
+// and a late cancel / no-show leaves the money with the venue, exactly as the
+// policy says. Nothing new decides anything about money here.
+func WithLateCancelSettlement(bookings bookingReader, settler DepositCancellationUseCase) WebhookOption {
+	return func(u *webhookUseCase) {
+		u.bookings = bookings
+		u.lateSettler = settler
+	}
 }
 
 // NewWebhookUseCase constructs the webhook-processing usecase.
@@ -42,8 +97,13 @@ func NewWebhookUseCase(
 	outbox domain.PaymentOutboxRepository,
 	gateways gatewayResolver,
 	tx domain.TxManager,
+	opts ...WebhookOption,
 ) WebhookUseCase {
-	return &webhookUseCase{payments: payments, events: events, ledger: ledger, outbox: outbox, gateways: gateways, tx: tx}
+	u := &webhookUseCase{payments: payments, events: events, ledger: ledger, outbox: outbox, gateways: gateways, tx: tx}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // HandleWebhook is the single entry point for every provider's callback
@@ -228,6 +288,88 @@ func (u *webhookUseCase) resolvePayment(ctx context.Context, provider domain.Pay
 // acknowledged and never read as "paid" (spec §7) — it is evidence, already
 // stored, waiting for a human.
 func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
+	if err := u.applyToPayment(ctx, gw, p, event); err != nil {
+		return err
+	}
+	// Project the payment's now-current status onto a non-booking subject (an
+	// event ticket). p.Status was updated in place by the handler above. A
+	// projection failure is returned so the webhook event stays unprocessed and
+	// is retried — the ticket must never silently diverge from its payment.
+	if u.ticketObserver != nil && p.EventTicketID != nil {
+		return u.ticketObserver.OnPaymentApplied(ctx, p)
+	}
+	return u.settleIfBookingAlreadyCancelled(ctx, p)
+}
+
+// settleIfBookingAlreadyCancelled settles money that arrived for a booking the
+// venue has already closed (see WithLateCancelSettlement).
+//
+// It runs only after the callback was applied successfully, so the payment's
+// status is the truth before any decision is taken. An error is RETURNED,
+// which leaves the webhook event unprocessed and gets it retried: money taken
+// for a cancelled booking that nobody settled must stay visible, not be
+// swallowed by an acknowledged callback.
+func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p *domain.Payment) error {
+	if u.lateSettler == nil || u.bookings == nil || p.BookingID == uuid.Nil {
+		return nil
+	}
+	// Only a payment that is holding or has taken money is worth settling; a
+	// failed / expired callback leaves nothing behind.
+	if !p.Status.HoldsMoney() {
+		return nil
+	}
+	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	trigger, ok := lateSettlementTrigger(b)
+	if !ok {
+		return nil // the booking is alive; the ordinary flow owns this payment
+	}
+
+	logging.FromContext(ctx).Warn("payment.paid_after_booking_closed",
+		slog.String("payment_id", p.ID.String()),
+		slog.String("booking_id", p.BookingID.String()),
+		slog.String("booking_status", string(b.Status)),
+		slog.String("trigger", string(trigger)),
+	)
+	_, err = u.lateSettler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
+		Trigger:     trigger,
+		CancelledAt: b.CancelledAt,
+		Reason:      strPtr("payment arrived after the booking was already closed"),
+	})
+	return err
+}
+
+// lateSettlementTrigger maps a closed booking onto the refund trigger whose
+// policy applies. ok=false means the booking is still alive.
+//
+// A no-show is its own trigger (the venue keeps the money). A cancellation is
+// attributed to whoever made it: the guest's own cancel is judged against the
+// free-cancellation window, while a venue or system cancellation always
+// returns the money in full. An unrecorded cancelled_by is treated as the
+// VENUE's — the guest must not lose money because we failed to write down who
+// cancelled.
+func lateSettlementTrigger(b *domain.Booking) (domain.RefundTrigger, bool) {
+	switch b.Status {
+	case domain.BookingNoShow:
+		return domain.RefundTriggerNoShow, true
+	case domain.BookingCancelled:
+		if b.CancelledBy != nil && *b.CancelledBy == domain.CancelledByGuest {
+			return domain.RefundTriggerGuestCancel, true
+		}
+		return domain.RefundTriggerVenueCancel, true
+	default:
+		return "", false
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func (u *webhookUseCase) applyToPayment(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
 	switch event.Type {
 	case domain.WebhookPaymentAuthorized:
 		return u.applyAuthorized(ctx, gw, p, event)
@@ -261,8 +403,25 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 // released — this is the saga compensation from spec §6 applied to two
 // concurrent checkouts on one booking instead of a lost table.
 func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
-	if p.Status == domain.PaymentAuthorized {
-		return nil // already applied; a defensive no-op, events.Create already dedups the common case
+	// Idempotency for this callback is PURPOSE-aware. A PRE-ORDER is captured
+	// immediately on authorization (captureIfPreorder), so the authorized →
+	// captured range is all "this callback's work is done or resumable":
+	//   - already captured / refunded → nothing left to do, ack;
+	//   - still only authorized → a previous immediate-capture attempt was
+	//     declined (captureHold released the hold back to authorized) or never
+	//     ran; a redelivery must RESUME the capture, not ack it as done —
+	//     otherwise a failed pre-order capture is never retried and the money
+	//     is left as an uncaptured hold that auto-expires (silent revenue loss).
+	// A DEPOSIT is a plain created → authorized and is done once authorized.
+	if p.Purpose.CapturesImmediately() {
+		switch p.Status {
+		case domain.PaymentCaptured, domain.PaymentRefunded, domain.PaymentPartiallyRefunded:
+			return nil
+		case domain.PaymentAuthorized:
+			return u.captureIfPreorder(ctx, p)
+		}
+	} else if p.Status == domain.PaymentAuthorized {
+		return nil // deposit already applied; events.Create dedups the common case
 	}
 	if err := domain.ValidatePaymentTransition(p.Status, domain.PaymentAuthorized); err != nil {
 		return fmt.Errorf("webhook authorized on payment %s (currently %s): %w", p.ID, p.Status, err)
@@ -279,12 +438,41 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 	})
 	if txErr == nil {
 		logging.FromContext(ctx).Info(logging.EventPaymentAuthorized, slog.String("payment_id", p.ID.String()))
-		return nil
+		// The authorization is durably committed. The immediate pre-order
+		// capture is a follow-on; if it fails, its error is PROPAGATED so
+		// resolveAndApply leaves the webhook event UNPROCESSED (report item #9)
+		// and a redelivery / the reconciler retries it — never swallowed.
+		return u.captureIfPreorder(ctx, p)
 	}
 	if !errors.Is(txErr, domain.ErrAlreadyExists) {
 		return txErr
 	}
 	return u.compensateLostRace(ctx, gw, p)
+}
+
+// captureIfPreorder captures a PRE-ORDER hold the instant it is authorized: the
+// kitchen has to prepare the food, so a pre-order is taken at payment time
+// rather than held until seating (a DEPOSIT, by contrast, stays a hold and is
+// only captured on a late cancellation / no-show — see cancel.go). A DEPOSIT is
+// a no-op (returns nil).
+//
+// It reuses CaptureOnSeating's exact CAS-guarded mechanic (captureHold), so it
+// is idempotent: an already-captured pre-order finds status == captured and is
+// a no-op, so a successful retry never double-captures. The capture error is
+// RETURNED (not swallowed): a decline or an unknown outcome must leave the
+// webhook event unprocessed so it is retried, otherwise the food is prepared
+// while the money stays an uncaptured hold that silently auto-expires.
+func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) error {
+	if !p.Purpose.CapturesImmediately() {
+		return nil
+	}
+	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
+	if _, err := cv.captureHold(ctx, p); err != nil {
+		logging.FromContext(ctx).Error("payment.preorder_immediate_capture_failed",
+			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+		return fmt.Errorf("immediate capture of pre-order payment %s: %w", p.ID, err)
+	}
+	return nil
 }
 
 // compensateLostRace releases the hold this payment placed after it lost the

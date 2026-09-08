@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"backend-core/internal/domain"
 )
 
@@ -42,6 +44,28 @@ type Worker struct {
 	wcfg        WorkerConfig
 	log         *slog.Logger
 	now         func() time.Time // injectable clock for tests
+	deposits    DepositSettler
+	reminders   domain.BookingReminderRepository
+}
+
+// WorkerOption configures optional worker dependencies without breaking the
+// constructor's existing positional callers (tests pass none).
+type WorkerOption func(*Worker)
+
+// WithWorkerDepositSettler wires the deposit settlement the worker runs for the
+// bookings it closes: a no-show forfeits the held deposit to the venue, a
+// venue-never-responded abandonment releases it back to the guest. Left nil in
+// tests / when payments are disabled (no settlement then).
+func WithWorkerDepositSettler(d DepositSettler) WorkerOption {
+	return func(w *Worker) { w.deposits = d }
+}
+
+// WithGuestReminders enables the pre-visit guest reminder pass. Left nil in
+// tests that do not exercise it, and in any deployment that has not run
+// migration 0049 — with a nil repository the pass is simply not run, exactly
+// like the deposit settler.
+func WithGuestReminders(r domain.BookingReminderRepository) WorkerOption {
+	return func(w *Worker) { w.reminders = r }
 }
 
 // WorkerConfig is the worker's own scheduling configuration. The per-booking
@@ -53,6 +77,10 @@ type WorkerConfig struct {
 	// NoShowGrace is how long after ends_at a booking is left alone before it
 	// is closed as completed / no_show. env: WORKER_NO_SHOW_GRACE
 	NoShowGrace time.Duration
+	// ReminderLead is how long before starts_at the guest gets their pre-visit
+	// reminder. The old Supabase system sent two (60 and 30 minutes); this one
+	// sends exactly one per booking. env: WORKER_GUEST_REMINDER_LEAD
+	ReminderLead time.Duration
 	// BatchSize caps how many bookings one pass claims per stage.
 	BatchSize int
 }
@@ -60,6 +88,7 @@ type WorkerConfig struct {
 const (
 	defaultTickInterval = time.Minute
 	defaultNoShowGrace  = 30 * time.Minute
+	defaultReminderLead = 60 * time.Minute
 	defaultBatchSize    = 100
 )
 
@@ -69,6 +98,9 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 	}
 	if c.NoShowGrace < 0 {
 		c.NoShowGrace = defaultNoShowGrace
+	}
+	if c.ReminderLead <= 0 {
+		c.ReminderLead = defaultReminderLead
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = defaultBatchSize
@@ -86,13 +118,18 @@ func NewWorker(
 	cfg Config,
 	wcfg WorkerConfig,
 	log *slog.Logger,
+	opts ...WorkerOption,
 ) *Worker {
-	return &Worker{
+	w := &Worker{
 		bookings: bookingsRepo, history: history, outbox: outbox,
 		restaurants: restaurants, tx: tx,
 		cfg: cfg.withDefaults(), wcfg: wcfg.withDefaults(),
 		log: log, now: time.Now,
 	}
+	for _, o := range opts {
+		o(w)
+	}
+	return w
 }
 
 // TickResult counts what one pass did. Zero values are the normal steady state.
@@ -102,6 +139,7 @@ type TickResult struct {
 	Abandoned int // pending/waitlist the venue never answered → cancelled
 	Completed int // arrived → completed
 	NoShow    int // confirmed → no_show
+	Reminded  int // pre-visit guest reminders emitted
 	Skipped   int // claimed but not actionable (SLA not reached, illegal transition)
 }
 
@@ -109,7 +147,8 @@ func (r TickResult) attrs() []any {
 	return []any{
 		slog.Int("confirmed", r.Confirmed), slog.Int("escalated", r.Escalated),
 		slog.Int("abandoned", r.Abandoned), slog.Int("completed", r.Completed),
-		slog.Int("no_show", r.NoShow), slog.Int("skipped", r.Skipped),
+		slog.Int("no_show", r.NoShow), slog.Int("reminded", r.Reminded),
+		slog.Int("skipped", r.Skipped),
 	}
 }
 
@@ -147,8 +186,13 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	now := w.now()
 	var res TickResult
+	// Deposit settlements to run AFTER the passes commit: each makes an external
+	// acquirer call, which must never run inside the pass transaction (it holds
+	// the ClaimDue row locks). Collected here, settled by settleDeposits below.
+	var abandonedIDs, noShowIDs []uuid.UUID
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		r, err := w.processAbandoned(ctx, now)
+		ids, r, err := w.processAbandoned(ctx, now)
+		abandonedIDs = ids
 		res.Abandoned, res.Skipped = r.Abandoned, r.Skipped
 		return err
 	}); err != nil {
@@ -163,14 +207,50 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 		return res, fmt.Errorf("confirm sla pass: %w", err)
 	}
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		r, err := w.processExpired(ctx, now)
+		ids, r, err := w.processExpired(ctx, now)
+		noShowIDs = ids
 		res.Completed, res.NoShow = r.Completed, r.NoShow
 		res.Skipped += r.Skipped
 		return err
 	}); err != nil {
 		return res, fmt.Errorf("expiry pass: %w", err)
 	}
+	// Reminders run LAST: the passes above may have just cancelled or closed a
+	// booking, and a guest must never be reminded about a visit that stopped
+	// existing a millisecond earlier.
+	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
+		n, err := w.processReminders(ctx, now)
+		res.Reminded = n
+		return err
+	}); err != nil {
+		return res, fmt.Errorf("reminder pass: %w", err)
+	}
+	// A no-show forfeits the held deposit to the venue; a venue-never-responded
+	// abandonment releases it to the guest. Outside every transaction, and never
+	// fatal: a settlement error is logged and left for the reconciliation worker.
+	w.settleDeposits(ctx, noShowIDs, domain.RefundTriggerNoShow)
+	w.settleDeposits(ctx, abandonedIDs, domain.RefundTriggerVenueCancel)
 	return res, nil
+}
+
+// settleDeposits runs the held-deposit money decision for a set of just-closed
+// bookings, outside any transaction. A booking with no deposit is a cheap
+// no-op inside the settler; an error never fails the tick.
+func (w *Worker) settleDeposits(ctx context.Context, bookingIDs []uuid.UUID, trigger domain.RefundTrigger) {
+	if w.deposits == nil {
+		return
+	}
+	for _, id := range bookingIDs {
+		// cancelledAt is nil: a no-show is decided at the visit window's lapse
+		// (the settler treats no-show as a late forfeit regardless of timing),
+		// and a venue-side release does not consult it either.
+		if err := w.deposits.SettleDepositOnCancel(ctx, id, trigger, nil); err != nil {
+			w.log.Error("booking worker deposit settlement failed",
+				slog.String("booking_id", id.String()),
+				slog.String("trigger", string(trigger)),
+				slog.String("error", err.Error()))
+		}
+	}
 }
 
 // processConfirmSLA handles bookings the venue has not answered in time.
@@ -243,14 +323,15 @@ const abandonedReason = "venue never responded"
 // worker cancels them as the system with an explicit reason. Cancelling also
 // releases the table: booking_tables.active is driven by the status trigger,
 // and a dead pending booking must not sit on a slot forever.
-func (w *Worker) processAbandoned(ctx context.Context, now time.Time) (TickResult, error) {
+func (w *Worker) processAbandoned(ctx context.Context, now time.Time) ([]uuid.UUID, TickResult, error) {
 	var res TickResult
+	var settled []uuid.UUID
 	cutoff := now.Add(-w.wcfg.NoShowGrace)
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist},
 		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
 	if err != nil {
-		return res, err
+		return nil, res, err
 	}
 	reason := abandonedReason
 	for i := range due {
@@ -263,27 +344,29 @@ func (w *Worker) processAbandoned(ctx context.Context, now time.Time) (TickResul
 				b.CancellationReason = &reason
 			})
 		if err != nil {
-			return res, err
+			return nil, res, err
 		}
 		if !ok {
 			res.Skipped++
 			continue
 		}
 		res.Abandoned++
+		settled = append(settled, b.ID)
 	}
-	return res, nil
+	return settled, res, nil
 }
 
 // processExpired closes bookings whose visit window is over: arrived guests are
 // completed, guests never marked as arrived become no_show.
-func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult, error) {
+func (w *Worker) processExpired(ctx context.Context, now time.Time) ([]uuid.UUID, TickResult, error) {
 	var res TickResult
+	var noShowIDs []uuid.UUID
 	cutoff := now.Add(-w.wcfg.NoShowGrace)
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingArrived, domain.BookingConfirmed},
 		domain.ClaimByEndsAt, cutoff, w.wcfg.BatchSize)
 	if err != nil {
-		return res, err
+		return nil, res, err
 	}
 	for i := range due {
 		b := due[i]
@@ -293,7 +376,7 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 		}
 		ok, err := w.transition(ctx, &b, to, now, reason, nil)
 		if err != nil {
-			return res, err
+			return nil, res, err
 		}
 		if !ok {
 			res.Skipped++
@@ -303,9 +386,56 @@ func (w *Worker) processExpired(ctx context.Context, now time.Time) (TickResult,
 			res.Completed++
 		} else {
 			res.NoShow++
+			noShowIDs = append(noShowIDs, b.ID)
 		}
 	}
-	return res, nil
+	return noShowIDs, res, nil
+}
+
+// processReminders emits the pre-visit reminder for bookings whose visit is
+// within ReminderLead. It is the one pass that changes NO status: it stamps
+// bookings.guest_reminder_sent_at and writes one booking.reminder outbox event,
+// which the notification dispatcher then delivers to the guest's devices — the
+// same delivery path every other booking event takes.
+//
+// Idempotency, in one place: MarkReminderSent is a conditional UPDATE
+// (guest_reminder_sent_at IS NULL AND status is still live). It runs in the same
+// transaction as the outbox insert, so:
+//
+//   - a second tick finds the marker set, gets false, and emits nothing;
+//   - a crash between the stamp and the event rolls BOTH back, so the reminder
+//     is re-emitted on the next tick rather than silently lost;
+//   - a booking cancelled between the claim and the stamp fails the status
+//     predicate and is skipped (the claim's row lock already prevents this, but
+//     the predicate holds even if the pass is ever run without one).
+//
+// A nil reminders repository (worker built without WithGuestReminders) turns the
+// pass into a no-op — the same discipline as the optional deposit settler.
+func (w *Worker) processReminders(ctx context.Context, now time.Time) (int, error) {
+	if w.reminders == nil {
+		return 0, nil
+	}
+	due, err := w.reminders.ClaimDueReminders(ctx, now, now.Add(w.wcfg.ReminderLead), w.wcfg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	sent := 0
+	for i := range due {
+		b := due[i]
+		ok, err := w.reminders.MarkReminderSent(ctx, b.ID, now)
+		if err != nil {
+			return sent, err
+		}
+		if !ok {
+			// Already reminded, or no longer live. Not our booking to announce.
+			continue
+		}
+		if err := publish(ctx, w.outbox, &b, domain.EventBookingReminder, now); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 // transition applies one system-driven status change: bookings UPDATE + history

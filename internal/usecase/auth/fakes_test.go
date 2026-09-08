@@ -55,6 +55,20 @@ func (f *fakeUsers) Update(_ context.Context, u *domain.User) error {
 	f.byID[u.ID] = &cp
 	return nil
 }
+func (f *fakeUsers) Delete(_ context.Context, id uuid.UUID) error {
+	u, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if u.DeletedAt != nil {
+		return nil
+	}
+	now := time.Now()
+	u.DeletedAt = &now
+	u.Email, u.Phone, u.FullName, u.AvatarURL, u.City, u.CountryCode, u.BirthDate = nil, nil, "", nil, nil, nil, nil
+	u.IsActive = false
+	return nil
+}
 
 type fakeCreds struct{ byUser map[uuid.UUID]string }
 
@@ -96,21 +110,48 @@ func (f *fakeRefresh) Revoke(_ context.Context, id uuid.UUID) error {
 	}
 	return nil
 }
+func (f *fakeRefresh) RevokeAllByUser(_ context.Context, userID uuid.UUID) error {
+	now := time.Now()
+	for _, t := range f.byHash {
+		if t.UserID == userID && t.RevokedAt == nil {
+			t.RevokedAt = &now
+		}
+	}
+	return nil
+}
 
 // fakeOTP is defined here; exercised in Task 12.
-type fakeOTP struct{ codes []*domain.OTPCode }
+type fakeOTP struct {
+	codes []*domain.OTPCode
+	// lastUsedErr makes the delivery memory misbehave, so a test can prove the
+	// usecase treats it as best effort and never lets it break a login.
+	lastUsedErr error
+}
 
 func newFakeOTP() *fakeOTP { return &fakeOTP{} }
-func (f *fakeOTP) Create(_ context.Context, c *domain.OTPCode) error {
+
+// Create УВАЖАЕТ контекст, как настоящий репозиторий: pgx отменяет запрос
+// вместе с ним, и без этой проверки подделка молча прощала бы ошибку, которую
+// живая база не прощает (24.08.2026: клиент отваливался по своему таймауту, и
+// уже отправленный код не сохранялся).
+func (f *fakeOTP) Create(ctx context.Context, c *domain.OTPCode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cp := *c
 	f.codes = append(f.codes, &cp)
 	return nil
 }
+
+// LatestActiveByPhone returns a COPY, like the Postgres repository does: a
+// caller must not see its snapshot change under it when a later call writes to
+// the row (that aliasing hid an off-by-one in the attempt counter once).
 func (f *fakeOTP) LatestActiveByPhone(_ context.Context, phone string) (*domain.OTPCode, error) {
 	for i := len(f.codes) - 1; i >= 0; i-- {
 		c := f.codes[i]
 		if c.Phone == phone && c.UsedAt == nil && c.ExpiresAt.After(time.Now()) {
-			return c, nil
+			cp := *c
+			return &cp, nil
 		}
 	}
 	return nil, domain.ErrNotFound
@@ -142,6 +183,66 @@ func (f *fakeOTP) CountSince(_ context.Context, phone string, ts time.Time) (int
 	return n, nil
 }
 
+// LastUsedChannelByPhone mirrors the SQL: the newest USED code for the phone
+// whose channel is one a guest can be routed back to.
+func (f *fakeOTP) LastUsedChannelByPhone(_ context.Context, phone string) (string, error) {
+	if f.lastUsedErr != nil {
+		return "", f.lastUsedErr
+	}
+	for i := len(f.codes) - 1; i >= 0; i-- {
+		c := f.codes[i]
+		if c.Phone == phone && c.UsedAt != nil && domain.OTPRememberableChannel(c.Channel) {
+			return c.Channel, nil
+		}
+	}
+	return "", nil
+}
+
+func (f *fakeOTP) InvalidateActiveByPhone(_ context.Context, phone string) error {
+	now := time.Now()
+	for _, c := range f.codes {
+		if c.Phone == phone && c.UsedAt == nil && c.ExpiresAt.After(now) {
+			c.UsedAt = &now
+		}
+	}
+	return nil
+}
+
+// fakeBookingLinker is an in-memory guestBookingLinker over a tiny booking
+// table: phone -> owner (nil = nobody). It mirrors the SQL of
+// booking.Repository.AttachOrphanedByPhone exactly — only rows whose owner is
+// nil and whose phone matches EXACTLY are taken — so a test that passes here is
+// making a claim about the real behaviour, not about a convenient fake.
+type fakeBookingLinker struct {
+	rows  []*fakeBooking
+	err   error // when set, every attach fails (the "login must roll back" case)
+	calls int
+}
+
+type fakeBooking struct {
+	phone string
+	owner *uuid.UUID
+}
+
+func (f *fakeBookingLinker) AttachOrphanedByPhone(_ context.Context, userID uuid.UUID, phone string) (int64, error) {
+	f.calls++
+	if f.err != nil {
+		return 0, f.err
+	}
+	if phone == "" {
+		return 0, nil
+	}
+	var n int64
+	for _, r := range f.rows {
+		if r.owner == nil && r.phone == phone {
+			id := userID
+			r.owner = &id
+			n++
+		}
+	}
+	return n, nil
+}
+
 // noTx runs fn directly (no real transaction) — fine for unit tests.
 type noTx struct{}
 
@@ -149,11 +250,33 @@ func (noTx) WithinTx(ctx context.Context, fn func(context.Context) error) error 
 
 func (noTx) Detach(ctx context.Context) context.Context { return ctx }
 
-// stubSender records nothing and returns channel "test".
-type stubSender struct{ lastCode string }
+// stubSender records the code and the ordering hint it was handed. It answers
+// with channel "test" unless a test sets a real channel name, and fails every
+// send once err is set (the "no channel took the code" path).
+type stubSender struct {
+	lastCode string
+	lastHint domain.OTPSendHint
+	channel  string
+	err      error
+	calls    int
+	// onSend срабатывает В МОМЕНТ доставки: так тест может воспроизвести
+	// клиента, который отвалился уже после того, как код ушёл человеку.
+	onSend func()
+}
 
-func (s *stubSender) Send(_ context.Context, _, code string) (string, error) {
+func (s *stubSender) Send(_ context.Context, _, code string, hint domain.OTPSendHint) (string, error) {
+	s.calls++
+	if s.onSend != nil {
+		s.onSend()
+	}
+	s.lastHint = hint
 	s.lastCode = code
+	if s.err != nil {
+		return "", s.err
+	}
+	if s.channel != "" {
+		return s.channel, nil
+	}
 	return "test", nil
 }
 

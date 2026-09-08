@@ -7,8 +7,49 @@ import (
 	"log/slog"
 )
 
+// etlRestaurantUpdateSet is the assignment list of the "restaurants" step's
+// ON CONFLICT DO UPDATE, pulled out into a named constant for the same reason
+// as legacyRestaurantUpdateSet in
+// internal/infrastructure/postgres/legacysync/sink.go: what is NOT assigned
+// here matters more than what is, and an omission buried inside a 20-line SQL
+// literal is invisible in review.
+//
+// cuisine_type / cuisine_type_i18n and city are absent BY DESIGN — see the
+// notes in place below. Keep this list and legacyRestaurantUpdateSet in step:
+// they are two doors into the same table, and closing only one of them is the
+// same as closing neither.
+const etlRestaurantUpdateSet = `
+			  category_id=EXCLUDED.category_id, name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n,
+			  description=EXCLUDED.description, description_i18n=EXCLUDED.description_i18n,
+			  -- cuisine_type / cuisine_type_i18n: НЕ ПРИСВАИВАЮТСЯ. Кухня — наша
+			  -- (ADR-023): с миграции 0079 источник истины это restaurant_cuisines,
+			  -- заполняемая в кабинете, а строка — производная от неё.
+			  -- city: НЕ ПРИСВАИВАЕТСЯ. Город — тоже наш (ADR-023): его
+			  -- редактируют в кабинете, старая система им больше не владеет.
+			  --
+			  -- Отдельно про ЭТОТ файл: импортёр запускается РУКАМИ
+			  -- (go run ./cmd/etl restaurants) и месяцами о нём никто не
+			  -- вспоминает. Именно поэтому пропуск продублирован здесь, а не
+			  -- только в legacysync: один ручной прогон с этими колонками в
+			  -- списке молча вернёт кухни и города к значениям из старого дампа,
+			  -- и искать причину будут в кабинете, а не в разовом скрипте.
+			  address=EXCLUDED.address, address_i18n=EXCLUDED.address_i18n,
+			  opening_hours=EXCLUDED.opening_hours, opening_hours_i18n=EXCLUDED.opening_hours_i18n,
+			  price_category=EXCLUDED.price_category, email=EXCLUDED.email,
+			  phone=EXCLUDED.phone, latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
+			  kwaaka_restaurant_id=EXCLUDED.kwaaka_restaurant_id, is_active=EXCLUDED.is_active,
+			  is_new=EXCLUDED.is_new, is_popular=EXCLUDED.is_popular, is_premium=EXCLUDED.is_premium,
+			  hidden_from_home=EXCLUDED.hidden_from_home, display_order=EXCLUDED.display_order,
+			  updated_at=EXCLUDED.updated_at`
+
 // runRestaurants upserts the restaurant catalog from raw_supabase into the clean
 // schema. Idempotent (upsert by id); FK order: categories → restaurants → children.
+//
+// A venue's features are NOT imported at all (see the note where that step
+// used to be). A venue's cuisine and city are written on INSERT (a venue seen for the first
+// time is better off with the legacy values than with an empty cuisine, and
+// `city` is NOT NULL since migration 0002) and left alone on UPDATE — see
+// etlRestaurantUpdateSet.
 func runRestaurants(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 	steps := []struct {
 		name string
@@ -33,23 +74,19 @@ func runRestaurants(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 			  COALESCE(is_active,true), is_new, is_popular, is_premium, COALESCE(hidden_from_home,false),
 			  display_order, COALESCE(created_at, now()), COALESCE(updated_at, now())
 			FROM raw_supabase.restaurants
-			ON CONFLICT (id) DO UPDATE SET
-			  category_id=EXCLUDED.category_id, name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n,
-			  description=EXCLUDED.description, description_i18n=EXCLUDED.description_i18n,
-			  cuisine_type=EXCLUDED.cuisine_type, cuisine_type_i18n=EXCLUDED.cuisine_type_i18n,
-			  address=EXCLUDED.address, address_i18n=EXCLUDED.address_i18n,
-			  opening_hours=EXCLUDED.opening_hours, opening_hours_i18n=EXCLUDED.opening_hours_i18n,
-			  city=EXCLUDED.city, price_category=EXCLUDED.price_category, email=EXCLUDED.email,
-			  phone=EXCLUDED.phone, latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
-			  kwaaka_restaurant_id=EXCLUDED.kwaaka_restaurant_id, is_active=EXCLUDED.is_active,
-			  is_new=EXCLUDED.is_new, is_popular=EXCLUDED.is_popular, is_premium=EXCLUDED.is_premium,
-			  hidden_from_home=EXCLUDED.hidden_from_home, display_order=EXCLUDED.display_order,
-			  updated_at=EXCLUDED.updated_at`},
-		{"features", `
-			INSERT INTO restaurant_features (id, restaurant_id, name, name_i18n, created_at)
-			SELECT id, restaurant_id, name, name_i18n, COALESCE(created_at, now())
-			FROM raw_supabase.restaurant_features
-			ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n`},
+			ON CONFLICT (id) DO UPDATE SET` + etlRestaurantUpdateSet},
+		// "features": УДАЛЁН. Особенности заведения больше не свободный текст:
+		// с миграции 0082 это справочник venue_features + связи
+		// restaurant_venue_features, а таблицы restaurant_features, в которую
+		// писал этот шаг, попросту нет.
+		//
+		// Это ТА ЖЕ дверь, что и с кухней с городом (ADR-023): импортёр
+		// запускается руками и о нём вспоминают раз в несколько месяцев.
+		// Оставленный здесь шаг либо уронил бы прогон на несуществующей
+		// таблице, либо — если бы кто-то её воссоздал — тихо вернул бы
+		// «Восточную кухню» и «Коктобе» в поле удобств.
+		// Раскладка старых формулировок сделана ОДИН РАЗ, явным списком
+		// в миграции 0082; автоматического импорта особенностей больше нет.
 		{"images", `
 			INSERT INTO restaurant_images (id, restaurant_id, image_url, is_primary, created_at)
 			SELECT id, restaurant_id, image_url, COALESCE(is_primary,false), COALESCE(created_at, now())

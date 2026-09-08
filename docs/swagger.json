@@ -28,6 +28,241 @@
                 }
             }
         },
+        "/api/v1/admin/dashboard/bookings": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Bookings breakdown by status over a period (superadmin)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "period start (RFC3339 or YYYY-MM-DD)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "period end (RFC3339 or YYYY-MM-DD)",
+                        "name": "to",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid period",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/dashboard/overview": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Platform overview counters (superadmin)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/dashboard/payments": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Payments GMV and refunds over a period (superadmin)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "period start (RFC3339 or YYYY-MM-DD)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "period end (RFC3339 or YYYY-MM-DD)",
+                        "name": "to",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "ISO currency, default KZT",
+                        "name": "currency",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid period",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/dashboard/top-restaurants": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Top restaurants by bookings or GMV over a period (superadmin)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "period start (RFC3339 or YYYY-MM-DD)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "period end (RFC3339 or YYYY-MM-DD)",
+                        "name": "to",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "ranking: bookings (default) or gmv",
+                        "name": "by",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "ISO currency for by=gmv, default KZT",
+                        "name": "currency",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "max rows, default 10, max 50",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid period or ranking",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/my-restaurants": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Restaurants where the caller is owner/manager/hostess, with their\nrole at each. A superadmin gets every restaurant (role \"admin\").",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "List restaurants I am staff of",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/login": {
             "post": {
                 "description": "Authenticates by email + password and returns a token pair.",
@@ -140,7 +375,7 @@
         },
         "/api/v1/auth/otp/request": {
             "post": {
-                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.",
+                "description": "Generates a one-time code and delivers it to the phone. Rate-limited\n(per-minute and per-hour); over the limit returns 422. The response\n\"code\" field is populated only when AUTH_OTP_DEV_EXPOSE=true.\n\nEvery 422 carries a machine-readable \"code\" in the error envelope —\nbranch on it, never on the message: otp_invalid_phone (the number is\nunusable, point at the field), otp_rate_limited_minute and\notp_rate_limited_hour (both carry a Retry-After header in seconds;\nit is the full window, an upper bound, not the exact time left).\n\nWhen no delivery channel accepts the code the answer is a plain 500\nwith the generic body — identical for a number nobody can reach and\nfor a provider outage. That is deliberate: a response that varied by\nchannel would let anyone enumerate which numbers have Telegram or\nWhatsApp. The per-channel reasons live in our logs, phone masked.",
                 "consumes": [
                     "application/json"
                 ],
@@ -186,13 +421,19 @@
                         "schema": {
                             "$ref": "#/definitions/response.Envelope"
                         }
+                    },
+                    "500": {
+                        "description": "the code could not be delivered on any channel",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
                     }
                 }
             }
         },
         "/api/v1/auth/otp/verify": {
             "post": {
-                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.",
+                "description": "Verifies the latest active code for the phone. On success, finds or\ncreates the user and returns a token pair. Wrong/expired codes and\ntoo many attempts return 401.\n\nThe 401 carries one of two codes. \"otp_invalid\" means the code was\nnot accepted and covers three cases on purpose — wrong, expired, and\nno active code at all: telling them apart would let anyone with a\nphone number detect when its owner is mid-login. \"otp_too_many_attempts\"\nmeans the code is dead from wrong guesses and only a new code helps.\nThe 422 codes are otp_invalid_phone and otp_code_required.\n\n\"is_new_user\" is true only when THIS call created the account, so\nthe app can show first-run onboarding to genuinely new guests. It\nis returned by this endpoint only; no other token-pair response\ncarries it.",
                 "consumes": [
                     "application/json"
                 ],
@@ -226,7 +467,7 @@
                                     "type": "object",
                                     "properties": {
                                         "data": {
-                                            "$ref": "#/definitions/auth.tokenPairResponse"
+                                            "$ref": "#/definitions/auth.otpVerifyResponse"
                                         }
                                     }
                                 }
@@ -710,6 +951,386 @@
                 }
             }
         },
+        "/api/v1/consents": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Latest grant/revoke record per consent type for the authenticated user.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "consent"
+                ],
+                "summary": "Get my current consent state",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Appends one grant or revoke of a consent type at a policy version.\nAppend-only: prior records are never mutated, so the full history\nis preserved as evidence.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "consent"
+                ],
+                "summary": "Record a consent decision",
+                "parameters": [
+                    {
+                        "description": "Consent decision",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/consent.recordRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "validation failed",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/devices/push-tokens": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Register my device for push notifications",
+                "parameters": [
+                    {
+                        "description": "Provider push token + platform",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/devicetokens.registerRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Unregister my device from push notifications",
+                "parameters": [
+                    {
+                        "description": "The token to silence",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/devicetokens.unregisterRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/favorites": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "favorites"
+                ],
+                "summary": "List my favorite restaurants",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/favorites/{restaurantId}": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "favorites"
+                ],
+                "summary": "Add a restaurant to my favorites",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "restaurantId",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "restaurant not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid restaurant id",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "favorites"
+                ],
+                "summary": "Remove a restaurant from my favorites",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "restaurantId",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid restaurant id",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/notification-preferences": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "consent"
+                ],
+                "summary": "Get my notification preferences",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "consent"
+                ],
+                "summary": "Set my notification preferences",
+                "parameters": [
+                    {
+                        "description": "Notification preferences",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/consent.preferenceRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "validation failed",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/payments/{id}": {
             "get": {
                 "description": "The payment's own owner, venue staff/admin of its restaurant, or (for a guest checkout with no account) anyone holding the id may read it.",
@@ -757,6 +1378,501 @@
                 }
             }
         },
+        "/api/v1/push/subscriptions": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Register my browser push subscription",
+                "parameters": [
+                    {
+                        "description": "PushSubscription + target restaurant",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/pushsubscriptions.registerRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "not staff of this restaurant",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "push"
+                ],
+                "summary": "Unregister my browser push subscription",
+                "parameters": [
+                    {
+                        "description": "The endpoint to remove",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/pushsubscriptions.unregisterRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/restaurants/{id}/map": {
+            "get": {
+                "description": "Returns a PNG map preview of the restaurant, rendered server-side so the map provider key never reaches the client. Size and zoom are whitelisted. Failures return a JSON envelope whose \"code\" tells them apart: map_no_coordinates (404), map_not_configured (503), map_provider_rate_limited (503), map_provider_unavailable (503).",
+                "produces": [
+                    "image/png"
+                ],
+                "tags": [
+                    "restaurants"
+                ],
+                "summary": "Restaurant map preview (server-side proxy)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path"
+                    },
+                    {
+                        "enum": [
+                            "card",
+                            "detail",
+                            "wide"
+                        ],
+                        "type": "string",
+                        "default": "detail",
+                        "description": "Image preset",
+                        "name": "size",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "default": 1,
+                        "description": "1 or 2 (HiDPI)",
+                        "name": "scale",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "default": 16,
+                        "description": "14..18",
+                        "name": "zoom",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "PNG image",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "404": {
+                        "description": "unknown restaurant or no coordinates",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "size/scale/zoom outside the whitelist",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "503": {
+                        "description": "provider not configured or unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/restaurants/{id}/reviews": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "List a restaurant's published reviews",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "1-based page",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "page size (max 100)",
+                        "name": "per_page",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/restaurants/{id}/reviews/me": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Get my review for a restaurant",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "no review yet",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Create or edit my review",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "review",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/reviews.submitRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "no completed booking at this restaurant",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "restaurant not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid rating or body",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Delete my review",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/restaurants/{id}/reviews/summary": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Restaurant aggregate rating",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Restaurant id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/reviews/{reviewId}/reply": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Reply to a review (staff)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Review id",
+                        "name": "reviewId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "reply",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/reviews.replyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "not staff of this restaurant",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "review not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/reviews/{reviewId}/status": {
+            "patch": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "reviews"
+                ],
+                "summary": "Hide/unhide a review (staff)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Review id",
+                        "name": "reviewId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/reviews.moderateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "403": {
+                        "description": "not staff of this restaurant",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "404": {
+                        "description": "review not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    },
+                    "422": {
+                        "description": "invalid status",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/me": {
             "get": {
                 "security": [
@@ -789,6 +1905,35 @@
                                     }
                                 }
                             ]
+                        }
+                    },
+                    "401": {
+                        "description": "unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Soft-deletes and anonymizes the authenticated user's account.\nBookings/payments keep their reference to the (now anonymized)\nuser id; they are never deleted or altered. Idempotent.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "users"
+                ],
+                "summary": "Delete current user's account",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Envelope"
                         }
                     },
                     "401": {
@@ -1028,6 +2173,27 @@
                 }
             }
         },
+        "auth.otpVerifyResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string",
+                    "example": "eyJhbGciOiJSUzI1NiIsImtpZCI6..."
+                },
+                "expires_at": {
+                    "type": "string",
+                    "example": "2026-07-12T18:30:00Z"
+                },
+                "is_new_user": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "refresh_token": {
+                    "type": "string",
+                    "example": "9c8b7a6f-4d3e-2b1a-...-refresh"
+                }
+            }
+        },
         "auth.refreshRequest": {
             "type": "object",
             "required": [
@@ -1076,6 +2242,71 @@
                 "refresh_token": {
                     "type": "string",
                     "example": "9c8b7a6f-4d3e-2b1a-...-refresh"
+                }
+            }
+        },
+        "consent.preferenceRequest": {
+            "type": "object",
+            "properties": {
+                "email_enabled": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "notifications_enabled": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "push_enabled": {
+                    "type": "boolean",
+                    "example": true
+                }
+            }
+        },
+        "consent.recordRequest": {
+            "type": "object",
+            "properties": {
+                "consent_type": {
+                    "type": "string",
+                    "example": "privacy_policy"
+                },
+                "granted": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "source": {
+                    "description": "Source is where the decision was captured: \"app\" or \"web\".",
+                    "type": "string",
+                    "example": "app"
+                },
+                "version": {
+                    "type": "string",
+                    "example": "2026-07-01"
+                }
+            }
+        },
+        "devicetokens.registerRequest": {
+            "type": "object",
+            "required": [
+                "platform",
+                "token"
+            ],
+            "properties": {
+                "platform": {
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "devicetokens.unregisterRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string"
                 }
             }
         },
@@ -1182,12 +2413,90 @@
                 }
             }
         },
+        "pushsubscriptions.registerRequest": {
+            "type": "object",
+            "required": [
+                "endpoint",
+                "keys",
+                "restaurant_id"
+            ],
+            "properties": {
+                "endpoint": {
+                    "type": "string"
+                },
+                "keys": {
+                    "type": "object",
+                    "required": [
+                        "auth",
+                        "p256dh"
+                    ],
+                    "properties": {
+                        "auth": {
+                            "type": "string"
+                        },
+                        "p256dh": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "restaurant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "pushsubscriptions.unregisterRequest": {
+            "type": "object",
+            "required": [
+                "endpoint"
+            ],
+            "properties": {
+                "endpoint": {
+                    "type": "string"
+                }
+            }
+        },
         "response.Envelope": {
             "type": "object",
             "properties": {
+                "code": {
+                    "type": "string"
+                },
                 "data": {},
                 "error": {
                     "type": "string"
+                }
+            }
+        },
+        "reviews.moderateRequest": {
+            "type": "object",
+            "required": [
+                "status"
+            ],
+            "properties": {
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "reviews.replyRequest": {
+            "type": "object",
+            "required": [
+                "reply"
+            ],
+            "properties": {
+                "reply": {
+                    "type": "string"
+                }
+            }
+        },
+        "reviews.submitRequest": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string"
+                },
+                "rating": {
+                    "type": "integer"
                 }
             }
         },
@@ -1198,9 +2507,26 @@
                     "type": "string",
                     "example": "https://cdn.example.com/a/jane.png"
                 },
+                "birth_date": {
+                    "description": "BirthDate is a plain date, \"YYYY-MM-DD\".",
+                    "type": "string",
+                    "example": "1998-05-04"
+                },
                 "city": {
                     "type": "string",
                     "example": "almaty"
+                },
+                "country_code": {
+                    "description": "CountryCode is an ISO 3166-1 alpha-2 code, e.g. \"KZ\".",
+                    "type": "string",
+                    "example": "KZ"
+                },
+                "cuisine_category_ids": {
+                    "description": "CuisineCategoryIDs replaces the foodie profile's picked cuisines when\npresent (including an empty array, which clears all picks). Omit the\nfield entirely to leave existing picks unchanged.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "full_name": {
                     "type": "string",
@@ -1219,13 +2545,28 @@
                     "type": "string",
                     "example": "https://cdn.example.com/a/jane.png"
                 },
+                "birth_date": {
+                    "type": "string",
+                    "example": "1998-05-04"
+                },
                 "city": {
                     "type": "string",
                     "example": "almaty"
                 },
+                "country_code": {
+                    "type": "string",
+                    "example": "KZ"
+                },
                 "created_at": {
                     "type": "string",
                     "example": "2026-01-15T08:30:00Z"
+                },
+                "cuisine_category_ids": {
+                    "description": "CuisineCategoryIDs is the foodie profile: ids from the restaurants' own\ncategory dictionary (restaurant_categories) the user picked.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "email": {
                     "type": "string",

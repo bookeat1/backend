@@ -1,0 +1,170 @@
+package payouts
+
+import (
+	"time"
+
+	"backend-core/internal/domain"
+	uc "backend-core/internal/usecase/payouts"
+)
+
+// destinationRequest sets a restaurant's payout destination. A raw PAN is never
+// accepted — token is a provider card token (UUID); the usecase rejects
+// anything PAN-shaped.
+type destinationRequest struct {
+	Method              string `json:"method"`
+	Token               string `json:"token"`
+	ProviderCustomerRef string `json:"provider_customer_ref"`
+	MaskedIdentifier    string `json:"masked_identifier"`
+}
+
+func (r destinationRequest) toInput() uc.DestinationInput {
+	return uc.DestinationInput{
+		Method:              domain.PayoutMethod(r.Method),
+		Token:               r.Token,
+		ProviderCustomerRef: r.ProviderCustomerRef,
+		MaskedIdentifier:    r.MaskedIdentifier,
+	}
+}
+
+type destinationResponse struct {
+	RestaurantID     string    `json:"restaurant_id"`
+	Provider         string    `json:"provider"`
+	Method           string    `json:"method"`
+	MaskedIdentifier string    `json:"masked_identifier"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// destinationToResponse deliberately OMITS the token and the provider customer
+// ref: they are the address of the money and never need to leave the server in
+// a read response. The masked identifier is the venue-facing hint.
+func destinationToResponse(d *domain.PayoutDestination) destinationResponse {
+	return destinationResponse{
+		RestaurantID:     d.RestaurantID.String(),
+		Provider:         string(d.Provider),
+		Method:           string(d.Method),
+		MaskedIdentifier: d.MaskedIdentifier,
+		CreatedAt:        d.CreatedAt,
+		UpdatedAt:        d.UpdatedAt,
+	}
+}
+
+// payoutSettingsRequest writes a venue's payout policy overrides.
+//
+// Both fields are POINTERS and both are meaningful when absent: omitting one
+// (or sending null) CLEARS that override and puts the venue back on the
+// platform default. Documented rather than clever — a caller that wants to
+// change only the threshold must resend the hold window it wants to keep.
+type payoutSettingsRequest struct {
+	MinPayoutMinor *int64 `json:"min_payout_minor"`
+	MaxHoldDays    *int   `json:"max_hold_days"`
+}
+
+func (r payoutSettingsRequest) toInput() uc.PayoutSettingsInput {
+	return uc.PayoutSettingsInput{MinPayoutMinor: r.MinPayoutMinor, MaxHoldDays: r.MaxHoldDays}
+}
+
+// payoutSettingsResponse returns BOTH layers: what this venue overrode (null =
+// nothing) and the numbers actually in force. A venue reading only its own
+// overrides would learn nothing about when it gets paid; `effective` is the
+// answer, resolved by the same code the daily payout pass decides with.
+type payoutSettingsResponse struct {
+	RestaurantID string `json:"restaurant_id"`
+	// MinPayoutMinor / MaxHoldDays are this venue's own overrides, null when it
+	// follows the platform.
+	MinPayoutMinor *int64 `json:"min_payout_minor"`
+	MaxHoldDays    *int   `json:"max_hold_days"`
+	// EffectiveMinPayoutMinor is the threshold below which this venue's money
+	// rolls into the next day.
+	EffectiveMinPayoutMinor int64 `json:"effective_min_payout_minor"`
+	// EffectiveMaxHoldDays is how many whole venue-local days the oldest unpaid
+	// money may wait before it is paid out regardless of the threshold. 0 means
+	// no cap.
+	EffectiveMaxHoldDays int `json:"effective_max_hold_days"`
+	// UpdatedAt is absent for a venue that has never had an override written.
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+func settingsToResponse(v *uc.PayoutSettingsView) payoutSettingsResponse {
+	var updatedAt *time.Time
+	if !v.Settings.UpdatedAt.IsZero() {
+		updatedAt = &v.Settings.UpdatedAt
+	}
+	return payoutSettingsResponse{
+		RestaurantID:            v.RestaurantID.String(),
+		MinPayoutMinor:          v.Settings.MinPayoutMinor,
+		MaxHoldDays:             v.Settings.MaxHoldDays,
+		EffectiveMinPayoutMinor: v.Effective.MinPayoutMinor,
+		EffectiveMaxHoldDays:    v.Effective.MaxHoldDays,
+		UpdatedAt:               updatedAt,
+	}
+}
+
+// payoutResponse is one line of a venue's statement. It exposes all THREE
+// amounts, not just the transferred one, so "we were owed X but Y arrived" is
+// answerable from the statement itself instead of from support:
+//
+//	gross_amount_minor — settled money for the period, before the payout fee
+//	fee_minor          — what moving it cost at the acquirer
+//	fee_bearer         — who paid that cost ("platform" = the venue's amount is
+//	                     untouched; "venue" = it was deducted here)
+//	amount_minor       — what was actually transferred
+type payoutResponse struct {
+	ID               string `json:"id"`
+	RestaurantID     string `json:"restaurant_id"`
+	AmountMinor      int64  `json:"amount_minor"`
+	GrossAmountMinor int64  `json:"gross_amount_minor"`
+	FeeMinor         int64  `json:"fee_minor"`
+	FeeBearer        string `json:"fee_bearer"`
+	// PeriodDate is the venue-local day this payout settled, "YYYY-MM-DD".
+	// Absent for a payout generated by hand outside the daily schedule.
+	PeriodDate *string `json:"period_date,omitempty"`
+	// ForcedByAge says WHY this payout happened: true = the venue was still
+	// below its payout threshold, but its oldest unpaid money had been held for
+	// the full max-hold window, so it was paid out anyway — fee included. Sent
+	// on every line so a venue reading a small payout with a 300 ₸ fee can see
+	// the reason instead of asking support.
+	ForcedByAge       bool       `json:"forced_by_age"`
+	Currency          string     `json:"currency"`
+	Status            string     `json:"status"`
+	ProviderRef       *string    `json:"provider_ref,omitempty"`
+	FailureReason     *string    `json:"failure_reason,omitempty"`
+	NeedsManualReview bool       `json:"needs_manual_review"`
+	SentAt            *time.Time `json:"sent_at,omitempty"`
+	PaidAt            *time.Time `json:"paid_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+}
+
+func payoutToResponse(p domain.Payout) payoutResponse {
+	var period *string
+	if p.PeriodDate != nil {
+		d := p.PeriodDate.Format(time.DateOnly)
+		period = &d
+	}
+	return payoutResponse{
+		ID:                p.ID.String(),
+		RestaurantID:      p.RestaurantID.String(),
+		AmountMinor:       p.AmountMinor,
+		GrossAmountMinor:  p.GrossAmountMinor,
+		FeeMinor:          p.FeeMinor,
+		FeeBearer:         string(p.FeeBearer),
+		PeriodDate:        period,
+		ForcedByAge:       p.ForcedByAge,
+		Currency:          string(p.Currency),
+		Status:            string(p.Status),
+		ProviderRef:       p.ProviderRef,
+		FailureReason:     p.FailureReason,
+		NeedsManualReview: p.NeedsManualReview,
+		SentAt:            p.SentAt,
+		PaidAt:            p.PaidAt,
+		CreatedAt:         p.CreatedAt,
+	}
+}
+
+func payoutsToResponse(list []domain.Payout) []payoutResponse {
+	out := make([]payoutResponse, 0, len(list))
+	for _, p := range list {
+		out = append(out, payoutToResponse(p))
+	}
+	return out
+}

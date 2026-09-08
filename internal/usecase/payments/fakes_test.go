@@ -26,6 +26,13 @@ import (
 type fakePaymentRepo struct {
 	mu   sync.Mutex
 	byID map[uuid.UUID]*domain.Payment
+	// Per-call-site accounting so a regression test can assert EVERY claim runs
+	// inside a transaction (ClaimStale is called by three different reconcile
+	// passes — a single shared bool would only prove the last writer was
+	// wrapped). *OutsideTx counts claims that ran without a tx on the context;
+	// it must stay zero.
+	claimStaleCalls, claimStaleOutsideTx     int
+	claimExpiredCalls, claimExpiredOutsideTx int
 }
 
 func newFakePaymentRepo(ps ...*domain.Payment) *fakePaymentRepo {
@@ -208,9 +215,13 @@ func stampStatusTime(p *domain.Payment, status domain.PaymentStatus, at time.Tim
 
 // ClaimStale mimics `SELECT ... WHERE status = ANY($statuses) AND
 // status_changed_at < $before ORDER BY status_changed_at LIMIT $limit`.
-func (f *fakePaymentRepo) ClaimStale(_ context.Context, statuses []domain.PaymentStatus, before time.Time, limit int) ([]domain.Payment, error) {
+func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.PaymentStatus, before time.Time, limit int) ([]domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimStaleCalls++
+	if !ctxInTx(ctx) {
+		f.claimStaleOutsideTx++
+	}
 	want := map[domain.PaymentStatus]struct{}{}
 	for _, s := range statuses {
 		want[s] = struct{}{}
@@ -235,9 +246,13 @@ func (f *fakePaymentRepo) ClaimStale(_ context.Context, statuses []domain.Paymen
 // ClaimExpiredHolds mimics `SELECT ... WHERE status = 'authorized' AND
 // expires_at IS NOT NULL AND expires_at < $before ORDER BY expires_at LIMIT
 // $limit` (idx_payments_expires).
-func (f *fakePaymentRepo) ClaimExpiredHolds(_ context.Context, before time.Time, limit int) ([]domain.Payment, error) {
+func (f *fakePaymentRepo) ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimExpiredCalls++
+	if !ctxInTx(ctx) {
+		f.claimExpiredOutsideTx++
+	}
 	var out []domain.Payment
 	for _, p := range f.byID {
 		if p.Status != domain.PaymentAuthorized || p.ExpiresAt == nil {
@@ -519,6 +534,8 @@ func (f *fakeEventRepo) SetPaymentID(_ context.Context, id uuid.UUID, paymentID 
 type fakeRefundRepo struct {
 	mu   sync.Mutex
 	byID map[uuid.UUID]*domain.PaymentRefund
+	// Per-call accounting; claimStaleOutsideTx must stay zero.
+	claimStaleCalls, claimStaleOutsideTx int
 }
 
 func newFakeRefundRepo() *fakeRefundRepo {
@@ -629,9 +646,13 @@ func (f *fakeRefundRepo) CompareAndSwapStatus(_ context.Context, id uuid.UUID, f
 
 // ClaimStale mimics `SELECT ... WHERE status = ANY($statuses) AND
 // status_changed_at < $before ORDER BY status_changed_at LIMIT $limit`.
-func (f *fakeRefundRepo) ClaimStale(_ context.Context, statuses []domain.RefundStatus, before time.Time, limit int) ([]domain.PaymentRefund, error) {
+func (f *fakeRefundRepo) ClaimStale(ctx context.Context, statuses []domain.RefundStatus, before time.Time, limit int) ([]domain.PaymentRefund, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimStaleCalls++
+	if !ctxInTx(ctx) {
+		f.claimStaleOutsideTx++
+	}
 	want := map[domain.RefundStatus]struct{}{}
 	for _, s := range statuses {
 		want[s] = struct{}{}
@@ -725,6 +746,10 @@ func (f *fakeItemReader) ListByBooking(_ context.Context, bookingID uuid.UUID) (
 
 type fakeRestaurantSettings struct {
 	byRestaurant map[uuid.UUID]domain.PaymentSettingsOverride
+	// err drives the "we could not read the venue's settings" path, which is
+	// NOT the same as "this venue does not take payments" — see
+	// TestAcceptsOnlinePaymentReportsAnErrorRatherThanADefiniteNo.
+	err error
 }
 
 func newFakeRestaurantSettings() *fakeRestaurantSettings {
@@ -732,7 +757,38 @@ func newFakeRestaurantSettings() *fakeRestaurantSettings {
 }
 
 func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error) {
+	if f.err != nil {
+		return domain.PaymentSettingsOverride{}, f.err
+	}
 	return f.byRestaurant[restaurantID], nil
+}
+
+// fakeSpecialDays is a hand-written specialDayResolver. By default no
+// restaurant has a paid special day (bookings are FREE) — the common case that
+// keeps every existing create test unchanged. A test that exercises the
+// paid-special-day path registers a (restaurantID -> depositMinor) entry via
+// setPaid; err lets a test drive the error path.
+type fakeSpecialDays struct {
+	paid map[uuid.UUID]int64
+	err  error
+}
+
+func newFakeSpecialDays() *fakeSpecialDays {
+	return &fakeSpecialDays{paid: map[uuid.UUID]int64{}}
+}
+
+func (f *fakeSpecialDays) setPaid(restaurantID uuid.UUID, depositMinor int64) {
+	f.paid[restaurantID] = depositMinor
+}
+
+func (f *fakeSpecialDays) PaidSpecialDayFor(_ context.Context, restaurantID uuid.UUID, _ time.Time) (bool, int64, error) {
+	if f.err != nil {
+		return false, 0, f.err
+	}
+	if amt, ok := f.paid[restaurantID]; ok {
+		return true, amt, nil
+	}
+	return false, 0, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -746,15 +802,24 @@ func (f *fakeRestaurantSettings) GetPaymentOverride(_ context.Context, restauran
 type fakeManagerChecker struct {
 	mu      sync.Mutex
 	managed map[uuid.UUID]map[uuid.UUID]bool // userID -> restaurantID -> manages
+	// permissions overrides HasPermission for a specific (user, restaurant,
+	// perm) triple — tests that care about the manager-vs-hostess RBAC split
+	// (e.g. TestSettle_HostessCannotRefund) register a narrower truth here;
+	// everything else falls back to allowAllByDefault, same as Manages.
+	permissions map[uuid.UUID]map[uuid.UUID]map[domain.Permission]bool
 	// allowAllByDefault mirrors "staff of any single venue" test setups that
-	// never register anything: true means every (user, restaurant) pair
-	// manages, matching the pre-item-#13 behaviour for tests that are not
-	// specifically about tenant scoping.
+	// never register anything: true means every (user, restaurant[, perm])
+	// combination is allowed, matching the pre-item-#13 behaviour for tests
+	// that are not specifically about tenant scoping or the RBAC split.
 	allowAllByDefault bool
 }
 
 func newFakeManagerChecker() *fakeManagerChecker {
-	return &fakeManagerChecker{managed: map[uuid.UUID]map[uuid.UUID]bool{}, allowAllByDefault: true}
+	return &fakeManagerChecker{
+		managed:           map[uuid.UUID]map[uuid.UUID]bool{},
+		permissions:       map[uuid.UUID]map[uuid.UUID]map[domain.Permission]bool{},
+		allowAllByDefault: true,
+	}
 }
 
 func (f *fakeManagerChecker) set(userID, restaurantID uuid.UUID, manages bool) {
@@ -766,12 +831,39 @@ func (f *fakeManagerChecker) set(userID, restaurantID uuid.UUID, manages bool) {
 	f.managed[userID][restaurantID] = manages
 }
 
+// setPermission registers an explicit HasPermission answer for (userID,
+// restaurantID, perm), overriding allowAllByDefault for that one triple.
+func (f *fakeManagerChecker) setPermission(userID, restaurantID uuid.UUID, perm domain.Permission, allowed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.permissions[userID] == nil {
+		f.permissions[userID] = map[uuid.UUID]map[domain.Permission]bool{}
+	}
+	if f.permissions[userID][restaurantID] == nil {
+		f.permissions[userID][restaurantID] = map[domain.Permission]bool{}
+	}
+	f.permissions[userID][restaurantID][perm] = allowed
+}
+
 func (f *fakeManagerChecker) Manages(_ context.Context, userID, restaurantID uuid.UUID) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if byRestaurant, ok := f.managed[userID]; ok {
 		if v, ok := byRestaurant[restaurantID]; ok {
 			return v, nil
+		}
+	}
+	return f.allowAllByDefault, nil
+}
+
+func (f *fakeManagerChecker) HasPermission(_ context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if byRestaurant, ok := f.permissions[userID]; ok {
+		if byPerm, ok := byRestaurant[restaurantID]; ok {
+			if v, ok := byPerm[perm]; ok {
+				return v, nil
+			}
 		}
 	}
 	return f.allowAllByDefault, nil
@@ -815,6 +907,10 @@ type fakeGateway struct {
 	authorizeErr  error
 	authorizeResp *domain.GatewayPayment
 	authorizeN    int
+	// lastAuthorize is the request the gateway last saw, so a test can assert
+	// what was actually handed to the acquirer (e.g. the split plan) and not
+	// merely that Authorize was reached.
+	lastAuthorize domain.AuthorizeRequest
 
 	// captureDelay forces concurrent CaptureOnSeating callers to actually
 	// overlap, same reasoning as authorizeDelay.
@@ -855,6 +951,7 @@ func (f *fakeGateway) Authorize(_ context.Context, req domain.AuthorizeRequest) 
 	}
 	f.mu.Lock()
 	f.authorizeN++
+	f.lastAuthorize = req
 	f.mu.Unlock()
 	if f.authorizeErr != nil {
 		return nil, f.authorizeErr
@@ -996,6 +1093,15 @@ func (f *fakeGatewayResolver) ForRefund(provider domain.PaymentProvider) (domain
 // transaction manager
 // ---------------------------------------------------------------------------
 
+// txMarkerKey marks a context as running inside fakeTx.WithinTx, mirroring how
+// the real sqltx.Manager carries the tx on the context.
+type txMarkerKey struct{}
+
+func ctxInTx(ctx context.Context) bool {
+	v, _ := ctx.Value(txMarkerKey{}).(bool)
+	return v
+}
+
 // fakeTx gives WithinTx genuine rollback-on-error semantics over the fakes
 // above by snapshotting before fn runs and restoring on a non-nil error —
 // the property the hard rule "transaction boundaries are explicit" depends
@@ -1015,6 +1121,12 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 	// and restore calls and prove nothing.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// Mark the context as being inside a transaction, mirroring how the real
+	// sqltx.Manager puts the tx on the context. The claim fakes read this so a
+	// test can assert ClaimStale/ClaimExpiredHolds run inside WithinTx (their
+	// FOR UPDATE SKIP LOCKED lock is meaningless otherwise).
+	ctx = context.WithValue(ctx, txMarkerKey{}, true)
 
 	var paySnap map[uuid.UUID]*domain.Payment
 	var ledgerSnap []domain.PaymentLedgerEntry
@@ -1052,3 +1164,11 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 }
 
 func (f *fakeTx) Detach(ctx context.Context) context.Context { return ctx }
+
+// Галерея в этих тестах не участвует: фейк принимает запись и отдаёт пустую
+// выборку — ровно столько, сколько нужно, чтобы удовлетворить интерфейс.
+func (f *fakeEventRepo) ReplaceImages(_ context.Context, _ uuid.UUID, _ []string) error { return nil }
+
+func (f *fakeEventRepo) ImagesByEvent(_ context.Context, _ []uuid.UUID) (map[uuid.UUID][]string, error) {
+	return map[uuid.UUID][]string{}, nil
+}

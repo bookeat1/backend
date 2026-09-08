@@ -55,13 +55,23 @@ func (f *fakePolicyWriter) UpdateBookingPolicy(_ context.Context, _ uuid.UUID, o
 	if o.AutoConfirm != nil {
 		p.AutoConfirm = o.AutoConfirm
 	}
+	if o.BookingCapacityMode != nil {
+		p.BookingCapacityMode = o.BookingCapacityMode
+	}
+	if o.BookingCapacitySeats != nil {
+		p.BookingCapacitySeats = o.BookingCapacitySeats
+	}
 	return nil
 }
 
 type policyHarness struct {
-	uc     PolicyUseCase
-	writer *fakePolicyWriter
-	rid    uuid.UUID
+	uc       PolicyUseCase
+	writer   *fakePolicyWriter
+	rid      uuid.UUID
+	schedule *fakeSchedule
+	capacity *fakeCapacity
+	links    *fakeLinks
+	bookings *fakeBookings
 }
 
 func newPolicyHarness(t *testing.T, managerID uuid.UUID) *policyHarness {
@@ -74,13 +84,19 @@ func newPolicyHarness(t *testing.T, managerID uuid.UUID) *policyHarness {
 		DefaultHorizonDays: 60, DefaultConfirmSLA: 120 * time.Minute,
 		DefaultMaxGuests: 20, DefaultAutoConfirm: true, TimezoneFallback: "Asia/Almaty",
 	}
+	sched := &fakeSchedule{}
+	capacity := newFakeCapacity()
+	bookings := newFakeBookings()
+	links := &fakeLinks{}
 	uc := NewPolicyUseCase(
 		&fakeRestaurants{agg: agg},
 		writer,
 		newFakeManagers([2]uuid.UUID{managerID, rid}),
+		sched, capacity, links, bookings, &fakeTx{},
 		cfg,
 	)
-	return &policyHarness{uc: uc, writer: writer, rid: rid}
+	return &policyHarness{uc: uc, writer: writer, rid: rid, schedule: sched,
+		capacity: capacity, links: links, bookings: bookings}
 }
 
 func TestPolicyUpdateAuthorization(t *testing.T) {
@@ -165,6 +181,15 @@ func TestPolicyUpdateValidation(t *testing.T) {
 		{"guests too many", domain.BookingPolicyOverride{MaxGuestsPerBooking: iptr(101)}, false},
 		{"guests at upper bound", domain.BookingPolicyOverride{MaxGuestsPerBooking: iptr(100)}, true},
 		{"auto_confirm off", domain.BookingPolicyOverride{AutoConfirm: bptr(false)}, true},
+		// The venue's zone decides its payout day, its paid special days and the
+		// wall clock its hours are read on, so the write is the last place a bad
+		// value can be stopped: the column is a plain varchar with no CHECK.
+		// These three all pass a naive time.LoadLocation check.
+		{"server-local timezone", domain.BookingPolicyOverride{Timezone: sptr("Local")}, false},
+		{"currency abbreviation as a timezone", domain.BookingPolicyOverride{Timezone: sptr("KZT")}, false},
+		{"fixed-offset abbreviation", domain.BookingPolicyOverride{Timezone: sptr("EST")}, false},
+		{"bare UTC offset", domain.BookingPolicyOverride{Timezone: sptr("+06")}, false},
+		{"UTC is allowed", domain.BookingPolicyOverride{Timezone: sptr("UTC")}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,6 +242,23 @@ func TestPolicyUpdatePatchSemantics(t *testing.T) {
 	}
 	if view.Override.BookingLeadMinutes != nil {
 		t.Errorf("lead override = %v, want nil (still inherited)", view.Override.BookingLeadMinutes)
+	}
+}
+
+// TestPolicyUpdateRejectedTimezoneCarriesItsOwnCode: the cabinet has to say
+// WHICH field it refused. A generic validation_failed on a form with a dozen
+// numeric limits leaves the venue guessing, and this is the one field whose bad
+// value would otherwise be discovered by an accountant.
+func TestPolicyUpdateRejectedTimezoneCarriesItsOwnCode(t *testing.T) {
+	owner := uuid.New()
+	h := newPolicyHarness(t, owner)
+	_, err := h.uc.Update(context.Background(), Actor{UserID: owner, Role: domain.RoleRestaurant},
+		h.rid, domain.BookingPolicyOverride{Timezone: sptr("KZT")})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+	if code, ok := domain.CodeOf(err); !ok || code != domain.CodeVenueTimezoneInvalid {
+		t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeVenueTimezoneInvalid)
 	}
 }
 
