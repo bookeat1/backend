@@ -48,6 +48,21 @@
 		file_server
 	}
 
+	# Preview of the desktop guest site (apps/web in bookeat1/frontend). Unlike
+	# /preview and /admin-preview this one is not a pile of files: it is a
+	# Next.js server rendering on demand, so Caddy proxies instead of serving.
+	#
+	# The upstream is a container from a SEPARATE compose project
+	# ("webpreview", /opt/bookeat/web-preview/docker-compose.yml) that joins
+	# this stack's network. If it is down, only /web-preview answers 502; the
+	# backend and the panel are unaffected.
+	#
+	# `handle`, NOT `handle_path`: the site is built with basePath=/web-preview,
+	# so Next expects to RECEIVE the prefix. Stripping it would 404 every page.
+	handle /web-preview* {
+		reverse_proxy web-preview:3100
+	}
+
 	# Liveness check does not need to go through the app's readiness path;
 	# Caddy just proxies everything, including /health and /health/ready.
 	reverse_proxy app:8080 {
