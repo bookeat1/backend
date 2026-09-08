@@ -20,7 +20,11 @@ func CORS(allowedOrigins []string) gin.HandlerFunc {
 	}
 	const (
 		methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-		headers = "Authorization, Content-Type, X-Requested-With"
+		// Idempotency-Key: required on POST /api/v1/bookings (and other
+		// idempotent writes) — see tickets/payments/bookings handlers.
+		// Accept-Language: read by reqlocale to pick the response locale and
+		// actually sent by the frontend HTTP client on every request.
+		headers = "Authorization, Content-Type, X-Requested-With, Idempotency-Key, Accept-Language"
 	)
 	maxAge := strconv.Itoa(int((12 * time.Hour).Seconds()))
 
