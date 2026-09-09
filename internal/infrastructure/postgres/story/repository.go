@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -27,17 +28,34 @@ func New(pool sqltx.Querier) *Repository { return &Repository{pool: pool} }
 var _ domain.StoryRepository = (*Repository)(nil)
 
 // selCols lists restaurant_stories columns for reads.
-const selCols = `id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active, created_at`
+const selCols = `id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active, expires_at, created_at`
 
-func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
+// ListActiveByRestaurant is the guest read: a venue's rail as of the instant
+// now. Two independent gates, both server-side so every client — app, cabinet,
+// anything later — sees the same truth:
+//
+//	is_active                              the venue's manual switch
+//	expires_at IS NULL OR expires_at > now  the optional lifetime (0106)
+//
+// The NULL branch is the load-bearing half: every story written before 0106 has
+// expires_at IS NULL and must keep being served exactly as before. Writing this
+// as a plain `expires_at > now` would silently retire the entire existing
+// catalogue, because NULL > now is NULL, not true.
+//
+// Filtering does not touch sort_order, so the remaining cards keep their
+// relative order and simply close ranks — the rail is shorter, never reshuffled.
+func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uuid.UUID, now time.Time) ([]domain.Story, error) {
 	// id is the final tie-break: now() is constant within a transaction, so a
 	// bulk insert gives every row the same created_at — without id the order of
 	// same-sort_order cards would not be stable between reads. The listing index
-	// carries all three sort columns so this stays an index-ordered scan.
+	// carries all three sort columns so this stays an index-ordered scan; the
+	// expires_at predicate is a recheck on the handful of rows a venue has (see
+	// migration 0106 on why it is not in the index).
 	q := `SELECT ` + selCols + ` FROM restaurant_stories
 	      WHERE restaurant_id=$1 AND is_active
+	        AND (expires_at IS NULL OR expires_at > $2)
 	      ORDER BY sort_order ASC, created_at ASC, id ASC`
-	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, restaurantID)
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, restaurantID, now)
 	if err != nil {
 		return nil, fmt.Errorf("list restaurant stories: %w", err)
 	}
@@ -56,10 +74,14 @@ func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uu
 	return stories, nil
 }
 
-// ListByRestaurant returns ALL of a restaurant's stories (active and inactive)
-// for the admin cabinet, in the same display order as the public read. Only the
-// is_active filter is dropped — the ordering (and its stable id tie-break) is
-// identical so the cabinet shows cards in the exact order guests would see them.
+// ListByRestaurant returns ALL of a restaurant's stories (active, inactive and
+// EXPIRED) for the admin cabinet, in the same display order as the public read.
+// Only the visibility filters are dropped — the ordering (and its stable id
+// tie-break) is identical so the cabinet shows cards in the exact order guests
+// would see them. There is deliberately no clock here: a card that stopped
+// being served must still appear in the venue's own list, marked as expired, so
+// the venue can extend or delete it instead of hunting for a card that silently
+// disappeared.
 func (r *Repository) ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.Story, error) {
 	q := `SELECT ` + selCols + ` FROM restaurant_stories
 	      WHERE restaurant_id=$1
@@ -104,10 +126,10 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 		s.ID = uuid.New()
 	}
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO restaurant_stories (id, restaurant_id, image_url, caption, caption_i18n, action_url, sort_order, is_active, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING created_at`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive).
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive, s.ExpiresAt).
 		Scan(&s.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -125,9 +147,9 @@ func (r *Repository) Create(ctx context.Context, s *domain.Story) error {
 func (r *Repository) Update(ctx context.Context, s *domain.Story) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE restaurant_stories
-		 SET image_url=$3, caption=$4, caption_i18n=$5, action_url=$6, sort_order=$7, is_active=$8
+		 SET image_url=$3, caption=$4, caption_i18n=$5, action_url=$6, sort_order=$7, is_active=$8, expires_at=$9
 		 WHERE id=$1 AND restaurant_id=$2`,
-		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive)
+		s.ID, s.RestaurantID, s.ImageURL, s.Caption, i18nToDB(s.CaptionI18n), s.ActionURL, s.SortOrder, s.IsActive, s.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("update restaurant story: %w", err)
 	}
@@ -183,7 +205,7 @@ func scanStory(row scanner) (*domain.Story, error) {
 	var captionI18n []byte
 	if err := row.Scan(
 		&s.ID, &s.RestaurantID, &s.ImageURL, &s.Caption, &captionI18n, &s.ActionURL, &s.SortOrder,
-		&s.IsActive, &s.CreatedAt,
+		&s.IsActive, &s.ExpiresAt, &s.CreatedAt,
 	); err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -104,7 +105,7 @@ func TestGuestShapeHasNoRawMapAndCabinetDoes(t *testing.T) {
 		t.Error("the guest shape must not carry caption_i18n")
 	}
 
-	cabinet, err := json.Marshal(adminStoryToResponse(&s))
+	cabinet, err := json.Marshal(adminStoryToResponse(&s, time.Now()))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
