@@ -10,7 +10,8 @@ import (
 )
 
 // RunWorker starts the background booking worker, the payments reconciliation
-// worker and the notification dispatcher side by side, and blocks until SIGINT
+// worker, the notification dispatcher and the guest-push receipt poller side by
+// side, and blocks until SIGINT
 // or SIGTERM. The current pass of each is allowed to finish: the signal cancels
 // the shared context, each worker returns from its own Run between ticks, and
 // the pool is closed only after all have stopped.
@@ -76,6 +77,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// worker redeploy, only the env var.
 	analyticsDispatcher := NewAnalyticsDispatcher(cfg, db, log)
 
+	// The guest-push receipt worker closes the loop the send path cannot: a
+	// provider ticket says "accepted", and only the receipt says what happened
+	// on the device. It is nil (and simply never started) when no push provider
+	// is configured — unlike the reconcilers, it has no work that exists
+	// independently of a provider, because without one nothing is ever sent.
+	pushReceipts := NewPushReceiptWorker(cfg, db, log)
+
 	// The legacy one-way sync (old Supabase -> new DB) is started only when
 	// LEGACY_DB_URL is set. When it is unset legacySync is nil and the loop is
 	// simply never started — a clean no-op, same discipline as the other
@@ -94,7 +102,7 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 
 	var wg sync.WaitGroup
 	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	var recurrenceErr error
+	var recurrenceErr, pushReceiptErr error
 	wg.Add(8)
 	go func() {
 		defer wg.Done()
@@ -128,6 +136,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer wg.Done()
 		recurrenceErr = recurrenceGenerator.Run(ctx)
 	}()
+	if pushReceipts != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pushReceiptErr = pushReceipts.Run(ctx)
+		}()
+	}
 	if legacySync != nil {
 		wg.Add(1)
 		go func() {
@@ -160,6 +175,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if recurrenceErr != nil {
 		return fmt.Errorf("event recurrence generator: %w", recurrenceErr)
+	}
+	if pushReceiptErr != nil {
+		return fmt.Errorf("push receipt worker: %w", pushReceiptErr)
 	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)

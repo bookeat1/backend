@@ -107,12 +107,13 @@ func (h *Handler) createWithHost(c *gin.Context, rid *uuid.UUID) {
 		RestaurantID:    rid,
 		City:            req.City,
 		Title:           req.Title,
-		TitleI18n:       domain.I18n(req.TitleI18n),
+		TitleI18n:       domain.I18nPatch(req.TitleI18n),
 		Description:     req.Description,
-		DescriptionI18n: domain.I18n(req.DescriptionI18n),
+		DescriptionI18n: domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:        startsAt,
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
+		TermsI18n:       domain.I18nPatch(req.TermsI18n),
 		CoverImageURL:   req.CoverImageURL,
 		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
@@ -145,12 +146,13 @@ func (h *Handler) update(c *gin.Context) {
 	}
 	p, err := h.facade.Update(c.Request.Context(), actor, pid, uc.UpdateInput{
 		Title:           req.Title,
-		TitleI18n:       domain.I18n(req.TitleI18n),
+		TitleI18n:       domain.I18nPatch(req.TitleI18n),
 		Description:     req.Description,
-		DescriptionI18n: domain.I18n(req.DescriptionI18n),
+		DescriptionI18n: domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:        startsAt,
 		EndsAt:          endsAt,
 		Terms:           req.Terms,
+		TermsI18n:       domain.I18nPatch(req.TermsI18n),
 		CoverImageURL:   req.CoverImageURL,
 		DiscountPercent: req.DiscountPercent,
 		Status:          domain.PromoStatus(req.Status),
@@ -349,13 +351,22 @@ func parsePromoStatuses(raw string) []domain.PromoStatus {
 // --- DTOs ---
 
 type promoRequest struct {
-	Title           string            `json:"title"`
-	TitleI18n       map[string]string `json:"title_i18n"`
-	Description     string            `json:"description"`
-	DescriptionI18n map[string]string `json:"description_i18n"`
-	StartsAt        string            `json:"starts_at"`
-	EndsAt          string            `json:"ends_at"`
-	Terms           string            `json:"terms"`
+	Title string `json:"title"`
+	// The `*_i18n` objects are PARTIAL translation updates, and the ONE thing
+	// in this payload that is not a full replace:
+	//
+	//	{"title_i18n": {"kk": "Кешкі ас", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored. The plain
+	// field next to it is the Russian text and wins over a `ru` key here.
+	TitleI18n       map[string]*string `json:"title_i18n"`
+	Description     string             `json:"description"`
+	DescriptionI18n map[string]*string `json:"description_i18n"`
+	StartsAt        string             `json:"starts_at"`
+	EndsAt          string             `json:"ends_at"`
+	Terms           string             `json:"terms"`
+	TermsI18n       map[string]*string `json:"terms_i18n"`
 	// CoverImageURL is the full public image URL. Omitted or null means the
 	// promo has no picture — that is a valid, honest state, not a missing field.
 	CoverImageURL *string `json:"cover_image_url"`
@@ -398,6 +409,7 @@ type promoResponse struct {
 	StartsAt        string            `json:"starts_at"`
 	EndsAt          string            `json:"ends_at"`
 	Terms           string            `json:"terms,omitempty"`
+	TermsI18n       map[string]string `json:"terms_i18n,omitempty"`
 	// CoverImageURL is omitted entirely when the promo has no picture: the
 	// client must render its own placeholder, never a made-up URL.
 	CoverImageURL *string `json:"cover_image_url,omitempty"`
@@ -472,6 +484,7 @@ func adminResponse(p domain.Promo) promoResponse {
 		StartsAt:        p.StartsAt.Format(time.RFC3339),
 		EndsAt:          p.EndsAt.Format(time.RFC3339),
 		Terms:           p.Terms,
+		TermsI18n:       p.TermsI18n,
 		CoverImageURL:   p.CoverImageURL,
 		DiscountPercent: p.DiscountPercent,
 		Status:          string(p.Status),
@@ -486,8 +499,10 @@ func publicResponse(p domain.Promo, lang string) promoResponse {
 	r := adminResponse(p)
 	r.Title = p.TitleI18n.Resolve(lang, p.Title)
 	r.Description = p.DescriptionI18n.Resolve(lang, p.Description)
+	r.Terms = p.TermsI18n.Resolve(lang, p.Terms)
 	r.TitleI18n = nil
 	r.DescriptionI18n = nil
+	r.TermsI18n = nil
 	return r
 }
 

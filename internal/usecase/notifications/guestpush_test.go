@@ -19,22 +19,24 @@ func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 
 // guestHarness wires a GuestPushNotifier over in-memory fakes.
 type guestHarness struct {
-	n      *GuestPushNotifier
-	tokens *fakeDeviceTokens
-	prefs  *fakeGuestPrefs
-	sender *recordingMobileSender
-	deliv  *fakeDeliveries
+	n       *GuestPushNotifier
+	tokens  *fakeDeviceTokens
+	prefs   *fakeGuestPrefs
+	sender  *recordingMobileSender
+	deliv   *fakeDeliveries
+	tickets *fakePushTickets
 }
 
 func newGuestHarness(t *testing.T, tokens ...domain.DevicePushToken) *guestHarness {
 	t.Helper()
 	h := &guestHarness{
-		tokens: newFakeDeviceTokens(tokens...),
-		prefs:  newFakeGuestPrefs(),
-		sender: newRecordingMobileSender(),
-		deliv:  newFakeDeliveries(),
+		tokens:  newFakeDeviceTokens(tokens...),
+		prefs:   newFakeGuestPrefs(),
+		sender:  newRecordingMobileSender(),
+		deliv:   newFakeDeliveries(),
+		tickets: newFakePushTickets(),
 	}
-	h.n = NewGuestPushNotifier(h.tokens, h.deliv,
+	h.n = NewGuestPushNotifier(h.tokens, h.deliv, h.tickets,
 		NewGuestNotificationGate(h.prefs), fakeVenues{name: "Ocean Basket"},
 		h.sender.send, true, discardLog())
 	return h
@@ -211,8 +213,8 @@ func TestGuestPushDisabledIsNoop(t *testing.T) {
 	uid := uuid.New()
 	sender := newRecordingMobileSender()
 	n := NewGuestPushNotifier(newFakeDeviceTokens(guestToken(uid)), newFakeDeliveries(),
-		NewGuestNotificationGate(newFakeGuestPrefs()), fakeVenues{name: "Ocean Basket"},
-		sender.send, false, discardLog())
+		newFakePushTickets(), NewGuestNotificationGate(newFakeGuestPrefs()),
+		fakeVenues{name: "Ocean Basket"}, sender.send, false, discardLog())
 
 	if err := n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
 		t.Fatalf("notify: %v", err)
@@ -284,5 +286,84 @@ func TestToEventCarriesGuestFields(t *testing.T) {
 	}
 	if e.CancelledBy != domain.CancelledByRestaurant {
 		t.Fatalf("cancelled_by = %q, want restaurant", e.CancelledBy)
+	}
+}
+
+// THE RECEIPT HANDLE. Expo's `ok` ticket means "accepted", not "delivered", so
+// the ticket id must be queued for receipt polling. This test fails on the old
+// behaviour, where Send returned a bare verdict and the id was thrown away:
+// nothing was ever enqueued and a delayed DeviceNotRegistered could not be seen.
+func TestGuestPushEnqueuesTicketForReceiptPolling(t *testing.T) {
+	uid := uuid.New()
+	tok := guestToken(uid)
+	h := newGuestHarness(t, tok)
+	e := guestEvent(uid, domain.EventBookingConfirmed)
+
+	if err := h.n.Notify(context.Background(), e); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	ticket := h.sender.ticketOf(tok.Token)
+	if ticket == "" {
+		t.Fatal("the fake provider handed out no ticket id")
+	}
+	queued := h.tickets.unresolvedIDs()
+	if len(queued) != 1 || queued[0] != ticket {
+		t.Fatalf("queued tickets = %v, want exactly the ticket the provider returned (%s)", queued, ticket)
+	}
+	h.tickets.mu.Lock()
+	row := h.tickets.rows[ticket]
+	h.tickets.mu.Unlock()
+	if row.DeviceTokenID != tok.ID {
+		t.Fatalf("ticket points at device %s, want %s", row.DeviceTokenID, tok.ID)
+	}
+	if row.OutboxEventID == nil || *row.OutboxEventID != e.OutboxEventID {
+		t.Fatalf("ticket outbox_event_id = %v, want %s", row.OutboxEventID, e.OutboxEventID)
+	}
+}
+
+// A verdict with no ticket id enqueues nothing: there is no receipt to ask for,
+// and a row with an empty id would be a permanent no-answer in the queue.
+func TestGuestPushEnqueuesNothingWithoutATicketID(t *testing.T) {
+	uid := uuid.New()
+	h := newGuestHarness(t, guestToken(uid))
+	h.sender.noTicket = true
+
+	if err := h.n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if got := h.tickets.count(); got != 0 {
+		t.Fatalf("queued %d tickets without an id, want 0", got)
+	}
+}
+
+// A dead device reported ALREADY IN THE TICKET has no receipt to poll: it is
+// deactivated on the spot, and nothing is queued.
+func TestGuestPushEnqueuesNothingForAGoneDevice(t *testing.T) {
+	uid := uuid.New()
+	tok := guestToken(uid)
+	h := newGuestHarness(t, tok)
+	h.sender.verdict[tok.Token] = MobilePushDeviceGone
+
+	if err := h.n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if got := h.tickets.count(); got != 0 {
+		t.Fatalf("queued %d tickets for a device the ticket already declared gone, want 0", got)
+	}
+}
+
+// Bookkeeping must never jam the outbox: a failing ticket store is logged, not
+// returned. The push has already left; failing the event would re-run every
+// sibling channel for the sake of a row nobody is waiting on.
+func TestGuestPushSurvivesTicketStoreFailure(t *testing.T) {
+	uid := uuid.New()
+	h := newGuestHarness(t, guestToken(uid))
+	h.tickets.recErr = errors.New("db down")
+
+	if err := h.n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
+		t.Fatalf("notify: %v, want the event to drain despite the ticket write failing", err)
+	}
+	if got := h.sender.count(); got != 1 {
+		t.Fatalf("pushes sent = %d, want 1", got)
 	}
 }

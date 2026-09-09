@@ -181,9 +181,19 @@ func (h *EditorHandler) listCollections(c *gin.Context) {
 		v := domain.City(raw)
 		city = &v
 	}
+	// ?kind=collection|article. Absent means both — the cabinet's default
+	// screen still lists everything the editor owns. An unknown value is a 422
+	// from the usecase (guide_unknown_kind), not a silently empty page: on an
+	// admin screen "nothing found" because of a typo in a filter is
+	// indistinguishable from "you have written nothing".
+	var kind *domain.GuideCollectionKind
+	if raw := strings.TrimSpace(c.Query("kind")); raw != "" {
+		v := domain.GuideCollectionKind(raw)
+		kind = &v
+	}
 	page, perPage := pagination(c)
 	items, total, err := h.editor.ListCollections(c.Request.Context(), actor, uc.AdminListInput{
-		Statuses: statuses, City: city, Query: strings.TrimSpace(c.Query("q")),
+		Statuses: statuses, City: city, Kind: kind, Query: strings.TrimSpace(c.Query("q")),
 		Page: page, PerPage: perPage,
 	})
 	if err != nil {
@@ -418,7 +428,7 @@ func (h *EditorHandler) attachVenue(c *gin.Context) {
 		return
 	}
 	if err := h.editor.AttachVenue(c.Request.Context(), actor, id, uc.AttachVenueInput{
-		RestaurantID: rid, Note: req.Note, NoteI18n: req.NoteI18n,
+		RestaurantID: rid, Note: req.Note, NoteI18n: domain.I18nPatch(req.NoteI18n),
 		EventID: eventID, PromoID: promoID,
 	}); err != nil {
 		response.HandleError(c.Writer, err)
@@ -479,7 +489,7 @@ func (h *EditorHandler) setVenueNote(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
-	if err := h.editor.SetVenueNote(c.Request.Context(), actor, id, rid, req.Note, req.NoteI18n); err != nil {
+	if err := h.editor.SetVenueNote(c.Request.Context(), actor, id, rid, req.Note, domain.I18nPatch(req.NoteI18n)); err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
@@ -565,10 +575,21 @@ func parseUUIDs(c *gin.Context, raw []string, msg string) ([]uuid.UUID, bool) {
 // --- request DTOs ---
 
 type categoryRequest struct {
-	Slug      string      `json:"slug"`
-	Title     string      `json:"title"`
-	TitleI18n domain.I18n `json:"title_i18n"`
-	Position  int         `json:"position"`
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
+	// The `*_i18n` objects here and below are PARTIAL translation updates, and
+	// the ONE thing in these payloads that is not a full replace:
+	//
+	//	{"title_i18n": {"kk": "Таңғы ас", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored — so two
+	// editors with the same form open no longer overwrite each other. Omitting
+	// the object entirely touches no translation at all. The plain field next
+	// to it is the Russian text and wins over a `ru` key inside the map;
+	// deleting `ru` is a 422, and so is a language outside ru/kk/en.
+	TitleI18n map[string]*string `json:"title_i18n"`
+	Position  int                `json:"position"`
 	// IsActive is a pointer so an omitted field means "active" rather than
 	// "switch this rubric off" — a panel build that predates the flag must not
 	// silently hide a rubric every time somebody fixes its title.
@@ -581,30 +602,35 @@ func (r categoryRequest) toInput() uc.CategoryInput {
 		active = *r.IsActive
 	}
 	return uc.CategoryInput{
-		Slug: r.Slug, Title: r.Title, TitleI18n: r.TitleI18n,
+		Slug: r.Slug, Title: r.Title, TitleI18n: domain.I18nPatch(r.TitleI18n),
 		Position: r.Position, IsActive: active,
 	}
 }
 
 type collectionRequest struct {
-	Slug            string      `json:"slug"`
-	Title           string      `json:"title"`
-	TitleI18n       domain.I18n `json:"title_i18n"`
-	Subtitle        string      `json:"subtitle"`
-	SubtitleI18n    domain.I18n `json:"subtitle_i18n"`
-	Description     string      `json:"description"`
-	DescriptionI18n domain.I18n `json:"description_i18n"`
-	CoverImageURL   *string     `json:"cover_image_url"`
-	City            *string     `json:"city"`
-	Position        int         `json:"position"`
+	Slug            string             `json:"slug"`
+	Title           string             `json:"title"`
+	TitleI18n       map[string]*string `json:"title_i18n"`
+	Subtitle        string             `json:"subtitle"`
+	SubtitleI18n    map[string]*string `json:"subtitle_i18n"`
+	Description     string             `json:"description"`
+	DescriptionI18n map[string]*string `json:"description_i18n"`
+	CoverImageURL   *string            `json:"cover_image_url"`
+	City            *string            `json:"city"`
+	// Kind is "collection" or "article" (migration 0096). Omitted or empty
+	// means "collection", so an admin build that predates the split keeps
+	// creating exactly what it used to.
+	Kind     string `json:"kind"`
+	Position int    `json:"position"`
 }
 
 func (r collectionRequest) toInput() uc.CollectionInput {
 	in := uc.CollectionInput{
-		Slug: r.Slug, Title: r.Title, TitleI18n: r.TitleI18n,
-		Subtitle: r.Subtitle, SubtitleI18n: r.SubtitleI18n,
-		Description: r.Description, DescriptionI18n: r.DescriptionI18n,
+		Slug: r.Slug, Title: r.Title, TitleI18n: domain.I18nPatch(r.TitleI18n),
+		Subtitle: r.Subtitle, SubtitleI18n: domain.I18nPatch(r.SubtitleI18n),
+		Description: r.Description, DescriptionI18n: domain.I18nPatch(r.DescriptionI18n),
 		CoverImageURL: r.CoverImageURL, Position: r.Position,
+		Kind: domain.GuideCollectionKind(strings.ToLower(strings.TrimSpace(r.Kind))),
 	}
 	// An empty city string is "every city", the same thing a missing field
 	// means: a <select> with nothing chosen posts "".
@@ -628,16 +654,16 @@ type setCategoriesRequest struct {
 
 type attachVenueRequest struct {
 	// EventID / PromoID — необязательная подсветка блока: событие ИЛИ акция.
-	EventID      string      `json:"event_id"`
-	PromoID      string      `json:"promo_id"`
-	RestaurantID string      `json:"restaurant_id"`
-	Note         string      `json:"note"`
-	NoteI18n     domain.I18n `json:"note_i18n"`
+	EventID      string             `json:"event_id"`
+	PromoID      string             `json:"promo_id"`
+	RestaurantID string             `json:"restaurant_id"`
+	Note         string             `json:"note"`
+	NoteI18n     map[string]*string `json:"note_i18n"`
 }
 
 type venueNoteRequest struct {
-	Note     string      `json:"note"`
-	NoteI18n domain.I18n `json:"note_i18n"`
+	Note     string             `json:"note"`
+	NoteI18n map[string]*string `json:"note_i18n"`
 }
 
 type reorderRequest struct {
@@ -676,6 +702,7 @@ type adminCollectionResponse struct {
 	DescriptionI18n domain.I18n `json:"description_i18n,omitempty"`
 	CoverImageURL   *string     `json:"cover_image_url"`
 	City            *string     `json:"city"`
+	Kind            string      `json:"kind"`
 	Status          string      `json:"status"`
 	PublishedAt     *time.Time  `json:"published_at"`
 	Position        int         `json:"position"`
@@ -693,8 +720,8 @@ func newAdminCollectionResponse(c domain.GuideCollection) adminCollectionRespons
 		Title: c.Title, TitleI18n: c.TitleI18n,
 		Subtitle: c.Subtitle, SubtitleI18n: c.SubtitleI18n,
 		Description: c.Description, DescriptionI18n: c.DescriptionI18n,
-		CoverImageURL: c.CoverImageURL,
-		Status:        string(c.Status), PublishedAt: c.PublishedAt,
+		CoverImageURL: c.CoverImageURL, Kind: string(c.Kind),
+		Status: string(c.Status), PublishedAt: c.PublishedAt,
 		Position: c.Position, VenueCount: c.VenueCount,
 		CategorySlugs: c.CategorySlugs, UpdatedAt: c.UpdatedAt,
 	}

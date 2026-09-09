@@ -22,6 +22,16 @@ import (
 // 80 would fail every other package in the suite.
 const citiesMigrationVersion = 81
 
+// citiesMigrationFloor is the version immediately below 0081. The round trip
+// reverts down TO it instead of "one step down": goose's Down takes off the
+// LAST applied migration, and 0081 stopped being the last one the moment 0082
+// landed. From then on the rollback removed a stranger's migration, the 0081
+// trigger stayed in place, the raw spellings restored by the mutate hook were
+// canonicalized on the spot by that trigger, and the backfill this test exists
+// to check was never run at all — a green test measuring nothing (same rot as
+// cuisineMigrationFloor / featuresMigrationFloor document).
+const citiesMigrationFloor = citiesMigrationVersion - 1
+
 const (
 	astanaID = "452c6951-5bde-5a1b-b1b4-8a4c938ae456"
 	almatyID = "f157fb6e-7c0a-51d8-9526-37870bc306bf"
@@ -37,11 +47,21 @@ func gooseDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open goose db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
 	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("goose dialect: %v", err)
 	}
+	// Put the SHARED database back at the latest version whatever happens here,
+	// including a t.Fatal between the rollback and the re-apply. Without this a
+	// failing assertion in the middle of the down/up dance leaves the database
+	// several migrations short and every package that runs afterwards fails on
+	// a column missing for reasons of its own.
+	t.Cleanup(func() {
+		if err := goose.UpContext(context.Background(), db, "."); err != nil {
+			t.Errorf("restore the shared test database: %v", err)
+		}
+		_ = db.Close()
+	})
 	return db
 }
 
@@ -63,8 +83,8 @@ func downThenUp(t *testing.T, db *sql.DB) {
 func downMutateUp(t *testing.T, db *sql.DB, mutate func()) {
 	t.Helper()
 	ctx := context.Background()
-	if err := goose.DownContext(ctx, db, "."); err != nil {
-		t.Fatalf("goose down: %v", err)
+	if err := goose.DownToContext(ctx, db, ".", citiesMigrationFloor); err != nil {
+		t.Fatalf("goose down to %d: %v", citiesMigrationFloor, err)
 	}
 	if mutate != nil {
 		mutate()

@@ -52,32 +52,63 @@ type RouteAdminListInput struct {
 // RouteInput is a route's editable fields as they arrive from the cabinet.
 // Status is absent by design — see Publish/Unpublish/Archive.
 type RouteInput struct {
-	Slug              string
-	Title             string
-	TitleI18n         domain.I18n
+	Slug  string
+	Title string
+	// The *I18n maps are PARTIAL translation updates (domain.I18nPatch), the
+	// only fields here that are not a full replace: a named language is
+	// written, a null (or blank) one is removed, and an unmentioned one keeps
+	// whatever is stored. The plain field next to each map is its Russian text
+	// and wins over a `ru` key inside it (domain.ApplyTranslations).
+	TitleI18n         domain.I18nPatch
 	Description       string
-	DescriptionI18n   domain.I18n
+	DescriptionI18n   domain.I18nPatch
 	CoverImageURL     *string
 	DurationLabel     string
-	DurationLabelI18n domain.I18n
+	DurationLabelI18n domain.I18nPatch
 	City              *domain.City
 	Position          int
+}
+
+// validateTranslations refuses a route's translation patches. Called BEFORE
+// anything is read or written, so an unsupported language is a 422 whatever the
+// id turns out to point at.
+func (in RouteInput) validateTranslations() error {
+	if err := in.TitleI18n.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := in.DescriptionI18n.Validate("description_i18n"); err != nil {
+		return err
+	}
+	return in.DurationLabelI18n.Validate("duration_label_i18n")
 }
 
 // PointInput is one stop as the cabinet posts it. Position is absent: a new
 // stop is appended, and moving stops is ReorderPoints.
 type PointInput struct {
-	Kind            domain.GuideRoutePointKind
-	RestaurantID    *uuid.UUID
-	Title           string
-	TitleI18n       domain.I18n
+	Kind         domain.GuideRoutePointKind
+	RestaurantID *uuid.UUID
+	Title        string
+	// The *I18n maps are PARTIAL translation updates — see RouteInput.
+	TitleI18n       domain.I18nPatch
 	Description     string
-	DescriptionI18n domain.I18n
+	DescriptionI18n domain.I18nPatch
 	PhotoURL        *string
 	Address         string
-	AddressI18n     domain.I18n
+	AddressI18n     domain.I18nPatch
 	Latitude        *float64
 	Longitude       *float64
+}
+
+// validateTranslations refuses a stop's translation patches before anything is
+// read or written.
+func (in PointInput) validateTranslations() error {
+	if err := in.TitleI18n.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := in.DescriptionI18n.Validate("description_i18n"); err != nil {
+		return err
+	}
+	return in.AddressI18n.Validate("address_i18n")
 }
 
 type routeEditor struct {
@@ -132,18 +163,29 @@ func (e *routeEditor) CreateRoute(ctx context.Context, actor EditorActor, in Rou
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateRoute(in)
+	w, err := validateRoute(in, nil)
 	if err != nil {
 		return nil, err
 	}
 	return e.repo.CreateRoute(ctx, w)
 }
 
+// UpdateRoute reads the route before writing it, because its `*_i18n` fields
+// are PARTIAL updates: the stored maps are one half of the result and the
+// request is the other. Without the read, "I did not mention English" and
+// "delete English" would be the same request.
 func (e *routeEditor) UpdateRoute(ctx context.Context, actor EditorActor, id uuid.UUID, in RouteInput) (*domain.GastroRoute, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateRoute(in)
+	if err := in.validateTranslations(); err != nil {
+		return nil, err
+	}
+	current, err := e.repo.GetRouteAdmin(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	w, err := validateRoute(in, &current.GastroRoute)
 	if err != nil {
 		return nil, err
 	}
@@ -229,18 +271,42 @@ func (e *routeEditor) AddPoint(ctx context.Context, actor EditorActor, routeID u
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validatePoint(in)
+	w, err := validatePoint(in, nil)
 	if err != nil {
 		return nil, err
 	}
 	return e.repo.AddPoint(ctx, routeID, w)
 }
 
+// UpdatePoint reads the stop before writing it, for the same reason UpdateRoute
+// reads the route: a translation patch is merged onto what is stored.
+//
+// The stop is found inside the route's admin detail rather than through a
+// dedicated read — it is the same query the cabinet screen runs, and a stop
+// that belongs to another route has to be ErrNotFound here anyway, which is
+// exactly what the repository would answer.
 func (e *routeEditor) UpdatePoint(ctx context.Context, actor EditorActor, routeID, pointID uuid.UUID, in PointInput) (*domain.GuideRoutePoint, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validatePoint(in)
+	if err := in.validateTranslations(); err != nil {
+		return nil, err
+	}
+	current, err := e.repo.GetRouteAdmin(ctx, routeID)
+	if err != nil {
+		return nil, err
+	}
+	var stored *domain.GuideRoutePoint
+	for i := range current.Points {
+		if current.Points[i].ID == pointID {
+			stored = &current.Points[i]
+			break
+		}
+	}
+	if stored == nil {
+		return nil, fmt.Errorf("update guide route point: %w", domain.ErrNotFound)
+	}
+	w, err := validatePoint(in, stored)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +340,14 @@ func (e *routeEditor) ReorderPoints(ctx context.Context, actor EditorActor, rout
 
 // --- validation ---
 
-func validateRoute(in RouteInput) (domain.GastroRouteWrite, error) {
+// validateRoute turns the cabinet's payload into the row to write. base is the
+// route as it is STORED (nil on create): its translation maps are what the
+// partial patches are merged onto, so a language neither side mentions —
+// including the ko/zh rows the old import left behind — survives untouched.
+func validateRoute(in RouteInput, base *domain.GastroRoute) (domain.GastroRouteWrite, error) {
+	if err := in.validateTranslations(); err != nil {
+		return domain.GastroRouteWrite{}, err
+	}
 	slug, err := normalizeSlug(in.Slug)
 	if err != nil {
 		return domain.GastroRouteWrite{}, err
@@ -287,12 +360,20 @@ func validateRoute(in RouteInput) (domain.GastroRouteWrite, error) {
 		return domain.GastroRouteWrite{}, domain.WithCode(domain.CodeCityRequired,
 			fmt.Errorf("%w: unknown city", domain.ErrValidation))
 	}
+	var baseTitle, baseDescription, baseDuration domain.I18n
+	if base != nil {
+		baseTitle, baseDescription, baseDuration = base.TitleI18n, base.DescriptionI18n, base.DurationLabelI18n
+	}
+	description := strings.TrimSpace(in.Description)
+	durationLabel := strings.TrimSpace(in.DurationLabel)
 	return domain.GastroRouteWrite{
-		Slug: slug, Title: title, TitleI18n: cleanI18n(in.TitleI18n),
-		Description: strings.TrimSpace(in.Description), DescriptionI18n: cleanI18n(in.DescriptionI18n),
+		Slug: slug, Title: title,
+		TitleI18n:         domain.ApplyTranslations(baseTitle, in.TitleI18n, title),
+		Description:       description,
+		DescriptionI18n:   domain.ApplyTranslations(baseDescription, in.DescriptionI18n, description),
 		CoverImageURL:     emptyToNil(in.CoverImageURL),
-		DurationLabel:     strings.TrimSpace(in.DurationLabel),
-		DurationLabelI18n: cleanI18n(in.DurationLabelI18n),
+		DurationLabel:     durationLabel,
+		DurationLabelI18n: domain.ApplyTranslations(baseDuration, in.DurationLabelI18n, durationLabel),
 		City:              in.City, Position: in.Position,
 	}, nil
 }
@@ -304,7 +385,10 @@ func validateRoute(in RouteInput) (domain.GastroRouteWrite, error) {
 // the column stays nullable so that deleting a venue clears the link instead of
 // deleting the stop (ON DELETE SET NULL). Which means the "a venue stop names a
 // venue" rule can only live here, at the write.
-func validatePoint(in PointInput) (domain.GuideRoutePointWrite, error) {
+func validatePoint(in PointInput, base *domain.GuideRoutePoint) (domain.GuideRoutePointWrite, error) {
+	if err := in.validateTranslations(); err != nil {
+		return domain.GuideRoutePointWrite{}, err
+	}
 	if !in.Kind.Valid() {
 		return domain.GuideRoutePointWrite{}, fmt.Errorf(
 			"%w: kind must be %q or %q", domain.ErrValidation,
@@ -334,13 +418,22 @@ func validatePoint(in PointInput) (domain.GuideRoutePointWrite, error) {
 	if err != nil {
 		return domain.GuideRoutePointWrite{}, err
 	}
+	var baseTitle, baseDescription, baseAddress domain.I18n
+	if base != nil {
+		baseTitle, baseDescription, baseAddress = base.TitleI18n, base.DescriptionI18n, base.AddressI18n
+	}
+	description := strings.TrimSpace(in.Description)
+	address := strings.TrimSpace(in.Address)
 	return domain.GuideRoutePointWrite{
 		Kind: in.Kind, RestaurantID: in.RestaurantID,
-		Title: title, TitleI18n: cleanI18n(in.TitleI18n),
-		Description: strings.TrimSpace(in.Description), DescriptionI18n: cleanI18n(in.DescriptionI18n),
-		PhotoURL: emptyToNil(in.PhotoURL),
-		Address:  strings.TrimSpace(in.Address), AddressI18n: cleanI18n(in.AddressI18n),
-		Latitude: lat, Longitude: lng,
+		Title:           title,
+		TitleI18n:       domain.ApplyTranslations(baseTitle, in.TitleI18n, title),
+		Description:     description,
+		DescriptionI18n: domain.ApplyTranslations(baseDescription, in.DescriptionI18n, description),
+		PhotoURL:        emptyToNil(in.PhotoURL),
+		Address:         address,
+		AddressI18n:     domain.ApplyTranslations(baseAddress, in.AddressI18n, address),
+		Latitude:        lat, Longitude: lng,
 	}, nil
 }
 

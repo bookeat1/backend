@@ -312,7 +312,9 @@ docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
 docker compose exec -T postgres psql -U "$DB_USERNAME" -d postgres \
   -c "ALTER DATABASE bookeat_restored RENAME TO bookeat;"
 docker compose restart app worker   # they hold a connection pool to the old name
-curl -fsS http://127.0.0.1/health
+# NB: http://127.0.0.1/health on the host is Caddy's 308 redirect, not the app.
+# Ask the app itself:
+docker compose exec -T app wget -q -T 3 -O - http://127.0.0.1:8080/health; echo
 #   Only drop bookeat_old_broken once you're sure — keep it a day, not a minute.
 
 # 6b. If this was just a drill/verification, clean up instead:

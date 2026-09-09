@@ -71,49 +71,89 @@ type Editor interface {
 	// заведения. Оба nil — снять подсветку.
 	SetVenueHighlight(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, eventID, promoID *uuid.UUID) error
 	DetachVenue(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID) error
-	SetVenueNote(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, note string, noteI18n domain.I18n) error
+	SetVenueNote(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, note string, noteI18n domain.I18nPatch) error
 	// ReorderVenues writes the intended FINAL order of the collection's venues.
 	ReorderVenues(ctx context.Context, actor EditorActor, collectionID uuid.UUID, restaurantIDs []uuid.UUID) error
 }
 
 // CategoryInput is a rubric's editable fields as they arrive from the cabinet.
 type CategoryInput struct {
-	Slug      string
-	Title     string
-	TitleI18n domain.I18n
+	Slug  string
+	Title string
+	// TitleI18n is a PARTIAL translation update (domain.I18nPatch) and the one
+	// field here that is not a full replace: a named language is written, a
+	// null (or blank) one is removed, and a language the object does not
+	// mention keeps whatever is stored. Two editors with the same form open no
+	// longer overwrite each other's language.
+	//
+	// Title is the Russian text: it always wins over a `ru` key in the map, and
+	// the merge re-establishes i18n["ru"] == Title (domain.ApplyTranslations).
+	TitleI18n domain.I18nPatch
 	Position  int
 	IsActive  bool
+}
+
+// validateTranslations refuses a rubric's translation patch. Called BEFORE
+// anything is read or written, so an unsupported language is a 422 whatever
+// the id turns out to point at.
+func (in CategoryInput) validateTranslations() error {
+	return in.TitleI18n.Validate("title_i18n")
 }
 
 // CollectionInput is a collection's editable fields as they arrive from the
 // cabinet. Status is absent by design — see Publish/Unpublish/Archive.
 type CollectionInput struct {
-	Slug            string
-	Title           string
-	TitleI18n       domain.I18n
+	Slug  string
+	Title string
+	// The *I18n maps are PARTIAL translation updates — see CategoryInput. The
+	// plain field next to each one is its Russian text and wins over a `ru`
+	// key in the map.
+	TitleI18n       domain.I18nPatch
 	Subtitle        string
-	SubtitleI18n    domain.I18n
+	SubtitleI18n    domain.I18nPatch
 	Description     string
-	DescriptionI18n domain.I18n
+	DescriptionI18n domain.I18nPatch
 	CoverImageURL   *string
 	City            *domain.City
-	Position        int
+	// Kind is "collection" or "article". EMPTY means "collection": an admin
+	// build that predates migration 0096 does not send the field, and its
+	// creates must keep producing what they always produced. An unknown value
+	// is a 422 (CodeGuideUnknownKind), never coerced.
+	Kind     domain.GuideCollectionKind
+	Position int
+}
+
+// validateTranslations refuses a collection's translation patches before
+// anything is read or written.
+func (in CollectionInput) validateTranslations() error {
+	if err := in.TitleI18n.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := in.SubtitleI18n.Validate("subtitle_i18n"); err != nil {
+		return err
+	}
+	return in.DescriptionI18n.Validate("description_i18n")
 }
 
 // AdminListInput narrows the cabinet's collection listing.
 type AdminListInput struct {
 	Statuses []domain.GuideCollectionStatus
 	City     *domain.City
-	Query    string
-	Page     int
-	PerPage  int
+	// Kind narrows the cabinet listing to collections or to articles. Nil means
+	// both.
+	Kind    *domain.GuideCollectionKind
+	Query   string
+	Page    int
+	PerPage int
 }
 
 // AttachVenueInput puts one venue into a collection, at the end.
 type AttachVenueInput struct {
 	RestaurantID uuid.UUID
 	Note         string
-	NoteI18n     domain.I18n
+	// NoteI18n is a PARTIAL translation update — see CategoryInput. On an
+	// attach there is nothing stored yet, so it starts from an empty map.
+	NoteI18n domain.I18nPatch
 	// EventID / PromoID — необязательная подсветка блока: событие ИЛИ акция.
 	EventID *uuid.UUID
 	PromoID *uuid.UUID
@@ -153,18 +193,29 @@ func (e *editor) CreateCategory(ctx context.Context, actor EditorActor, in Categ
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateCategory(in)
+	w, err := validateCategory(in, nil)
 	if err != nil {
 		return nil, err
 	}
 	return e.repo.CreateCategory(ctx, w)
 }
 
+// UpdateCategory reads the rubric before writing it, because title_i18n is a
+// PARTIAL update: the stored map is one half of the result and the request is
+// the other. Without the read, "I did not mention English" and "delete English"
+// would be the same request — which is the bug this replaced.
 func (e *editor) UpdateCategory(ctx context.Context, actor EditorActor, id uuid.UUID, in CategoryInput) (*domain.GuideCategory, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateCategory(in)
+	if err := in.validateTranslations(); err != nil {
+		return nil, err
+	}
+	current, err := e.repo.GetCategory(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	w, err := validateCategory(in, current.TitleI18n)
 	if err != nil {
 		return nil, err
 	}
@@ -186,8 +237,12 @@ func (e *editor) ListCollections(ctx context.Context, actor EditorActor, in Admi
 		return nil, 0, domain.WithCode(domain.CodeCityRequired,
 			fmt.Errorf("%w: unknown city", domain.ErrValidation))
 	}
+	if in.Kind != nil && !in.Kind.Valid() {
+		return nil, 0, domain.WithCode(domain.CodeGuideUnknownKind,
+			fmt.Errorf("%w: unknown collection kind %q", domain.ErrValidation, *in.Kind))
+	}
 	return e.repo.ListCollectionsAdmin(ctx, domain.GuideCollectionAdminFilter{
-		Statuses: in.Statuses, City: in.City, Query: in.Query,
+		Statuses: in.Statuses, City: in.City, Kind: in.Kind, Query: in.Query,
 		Page: in.Page, PerPage: in.PerPage,
 	})
 }
@@ -203,20 +258,46 @@ func (e *editor) CreateCollection(ctx context.Context, actor EditorActor, in Col
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateCollection(in)
+	w, err := validateCollection(in, nil)
 	if err != nil {
 		return nil, err
 	}
 	return e.repo.CreateCollection(ctx, w)
 }
 
+// UpdateCollection replaces the editable fields, and refuses to turn an item
+// that carries rubrics into an article.
+//
+// The refusal is here and not only in SQL on purpose: the alternative — writing
+// kind='article' and quietly deleting the rubric links — is a destructive edit
+// the editor never asked for and would not see in the response. Making them
+// detach the rubrics first costs one extra call and keeps the deletion an
+// explicit act.
+//
+// The collection is now read UNCONDITIONALLY, where before it was read only to
+// check the rubrics of an article: its stored translation maps are half of what
+// the write produces, because the `*_i18n` objects in the payload are partial
+// patches. The read that the article check needed is the same one, so this
+// costs no extra query on that path.
 func (e *editor) UpdateCollection(ctx context.Context, actor EditorActor, id uuid.UUID, in CollectionInput) (*domain.GuideCollection, error) {
 	if err := e.authorize(actor); err != nil {
 		return nil, err
 	}
-	w, err := validateCollection(in)
+	if err := in.validateTranslations(); err != nil {
+		return nil, err
+	}
+	current, err := e.repo.GetCollectionAdmin(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	w, err := validateCollection(in, &current.GuideCollection)
+	if err != nil {
+		return nil, err
+	}
+	if w.Kind == domain.GuideKindArticle && len(current.Categories) > 0 {
+		return nil, domain.WithCode(domain.CodeGuideArticleHasRubrics,
+			fmt.Errorf("%w: an article carries no rubrics — detach %d rubric(s) first",
+				domain.ErrValidation, len(current.Categories)))
 	}
 	return e.repo.UpdateCollection(ctx, id, w)
 }
@@ -279,9 +360,24 @@ func (e *editor) Archive(ctx context.Context, actor EditorActor, id uuid.UUID) (
 
 // --- membership ---
 
+// SetCategories replaces a collection's whole rubric set. Attaching a rubric to
+// an ARTICLE is refused: rubrics are what a collection is, and an article that
+// carried one would show up in the guide's rubric navigation, which is exactly
+// the thing migration 0096 separates. Detaching (an empty list) stays legal for
+// either kind — that is how a collection is turned into an article.
 func (e *editor) SetCategories(ctx context.Context, actor EditorActor, collectionID uuid.UUID, categoryIDs []uuid.UUID) error {
 	if err := e.authorize(actor); err != nil {
 		return err
+	}
+	if len(categoryIDs) > 0 {
+		current, err := e.repo.GetCollectionAdmin(ctx, collectionID)
+		if err != nil {
+			return err
+		}
+		if current.Kind == domain.GuideKindArticle {
+			return domain.WithCode(domain.CodeGuideArticleHasRubrics,
+				fmt.Errorf("%w: an article carries no rubrics", domain.ErrValidation))
+		}
 	}
 	seen := make(map[uuid.UUID]bool, len(categoryIDs))
 	for _, id := range categoryIDs {
@@ -303,10 +399,14 @@ func (e *editor) AttachVenue(ctx context.Context, actor EditorActor, collectionI
 	if in.EventID != nil && in.PromoID != nil {
 		return fmt.Errorf("%w: a block may highlight an event or a promo, not both", domain.ErrValidation)
 	}
+	if err := in.NoteI18n.Validate("note_i18n"); err != nil {
+		return err
+	}
+	note := strings.TrimSpace(in.Note)
 	return e.repo.AttachVenue(ctx, collectionID, domain.GuideVenueAttachment{
 		RestaurantID: in.RestaurantID,
-		Note:         strings.TrimSpace(in.Note),
-		NoteI18n:     in.NoteI18n,
+		Note:         note,
+		NoteI18n:     domain.ApplyTranslations(nil, in.NoteI18n, note),
 		EventID:      in.EventID,
 		PromoID:      in.PromoID,
 	})
@@ -329,11 +429,39 @@ func (e *editor) DetachVenue(ctx context.Context, actor EditorActor, collectionI
 	return e.repo.DetachVenue(ctx, collectionID, restaurantID)
 }
 
-func (e *editor) SetVenueNote(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, note string, noteI18n domain.I18n) error {
+// SetVenueNote rewrites the editor's line under one venue's card. note_i18n is
+// a PARTIAL update, so the note's stored translations are read first — they are
+// half of the result.
+//
+// The venue is looked up in the collection's admin detail rather than through a
+// dedicated read: it is the same query the cabinet screen itself runs, and a
+// restaurant that is not in this collection has to be ErrNotFound here anyway
+// (the repository would report the same thing from its zero rows affected).
+func (e *editor) SetVenueNote(ctx context.Context, actor EditorActor, collectionID, restaurantID uuid.UUID, note string, noteI18n domain.I18nPatch) error {
 	if err := e.authorize(actor); err != nil {
 		return err
 	}
-	return e.repo.UpdateVenueNote(ctx, collectionID, restaurantID, strings.TrimSpace(note), noteI18n)
+	if err := noteI18n.Validate("note_i18n"); err != nil {
+		return err
+	}
+	current, err := e.repo.GetCollectionAdmin(ctx, collectionID)
+	if err != nil {
+		return err
+	}
+	var stored domain.I18n
+	found := false
+	for _, v := range current.Venues {
+		if v.RestaurantID == restaurantID {
+			stored, found = v.NoteI18n, true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("set guide venue note: %w", domain.ErrNotFound)
+	}
+	trimmed := strings.TrimSpace(note)
+	return e.repo.UpdateVenueNote(ctx, collectionID, restaurantID, trimmed,
+		domain.ApplyTranslations(stored, noteI18n, trimmed))
 }
 
 // ReorderVenues hands the intended final order straight to the repository, which
@@ -356,7 +484,14 @@ func (e *editor) ReorderVenues(ctx context.Context, actor EditorActor, collectio
 
 // --- validation ---
 
-func validateCategory(in CategoryInput) (domain.GuideCategoryWrite, error) {
+// validateCategory turns the cabinet's payload into the row to write. base is
+// the rubric's CURRENTLY STORED title_i18n (nil on create) — the patch is
+// merged onto it, and a language neither side mentions (including the ko/zh
+// rows the old import left behind) survives untouched.
+func validateCategory(in CategoryInput, base domain.I18n) (domain.GuideCategoryWrite, error) {
+	if err := in.validateTranslations(); err != nil {
+		return domain.GuideCategoryWrite{}, err
+	}
 	slug, err := normalizeSlug(in.Slug)
 	if err != nil {
 		return domain.GuideCategoryWrite{}, err
@@ -366,12 +501,19 @@ func validateCategory(in CategoryInput) (domain.GuideCategoryWrite, error) {
 		return domain.GuideCategoryWrite{}, err
 	}
 	return domain.GuideCategoryWrite{
-		Slug: slug, Title: title, TitleI18n: cleanI18n(in.TitleI18n),
-		Position: in.Position, IsActive: in.IsActive,
+		Slug: slug, Title: title,
+		TitleI18n: domain.ApplyTranslations(base, in.TitleI18n, title),
+		Position:  in.Position, IsActive: in.IsActive,
 	}, nil
 }
 
-func validateCollection(in CollectionInput) (domain.GuideCollectionWrite, error) {
+// validateCollection turns the cabinet's payload into the row to write. base is
+// the collection as it is STORED (nil on create): its translation maps are what
+// the partial patches are merged onto.
+func validateCollection(in CollectionInput, base *domain.GuideCollection) (domain.GuideCollectionWrite, error) {
+	if err := in.validateTranslations(); err != nil {
+		return domain.GuideCollectionWrite{}, err
+	}
 	slug, err := normalizeSlug(in.Slug)
 	if err != nil {
 		return domain.GuideCollectionWrite{}, err
@@ -396,11 +538,30 @@ func validateCollection(in CollectionInput) (domain.GuideCollectionWrite, error)
 			cover = &trimmed
 		}
 	}
+	// An omitted kind is a collection: the field arrived with migration 0096,
+	// and every admin build older than it posts a collection without saying so.
+	kind := in.Kind
+	if kind == "" {
+		kind = domain.GuideKindCollection
+	}
+	if !kind.Valid() {
+		return domain.GuideCollectionWrite{}, domain.WithCode(domain.CodeGuideUnknownKind,
+			fmt.Errorf("%w: unknown collection kind %q", domain.ErrValidation, in.Kind))
+	}
+	var baseTitle, baseSubtitle, baseDescription domain.I18n
+	if base != nil {
+		baseTitle, baseSubtitle, baseDescription = base.TitleI18n, base.SubtitleI18n, base.DescriptionI18n
+	}
+	subtitle := strings.TrimSpace(in.Subtitle)
+	description := strings.TrimSpace(in.Description)
 	return domain.GuideCollectionWrite{
-		Slug: slug, Title: title, TitleI18n: cleanI18n(in.TitleI18n),
-		Subtitle: strings.TrimSpace(in.Subtitle), SubtitleI18n: cleanI18n(in.SubtitleI18n),
-		Description: strings.TrimSpace(in.Description), DescriptionI18n: cleanI18n(in.DescriptionI18n),
-		CoverImageURL: cover, City: in.City, Position: in.Position,
+		Slug: slug, Title: title,
+		TitleI18n:       domain.ApplyTranslations(baseTitle, in.TitleI18n, title),
+		Subtitle:        subtitle,
+		SubtitleI18n:    domain.ApplyTranslations(baseSubtitle, in.SubtitleI18n, subtitle),
+		Description:     description,
+		DescriptionI18n: domain.ApplyTranslations(baseDescription, in.DescriptionI18n, description),
+		CoverImageURL:   cover, City: in.City, Kind: kind, Position: in.Position,
 	}, nil
 }
 
@@ -427,23 +588,4 @@ func normalizeTitle(raw string) (string, error) {
 		return "", fmt.Errorf("%w: title is longer than %d characters", domain.ErrValidation, maxTitleLen)
 	}
 	return title, nil
-}
-
-// cleanI18n drops empty translations so an editor clearing a language field does
-// not leave {"kk": ""} behind — I18n.Resolve would then answer with an empty
-// string instead of falling back to the base ru column.
-func cleanI18n(m domain.I18n) domain.I18n {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(domain.I18n, len(m))
-	for k, v := range m {
-		if s := strings.TrimSpace(v); s != "" {
-			out[strings.ToLower(strings.TrimSpace(k))] = s
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }

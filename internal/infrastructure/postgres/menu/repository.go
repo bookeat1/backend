@@ -35,16 +35,38 @@ const selCols = `id, restaurant_id, name, name_i18n, description, description_i1
 	subcategory_i18n, portion_size, portion_size_i18n, language, display_order,
 	created_at, updated_at`
 
+// baseRowsPredicate keeps ONE dish out of the per-language copies the imported
+// data contains.
+//
+// Part of menu_items stores a translation as a separate row (same dish, Kazakh
+// text, language='kk' after migration 0100) next to the Russian original. Those
+// rows must never be listed alongside their originals — that is the same dish
+// twice in the guest's menu — so a listing serves the venue's BASE rows only:
+// language NULL or 'ru', which is what the base scalar columns hold anyway.
+//
+// The NOT EXISTS arm is the safety net, not the normal path: a venue whose menu
+// was uploaded ENTIRELY in another language has no base rows at all, and
+// filtering it down to nothing would turn "untranslated" into "this restaurant
+// has no menu". Both arms are disjoint per venue, so the union can never
+// duplicate a row. The alias is required: the subquery correlates on the outer
+// row's restaurant_id.
+//
+// lower() because the label is free text: 'RU' from a spreadsheet import must
+// not read as a translation row.
+const baseRowsPredicate = `(m.language IS NULL OR lower(m.language) = 'ru'
+	 OR NOT EXISTS (SELECT 1 FROM menu_items b
+	                 WHERE b.restaurant_id = m.restaurant_id
+	                   AND (b.language IS NULL OR lower(b.language) = 'ru')))`
+
+// ListByRestaurant returns the venue's menu — the same dishes whatever language
+// the caller reads them in. The requested locale is resolved from the *_i18n
+// maps at the transport edge, never by picking different ROWS: doing the latter
+// is what made GET /restaurants/:id/menu?lang=kk answer with an empty menu.
 func (r *Repository) ListByRestaurant(ctx context.Context, f domain.MenuItemFilter) ([]domain.MenuItem, error) {
-	q := `SELECT ` + selCols + ` FROM menu_items WHERE restaurant_id=$1`
+	q := `SELECT ` + prefixed(selCols, "m") + ` FROM menu_items m
+	      WHERE m.restaurant_id=$1 AND ` + baseRowsPredicate
 	args := []any{f.RestaurantID}
-	if f.Language == nil {
-		q += ` AND (language = 'ru' OR language IS NULL)`
-	} else {
-		args = append(args, *f.Language)
-		q += ` AND language = $2`
-	}
-	q += ` ORDER BY display_order ASC NULLS LAST, name ASC`
+	q += ` ORDER BY m.display_order ASC NULLS LAST, m.name ASC`
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list menu items: %w", err)
@@ -189,14 +211,9 @@ func (r *Repository) ListFeatured(ctx context.Context, f domain.FeaturedMenuFilt
 	q := `SELECT ` + prefixed(selCols, "m") + `, r.name, r.name_i18n
 	      FROM menu_items m
 	      JOIN restaurants r ON r.id = m.restaurant_id
-	      WHERE m.is_featured AND m.is_available AND r.is_active AND r.city = $1`
+	      WHERE m.is_featured AND m.is_available AND r.is_active AND r.city = $1
+	        AND ` + baseRowsPredicate
 	args := []any{string(f.City)}
-	if f.Language == nil {
-		q += ` AND (m.language = 'ru' OR m.language IS NULL)`
-	} else {
-		args = append(args, *f.Language)
-		q += fmt.Sprintf(` AND m.language = $%d`, len(args))
-	}
 	args = append(args, f.Limit)
 	q += fmt.Sprintf(` ORDER BY m.updated_at DESC, m.id LIMIT $%d`, len(args))
 

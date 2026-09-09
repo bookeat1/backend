@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,13 +33,26 @@ const (
 	MobilePushRejected
 )
 
+// MobilePushResult is what the provider said about ONE send.
+//
+// TicketID is the receipt handle. The providers answer a send with a ticket
+// ("accepted"), not with a delivery — the per-device outcome is only readable
+// later, through the receipt endpoint. Dropping the ticket id (which this seam
+// used to do) makes a delayed DeviceNotRegistered invisible forever, so the id
+// travels back to the notifier and into the push_tickets queue. It may be empty:
+// a provider that answers without one simply produces no receipt to poll.
+type MobilePushResult struct {
+	Verdict  MobilePushVerdict
+	TicketID string
+}
+
 // MobilePushSender delivers ONE notification to ONE device token. It is the seam
 // that keeps the provider (Expo today, FCM/APNs later) and the network out of
 // the notifier, so the gate / fan-out / dedupe behaviour is unit-testable
 // without a device. A non-nil error means a TRANSIENT failure (timeout, 429,
-// 5xx) the caller retries on the next tick; the verdict is meaningless then and
+// 5xx) the caller retries on the next tick; the result is meaningless then and
 // must be ignored.
-type MobilePushSender func(ctx context.Context, token string, msg MobilePushMessage) (MobilePushVerdict, error)
+type MobilePushSender func(ctx context.Context, token string, msg MobilePushMessage) (MobilePushResult, error)
 
 // MobilePushMessage is the rendered, non-sensitive notification. Data carries
 // only ids the app uses to deep-link into the booking screen — never a phone
@@ -80,6 +94,7 @@ type venueNameReader interface {
 type GuestPushNotifier struct {
 	tokens     domain.DevicePushTokenRepository
 	deliveries domain.NotificationDeliveryRepository
+	tickets    domain.PushTicketRepository
 	gate       *GuestNotificationGate
 	venues     venueNameReader
 	send       MobilePushSender
@@ -89,9 +104,14 @@ type GuestPushNotifier struct {
 
 // NewGuestPushNotifier builds the guest mobile-push channel. Pass enabled=false
 // (or a nil sender) to run it as a clean no-op when no provider is configured.
+//
+// tickets may be nil: without it the channel still delivers, it just cannot
+// enqueue receipts, which is exactly how it behaved before the receipt worker
+// existed.
 func NewGuestPushNotifier(
 	tokens domain.DevicePushTokenRepository,
 	deliveries domain.NotificationDeliveryRepository,
+	tickets domain.PushTicketRepository,
 	gate *GuestNotificationGate,
 	venues venueNameReader,
 	send MobilePushSender,
@@ -99,7 +119,7 @@ func NewGuestPushNotifier(
 	log *slog.Logger,
 ) *GuestPushNotifier {
 	return &GuestPushNotifier{
-		tokens: tokens, deliveries: deliveries, gate: gate, venues: venues,
+		tokens: tokens, deliveries: deliveries, tickets: tickets, gate: gate, venues: venues,
 		send: send, enabled: enabled && send != nil, log: log,
 	}
 }
@@ -202,7 +222,7 @@ func (g *GuestPushNotifier) Notify(ctx context.Context, e Event) error {
 			continue
 		}
 
-		verdict, err := g.send(ctx, t.Token, msg)
+		res, err := g.send(ctx, t.Token, msg)
 		if err != nil {
 			// Transport / 429 / 5xx — retryable. The token itself is NEVER put
 			// in the error: it is a device credential (see the repo's masking
@@ -210,8 +230,11 @@ func (g *GuestPushNotifier) Notify(ctx context.Context, e Event) error {
 			firstErr = errOr(firstErr, fmt.Errorf("guest push: send to device %s: %w", t.ID, err))
 			continue
 		}
-		switch verdict {
+		switch res.Verdict {
 		case MobilePushDelivered:
+			// The provider ACCEPTED the message; whether the device got it is
+			// only knowable from the receipt, so enqueue the ticket first.
+			g.recordTicket(ctx, res.TicketID, t.ID, e.OutboxEventID)
 			// Record AFTER success (at-least-once: a crash here re-sends next
 			// tick, never drops the notification).
 			if err := g.deliveries.RecordDelivered(ctx, e.OutboxEventID, domain.ChannelMobilePush, t.ID); err != nil {
@@ -231,6 +254,28 @@ func (g *GuestPushNotifier) Notify(ctx context.Context, e Event) error {
 		}
 	}
 	return firstErr
+}
+
+// recordTicket enqueues an accepted push for receipt polling.
+//
+// A failure here is LOGGED, never returned. The push has already left; making
+// the outbox event fail would re-run every sibling channel for a bookkeeping
+// row, and the only thing a lost ticket costs is one missed chance to notice a
+// dead token — which the next push to the same device gets another shot at.
+func (g *GuestPushNotifier) recordTicket(ctx context.Context, ticketID string, deviceTokenID, outboxEventID uuid.UUID) {
+	if g.tickets == nil || strings.TrimSpace(ticketID) == "" {
+		return
+	}
+	event := outboxEventID
+	if err := g.tickets.Record(ctx, domain.PushTicket{
+		ID:            ticketID,
+		DeviceTokenID: deviceTokenID,
+		OutboxEventID: &event,
+	}); err != nil {
+		g.log.Error("guest push: record receipt ticket failed",
+			slog.String("device_token_id", deviceTokenID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // buildGuestMessage renders the Russian guest-facing text. It carries ONLY what

@@ -18,14 +18,18 @@ import (
 // untouched — this is what keeps the JSON shape identical for every existing
 // client that never asks for a language.
 //
+// Tags travel through domain.NormalizeLocale, so a region subtag ("kk-KZ") and
+// the historical alias "kz" — which old store builds send and which is what the
+// imported menu rows were labelled with — both resolve to "kk".
+//
 // A caller that DOES ask for something, but names an unsupported/unparseable
 // language, still gets an explicit "ru" back rather than being silently
 // treated as "asked for nothing" — ru is always a safe answer since it is the
 // same text the base columns already hold.
 func Resolve(c *gin.Context) string {
-	if v := strings.ToLower(strings.TrimSpace(c.Query("lang"))); v != "" {
-		if domain.IsSupportedLocale(v) {
-			return v
+	if v := strings.TrimSpace(c.Query("lang")); v != "" {
+		if l := domain.NormalizeLocale(v); l != "" {
+			return l
 		}
 		return domain.LocaleRU
 	}
@@ -35,9 +39,8 @@ func Resolve(c *gin.Context) string {
 	}
 	for _, part := range strings.Split(h, ",") {
 		tag := strings.SplitN(strings.TrimSpace(part), ";", 2)[0]
-		tag = strings.ToLower(strings.SplitN(tag, "-", 2)[0])
-		if domain.IsSupportedLocale(tag) {
-			return tag
+		if l := domain.NormalizeLocale(tag); l != "" {
+			return l
 		}
 	}
 	return domain.LocaleRU

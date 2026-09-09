@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 )
 
 type menuItemResponse struct {
@@ -25,10 +26,16 @@ type menuItemResponse struct {
 	// so it always converts. The authority on what a guest actually pays stays
 	// the server (see PriceStringToMinor in the pre-order flow) — this field is
 	// for arithmetic the UI shows, not for an amount the client sends back.
-	PriceMinor  *int64  `json:"price_minor"`
-	ImageURL    *string `json:"image_url"`
-	IsAvailable bool    `json:"is_available"`
-	IsFeatured  bool    `json:"is_featured"`
+	PriceMinor *int64  `json:"price_minor"`
+	ImageURL   *string `json:"image_url"`
+	// ImageURLCard / ImageURLDetail are the resized derivatives of ImageURL
+	// (see internal/media.VariantURLs). Additive, nil when there is no image
+	// or the derivative has not been generated yet — ImageURL is unchanged
+	// and stays the field an old client reads.
+	ImageURLCard   *string `json:"image_url_card,omitempty"`
+	ImageURLDetail *string `json:"image_url_detail,omitempty"`
+	IsAvailable    bool    `json:"is_available"`
+	IsFeatured     bool    `json:"is_featured"`
 	// IsTopPick / TopPickPosition — the VENUE's own «Лучшие позиции» mark on its
 	// storefront rail. Not to be confused with IsFeatured, which is the
 	// cross-venue "chef's picks" rail of the main screen.
@@ -55,31 +62,73 @@ type menuCategoryResponse struct {
 	DisplayOrder int               `json:"display_order"`
 }
 
-func itemToResponse(m *domain.MenuItem) menuItemResponse {
+// itemToResponse maps one dish. lang is the resolved caller locale ("" when the
+// caller asked for nothing, and for the cabinet views, which edit base text).
+//
+// Both models are served at once, on purpose: the scalar fields are resolved
+// HERE, like every other localized entity (restaurants, events, guide), while
+// the raw *_i18n maps stay in the payload because the mobile app resolves the
+// menu itself today. Dropping the maps would break installed builds; not
+// resolving the scalars leaves every other client with Russian text.
+func itemToResponse(m *domain.MenuItem, lang string) menuItemResponse {
 	tags := make([]string, 0, len(m.Tags))
 	for _, t := range m.Tags {
 		tags = append(tags, t.Tag)
 	}
+	imageCard, imageDetail := imageVariantPtrs(m.ImageURL)
 	return menuItemResponse{
-		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(), Name: m.Name, NameI18n: m.NameI18n,
-		Description: m.Description, DescriptionI18n: m.DescriptionI18n, Price: m.Price,
+		ID: m.ID.String(), RestaurantID: m.RestaurantID.String(),
+		Name: m.NameI18n.Resolve(lang, m.Name), NameI18n: m.NameI18n,
+		Description: m.DescriptionI18n.Resolve(lang, m.Description), DescriptionI18n: m.DescriptionI18n,
+		Price:      m.Price,
 		PriceMinor: priceMinorOf(m.Price), ImageURL: m.ImageURL,
+		ImageURLCard: imageCard, ImageURLDetail: imageDetail,
 		IsAvailable: m.IsAvailable, IsFeatured: m.IsFeatured,
 		IsTopPick: m.TopPickPosition != nil, TopPickPosition: m.TopPickPosition,
-		Category: m.Category, CategoryI18n: m.CategoryI18n,
-		Subcategory: m.Subcategory, SubcategoryI18n: m.SubcategoryI18n, PortionSize: m.PortionSize,
+		Category: resolvePtr(m.CategoryI18n, lang, m.Category), CategoryI18n: m.CategoryI18n,
+		Subcategory: resolvePtr(m.SubcategoryI18n, lang, m.Subcategory), SubcategoryI18n: m.SubcategoryI18n,
+		PortionSize:     resolvePtr(m.PortionSizeI18n, lang, m.PortionSize),
 		PortionSizeI18n: m.PortionSizeI18n, Language: m.Language, DisplayOrder: m.DisplayOrder,
 		Tags: tags, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 	}
 }
 
-func categoryToResponse(c domain.MenuCategory) menuCategoryResponse {
+// imageVariantPtrs returns the card/detail derivative URLs of a nullable
+// image_url column as new pointers, or (nil, nil) when there is no image or
+// no derivative exists yet for it.
+func imageVariantPtrs(imageURL *string) (card, detail *string) {
+	if imageURL == nil {
+		return nil, nil
+	}
+	c, d := media.VariantURLs(*imageURL)
+	if c != "" {
+		card = &c
+	}
+	if d != "" {
+		detail = &d
+	}
+	return card, detail
+}
+
+// resolvePtr is I18n.Resolve for a nullable column: a NULL base stays NULL even
+// when a translation exists, because the field is absent for this dish, not
+// untranslated. A resolved value is returned in a NEW pointer so the domain
+// aggregate is never aliased.
+func resolvePtr(i domain.I18n, lang string, base *string) *string {
+	if base == nil {
+		return nil
+	}
+	v := i.Resolve(lang, *base)
+	return &v
+}
+
+func categoryToResponse(c domain.MenuCategory, lang string) menuCategoryResponse {
 	var parent *string
 	if c.ParentID != nil {
 		s := c.ParentID.String()
 		parent = &s
 	}
-	return menuCategoryResponse{ID: c.ID.String(), Name: c.Name, NameI18n: c.NameI18n, ParentID: parent, DisplayOrder: c.DisplayOrder}
+	return menuCategoryResponse{ID: c.ID.String(), Name: c.NameI18n.Resolve(lang, c.Name), NameI18n: c.NameI18n, ParentID: parent, DisplayOrder: c.DisplayOrder}
 }
 
 // featuredItemResponse is one card of the cross-venue "chef's picks" rail. It
@@ -92,11 +141,11 @@ type featuredItemResponse struct {
 	RestaurantNameI18n map[string]string `json:"restaurant_name_i18n,omitempty"`
 }
 
-func featuredToResponse(f domain.FeaturedMenuItem) featuredItemResponse {
+func featuredToResponse(f domain.FeaturedMenuItem, lang string) featuredItemResponse {
 	item := f.Item
 	return featuredItemResponse{
-		menuItemResponse:   itemToResponse(&item),
-		RestaurantName:     f.RestaurantName,
+		menuItemResponse:   itemToResponse(&item, lang),
+		RestaurantName:     f.RestaurantI18n.Resolve(lang, f.RestaurantName),
 		RestaurantNameI18n: f.RestaurantI18n,
 	}
 }
@@ -115,10 +164,10 @@ func priceMinorOf(price string) *int64 {
 
 // itemsToResponse maps a slice of dishes, preserving order — the rail's order
 // IS the payload here, so no map/sort may happen after the usecase decided it.
-func itemsToResponse(items []domain.MenuItem) []menuItemResponse {
+func itemsToResponse(items []domain.MenuItem, lang string) []menuItemResponse {
 	out := make([]menuItemResponse, 0, len(items))
 	for i := range items {
-		out = append(out, itemToResponse(&items[i]))
+		out = append(out, itemToResponse(&items[i], lang))
 	}
 	return out
 }

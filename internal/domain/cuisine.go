@@ -127,12 +127,19 @@ type CuisineRepository interface {
 	// List returns dictionary entries ordered by display_order, then name.
 	List(ctx context.Context, f CuisineFilter) ([]Cuisine, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*Cuisine, error)
-	// Create inserts a new entry. A duplicate code or a duplicate normalized
-	// name returns ErrAlreadyExists — the unique indexes are the guard, never a
-	// read-then-write check (two admins can race).
+	// Create inserts a new entry AND its own lookup aliases (normalized name +
+	// code) atomically. The aliases are not decoration: the catalog filter
+	// resolves `?cuisine=` through cuisine_aliases, so an entry without them is
+	// invisible to a filter by its own code — see NormalizeCuisineKey.
+	//
+	// A duplicate code or a duplicate normalized name returns ErrAlreadyExists,
+	// and so does a spelling already owned by another cuisine — the unique
+	// indexes are the guard, never a read-then-write check (two admins can race).
 	Create(ctx context.Context, c *Cuisine) error
-	// Update writes name/i18n/image/order/active in place. Same duplicate rule
-	// as Create; ErrNotFound when the id is absent.
+	// Update writes name/i18n/image/order/active in place and ADDS the aliases
+	// of the current name/code, never removing the previous ones: a former
+	// spelling still means this cuisine. Same duplicate rule as Create;
+	// ErrNotFound when the id is absent.
 	Update(ctx context.Context, c *Cuisine) error
 
 	// ListByRestaurants returns each restaurant's cuisines in link order

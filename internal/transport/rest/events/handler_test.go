@@ -70,6 +70,10 @@ func (f *fakeFacade) SetRefundPolicy(context.Context, uc.Actor, uuid.UUID, domai
 	return nil, f.err
 }
 
+func (f *fakeFacade) ResetSeriesContent(context.Context, uc.Actor, uuid.UUID, []domain.EventContentField) (*domain.Event, error) {
+	return nil, f.err
+}
+
 func (f *fakeFacade) ListPublic(context.Context, uuid.UUID, int, int) ([]domain.Event, int, error) {
 	return nil, 0, f.err
 }

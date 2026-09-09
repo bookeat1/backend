@@ -46,6 +46,18 @@ type TelegramNotifier struct {
 	actions    TelegramActions
 	enabled    bool // bot token configured
 	log        *slog.Logger
+
+	// --- staged migration to @book_eat_restaurants_bot (spec §7) ---
+	//
+	// The NEW bot lives BESIDE the old one, never instead of it. A venue is
+	// moved over one at a time, and only after the new bot has proved it can
+	// write to that chat (telegram_new_bot_ready_at). Everything below is nil /
+	// false until RESTAURANTS_BOT_TOKEN is configured, in which case this
+	// notifier behaves exactly as it did before the migration existed.
+	newSend     TelegramSender
+	newSendWith TelegramActionSender
+	newActions  TelegramActions
+	newEnabled  bool
 }
 
 // NewTelegramNotifier builds the Telegram channel. Pass enabled=false (or a nil
@@ -70,6 +82,27 @@ func (t *TelegramNotifier) WithActions(send TelegramActionSender, actions Telegr
 	if send != nil && actions != nil {
 		t.sendWith, t.actions = send, actions
 	}
+	return t
+}
+
+// WithNewBot arms the staged migration to the second (restaurants) bot. send is
+// required; sendWith/actions are optional and follow the same rule as
+// WithActions — buttons only when the venue can actually answer them, which for
+// the new bot means its OWN webhook is configured.
+//
+// Arming this changes nothing for a venue whose telegram_new_bot_ready_at is
+// NULL: it keeps receiving alerts from the old bot until it presses Start.
+func (t *TelegramNotifier) WithNewBot(send TelegramSender, sendWith TelegramActionSender, actions TelegramActions) *TelegramNotifier {
+	if send == nil {
+		return t
+	}
+	t.newSend, t.newEnabled = send, true
+	if sendWith != nil && actions != nil {
+		t.newSendWith, t.newActions = sendWith, actions
+	}
+	// The new bot alone is enough to run the channel: a deployment that only
+	// ever had the new token must still notify.
+	t.enabled = true
 	return t
 }
 
@@ -138,15 +171,62 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 	}
 
 	text := buildTelegramText(e)
-	var status int
-	if t.sendWith != nil && t.actions != nil && e.Type == domain.EventBookingCreated {
-		// Buttons only on a NEW booking: that is the only event the venue is
-		// being asked to answer. A cancellation alert with a "Confirm" button
-		// under it would be nonsense.
-		status, err = t.sendWith(ctx, cfg.ChatID, text, t.actions(e.BookingID))
-	} else {
-		status, err = t.send(ctx, cfg.ChatID, text)
+	// Buttons only on a NEW booking: that is the only event the venue is being
+	// asked to answer. A cancellation alert with a "Confirm" button under it
+	// would be nonsense.
+	withButtons := e.Type == domain.EventBookingCreated
+
+	// --- attempt 1: the NEW bot, but only for a venue already migrated ---
+	//
+	// A venue is migrated when its own staff proved it, never when we assumed
+	// it: telegram_new_bot_ready_at is written by the new bot's webhook.
+	if t.newEnabled && cfg.NewBotReady() {
+		status, err := t.deliver(ctx, t.newSend, t.newSendWith, t.newActions, cfg.ChatID, text, e, withButtons)
+		if err != nil {
+			// Transport error — retryable, and NOT a reason to demote the venue:
+			// a DNS blip says nothing about whether the bot may write here.
+			return fmt.Errorf("telegram: send to restaurant %s via new bot: %w", e.RestaurantID, err)
+		}
+		switch {
+		case status >= 200 && status < 300:
+			return t.recordDelivered(ctx, e)
+		case status == 400 || status == 403:
+			// The new bot is refused by this chat (never started, kicked out of
+			// the group, blocked). Demote the venue back to the old bot and FALL
+			// THROUGH — the whole point of the staged migration is that this
+			// event still gets delivered, by the bot that can.
+			t.log.Warn("telegram.new_bot_rejected",
+				slog.String("restaurant_id", e.RestaurantID.String()),
+				slog.String("booking_id", e.BookingID.String()),
+				slog.Int("status", status))
+			if err := t.settings.MarkTelegramNewBotFailed(ctx, e.RestaurantID); err != nil {
+				// Not fatal and deliberately not returned: failing here would
+				// retry the whole event and re-send through the old bot below on
+				// the next tick anyway. Worst case the demotion is retried on the
+				// next event.
+				t.log.Error("telegram: could not record the new bot's refusal",
+					slog.String("restaurant_id", e.RestaurantID.String()),
+					slog.String("error", err.Error()))
+			}
+		default:
+			// 429 / 5xx — transient at Telegram, not a verdict about this chat.
+			// Retry the same event later rather than burning the fallback on it.
+			return fmt.Errorf("telegram: send to restaurant %s via new bot got status %d", e.RestaurantID, status)
+		}
 	}
+
+	// --- attempt 2: the OLD bot — the safety net for every unmigrated venue ---
+	if !t.enabledOldBot() {
+		// Only the new bot is configured and it just refused (or the venue is not
+		// migrated at all). There is nothing to fall back to; the event is drained
+		// rather than blocking the outbox forever, exactly as a 403 was drained
+		// before the migration. Loud, because this is a real undelivered alert.
+		t.log.Warn("telegram: no fallback bot configured, alert not delivered",
+			slog.String("restaurant_id", e.RestaurantID.String()),
+			slog.String("booking_id", e.BookingID.String()))
+		return nil
+	}
+	status, err := t.deliver(ctx, t.send, t.sendWith, t.actions, cfg.ChatID, text, e, withButtons)
 	if err != nil {
 		// A transport error (timeout/DNS/etc.) is retryable — leave the event
 		// unpublished so the next tick retries.
@@ -154,12 +234,7 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 	}
 	switch {
 	case status >= 200 && status < 300:
-		// Delivered — record AFTER success (at-least-once: a crash here re-sends
-		// next tick, never drops the notification).
-		if err := t.deliveries.RecordDelivered(ctx, e.OutboxEventID, domain.ChannelTelegram, e.RestaurantID); err != nil {
-			return fmt.Errorf("telegram: record delivery: %w", err)
-		}
-		return nil
+		return t.recordDelivered(ctx, e)
 	case status == 400 || status == 403:
 		// Bad or blocked chat (wrong chat id, bot removed from the group, bot
 		// blocked by the user). NOT retryable — retrying can never succeed until
@@ -172,6 +247,36 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		// 429 / 5xx / anything else — transient. Retry on the next tick.
 		return fmt.Errorf("telegram: send to restaurant %s got status %d", e.RestaurantID, status)
 	}
+}
+
+// enabledOldBot reports whether the original notifications bot can still send.
+// It is a method, not a field, so the "is there a fallback" question has exactly
+// one answer everywhere.
+func (t *TelegramNotifier) enabledOldBot() bool { return t.send != nil }
+
+// deliver performs one send through the given pair of senders, choosing the
+// keyboard variant. Extracted so the new-bot and old-bot attempts cannot drift
+// apart in how they build a message.
+func (t *TelegramNotifier) deliver(
+	ctx context.Context,
+	send TelegramSender, sendWith TelegramActionSender, actions TelegramActions,
+	chatID, text string, e Event, withButtons bool,
+) (int, error) {
+	if withButtons && sendWith != nil && actions != nil {
+		return sendWith(ctx, chatID, text, actions(e.BookingID))
+	}
+	return send(ctx, chatID, text)
+}
+
+// recordDelivered writes the dedupe marker AFTER a successful send
+// (at-least-once: a crash here re-sends next tick, never drops the
+// notification). One marker per event+venue, whichever bot delivered it — so a
+// venue can never receive the same alert from both bots.
+func (t *TelegramNotifier) recordDelivered(ctx context.Context, e Event) error {
+	if err := t.deliveries.RecordDelivered(ctx, e.OutboxEventID, domain.ChannelTelegram, e.RestaurantID); err != nil {
+		return fmt.Errorf("telegram: record delivery: %w", err)
+	}
+	return nil
 }
 
 // buildTelegramText renders the non-sensitive booking alert in Russian. No OTP,

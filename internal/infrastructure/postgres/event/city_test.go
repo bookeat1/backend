@@ -264,6 +264,17 @@ func TestRenameCityStringFollowsTheOverride(t *testing.T) {
 	assertTitles(t, titlesFor(ctx, t, repo, "Астана"))
 }
 
+// eventCityMigrationVersion is the migration this file exercises;
+// eventCityMigrationFloor is the version immediately below it. The rollback
+// goes down TO the floor instead of "one step down": goose's Down takes off the
+// LAST applied migration, which stopped being 0084 the moment 0085 landed. A
+// step count silently starts rolling back somebody else's migration and the
+// test goes on passing while exercising nothing.
+const (
+	eventCityMigrationVersion = 84
+	eventCityMigrationFloor   = eventCityMigrationVersion - 1
+)
+
 // gooseDB opens goose's database/sql handle onto the same TEST_DATABASE_URL the
 // pgx pool uses, so the assertions read what the migration really produced.
 func gooseDB(t *testing.T) *sql.DB {
@@ -302,8 +313,8 @@ func TestEventCityMigrationIsSafeOnExistingRows(t *testing.T) {
 			t.Errorf("restore migrations: %v", err)
 		}
 	})
-	if err := goose.DownContext(ctx, db, "."); err != nil {
-		t.Fatalf("goose down: %v", err)
+	if err := goose.DownToContext(ctx, db, ".", eventCityMigrationFloor); err != nil {
+		t.Fatalf("goose down to %d: %v", eventCityMigrationFloor, err)
 	}
 
 	almatyVenue := seedVenueIn(ctx, t, pool, "Bistro Almaty", domain.CityAlmaty)
@@ -328,6 +339,13 @@ func TestEventCityMigrationIsSafeOnExistingRows(t *testing.T) {
 
 	if err := goose.UpContext(ctx, db, "."); err != nil {
 		t.Fatalf("goose up: %v", err)
+	}
+	v, err := goose.GetDBVersionContext(ctx, db)
+	if err != nil {
+		t.Fatalf("goose version: %v", err)
+	}
+	if v < eventCityMigrationVersion {
+		t.Fatalf("database left at version %d, want >= %d", v, eventCityMigrationVersion)
 	}
 
 	var withACity int

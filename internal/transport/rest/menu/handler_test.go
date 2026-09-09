@@ -27,10 +27,16 @@ type fakeFacade struct {
 	setErr          error
 
 	replaced []uuid.UUID
+
+	// items backs ListByRestaurant; listRID records what the transport asked
+	// for.
+	items   []domain.MenuItem
+	listRID uuid.UUID
 }
 
-func (f *fakeFacade) ListByRestaurant(context.Context, uuid.UUID, *string) ([]domain.MenuItem, error) {
-	return nil, nil
+func (f *fakeFacade) ListByRestaurant(_ context.Context, rid uuid.UUID) ([]domain.MenuItem, error) {
+	f.listRID = rid
+	return f.items, nil
 }
 func (f *fakeFacade) Get(context.Context, uuid.UUID) (*domain.MenuItem, error) { return nil, nil }
 func (f *fakeFacade) Categories(context.Context) ([]domain.MenuCategory, error) {
@@ -50,10 +56,10 @@ func (f *fakeFacade) SetAvailableBulk(context.Context, uuid.UUID, []uuid.UUID, b
 	return 0, nil
 }
 func (f *fakeFacade) SetFeatured(context.Context, uuid.UUID, uuid.UUID, bool) error { return nil }
-func (f *fakeFacade) ListFeatured(context.Context, domain.City, *string, int) ([]domain.FeaturedMenuItem, error) {
+func (f *fakeFacade) ListFeatured(context.Context, domain.City, int) ([]domain.FeaturedMenuItem, error) {
 	return nil, nil
 }
-func (f *fakeFacade) ListHighlights(_ context.Context, rid uuid.UUID, _ *string, limit int) ([]domain.MenuItem, error) {
+func (f *fakeFacade) ListHighlights(_ context.Context, rid uuid.UUID, limit int) ([]domain.MenuItem, error) {
 	f.highlightsRID, f.highlightsLim = rid, limit
 	return f.highlights, nil
 }
@@ -147,6 +153,31 @@ func TestHighlightsEndpointReturnsTheRailWithNumericPrices(t *testing.T) {
 	}
 	if *body.Data[0].PriceMinor != 899000 || *body.Data[1].PriceMinor != 120050 {
 		t.Fatalf("wrong minor units: %s", w.Body.String())
+	}
+}
+
+// A venue whose dishes all lack a photo now has an EMPTY rail (see
+// usecase/menu.resolveHighlights). That must reach the app as `"data": []`, not
+// as `null` and not as an error: the section is hidden on an empty list, while
+// `null` is what makes a client blow up on `.map`.
+func TestHighlightsEndpointReturnsAnEmptyArrayNotNull(t *testing.T) {
+	rid := uuid.New()
+	f := &fakeFacade{highlights: nil}
+	w := do(t, router(f), http.MethodGet, "/api/v1/restaurants/"+rid.String()+"/menu-highlights", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("an empty rail is not an error: status %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Data *[]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if body.Data == nil {
+		t.Fatalf("data must be [], not null: %s", w.Body.String())
+	}
+	if len(*body.Data) != 0 {
+		t.Fatalf("want an empty rail, got %s", w.Body.String())
 	}
 }
 

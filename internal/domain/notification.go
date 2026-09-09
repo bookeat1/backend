@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -128,6 +129,54 @@ type DevicePushTokenRepository interface {
 	DeactivateForUser(ctx context.Context, userID uuid.UUID, token string) error
 }
 
+// PushTicket is ONE accepted mobile push whose real fate is not known yet.
+//
+// The mobile providers answer a send with a TICKET ("queued"), not with a
+// delivery: the per-device outcome shows up later, in a RECEIPT fetched by
+// ticket id. Expo's own wording is that a ticket only means "we accepted it",
+// and the receipt is where DeviceNotRegistered actually appears — observed live
+// on 2026-09-01, when three production android tokens all came back `ok` from
+// the send and two of them came back DeviceNotRegistered from getReceipts.
+//
+// The row is short-lived by construction: providers keep receipts for 24 hours,
+// so a ticket nobody could resolve inside that window is force-resolved rather
+// than kept forever.
+type PushTicket struct {
+	// ID is the provider's ticket id, and the table's primary key: recording
+	// the same ticket twice must be a no-op, not a second poll.
+	ID string
+	// DeviceTokenID is the device the push went to — the row DeactivateByID
+	// silences when the receipt says the device is gone.
+	DeviceTokenID uuid.UUID
+	// OutboxEventID is the booking event the push came from. Forensics only
+	// (nullable, no FK): the ticket's fate must not depend on the outbox row.
+	OutboxEventID *uuid.UUID
+	CreatedAt     time.Time
+	// ResolvedAt is nil while the receipt is still pending.
+	ResolvedAt *time.Time
+}
+
+// PushTicketRepository is the poll queue for mobile push receipts. It is
+// deliberately separate from the delivery ledger: the ledger is a permanent
+// dedupe key on the hot fan-out path, this is a 24-hour work queue only the
+// receipt worker reads.
+type PushTicketRepository interface {
+	// Record stores an accepted ticket. Idempotent on the ticket id: a resend
+	// that repeats a ticket must not enqueue a second poll.
+	Record(ctx context.Context, t PushTicket) error
+	// ListUnresolved returns the oldest tickets still awaiting a receipt that
+	// were created before createdBefore (providers need a grace period before a
+	// receipt exists), capped at limit.
+	ListUnresolved(ctx context.Context, createdBefore time.Time, limit int) ([]PushTicket, error)
+	// Resolve marks the given tickets answered. Ids that do not exist (or are
+	// already resolved) are ignored — it is idempotent.
+	Resolve(ctx context.Context, ticketIDs []string, at time.Time) error
+	// ExpireOlderThan force-resolves every unresolved ticket created before the
+	// cutoff and returns how many it closed. Without it the table would grow
+	// forever with tickets whose receipts the provider has already deleted.
+	ExpireOlderThan(ctx context.Context, cutoff time.Time, at time.Time) (int64, error)
+}
+
 // NotificationDeliveryRepository is the at-least-once dedupe ledger. A row is
 // written only AFTER a successful send, so a crash between send and record
 // re-sends (a tolerated duplicate) rather than dropping a notification; the
@@ -149,7 +198,49 @@ type NotificationDeliveryRepository interface {
 type TelegramSettings struct {
 	ChatID  string
 	Enabled bool
+	// NewBotReadyAt is set once @book_eat_restaurants_bot has proved it can
+	// write to ChatID (staff pressed /start, or the bot was added to the group).
+	// NIL means "not migrated yet" and is what keeps the OLD notifications bot
+	// in charge for this venue — see the staged migration in
+	// specs/telegram-miniapp-restaurant.md §7. It is never inferred: only an
+	// inbound update from the new bot sets it.
+	NewBotReadyAt *time.Time
+	// NewBotFailedAt records the last time the new bot was refused by this chat
+	// (Bot API 400/403). It is written together with clearing NewBotReadyAt, so
+	// a venue that kicks the new bot out silently falls back to the old one
+	// instead of losing its alerts.
+	NewBotFailedAt *time.Time
 }
+
+// NewBotReady reports whether the new restaurants bot may be used for this
+// venue. Chat id and channel toggle are checked separately by the notifier;
+// this answers only the "which bot" question.
+func (s TelegramSettings) NewBotReady() bool { return s.NewBotReadyAt != nil }
+
+// TelegramMigrationRow is one venue's line in the bot-migration report: does it
+// have a chat connected at all, and has the new bot reached it yet. Read-only,
+// built for the superadmin's "who is still behind" view.
+type TelegramMigrationRow struct {
+	RestaurantID   uuid.UUID
+	RestaurantName string
+	ChatID         string
+	Enabled        bool
+	NewBotReadyAt  *time.Time
+	NewBotFailedAt *time.Time
+}
+
+// ChatIsUsername reports whether the connected target is an @username / channel
+// handle rather than a numeric chat id. Those venues cannot self-migrate:
+// there is no "Start" to press in a channel — the new bot has to be added as an
+// administrator by hand. They are called out separately in the report for
+// exactly that reason.
+func (r TelegramMigrationRow) ChatIsUsername() bool {
+	return strings.HasPrefix(strings.TrimSpace(r.ChatID), "@")
+}
+
+// NewBotReady reports whether this venue already receives alerts from the new
+// bot.
+func (r TelegramMigrationRow) NewBotReady() bool { return r.NewBotReadyAt != nil }
 
 // WhatsAppSettings is a venue's WhatsApp channel state: the number staff
 // asked us to notify (empty when unset) and whether the channel is enabled.
@@ -185,6 +276,23 @@ type RestaurantNotificationSettingsRepository interface {
 	// that switched Telegram off must not still be able to act through it.
 	// ErrNotFound when no venue owns the chat.
 	RestaurantByTelegramChatID(ctx context.Context, chatID string) (uuid.UUID, error)
+
+	// MarkTelegramNewBotReady records that @book_eat_restaurants_bot can write
+	// to this venue's chat: ready_at = now(). Called ONLY from the new bot's own
+	// webhook (an inbound /start or my_chat_member), never guessed from a send.
+	// Idempotent — a second /start just refreshes the timestamp. A venue with no
+	// settings row is a no-op: there is no chat to migrate.
+	MarkTelegramNewBotReady(ctx context.Context, restaurantID uuid.UUID) error
+	// MarkTelegramNewBotFailed records a refusal by the new bot: ready_at is
+	// CLEARED and failed_at = now(). Clearing is the important half — it is what
+	// puts the venue back on the old bot on the very next event instead of
+	// letting alerts die quietly.
+	MarkTelegramNewBotFailed(ctx context.Context, restaurantID uuid.UUID) error
+	// TelegramMigrationStatus lists every venue that has a Telegram chat
+	// connected, with its new-bot state. Platform-wide and read-only: it is the
+	// superadmin's answer to "who is still on the old bot", and the only way to
+	// know the staged migration is finished.
+	TelegramMigrationStatus(ctx context.Context) ([]TelegramMigrationRow, error)
 
 	// WhatsAppSettings mirrors TelegramSettings for the WhatsApp channel: a
 	// missing row is WhatsAppSettings{Phone: "", Enabled: true} — enabled, but

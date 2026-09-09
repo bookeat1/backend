@@ -25,6 +25,9 @@ type GuideCollectionAdminFilter struct {
 	// guest listing adds, because an editor filtering by Astana is asking "what
 	// is pinned to Astana", not "what would an Astana guest see".
 	City *City
+	// Kind limits the listing to collections or to articles. Nil means both —
+	// the cabinet's default screen still shows everything the editor owns.
+	Kind *GuideCollectionKind
 	// Query is a case-insensitive substring match over slug and title, so an
 	// editor can find a collection without paging.
 	Query   string
@@ -54,6 +57,13 @@ type GuideCollectionAdminDetail struct {
 // and a partial-update protocol would make "clear the subtitle" and "do not
 // touch the subtitle" indistinguishable.
 //
+// The *I18n maps are the ONE exception, and they arrive here ALREADY MERGED:
+// the request carries a partial patch (I18nPatch), the usecase merges it onto
+// what is stored and re-establishes i18n["ru"] == the plain column
+// (ApplyTranslations), and the repository writes the finished map. So this
+// struct still means "replace the column with exactly this" — the merging is
+// simply not the repository's job.
+//
 // Status and PublishedAt are NOT here. Publication is its own set of operations
 // (Publish/Unpublish/Archive) with its own preconditions, so an editor cannot
 // take a collection live as a side effect of fixing a typo.
@@ -67,7 +77,16 @@ type GuideCollectionWrite struct {
 	DescriptionI18n I18n
 	CoverImageURL   *string
 	City            *City
-	Position        int
+	// Kind is 'collection' or 'article'. It has NO usable zero value: the
+	// column's CHECK refuses an empty string, so every caller must set it —
+	// defaulting an omitted kind is the usecase's job (validateCollection), and
+	// the repository writes what it is given. It IS part of the write (unlike
+	// Status): an editor decides what they are writing when they write it, and
+	// a piece that turned out to be an article is retyped in the same form, not
+	// through a separate state machine. The usecase defaults an omitted value
+	// to 'collection' so admin builds that predate migration 0096 keep working.
+	Kind     GuideCollectionKind
+	Position int
 }
 
 // GuideCategoryWrite is a rubric's editable fields. Categories carry no
@@ -108,6 +127,14 @@ type GastroguideEditorRepository interface {
 
 	// ListAllCategories returns every rubric, active or not, in editorial order.
 	ListAllCategories(ctx context.Context) ([]GuideCategory, error)
+	// GetCategory returns one rubric of any state. Unknown id is ErrNotFound.
+	//
+	// It exists because a rubric's translations are written with a PARTIAL
+	// patch (I18nPatch): the stored map is half of the result, so the update
+	// has to read it before it can write it. Listing every rubric to find one
+	// would work — the dictionary is small — but it hides the dependency and
+	// would quietly become an N-row scan the day rubrics stop being few.
+	GetCategory(ctx context.Context, id uuid.UUID) (*GuideCategory, error)
 	// CreateCategory inserts a rubric. A duplicate slug is ErrAlreadyExists
 	// tagged CodeGuideSlugTaken.
 	CreateCategory(ctx context.Context, in GuideCategoryWrite) (*GuideCategory, error)

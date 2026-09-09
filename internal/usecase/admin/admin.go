@@ -42,6 +42,9 @@ type UseCase struct {
 	paySettings  paymentSettingsWriter
 	telegram     telegramSettings
 	preorder     preorderLister
+	// acquirerAccounts is optional (see Option / WithAcquirerAccounts): nil in
+	// a deployment that maps no venue to an acquirer-side account.
+	acquirerAccounts acquirerAccountStore
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -56,12 +59,17 @@ func NewUseCase(
 	bookingTx bookingTransitioner,
 	paySettings paymentSettingsWriter,
 	telegram telegramSettings,
+	opts ...Option,
 ) *UseCase {
-	return &UseCase{
+	u := &UseCase{
 		perms: perms, restaurants: rest, menu: menu, workingHours: workingHours,
 		overrides: overrides, guests: guests, bookingList: bookingList, bookingTx: bookingTx,
 		paySettings: paySettings, telegram: telegram,
 	}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
 }
 
 // Bounds for the free-cancellation window (minutes), enforced here rather than
@@ -262,13 +270,20 @@ func (u *UseCase) authorize(ctx context.Context, actor Actor, restaurantID uuid.
 // venue premium/popular or reactivate a deactivated venue through the panel.
 // Those stay superadmin-only via the existing restaurants admin routes.
 type ProfileInput struct {
-	Name         *string
-	NameI18n     domain.I18n
-	Description  *string
-	Address      *string
-	Phone        *string
-	Email        *string
-	OpeningHours *string // free-text / JSON working-hours summary shown on the storefront
+	Name *string
+	// The *I18n fields are PARTIAL translation updates with the same three
+	// states as everywhere else (see domain.I18nPatch): a named language is
+	// written, a null one removed, an unmentioned one kept. A `ru` key is
+	// routed to the plain field, because that column IS the Russian text.
+	NameI18n         domain.I18nPatch
+	Description      *string
+	DescriptionI18n  domain.I18nPatch
+	Address          *string
+	AddressI18n      domain.I18nPatch
+	Phone            *string
+	Email            *string
+	OpeningHours     *string // free-text / JSON working-hours summary shown on the storefront
+	OpeningHoursI18n domain.I18nPatch
 }
 
 // GetProfile returns the venue's own profile aggregate. owner/manager.
@@ -287,13 +302,16 @@ func (u *UseCase) UpdateProfile(ctx context.Context, actor Actor, restaurantID u
 		return nil, err
 	}
 	save := restaurants.SaveInput{
-		Name:         in.Name,
-		NameI18n:     in.NameI18n,
-		Description:  in.Description,
-		Address:      in.Address,
-		Phone:        in.Phone,
-		Email:        in.Email,
-		OpeningHours: in.OpeningHours,
+		Name:             in.Name,
+		NameI18n:         in.NameI18n,
+		Description:      in.Description,
+		DescriptionI18n:  in.DescriptionI18n,
+		Address:          in.Address,
+		AddressI18n:      in.AddressI18n,
+		Phone:            in.Phone,
+		Email:            in.Email,
+		OpeningHours:     in.OpeningHours,
+		OpeningHoursI18n: in.OpeningHoursI18n,
 	}
 	return u.restaurants.Update(ctx, restaurantID, save)
 }
@@ -301,11 +319,15 @@ func (u *UseCase) UpdateProfile(ctx context.Context, actor Actor, restaurantID u
 // ---- Menu ------------------------------------------------------------------
 
 // ListMenu returns the venue's menu items. owner/manager.
-func (u *UseCase) ListMenu(ctx context.Context, actor Actor, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error) {
+//
+// No language argument: the cabinet edits the dish, not a per-language copy of
+// it, so it must always see the same rows. Translations travel in the *_i18n
+// maps of each item.
+func (u *UseCase) ListMenu(ctx context.Context, actor Actor, restaurantID uuid.UUID) ([]domain.MenuItem, error) {
 	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
 		return nil, err
 	}
-	return u.menu.ListByRestaurant(ctx, restaurantID, lang)
+	return u.menu.ListByRestaurant(ctx, restaurantID)
 }
 
 // ListCategories returns the GLOBAL menu-category reference tree (read-only for

@@ -233,6 +233,16 @@ const (
 	// request is malformed, the shelf is simply full.
 	CodeMenuTopPicksLimit ErrorCode = "menu_top_picks_limit"
 
+	// CodeMenuItemLanguageNotBase — a menu write tried to label a dish with a
+	// language other than Russian. A dish row is the BASE row of that dish, and
+	// its translations live in the *_i18n maps; a row labelled with another
+	// language is a leftover of the old import that the guest listing has to
+	// hide (it would otherwise show the same dish twice), so accepting one from
+	// the panel would silently create a dish no guest can ever see. Its own 422
+	// code because the panel must say "переводы вносите в поля перевода", not
+	// "validation failed" — nothing else about the request is wrong.
+	CodeMenuItemLanguageNotBase ErrorCode = "menu_item_language_not_base"
+
 	// CodeVenueTimezoneInvalid — the timezone offered for (or already stored
 	// against) a venue is not a usable IANA zone name. Kept apart from the
 	// generic validation code because it is the one venue field money decisions
@@ -296,6 +306,22 @@ const (
 	// A venue may sit in any number of DIFFERENT collections; what the primary
 	// key forbids is the same venue twice in one.
 	CodeGuideVenueAlreadyAttached ErrorCode = "guide_venue_already_attached"
+
+	// CodeGuideUnknownKind — the write named a kind that is not 'collection'
+	// or 'article' (migration 0096). An omitted kind is NOT this error: it
+	// defaults to 'collection', so an admin build that predates the split keeps
+	// working. Only a value we cannot store is refused, and it is refused
+	// rather than coerced — silently turning a typo into a collection would put
+	// an article into the rubric navigation. Not retryable as sent.
+	CodeGuideUnknownKind ErrorCode = "guide_unknown_kind"
+
+	// CodeGuideArticleHasRubrics — the write would leave an article carrying
+	// rubrics: either kind was set to 'article' on a row that already has them,
+	// or rubrics were attached to a row that is already an article. Refused
+	// instead of dropping the rubrics, because dropping them is a destructive
+	// edit the editor did not ask for and would not see. Fixed by detaching the
+	// rubrics first (or by keeping the item a collection).
+	CodeGuideArticleHasRubrics ErrorCode = "guide_article_has_rubrics"
 
 	// CodeGuideRouteEmpty — publishing a route with no stops (migration 0078).
 	// Deliberately NOT the mirror of a collection, where the same guard was
@@ -383,10 +409,120 @@ const (
 	// support for. See docs/payments/tiptoppay-splits.md.
 	CodeSplitFlowUnsupported ErrorCode = "split_flow_unsupported"
 
+	// --- booking pre-order (internal/usecase/preorder) ---
+	//
+	// Several different reasons a PUT /bookings/:id/preorder is refused. All are
+	// 422 and all mean "nothing was written", which is exactly why they need
+	// codes: the app has to say ONE true sentence, and the sentences are not
+	// interchangeable ("позвоните в ресторан" vs "дождитесь оплаты" vs "бронь
+	// уже закрыта" vs "добавьте ещё на N ₸" vs "уберите недоступное блюдо").
+	// CodePreorderLocked / CodePreorderPaymentInFlight / CodePreorderBookingClosed
+	// are about WHO may change the pre-order and WHEN; CodePreorderBelowMinimum
+	// / CodePreorderItemUnavailable (added 2026-09-08) are about WHAT was sent.
+
+	// CodePreorderLocked — the booking is CONFIRMED and the caller is the
+	// GUEST. From confirmation on, the venue has accepted the order and plans
+	// the kitchen around it, so the guest may no longer edit it from the app;
+	// the change has to go through the venue, who can still adjust the lines
+	// (see usecase/preorder.Replace). Permanent for this booking: no retry and
+	// no other client of the guest's helps. The app shows "свяжитесь с
+	// рестораном", not a field error.
+	CodePreorderLocked ErrorCode = "preorder_locked"
+
+	// CodePreorderPaymentInFlight — a non-terminal payment exists for this
+	// booking (including one still in `created`, whose amount is already
+	// snapshotted and will be captured by the webhook). Editing the lines now
+	// would move the charged amount away from the ordered food. Unlike
+	// CodePreorderLocked this is TEMPORARY: once the payment reaches a terminal
+	// state the pre-order is editable again, so the app tells the guest to wait
+	// for the payment to finish rather than to phone the venue.
+	CodePreorderPaymentInFlight ErrorCode = "preorder_payment_in_flight"
+
+	// CodePreorderBookingClosed — the booking is in a status that can no longer
+	// be prepared for at all (arrived, completed, cancelled, no_show). Nobody —
+	// guest, venue or admin — may change the pre-order of a booking that is
+	// over. Permanent.
+	CodePreorderBookingClosed ErrorCode = "preorder_booking_closed"
+
+	// CodePreorderBelowMinimum — the submitted lines price out below the
+	// venue's optional restaurants.preorder_min_amount_minor (checked only when
+	// the total is non-zero — an empty pre-order always clears cleanly). Added
+	// 2026-09-08 (spec web-preorder-menu-20260908 §D2) so a client can show
+	// "добавьте ещё на N ₸" instead of a generic refusal; additive, the message
+	// text is unchanged from before this code existed.
+	CodePreorderBelowMinimum ErrorCode = "preorder_below_minimum"
+
+	// CodePreorderItemUnavailable — a submitted line's menu_item_id does not
+	// exist, belongs to a different restaurant than this booking's, or is
+	// currently is_available=false. All three collapse to one code because the
+	// guest's remedy is the same in every case: drop that line and resubmit: a
+	// crafted/stale id and a dish the kitchen just 86'd both mean "this item
+	// cannot be ordered right now". Added 2026-09-08 (spec
+	// web-preorder-menu-20260908 §D2); additive, the message text is unchanged.
+	CodePreorderItemUnavailable ErrorCode = "preorder_item_unavailable"
+
 	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
 	// number. Nothing to verify and nothing to change; a plain validation_failed
 	// would make the app show a field error with no actionable reason. 422.
 	CodePhoneUnchanged ErrorCode = "phone_unchanged"
+
+	// --- Telegram mini app «кабинет ресторана» (spec §5.2) ------------------
+	//
+	// The mini app's three sign-in codes exist because the app has to tell four
+	// outcomes apart on one screen and they share only two statuses. A generic
+	// "unauthorized" would leave it unable to choose between showing the
+	// password form, sending the user back to the bot, and saying access was
+	// withdrawn.
+
+	// CodeInitDataInvalid — the initData blob did not verify against the bot
+	// token: a forged or edited field, or a signature from a DIFFERENT bot. 401.
+	// The app must NOT show the password form for this — nothing the person
+	// types can fix it. It means the request did not come from our mini app.
+	CodeInitDataInvalid ErrorCode = "init_data_invalid"
+
+	// CodeInitDataExpired — the signature is genuine but auth_date is outside
+	// the accepted window (stale, or in the future beyond the clock-skew
+	// allowance). 401. Recoverable and boring: reopen the mini app from the bot
+	// and Telegram mints a fresh blob.
+	CodeInitDataExpired ErrorCode = "init_data_expired"
+
+	// CodeLinkRequired — initData verified, but this Telegram account has never
+	// been linked to a BookEat account (or the link was revoked). 403, and the
+	// ONLY code that means "show the email + password form". Not 401: nothing is
+	// wrong with the credentials presented, there simply are none yet.
+	CodeLinkRequired ErrorCode = "link_required"
+
+	// CodeStaffNotFound — the BookEat account is real and the password (or the
+	// link) checked out, but the person is not staff of any venue: a guest
+	// account, or an employee removed from their last restaurant. 403. On the
+	// link path no link is written; on the sign-in path the existing link is
+	// revoked, so the next open asks for the password again instead of looping.
+	CodeStaffNotFound ErrorCode = "staff_not_found"
+
+	// CodeInvalidCredentials — wrong email or wrong password on the first sign
+	// in. 401. Deliberately ONE code for both, like /auth/login: telling them
+	// apart turns the mini app into an oracle for which emails have an account.
+	CodeInvalidCredentials ErrorCode = "invalid_credentials"
+
+	// --- mobile update gate (GET /api/v1/app/version-check) -----------------
+
+	// --- platform text pages (migration 0105, internal/usecase/platformpages) ---
+
+	// CodePageBodyEmpty — an admin write tried to set published=true while the
+	// page's Markdown body is empty. A generic validation_failed would leave
+	// the panel unable to say WHICH field is the problem; this one lets it
+	// point at the body editor instead of the "Опубликовано" toggle, which is
+	// the field that actually looks wrong to whoever clicked it.
+	CodePageBodyEmpty ErrorCode = "page_body_empty"
+
+	// CodeAppPlatformUnknown — the launch check was called without a platform,
+	// or with something that is neither ios nor android. 422 and the ONLY
+	// refusal that route has: every other doubtful input (an empty or
+	// unparsable version, a platform with no policy row) answers 200 with
+	// action="none", because a gate that can block the app must fail open.
+	// This one is a client bug worth surfacing rather than hiding behind a
+	// silent "do nothing".
+	CodeAppPlatformUnknown ErrorCode = "app_platform_unknown"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

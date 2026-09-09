@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -60,5 +61,27 @@ func TestCORSExplicitAllowlist(t *testing.T) {
 	r.ServeHTTP(rec, req)
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Errorf("Allow-Origin = %q, want empty for disallowed origin", got)
+	}
+}
+
+// TestCORSPreflightAllowsIdempotencyKey guards a regression (08.09.2026):
+// POST /api/v1/bookings requires an Idempotency-Key header, but the preflight
+// Allow-Headers list omitted it, so browsers silently blocked the real POST
+// after a successful 204 preflight.
+func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
+	r := newCORSEngine([]string{"*"})
+
+	req := httptest.NewRequest(http.MethodOptions, "/x", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Headers", "Idempotency-Key")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rec.Code)
+	}
+	got := strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers"))
+	if !strings.Contains(got, "idempotency-key") {
+		t.Errorf("Allow-Headers = %q, want it to contain idempotency-key", got)
 	}
 }

@@ -304,7 +304,10 @@ func TestEditorCreate_DuplicateSlugIsCoded(t *testing.T) {
 	pool, repo, ctx := editorSetup(t)
 	_ = pool
 
-	in := domain.GuideCollectionWrite{Slug: "kids", Title: "С детьми"}
+	// Kind is spelled out: the repository writes what it is given and the
+	// column's CHECK refuses an empty string — defaulting an omitted kind is
+	// the usecase's job (validateCollection), not the repository's.
+	in := domain.GuideCollectionWrite{Slug: "kids", Title: "С детьми", Kind: domain.GuideKindCollection}
 	if _, err := repo.CreateCollection(ctx, in); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -435,6 +438,7 @@ func TestEditorUpdateCollection_LeavesPublicationAlone(t *testing.T) {
 	}
 	if _, err := repo.UpdateCollection(ctx, col, domain.GuideCollectionWrite{
 		Slug: "live", Title: "Переписанный заголовок", Subtitle: "И подзаголовок",
+		Kind: domain.GuideKindCollection,
 	}); err != nil {
 		t.Fatalf("update: %v", err)
 	}

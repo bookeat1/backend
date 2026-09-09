@@ -5,36 +5,58 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"image/color"
 	"image/draw"
-	"image/jpeg"
+
+	"github.com/kolesa-team/go-webp/encoder"
+	"github.com/kolesa-team/go-webp/webp"
 
 	// Registered for their side effect: decoding a source we did not choose.
 	// The bucket holds JPEG, PNG and a handful of WebP; GIF is here because
 	// nothing stops an upload form from accepting one and a decoder we do not
 	// register turns into "unknown format" at backfill time.
 	_ "image/gif"
+	_ "image/jpeg"
 	_ "image/png"
 
-	// WebP DECODING only — golang.org/x/image/webp has no encoder, which is
-	// fine because the output format here is JPEG. This import is not
-	// theoretical: a dry run over the live bucket on 2026-07-27 reported
-	// exactly 6 "unsupported" results, which is the 3 .webp originals times
-	// the 2 sizes. Without it those three photos would silently keep being
-	// served full size forever, and the skip log would blame the file rather
-	// than the missing decoder.
+	// WebP DECODING of pre-existing originals. golang.org/x/image/webp is a
+	// pure-Go decoder with no encoder of its own; kept here rather than
+	// switched over to go-webp's (cgo) decoder because it already has this
+	// package's test coverage and needs nothing beyond the Go toolchain to
+	// decode with. Importing github.com/kolesa-team/go-webp/webp below (for
+	// its Encode) also registers a second, libwebp-backed "webp" decoder as a
+	// side effect of its own init() — harmless duplication, not a conflict:
+	// image.Decode tries registered decoders until one succeeds, and both
+	// decode the same bytes correctly.
+	//
+	// This import is not theoretical: a dry run over the live bucket on
+	// 2026-07-27 reported exactly 6 "unsupported" results, which is the 3
+	// .webp originals times the 2 sizes. Without it those three photos would
+	// silently keep being served full size forever, and the skip log would
+	// blame the file rather than the missing decoder.
 	_ "golang.org/x/image/webp"
 )
 
-// Quality is the JPEG encoder quality of every derivative.
+// Quality is the WebP encoder quality of every derivative, on libwebp's 0-100
+// scale.
 //
-// 82, the same value the old web app's client-side compressor already uses
+// 82, unchanged from this package's original JPEG encoder: it is the value
+// the old web app's client-side compressor already uses
 // (book-eat-app/src/lib/compressImage.ts), so a photo does not visibly change
-// character depending on which path produced it. Above ~85 a photo of a plate
-// of food gains bytes much faster than it gains detail; below ~75 flat areas
-// such as a tablecloth start to show blocking at exactly the sizes we are
-// generating.
+// character depending on which path produced it. The two encoders' quality
+// numbers are not the same metric, but at this end of the scale the practical
+// effect is the same shape — above ~85 a photo of a plate of food gains bytes
+// much faster than it gains detail; below ~75 flat areas such as a tablecloth
+// start to show blocking/banding at exactly the sizes we are generating. If a
+// future measurement pass wants to retune this for WebP specifically, that is
+// a one-constant change with the same test fixtures already in place.
 const Quality = 82
+
+// preset is the libwebp encoding preset. Photo, not Default: every source
+// this package resizes is a photograph (a restaurant, a dish, a story), never
+// a screenshot, line drawing or icon, and WebP's photo preset tunes the
+// segmentation/filtering heuristics for exactly that content instead of
+// leaving them at a generic default.
+const preset = encoder.PresetPhoto
 
 // ErrTooSmall is returned when the source is already no wider than the
 // requested derivative. It is an expected outcome, not a failure: some
@@ -58,21 +80,23 @@ type Rendered struct {
 	Height      int
 }
 
-// Render decodes src and returns a JPEG scaled to exactly `width` pixels wide,
-// preserving the aspect ratio.
+// Render decodes src and returns a WebP scaled to exactly `width` pixels
+// wide, preserving the aspect ratio.
 //
 // It never upscales: a source narrower than or equal to `width` returns
 // ErrTooSmall and no bytes.
 //
-// The source is decoded into whatever colour model it carries and then drawn
-// onto an opaque WHITE canvas before scaling. That matters for the 47 PNGs in
-// the bucket: JPEG has no alpha channel, so a transparent pixel encoded
-// straight to JPEG comes out BLACK — a logo on a transparent background would
-// turn into a logo in a black box. White is the right background because every
-// surface these photos are drawn on in the app is white or near-white. (Twelve
-// of those PNGs were sampled on 2026-07-27 and none actually used its alpha
-// channel, so in practice this is belt and braces — but the next upload is not
-// bound by that sample.)
+// TRANSPARENCY. The source is decoded into whatever colour model it carries
+// and drawn straight into a premultiplied-alpha RGBA canvas — no background
+// flattening. That is a deliberate change from this package's original JPEG
+// output: JPEG has no alpha channel, so a transparent pixel encoded straight
+// to JPEG came out BLACK, and the fix at the time was to flatten every source
+// onto an opaque white canvas before encoding (right for the 47 PNGs in the
+// bucket, all photos on a white-or-near-white app background, but lossy for
+// any future logo that does use its alpha). WebP encodes alpha natively, so
+// there is no longer a reason to throw it away: a transparent PNG now stays
+// transparent through to the derivative. See
+// TestRenderPreservesTransparencyInWebP.
 func Render(src []byte, width int) (Rendered, error) {
 	if width <= 0 {
 		return Rendered{}, fmt.Errorf("media: bad target width %d", width)
@@ -100,24 +124,36 @@ func Render(src []byte, width int) (Rendered, error) {
 		height = 1
 	}
 
+	// draw.Src, not draw.Over: there is no background to composite onto
+	// anymore, just a format conversion into a premultiplied-alpha canvas
+	// that the box filter below can average correctly (premultiplied values
+	// average correctly per channel; straight/non-premultiplied ones would
+	// bleed the colour of fully transparent pixels into a translucent edge).
 	flat := image.NewRGBA(b)
-	draw.Draw(flat, b, image.NewUniform(color.White), image.Point{}, draw.Src)
-	draw.Draw(flat, b, img, b.Min, draw.Over)
+	draw.Draw(flat, b, img, b.Min, draw.Src)
 
 	dst := image.NewRGBA(image.Rect(0, 0, width, height))
 	scale(dst, flat)
+
+	opts, err := encoder.NewLossyEncoderOptions(preset, Quality)
+	if err != nil {
+		return Rendered{}, fmt.Errorf("media: encoder options: %w", err)
+	}
 
 	var out bytes.Buffer
 	// Pre-size the buffer to something in the right order of magnitude so the
 	// encoder does not walk a doubling ladder for every one of 772 objects.
 	out.Grow(width * height / 8)
-	if err := jpeg.Encode(&out, dst, &jpeg.Options{Quality: Quality}); err != nil {
+	// webp.Encode accepts dst (an *image.RGBA, premultiplied) directly: its
+	// encoder converts to the *image.NRGBA libwebp wants via the standard
+	// image/color machinery, which unpremultiplies correctly along the way.
+	if err := webp.Encode(&out, dst, opts); err != nil {
 		return Rendered{}, fmt.Errorf("media: encode: %w", err)
 	}
 
 	return Rendered{
 		Bytes:       out.Bytes(),
-		ContentType: "image/jpeg",
+		ContentType: "image/webp",
 		Width:       width,
 		Height:      height,
 	}, nil
@@ -142,6 +178,16 @@ func Render(src []byte, width int) (Rendered, error) {
 //
 // Averaging happens in a uint32 accumulator per channel, so a source region of
 // up to ~16 million pixels cannot overflow.
+//
+// ALPHA is averaged the same way as colour, not forced opaque. src carries
+// PREMULTIPLIED alpha (image.RGBA's native form, and what draw.Draw produced
+// it as in Render), so a box average of the raw bytes is the correct way to
+// downsample it: a destination pixel straddling an opaque and a fully
+// transparent source pixel comes out both half-as-bright and half-opaque,
+// which is what "half opaque, half see-through" should look like. Averaging
+// NON-premultiplied (straight) alpha the same naive way would instead bleed
+// whatever colour a fully-transparent source pixel happens to hold into a
+// translucent edge — a classic "black halo around a PNG cutout" bug.
 func scale(dst *image.RGBA, src *image.RGBA) {
 	db := dst.Bounds()
 	sb := src.Bounds()
@@ -162,13 +208,14 @@ func scale(dst *image.RGBA, src *image.RGBA) {
 				x1 = x0 + 1
 			}
 
-			var r, g, b, n uint32
+			var r, g, b, a, n uint32
 			for y := y0; y < y1; y++ {
 				row := src.PixOffset(x0, y)
 				for x := x0; x < x1; x++ {
 					r += uint32(src.Pix[row])
 					g += uint32(src.Pix[row+1])
 					b += uint32(src.Pix[row+2])
+					a += uint32(src.Pix[row+3])
 					n++
 					row += 4
 				}
@@ -179,9 +226,7 @@ func scale(dst *image.RGBA, src *image.RGBA) {
 			dst.Pix[o] = uint8(r / n)
 			dst.Pix[o+1] = uint8(g / n)
 			dst.Pix[o+2] = uint8(b / n)
-			// The source was flattened onto opaque white before scaling, so
-			// every pixel is fully opaque by construction.
-			dst.Pix[o+3] = 0xff
+			dst.Pix[o+3] = uint8(a / n)
 		}
 	}
 }

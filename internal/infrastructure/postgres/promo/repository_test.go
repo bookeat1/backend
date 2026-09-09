@@ -225,3 +225,68 @@ func TestDiscountPercent_CheckRejectsOutOfRange(t *testing.T) {
 		t.Fatal("a discount over 100 must be refused by the CHECK constraint, got no error")
 	}
 }
+
+// The fine print's translations must survive a round trip through the column
+// added by migration 0101 — on create, on update, and through the LIST read
+// the guest listing and the favorites screen share (ScanListItem).
+func TestTermsI18nRoundTrip(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "promos", "restaurants")
+	ctx := context.Background()
+	rid := seedRestaurant(ctx, t, pool, "Bistro")
+	repo := New(pool)
+
+	p := mkPromo(rid, domain.PromoPublished, -time.Hour, 2*time.Hour)
+	p.Terms = "Только зал"
+	p.TermsI18n = domain.I18n{"ru": "Только зал", "kk": "Тек залда"}
+	if err := repo.Create(ctx, p); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.TermsI18n["kk"] != "Тек залда" || got.TermsI18n["ru"] != "Только зал" {
+		t.Fatalf("terms_i18n did not survive the write: %v", got.TermsI18n)
+	}
+	if v := got.TermsI18n.Resolve(domain.LocaleKK, got.Terms); v != "Тек залда" {
+		t.Errorf("kk read = %q", v)
+	}
+	if v := got.TermsI18n.Resolve(domain.LocaleEN, got.Terms); v != "Только зал" {
+		t.Errorf("en read = %q, want the Russian fallback", v)
+	}
+
+	got.TermsI18n = domain.I18n{"ru": "Только зал", "en": "Dine-in only"}
+	if err := repo.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	again, err := repo.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if again.TermsI18n["en"] != "Dine-in only" || again.TermsI18n["kk"] != "" {
+		t.Fatalf("update did not replace the map: %v", again.TermsI18n)
+	}
+
+	items, _, err := repo.ListActive(ctx, rid, time.Now(), 1, 20)
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(items) != 1 || items[0].TermsI18n["en"] != "Dine-in only" {
+		t.Fatalf("the listing read must carry terms_i18n, got %v", items)
+	}
+
+	// A promo with no translations keeps the column NULL rather than `{}`.
+	plain := mkPromo(rid, domain.PromoDraft, -time.Hour, 2*time.Hour)
+	if err := repo.Create(ctx, plain); err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	var isNull bool
+	if err := pool.QueryRow(ctx, `SELECT terms_i18n IS NULL FROM promos WHERE id = $1`, plain.ID).Scan(&isNull); err != nil {
+		t.Fatalf("read raw column: %v", err)
+	}
+	if !isNull {
+		t.Error("a promo without translations must leave terms_i18n NULL")
+	}
+}

@@ -60,6 +60,11 @@ func (h *Handler) RegisterAdminRoutes(rg *gin.RouterGroup) {
 	rg.PUT("/admin/events/:eventId", h.update)
 	rg.DELETE("/admin/events/:eventId", h.delete)
 	rg.PUT("/admin/events/:eventId/refund-policy", h.setRefundPolicy)
+	// One date of a series back to what the series says. A narrow route rather
+	// than a flag on the full-replace PUT: "верни как у всех" must not require
+	// the cabinet to first fetch what the series currently says, and it is the
+	// only way to clear an override without knowing its value.
+	rg.POST("/admin/events/:eventId/content/reset", h.resetSeriesContent)
 }
 
 func (h *Handler) listPublic(c *gin.Context) {
@@ -152,12 +157,14 @@ func (h *Handler) createWithHost(c *gin.Context, rid *uuid.UUID) {
 		RestaurantID:     rid,
 		Action:           req.Action.toDomain(),
 		Title:            req.Title,
-		TitleI18n:        domain.I18n(req.TitleI18n),
+		TitleI18n:        domain.I18nPatch(req.TitleI18n),
 		Description:      req.Description,
-		DescriptionI18n:  domain.I18n(req.DescriptionI18n),
+		DescriptionI18n:  domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		VenueI18n:        domain.I18nPatch(req.VenueI18n),
+		ActionLabelI18n:  req.Action.labelI18n(),
 		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
@@ -201,12 +208,14 @@ func (h *Handler) update(c *gin.Context) {
 	}
 	e, err := h.facade.Update(c.Request.Context(), actor, eid, uc.UpdateInput{
 		Title:            req.Title,
-		TitleI18n:        domain.I18n(req.TitleI18n),
+		TitleI18n:        domain.I18nPatch(req.TitleI18n),
 		Description:      req.Description,
-		DescriptionI18n:  domain.I18n(req.DescriptionI18n),
+		DescriptionI18n:  domain.I18nPatch(req.DescriptionI18n),
 		StartsAt:         startsAt,
 		EndsAt:           endsAt,
 		Venue:            req.Venue,
+		VenueI18n:        domain.I18nPatch(req.VenueI18n),
+		ActionLabelI18n:  req.Action.labelI18n(),
 		City:             req.City,
 		CoverImageURL:    req.CoverImageURL,
 		Status:           domain.EventStatus(req.Status),
@@ -223,6 +232,49 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, adminResponse(*e))
+}
+
+// resetSeriesContent hands the listed content fields of this DATE back to its
+// series (migration 0097). An empty or absent `fields` resets every content
+// field, which is the button the cabinet actually shows; the list exists for
+// "верни только афишу, текст оставь мой".
+func (h *Handler) resetSeriesContent(c *gin.Context) {
+	actor, ok := actorFrom(c)
+	if !ok {
+		return
+	}
+	eid, ok := pathUUID(c, "eventId", "invalid event id")
+	if !ok {
+		return
+	}
+	var req resetContentRequest
+	// An empty body is the normal case ("reset everything"), so a missing or
+	// blank payload is not an error — only a malformed one is.
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+	}
+	fields := make([]domain.EventContentField, 0, len(req.Fields))
+	for _, f := range req.Fields {
+		fields = append(fields, domain.EventContentField(strings.TrimSpace(f)))
+	}
+	e, err := h.facade.ResetSeriesContent(c.Request.Context(), actor, eid, fields)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, adminResponse(*e))
+}
+
+// resetContentRequest names the fields to hand back to the series. The
+// vocabulary is domain.EventContentFields ("title", "description", "venue",
+// "cover_image_url", "tags"); an unknown name is a 422 rather than a silent
+// no-op, because a cabinet that misspells a field would otherwise believe it
+// reset something.
+type resetContentRequest struct {
+	Fields []string `json:"fields"`
 }
 
 // setRefundPolicy lets an authorized venue role set THIS event's ticket-refund
@@ -445,15 +497,24 @@ func parseEventStatuses(raw string) []domain.EventStatus {
 // --- DTOs ---
 
 type eventRequest struct {
-	Title           string            `json:"title"`
-	TitleI18n       map[string]string `json:"title_i18n"`
-	Description     string            `json:"description"`
-	DescriptionI18n map[string]string `json:"description_i18n"`
-	StartsAt        string            `json:"starts_at"`
-	EndsAt          string            `json:"ends_at"`
-	Venue           string            `json:"venue"`
-	CoverImageURL   *string           `json:"cover_image_url"`
-	Status          string            `json:"status"`
+	Title string `json:"title"`
+	// The `*_i18n` objects are PARTIAL translation updates, and the ONE thing
+	// in this payload that is not a full replace:
+	//
+	//	{"venue_i18n": {"kk": "Шатыр террасасы", "en": null}}
+	//
+	// a named language is written, a null (or blank) one is removed, and a
+	// language the object does not mention keeps whatever is stored. The plain
+	// field next to it is the Russian text and wins over a `ru` key here.
+	TitleI18n       map[string]*string `json:"title_i18n"`
+	Description     string             `json:"description"`
+	DescriptionI18n map[string]*string `json:"description_i18n"`
+	StartsAt        string             `json:"starts_at"`
+	EndsAt          string             `json:"ends_at"`
+	Venue           string             `json:"venue"`
+	VenueI18n       map[string]*string `json:"venue_i18n"`
+	CoverImageURL   *string            `json:"cover_image_url"`
+	Status          string             `json:"status"`
 	// City переопределяет город, в котором показывается событие. Пусто или
 	// отсутствует — обычный случай: событие живёт в городе своего заведения, и
 	// переезжает вместе с ним. Значение резолвится по справочнику городов
@@ -492,6 +553,10 @@ type eventRequest struct {
 // external url, and someone would eventually have to guess which half is a lie.
 type eventActionRequest struct {
 	Label string `json:"label"`
+	// LabelI18n — переводы подписи кнопки, ЧАСТИЧНОЕ обновление, как и все
+	// прочие `*_i18n` здесь: названный язык записывается, null удаляется,
+	// неупомянутый сохраняется. Русский текст живёт в label.
+	LabelI18n map[string]*string `json:"label_i18n"`
 	// URL — внешняя ссылка. Отсутствует или null → кнопка ведёт на страницу
 	// самого события. Значение проверяется в домене: только http/https, с
 	// хостом, без учётных данных и управляющих символов; javascript:, data: и
@@ -499,12 +564,24 @@ type eventActionRequest struct {
 	URL *string `json:"url"`
 }
 
-// toDomain maps the optional button, nil staying nil ("no button").
+// toDomain maps the optional button, nil staying nil ("no button"). The
+// caption's translations travel SEPARATELY (labelI18n below) because they are a
+// patch, not a value: merging them onto what the button already has needs the
+// stored event, which only the usecase has.
 func (r *eventActionRequest) toDomain() *domain.EventAction {
 	if r == nil {
 		return nil
 	}
 	return &domain.EventAction{Label: r.Label, URL: r.URL}
+}
+
+// labelI18n is the button caption's translation patch, nil when there is no
+// button in the request at all.
+func (r *eventActionRequest) labelI18n() domain.I18nPatch {
+	if r == nil {
+		return nil
+	}
+	return domain.I18nPatch(r.LabelI18n)
 }
 
 // refundPolicyRequest is the narrow "just the refund rules" admin payload.
@@ -573,6 +650,7 @@ type eventResponse struct {
 	StartsAt        string            `json:"starts_at"`
 	EndsAt          string            `json:"ends_at"`
 	Venue           string            `json:"venue,omitempty"`
+	VenueI18n       map[string]string `json:"venue_i18n,omitempty"`
 	CoverImageURL   *string           `json:"cover_image_url,omitempty"`
 	Status          string            `json:"status"`
 	// City — переопределение города. Отсутствует, когда его нет: событие тогда
@@ -598,6 +676,11 @@ type eventResponse struct {
 	// for an ordinary one-off event. The cabinet uses it to tell the venue "this
 	// date comes from a series" before they edit or delete it.
 	RecurrenceID *string `json:"recurrence_id,omitempty"`
+	// ContentOverrides — какие поля контента эта дата ведёт САМА, а какие
+	// наследует от серии (миграция 0097). Поле административное: в гостевом
+	// ответе его нет (publicResponse его снимает), а у обычного события и у
+	// даты, которая целиком следует серии, оно пустое и потому не сериализуется.
+	ContentOverrides []string `json:"content_overrides,omitempty"`
 	// Action — кнопка карточки. Отсутствует, когда кнопки нет.
 	Action    *eventActionResponse `json:"action,omitempty"`
 	CreatedAt string               `json:"created_at"`
@@ -608,16 +691,31 @@ type eventResponse struct {
 // (see domain.EventAction.Target) and is what the client branches on: "event"
 // → open GET /events/{id} in-app, "external" → open url in a browser.
 type eventActionResponse struct {
-	Label  string  `json:"label"`
-	Target string  `json:"target"`
-	URL    *string `json:"url,omitempty"`
+	Label string `json:"label"`
+	// LabelI18n — сырые переводы подписи: их видит КАБИНЕТ (adminResponse),
+	// гостю карта не нужна, ему уже разрешили подпись в его язык.
+	LabelI18n map[string]string `json:"label_i18n,omitempty"`
+	Target    string            `json:"target"`
+	URL       *string           `json:"url,omitempty"`
 }
 
 func actionResponse(a *domain.EventAction) *eventActionResponse {
 	if a == nil {
 		return nil
 	}
-	return &eventActionResponse{Label: a.Label, Target: string(a.Target()), URL: a.URL}
+	return &eventActionResponse{
+		Label: a.Label, LabelI18n: a.LabelI18n, Target: string(a.Target()), URL: a.URL,
+	}
+}
+
+// localizeAction resolves the button caption into lang and drops the raw map —
+// the guest-facing half of actionResponse. A nil action stays nil.
+func localizeAction(r *eventActionResponse, a *domain.EventAction, lang string) {
+	if r == nil || a == nil {
+		return
+	}
+	r.Label = a.LabelI18n.Resolve(lang, a.Label)
+	r.LabelI18n = nil
 }
 
 // idOrNil renders an optional uuid as an optional string, so an absent owner
@@ -670,6 +768,7 @@ func adminResponse(e domain.Event) eventResponse {
 		StartsAt:         e.StartsAt.Format(time.RFC3339),
 		EndsAt:           e.EndsAt.Format(time.RFC3339),
 		Venue:            e.Venue,
+		VenueI18n:        e.VenueI18n,
 		City:             cityOrNil(e.City),
 		CoverImageURL:    e.CoverImageURL,
 		Status:           string(e.Status),
@@ -682,6 +781,7 @@ func adminResponse(e domain.Event) eventResponse {
 		TicketsRefundable:         e.TicketsRefundable,
 		TicketRefundCutoffMinutes: e.TicketRefundCutoffMinutes,
 		RecurrenceID:              recurrenceID,
+		ContentOverrides:          overridesResponse(e.ContentOverrides),
 		Action:                    actionResponse(e.Action),
 		CreatedAt:                 e.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 e.UpdatedAt.Format(time.RFC3339),
@@ -724,7 +824,29 @@ func publicResponse(e domain.Event, lang string) eventResponse {
 	r := adminResponse(e)
 	r.Title = e.TitleI18n.Resolve(lang, e.Title)
 	r.Description = e.DescriptionI18n.Resolve(lang, e.Description)
+	r.Venue = e.VenueI18n.Resolve(lang, e.Venue)
+	localizeAction(r.Action, e.Action, lang)
 	r.TitleI18n = nil
 	r.DescriptionI18n = nil
+	r.VenueI18n = nil
+	// Which fields this date inherits from its series is a cabinet's concern,
+	// not a guest's: the guest sees the resolved content, exactly as before
+	// migration 0097, and the response keeps the shape it always had.
+	r.ContentOverrides = nil
 	return r
+}
+
+// overridesResponse renders the override markers as plain strings, and returns
+// nil (not an empty slice) when there are none — the field is omitempty, so
+// "this date follows its series entirely" is an ABSENT field rather than an
+// empty array that a cabinet might mistake for something to render.
+func overridesResponse(fields []domain.EventContentField) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, string(f))
+	}
+	return out
 }

@@ -43,6 +43,23 @@ type Actor struct {
 	Role   domain.Role
 }
 
+// relation is the caller's resolved relation to a booking, as decided by
+// resolveRelation. It exists because authorization ("may you touch this
+// booking at all") and the pre-order lock ("may you still CHANGE it now that
+// it is confirmed") are two different questions with two different answers for
+// the same person: the guest who owns the booking passes the first and fails
+// the second once the booking is confirmed.
+type relation int
+
+const (
+	// relationGuest — the booking's own owner, acting as a guest from the app.
+	relationGuest relation = iota
+	// relationStaff — staff of the venue this booking belongs to.
+	relationStaff
+	// relationAdmin — a platform admin.
+	relationAdmin
+)
+
 // Line is one requested pre-order position. The client sends ONLY the menu item
 // and quantity (plus an optional comment) — never a price. The price is resolved
 // server-side from the menu item, see the package doc.
@@ -129,7 +146,7 @@ func (u *UseCase) Get(ctx context.Context, actor Actor, bookingID uuid.UUID) (*P
 	if err != nil {
 		return nil, err
 	}
-	if err := u.authorize(ctx, actor, b); err != nil {
+	if _, err := u.resolveRelation(ctx, actor, b); err != nil {
 		return nil, err
 	}
 	items, err := u.items.ListByBooking(ctx, bookingID)
@@ -150,20 +167,71 @@ func (u *UseCase) Get(ctx context.Context, actor Actor, bookingID uuid.UUID) (*P
 // price is taken from the menu item, never from the client. When the venue set a
 // minimum pre-order (restaurants.preorder_min_amount_minor) and the total is
 // non-zero, it must reach that floor.
+//
+// Who may still change it:
+//   - pending / waitlist — the guest, the venue's staff and admins;
+//   - confirmed with an EMPTY pre-order (no non-cancelled booking_items) —
+//     everyone, guest included: this is the guest's first attach, part of the
+//     original checkout at a confirm_on_create venue, not a change to an
+//     accepted order;
+//   - confirmed with an existing pre-order — the venue's staff and admins
+//     ONLY. The guest is refused with domain.CodePreorderLocked (see the block
+//     in the body for why the venue keeps the ability);
+//   - anything else (arrived/completed/cancelled/no_show) — nobody.
 func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID, lines []Line) (*Preorder, error) {
 	b, err := u.bookings.GetByID(ctx, bookingID)
 	if err != nil {
 		return nil, err
 	}
-	if err := u.authorize(ctx, actor, b); err != nil {
+	rel, err := u.resolveRelation(ctx, actor, b)
+	if err != nil {
 		return nil, err
 	}
 
 	// A pre-order only makes sense on a booking that can still be prepared for.
+	// This gate applies to EVERYONE, including staff and admins: a booking that
+	// is over (arrived/completed/cancelled/no_show) has nothing left to cook.
 	switch b.Status {
 	case domain.BookingPending, domain.BookingConfirmed, domain.BookingWaitlist:
 	default:
-		return nil, fmt.Errorf("%w: booking is %s, its pre-order can no longer be changed", domain.ErrValidation, b.Status)
+		return nil, domain.WithCode(domain.CodePreorderBookingClosed,
+			fmt.Errorf("%w: booking is %s, its pre-order can no longer be changed", domain.ErrValidation, b.Status))
+	}
+
+	// Once the booking is CONFIRMED the pre-order is closed TO THE GUEST: the
+	// venue has accepted the order and starts planning the kitchen against it,
+	// so a guest silently swapping the dishes afterwards is a change nobody at
+	// the venue agreed to. Pending and waitlist stay editable — nothing has been
+	// accepted yet in either.
+	//
+	// Venue staff (and admins) deliberately keep the ability after
+	// confirmation: the venue is the party that has to cook the order and the
+	// one that takes the phone call when a dish runs out or the guest changes
+	// their mind. Taking it away would leave a legitimate change with no path at
+	// all except cancelling the booking. The asymmetry is the point — the change
+	// now goes through the party that agreed to it.
+	//
+	// EXCEPTION — the guest's FIRST attach. Both clients call POST /bookings
+	// and PUT .../preorder as two separate requests; at a venue with
+	// confirm_on_create=true the booking is already `confirmed` by the time the
+	// second request lands, even though nothing about the venue's order has
+	// been accepted yet — there is no order to protect. So the lock only bites
+	// once the booking ALREADY has a pre-order: a guest attaching to a
+	// confirmed booking with zero non-cancelled booking_items is finishing their
+	// original checkout, not changing an accepted one, and is let through.
+	// Every subsequent Replace on that same booking (the lines are no longer
+	// empty) is a real change and is locked, same as before. A booking whose
+	// only lines are `cancelled` still counts as empty here — a fully-voided
+	// pre-order is not "an order the venue has accepted".
+	if rel == relationGuest && b.Status == domain.BookingConfirmed {
+		existing, err := u.items.ListByBooking(ctx, bookingID)
+		if err != nil {
+			return nil, err
+		}
+		if hasActivePreorderLines(existing) {
+			return nil, domain.WithCode(domain.CodePreorderLocked,
+				fmt.Errorf("%w: booking is confirmed, its pre-order can only be changed by the restaurant", domain.ErrValidation))
+		}
 	}
 
 	// Frozen while a payment is in flight: any non-terminal payment (including a
@@ -176,7 +244,8 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 		return nil, err
 	}
 	if inFlight {
-		return nil, fmt.Errorf("%w: this booking has a payment in progress; its pre-order can no longer be changed", domain.ErrValidation)
+		return nil, domain.WithCode(domain.CodePreorderPaymentInFlight,
+			fmt.Errorf("%w: this booking has a payment in progress; its pre-order can no longer be changed", domain.ErrValidation))
 	}
 
 	if len(lines) > maxLines {
@@ -191,15 +260,18 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 		mi, err := u.menu.GetByID(ctx, ln.MenuItemID)
 		if err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				return nil, fmt.Errorf("%w: menu item %s does not exist", domain.ErrValidation, ln.MenuItemID)
+				return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+					fmt.Errorf("%w: menu item %s does not exist", domain.ErrValidation, ln.MenuItemID))
 			}
 			return nil, err
 		}
 		if mi.RestaurantID != b.RestaurantID {
-			return nil, fmt.Errorf("%w: menu item %s does not belong to this booking's restaurant", domain.ErrValidation, ln.MenuItemID)
+			return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+				fmt.Errorf("%w: menu item %s does not belong to this booking's restaurant", domain.ErrValidation, ln.MenuItemID))
 		}
 		if !mi.IsAvailable {
-			return nil, fmt.Errorf("%w: menu item %q is not available", domain.ErrValidation, mi.Name)
+			return nil, domain.WithCode(domain.CodePreorderItemUnavailable,
+				fmt.Errorf("%w: menu item %q is not available", domain.ErrValidation, mi.Name))
 		}
 		priceMinor, err := domain.PriceStringToMinor(mi.Price)
 		if err != nil {
@@ -233,7 +305,8 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 			return nil, err
 		}
 		if min := override.PreorderMinAmountMinor; min != nil && total < *min {
-			return nil, fmt.Errorf("%w: pre-order total %d is below this restaurant's minimum of %d", domain.ErrValidation, total, *min)
+			return nil, domain.WithCode(domain.CodePreorderBelowMinimum,
+				fmt.Errorf("%w: pre-order total %d is below this restaurant's minimum of %d", domain.ErrValidation, total, *min))
 		}
 	}
 
@@ -252,34 +325,62 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 	return buildPreorder(bookingID, saved)
 }
 
-// authorize resolves the caller's relation to the booking: an admin always
-// passes; venue staff pass for their OWN restaurant; the booking's owner passes.
-// Everyone else gets ErrNotFound (a plain guest asking about someone else's
-// booking must not learn it exists — same enumeration-oracle guard as
-// usecase/bookings.authorize), except a restaurant-role caller managing another
-// venue, who gets the clearer ErrForbidden.
-func (u *UseCase) authorize(ctx context.Context, actor Actor, b *domain.Booking) error {
+// resolveRelation authorizes the caller AND reports in what capacity they pass:
+// an admin always passes; venue staff pass for their OWN restaurant; the
+// booking's owner passes as a guest. Everyone else gets ErrNotFound (a plain
+// guest asking about someone else's booking must not learn it exists — same
+// enumeration-oracle guard as usecase/bookings.authorize), except a
+// restaurant-role caller managing another venue, who gets the clearer
+// ErrForbidden.
+//
+// The staff check runs BEFORE the owner check, but only for a restaurant-role
+// caller, so it costs no extra query for an ordinary guest. The order matters
+// for the one person who is both: a staff member who booked a table at their
+// own venue is resolved as STAFF, i.e. keeps the venue's ability to change a
+// confirmed pre-order. They are the venue; the lock protects the venue from
+// unilateral guest edits, and there is nothing to protect it from here. Staff
+// who booked at SOMEBODY ELSE's venue fall through to the owner check and are
+// plain guests there, as they should be.
+func (u *UseCase) resolveRelation(ctx context.Context, actor Actor, b *domain.Booking) (relation, error) {
 	if actor.UserID == uuid.Nil {
-		return fmt.Errorf("%w: no authenticated actor", domain.ErrUnauthorized)
+		return 0, fmt.Errorf("%w: no authenticated actor", domain.ErrUnauthorized)
 	}
 	if actor.Role == domain.RoleAdmin {
-		return nil
+		return relationAdmin, nil
 	}
 	owner := b.UserID != nil && *b.UserID == actor.UserID
-	if owner {
-		return nil
-	}
 	if actor.Role == domain.RoleRestaurant {
 		ok, err := u.managers.Manages(ctx, actor.UserID, b.RestaurantID)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if ok {
-			return nil
+			return relationStaff, nil
 		}
-		return fmt.Errorf("%w: booking belongs to another restaurant", domain.ErrForbidden)
+		if owner {
+			return relationGuest, nil
+		}
+		return 0, fmt.Errorf("%w: booking belongs to another restaurant", domain.ErrForbidden)
 	}
-	return fmt.Errorf("%w: booking", domain.ErrNotFound)
+	if owner {
+		return relationGuest, nil
+	}
+	return 0, fmt.Errorf("%w: booking", domain.ErrNotFound)
+}
+
+// hasActivePreorderLines reports whether items contains at least one line that
+// is NOT cancelled. It answers "does this booking already have a pre-order the
+// venue is planning against", which is what the confirmed-guest lock in
+// Replace protects — see the EXCEPTION comment there. A booking whose only
+// lines are cancelled has nothing left for the venue to have accepted, so it
+// counts as empty, same as a booking with zero lines.
+func hasActivePreorderLines(items []domain.BookingItem) bool {
+	for _, it := range items {
+		if it.Status != domain.BookingItemCancelled {
+			return true
+		}
+	}
+	return false
 }
 
 // buildPreorder assembles the result. The total uses the SAME shared helper

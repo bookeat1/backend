@@ -53,10 +53,12 @@ func (h *Handler) RegisterAdminGlobal(rg *gin.RouterGroup) {
 	rg.POST("/restaurants", h.create)
 }
 
-// RegisterRestaurantScoped mounts mutations on an existing restaurant's own
-// fields. Mount on a RequireRestaurantManager(..., "id") group (admin or the
-// restaurant's own manager).
+// RegisterRestaurantScoped mounts the cabinet's reads and mutations on an
+// existing restaurant's own fields. Mount on a
+// RequireRestaurantManager(..., "id") group (admin or the restaurant's own
+// manager).
 func (h *Handler) RegisterRestaurantScoped(rg *gin.RouterGroup) {
+	rg.GET("/admin/restaurants/:id", h.adminGet)
 	rg.PATCH("/restaurants/:id", h.update)
 	rg.DELETE("/restaurants/:id", h.deactivate)
 }
@@ -361,20 +363,66 @@ func (h *Handler) get(c *gin.Context) {
 	response.OK(c.Writer, list[0])
 }
 
+// adminGet is the venue as ITS OWN CABINET must see it: the same detail payload
+// the public route serves, but for a DEACTIVATED venue too, and in the stored
+// (Russian) wording rather than a translation.
+//
+// Why it exists at all — the panel had no read that fits:
+//   - GET /restaurants/:id (public) answers 404 once is_active goes false, so
+//     hiding a venue also hid its own settings screen (the «Средний чек» and
+//     «Соцсети» cards, which prefill from that route, went blank);
+//   - GET /admin/restaurants/:id/profile works on a hidden venue but carries
+//     neither social_links nor the numeric price_range;
+//   - GET /admin/restaurants (the superadmin catalog) has price_range but no
+//     social links, and a venue's own manager may not call it.
+//
+// Authorization is the group's: RequireRestaurantManager("id") — the venue's
+// own staff or a superadmin, exactly the gate on PATCH /restaurants/:id right
+// next to it. Whoever may edit the venue may read what they are editing; this
+// widens nothing.
+//
+// NOT localized on purpose. The public route resolves each text field through
+// its i18n map into the caller's language, and a browser sends
+// Accept-Language: ru — so the cabinet would edit the translation it was shown
+// instead of the column it writes. Here the scalar fields are the stored
+// columns and the *_i18n maps travel alongside, which is the same contract as
+// GET /admin/restaurants/:id/profile.
+func (h *Handler) adminGet(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, "invalid id")
+		return
+	}
+	agg, err := h.facade.Get(c.Request.Context(), id)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, aggregateToResponse(agg, ""))
+}
+
 // attachFavorites sets IsFavorite on each element of out (in place, matched
 // by index against ids) for the current authenticated caller. A no-op for an
 // anonymous caller, a nil favoriteChecker, or when the lookup itself fails —
 // the favorites flag is a secondary enhancement and must never break the
 // catalog response it's attached to.
 func (h *Handler) attachFavorites(ctx context.Context, out []restaurantResponse, ids []uuid.UUID) {
-	if h.favorites == nil || len(out) != len(ids) {
+	attachFavoritesTo(ctx, h.favorites, out, ids)
+}
+
+// attachFavoritesTo is the body of the above, as a free function, so the picks
+// handler (picks_handler.go) gets the identical behaviour without a second copy
+// of it or a borrowed receiver. Both handlers hold the same optional dependency
+// and there is exactly one right answer to "is this venue a favorite".
+func attachFavoritesTo(ctx context.Context, favorites favoriteChecker, out []restaurantResponse, ids []uuid.UUID) {
+	if favorites == nil || len(out) != len(ids) {
 		return
 	}
 	au, ok := middleware.GetAuthUser(ctx)
 	if !ok {
 		return
 	}
-	set, err := h.favorites.FavoriteSet(ctx, au.ID, ids)
+	set, err := favorites.FavoriteSet(ctx, au.ID, ids)
 	if err != nil {
 		slog.Warn("favorite lookup failed, serving catalog without is_favorite", "error", err)
 		return
@@ -431,7 +479,11 @@ func (h *Handler) create(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.Created(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
+	// NOT localized, for the same reason adminGet is not: this is a cabinet
+	// write, its answer is what the editor's form re-reads, and a browser
+	// sending Accept-Language: ru would get the ru TRANSLATION back in the
+	// scalar fields and post it as the next value of the column.
+	response.Created(c.Writer, aggregateToResponse(agg, ""))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -467,7 +519,8 @@ func (h *Handler) update(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg, resolveLocale(c)))
+	// NOT localized — see create above and adminGet below.
+	response.OK(c.Writer, aggregateToResponse(agg, ""))
 }
 
 func (h *Handler) deactivate(c *gin.Context) {

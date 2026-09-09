@@ -22,24 +22,34 @@ const dateLayout = "2006-01-02"
 // profileRequest carries the venue-editable profile fields. Editorial/platform
 // flags are deliberately not present — they cannot be set through this panel.
 type profileRequest struct {
-	Name         *string           `json:"name"`
-	NameI18n     map[string]string `json:"name_i18n"`
-	Description  *string           `json:"description"`
-	Address      *string           `json:"address"`
-	Phone        *string           `json:"phone"`
-	Email        *string           `json:"email"`
-	OpeningHours *string           `json:"opening_hours"`
+	Name *string `json:"name"`
+	// The `*_i18n` objects are PARTIAL translation updates — see
+	// domain.I18nPatch and the same fields on saveRestaurantRequest: a named
+	// language is written, a null one removed, an unmentioned one kept, and a
+	// `ru` key writes the plain field it belongs to.
+	NameI18n         map[string]*string `json:"name_i18n"`
+	Description      *string            `json:"description"`
+	DescriptionI18n  map[string]*string `json:"description_i18n"`
+	Address          *string            `json:"address"`
+	AddressI18n      map[string]*string `json:"address_i18n"`
+	Phone            *string            `json:"phone"`
+	Email            *string            `json:"email"`
+	OpeningHours     *string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]*string `json:"opening_hours_i18n"`
 }
 
 func (r profileRequest) toInput() adminuc.ProfileInput {
 	return adminuc.ProfileInput{
-		Name:         r.Name,
-		NameI18n:     domain.I18n(r.NameI18n),
-		Description:  r.Description,
-		Address:      r.Address,
-		Phone:        r.Phone,
-		Email:        r.Email,
-		OpeningHours: r.OpeningHours,
+		Name:             r.Name,
+		NameI18n:         domain.I18nPatch(r.NameI18n),
+		Description:      r.Description,
+		DescriptionI18n:  domain.I18nPatch(r.DescriptionI18n),
+		Address:          r.Address,
+		AddressI18n:      domain.I18nPatch(r.AddressI18n),
+		Phone:            r.Phone,
+		Email:            r.Email,
+		OpeningHours:     r.OpeningHours,
+		OpeningHoursI18n: domain.I18nPatch(r.OpeningHoursI18n),
 	}
 }
 
@@ -59,9 +69,14 @@ type menuItemRequest struct {
 	SubcategoryI18n map[string]string `json:"subcategory_i18n"`
 	PortionSize     *string           `json:"portion_size"`
 	PortionSizeI18n map[string]string `json:"portion_size_i18n"`
-	Language        *string           `json:"language"`
-	DisplayOrder    *int              `json:"display_order"`
-	Tags            *[]string         `json:"tags"`
+	// Language: null or "ru" only. A dish row is the base row; translations
+	// live in the *_i18n maps. Any other value is a 422 with code
+	// menu_item_language_not_base, because the guest listing serves base rows
+	// and such a dish would be invisible to every guest while looking normal
+	// here.
+	Language     *string   `json:"language"`
+	DisplayOrder *int      `json:"display_order"`
+	Tags         *[]string `json:"tags"`
 }
 
 func (r menuItemRequest) toInput() menuuc.ItemInput {
@@ -237,4 +252,24 @@ type telegramChatRequest struct {
 // aimed at the person least able to fix it.
 type whatsAppPhoneRequest struct {
 	WhatsAppPhone string `json:"whatsapp_phone"`
+}
+
+// acquirerAccountRequest points a venue at one of an acquirer's accounts.
+// account_ref is an ADDRESS (for Kaspi, the company id inside our Kaspi
+// service), never a key — credentials are read from env and are not settable
+// over HTTP.
+type acquirerAccountRequest struct {
+	Provider   string `json:"provider"`
+	AccountRef string `json:"account_ref"`
+	// IsActive suspends the mapping without losing it. Absent means false, so
+	// the panel must send it explicitly when enabling a venue.
+	IsActive bool `json:"is_active"`
+}
+
+func (r acquirerAccountRequest) toInput() adminuc.AcquirerAccount {
+	return adminuc.AcquirerAccount{
+		Provider:   domain.PaymentProvider(strings.TrimSpace(r.Provider)),
+		AccountRef: r.AccountRef,
+		IsActive:   r.IsActive,
+	}
 }

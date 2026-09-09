@@ -20,8 +20,10 @@ import (
 	"backend-core/internal/infrastructure/otpsender"
 	paymentgw "backend-core/internal/infrastructure/payment"
 	"backend-core/internal/infrastructure/payment/freedompay"
+	"backend-core/internal/infrastructure/payment/kaspi"
 	"backend-core/internal/infrastructure/payment/tiptoppay"
 	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
+	appversionrepo "backend-core/internal/infrastructure/postgres/appversion"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	cityrepo "backend-core/internal/infrastructure/postgres/city"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
@@ -35,6 +37,7 @@ import (
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
 	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
+	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
@@ -42,12 +45,14 @@ import (
 	otprepo "backend-core/internal/infrastructure/postgres/otp"
 	paymentrepo "backend-core/internal/infrastructure/postgres/payment"
 	payoutrepo "backend-core/internal/infrastructure/postgres/payout"
+	platformpagesrepo "backend-core/internal/infrastructure/postgres/platformpages"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
 	schedulerepo "backend-core/internal/infrastructure/postgres/schedule"
 	storyrepo "backend-core/internal/infrastructure/postgres/story"
+	telegramlinkrepo "backend-core/internal/infrastructure/postgres/telegramlink"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	credrepo "backend-core/internal/infrastructure/postgres/usercredential"
 	usercuisinerepo "backend-core/internal/infrastructure/postgres/usercuisine"
@@ -63,6 +68,7 @@ import (
 	"backend-core/internal/transport/rest/telegramhook"
 	"backend-core/internal/usecase/admin"
 	"backend-core/internal/usecase/analytics"
+	appversionuc "backend-core/internal/usecase/appversion"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
 	citiesuc "backend-core/internal/usecase/cities"
@@ -75,11 +81,13 @@ import (
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
 	"backend-core/internal/usecase/gastroguide"
+	"backend-core/internal/usecase/homepicks"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
 	"backend-core/internal/usecase/payments"
 	"backend-core/internal/usecase/payouts"
+	platformpagesuc "backend-core/internal/usecase/platformpages"
 	"backend-core/internal/usecase/preorder"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
@@ -102,20 +110,30 @@ type Deps struct {
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
 	MyRestaurants      *restaurants.MyRestaurantsUseCase
-	Cities             citiesuc.UseCase
-	Cuisines           cuisinesuc.UseCase
-	VenueFeatures      venuefeaturesuc.UseCase
-	PushSubscriptions  *notifications.SubscriptionUseCase
-	DeviceTokens       *notifications.DeviceTokenUseCase
-	NotificationFeed   *notifications.NotificationFeedUseCase
-	FavoritesFacade    favorites.Facade
-	ConsentFacade      consent.Facade
-	ReviewsFacade      reviews.Facade
-	EventsFacade       events.Facade
+	// AuthMiniApp is sign-in for the Telegram venue mini app. Always built; it
+	// disables its own routes when RESTAURANTS_BOT_TOKEN is unset.
+	AuthMiniApp *auth.MiniAppUseCase
+	Cities      citiesuc.UseCase
+	Cuisines    cuisinesuc.UseCase
+	// AppVersion is the mobile update gate: the public launch check and the
+	// superadmin screen behind it (migration 0103).
+	AppVersion appversionuc.UseCase
+	// PlatformPages is the footer's editable text pages (migration 0105): the
+	// public read + the superadmin editor screen behind it.
+	PlatformPages     platformpagesuc.UseCase
+	VenueFeatures     venuefeaturesuc.UseCase
+	PushSubscriptions *notifications.SubscriptionUseCase
+	DeviceTokens      *notifications.DeviceTokenUseCase
+	NotificationFeed  *notifications.NotificationFeedUseCase
+	FavoritesFacade   favorites.Facade
+	ConsentFacade     consent.Facade
+	ReviewsFacade     reviews.Facade
+	EventsFacade      events.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
 	EventRecurrences  eventrecurrence.Facade
 	PromosFacade      promos.Facade
+	HomePicks         homepicks.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
 	// GastroRoutes / GastroRouteEditor — «Гастропрогулки» (migration 0078): the
@@ -147,6 +165,18 @@ type Deps struct {
 	TelegramAnswerer telegramhook.Answerer
 	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
 	TelegramWebhookSecret string
+	// StaffBotAnswerer is the SECOND bot's own answerer. A callback query can
+	// only be answered with the token of the bot that sent the message, so the
+	// two bots must never share one — during the migration both webhooks are
+	// live at once (spec §7 step 4). Nil when RESTAURANTS_BOT_TOKEN is unset.
+	StaffBotAnswerer telegramhook.Answerer
+	// StaffBotMessenger lets the new bot reply to an inbound /start. Same
+	// object as StaffBotAnswerer in practice; a separate field because the two
+	// roles are separate and either may legitimately be absent.
+	StaffBotMessenger telegramhook.Messenger
+	// StaffBotWebhookSecret gates the new bot's webhook. Its OWN value, never
+	// TelegramWebhookSecret; empty leaves that endpoint answering 404.
+	StaffBotWebhookSecret string
 	BookingUpdate         bookings.UpdateUseCase
 	BookingAvail          bookings.AvailabilityUseCase
 	BookingBlacklist      bookings.BlacklistUseCase
@@ -171,6 +201,12 @@ type Deps struct {
 	PaymentOutboxRepo    domain.PaymentOutboxRepository
 	PaymentProvidersRepo domain.PaymentProviderRepository
 	PaymentGateways      *paymentgw.Registry
+
+	// KaspiDirectory is the READ-ONLY view of our Kaspi service's company
+	// registry, behind the superadmin's «Приём оплаты» picker. nil when the
+	// service is not configured for this deployment; the handler answers 503
+	// rather than the process refusing to boot.
+	KaspiDirectory *kaspi.Directory
 
 	// Payments usecases — the guest/staff-facing HTTP surface (transport/rest/payments).
 	PaymentCreate        payments.CreateUseCase
@@ -254,6 +290,18 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	restaurantManagers := restaurants.NewManagerUseCase(restManagers, usersRepo, txm)
 	myRestaurants := restaurants.NewMyRestaurantsUseCase(restManagers, restRepo)
+	// Telegram venue mini app sign-in. The venue list goes through the SAME
+	// usecase the admin panel's picker uses (wrapped by staffVenueLister below),
+	// so the mini app and the panel can never disagree about who works where.
+	authMiniApp := auth.NewMiniAppUseCase(
+		telegramlinkrepo.New(db), usersRepo, credsRepo, refreshRepo,
+		staffVenueLister{myRestaurants}, txm, issuer, authCfg,
+		auth.MiniAppConfig{
+			BotToken:    strings.TrimSpace(cfg.Push.RestaurantsBotToken),
+			InitDataTTL: cfg.Push.MiniAppInitDataTTL,
+		},
+		log,
+	)
 	pushSubscriptions := notifications.NewSubscriptionUseCase(notificationrepo.NewSubscriptions(db), restManagers)
 	// Guest mobile push tokens: no restaurant, no RBAC — a guest device is
 	// notified about the guest's own bookings, so owning the account IS the
@@ -300,8 +348,21 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// two one-column writers; neither usecase depends on the other's package.
 	citiesUC := citiesuc.NewUseCase(cityrepo.New(db), restRepo, txm,
 		citiesuc.WithEventCityWriter(eventRepo))
+	// The mobile update gate. No transaction manager and no other usecase: one
+	// row per platform, read on the public launch check, written only from the
+	// superadmin screen.
+	appVersionUC := appversionuc.NewUseCase(appversionrepo.New(db), log)
+	// The footer's editable text pages (migration 0105). No transaction
+	// manager and no other usecase: one row per slug, the row set itself is
+	// fixed by the migration's seed.
+	platformPagesUC := platformpagesuc.NewUseCase(platformpagesrepo.New(db))
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
+		// The same repository again, in its second one-effect role: editing ONE
+		// date of a series has to know what the series says, or it cannot tell
+		// "this date now has its own poster" from "this date just re-saved the
+		// series poster" (migration 0097).
+		events.WithSeriesContent(recurrenceRepo),
 		// Same seam as the catalog: ?city=almaty, a historical spelling or a
 		// renamed city resolve to the one spelling the listing compares.
 		events.WithCityResolver(citiesUC))
@@ -355,6 +416,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build payment gateway registry: %w", err)
 	}
+	kaspiDirectory := newKaspiDirectory(log)
 	paymentsCfg := newPaymentsConfig(cfg)
 	paymentSettings := restRepo // *restaurant.Repository now also implements restaurantPaymentSettings (GetPaymentOverride)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: paymentsCfg}
@@ -385,8 +447,17 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// exact same callback flow a booking does.
 	eventTicketsRepo := eventticketrepo.New(db)
 	ticketObserver := tickets.NewPaymentObserver(eventTicketsRepo)
+	// Deposit hold settlement on booking cancel / no-show (void-early /
+	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
+	// uses. Hooked into the booking cancel/no-show transitions below, and into
+	// the webhook so that money which lands AFTER a cancellation is settled by
+	// the same policy instead of quietly staying taken.
+	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
+		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, txm, payments.WithPaymentSubjectObserver(ticketObserver))
+		paymentGateways, txm,
+		payments.WithPaymentSubjectObserver(ticketObserver),
+		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
 		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
@@ -394,12 +465,6 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	ticketRefund := tickets.NewRefundUseCase(eventTicketsRepo, eventrepo.New(db), ticketPayments, restaurantManagers)
 	ticketAdmin := tickets.NewAdminUseCase(eventTicketsRepo, eventrepo.New(db), restaurantManagers)
 	myTickets := tickets.NewMyTicketsUseCase(eventTicketsRepo)
-	// Deposit hold settlement on booking cancel / no-show (void-early /
-	// capture-late-or-noshow), reusing the same window resolver RefundUseCase
-	// uses. Hooked into the booking cancel/no-show transitions in bootstrap.
-	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
-		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
-
 	// Named facade/usecase variables so both the Deps struct and the admin
 	// panel below share the SAME instances (rather than re-constructing them).
 	// The public catalog reports each venue's structured weekly schedule, an
@@ -411,7 +476,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// ONE instance, shared by every endpoint that serves a catalog row (list,
 	// search, detail, favorites). Wiring a second one — or forgetting one
 	// endpoint — makes the same venue read differently on two screens.
-	venueState := restaurants.NewVenueState(restRelated, bookingCfg)
+	//
+	// paymentCreate is passed as the online-payment checker on purpose: it is
+	// the very usecase that would take the money, so the detail read's
+	// accepts_online_payment is answered by the same settings, the same
+	// acquirer registry and the same venue↔account mapping that the charge
+	// itself goes through (usecase/payments.venueGate). Wiring a second object
+	// here would let the flag and the checkout drift apart, which is the bug
+	// the flag exists to close.
+	venueState := restaurants.NewVenueState(restRelated, bookingCfg,
+		restaurants.WithVenuePayments(paymentCreate))
 	favoritesFacade := favorites.NewFacade(favoritesRepo, favorites.WithVenueState(venueState))
 	// The catalog's "гости + дата" filter runs on the SAME engine as the slot
 	// grid on a venue's booking screen (see bookings.AvailabilitySearch), only
@@ -434,6 +508,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// Teaches ?city= the dictionary: a code, a historical spelling and the
 		// Russian name all resolve to the one spelling stored on the venue.
 		restaurants.WithCityResolver(citiesUC))
+	// «Выбрали для вас» (migration 0090): the hand-curated venue rail on the
+	// main screen. It takes the catalog FACADE, not the repository, so the
+	// curated cards and the automatic fallback go through the very same
+	// listing — same enrichment, same city resolution — as GET /restaurants.
+	// The city dictionary is wired into the KEY of the curation as well: the
+	// panel saves the canonical name while a phone may send a code or an older
+	// spelling, and without folding both to one entry a curated rail would
+	// quietly fail to appear for exactly the guests it was curated for.
+	homePicksFacade := homepicks.NewFacade(homepicksrepo.New(db, txm), restaurantsFacade,
+		homepicks.WithCityResolver(citiesUC))
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
@@ -454,6 +538,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		scheduleRepo, guestrepo.New(db), bookingsFacade, bookingStatus,
 		restRepo,                         // paymentSettingsWriter: edits free_cancel_window_minutes
 		notificationrepo.NewSettings(db), // telegramSettings: connects/clears the venue's Telegram alert chat
+		// Which acquirer account a venue's money goes to (Kaspi: which company
+		// inside our Kaspi service). The SAME repo instance the checkout reads
+		// at Authorize time, so the panel and the charge can never disagree.
+		admin.WithAcquirerAccounts(paymentSplitAccounts),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -483,9 +571,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
+		HomePicks:             homePicksFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
+		AuthMiniApp:           authMiniApp,
 		Cities:                citiesUC,
+		AppVersion:            appVersionUC,
+		PlatformPages:         platformPagesUC,
 		Cuisines:              cuisinesUC,
 		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
@@ -515,6 +607,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
+		StaffBotAnswerer:      newStaffBotSender(cfg),
+		StaffBotMessenger:     newStaffBotMessenger(cfg),
+		StaffBotWebhookSecret: strings.TrimSpace(cfg.Push.RestaurantsBotWebhookSecret),
 		BookingUpdate: bookings.NewUpdateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingOutbox,
 			restRepo, restRelated, restaurantManagers, txm, bookingCfg),
 		BookingAvail: bookings.NewAvailabilityUseCase(bookingLinks, bookingCapacity, restRepo,
@@ -549,6 +644,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		PaymentOutboxRepo:    paymentOutboxRepo,
 		PaymentProvidersRepo: paymentProvidersRepo,
 		PaymentGateways:      paymentGateways,
+		KaspiDirectory:       kaspiDirectory,
 
 		PaymentCreate:         paymentCreate,
 		PaymentCapture:        paymentCapture,
@@ -581,6 +677,37 @@ func newTelegramAnswerer(cfg Config) telegramhook.Answerer {
 		return nil
 	}
 	return telegramnotify.NewSender(tgCfg)
+}
+
+// newStaffBotSender builds the NEW restaurants bot's client, or nil when it is
+// not fully configured. Same rule as the old bot: both a token (to talk) and a
+// webhook secret (to listen) — a bot that can send buttons nobody can answer is
+// worse than no bot.
+func newStaffBotClient(cfg Config) *telegramnotify.Sender {
+	tgCfg := telegramnotify.Config{BotToken: cfg.Push.RestaurantsBotToken}
+	if !tgCfg.Configured() || strings.TrimSpace(cfg.Push.RestaurantsBotWebhookSecret) == "" {
+		return nil
+	}
+	return telegramnotify.NewSender(tgCfg)
+}
+
+// newStaffBotSender returns the new bot's Answerer, typed nil-safe: returning a
+// typed nil pointer through an interface would produce a non-nil interface that
+// panics on first use.
+func newStaffBotSender(cfg Config) telegramhook.Answerer {
+	if c := newStaffBotClient(cfg); c != nil {
+		return c
+	}
+	return nil
+}
+
+// newStaffBotMessenger returns the new bot's plain-message sender (the reply to
+// an inbound /start), with the same nil-safety.
+func newStaffBotMessenger(cfg Config) telegramhook.Messenger {
+	if c := newStaffBotClient(cfg); c != nil {
+		return c
+	}
+	return nil
 }
 
 func newPayoutPorts(db *pgxpool.Pool, perms permissionCheckerPort, txm domain.TxManager, log *slog.Logger) payouts.Ports {
@@ -979,12 +1106,39 @@ func newPaymentGateways(cfg PaymentsConfig, providers domain.PaymentProviderRepo
 		gateways = append(gateways, gw)
 	}
 
+	kaspiCfg := kaspi.ConfigFromEnv()
+	if err := kaspiCfg.Validate(); err != nil {
+		log.Warn("kaspi adapter not configured, skipping", slog.String("reason", err.Error()))
+	} else {
+		gw, err := kaspi.New(kaspiCfg, client, log)
+		if err != nil {
+			return nil, fmt.Errorf("build kaspi gateway: %w", err)
+		}
+		gateways = append(gateways, gw)
+	}
+
 	fallback := domain.PaymentProvider(cfg.DefaultProvider)
 	registry, err := paymentgw.NewRegistry(providers, fallback, gateways...)
 	if err != nil {
 		return nil, fmt.Errorf("build payment registry: %w", err)
 	}
 	return registry, nil
+}
+
+// newKaspiDirectory builds the read-only client for our Kaspi service's company
+// registry (the superadmin's «Приём оплаты» picker).
+//
+// A misconfigured directory must never stop the API from starting: it feeds one
+// admin screen and no money path, so a failure here is logged and the handler
+// answers 503, the same shape as an acquirer whose credentials are absent.
+func newKaspiDirectory(log *slog.Logger) *kaspi.Directory {
+	dir, err := kaspi.NewDirectory(kaspi.DirectoryConfigFromEnv(), nil)
+	if err != nil {
+		log.Warn("kaspi company directory not configured, the panel picker will answer 503",
+			slog.String("reason", err.Error()))
+		return nil
+	}
+	return dir
 }
 
 // NewPaymentsReconciler wires the background payments reconciliation worker
@@ -1123,14 +1277,25 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	// that needs both the bot token (to send) and the webhook secret (to receive
 	// the press). Buttons that lead nowhere are worse than none — staff press
 	// them and conclude the product is broken.
+	venueActions := func(bookingID uuid.UUID) [][2]string {
+		return [][2]string{
+			{"Подтвердить", telegramhook.CallbackConfirm(bookingID)},
+			{"Отклонить", telegramhook.CallbackReject(bookingID)},
+		}
+	}
 	if tgCfg.Configured() && strings.TrimSpace(cfg.Push.TelegramWebhookSecret) != "" {
 		sender := telegramnotify.NewSender(tgCfg)
-		telegram = telegram.WithActions(sender.SendWithActions, func(bookingID uuid.UUID) [][2]string {
-			return [][2]string{
-				{"Подтвердить", telegramhook.CallbackConfirm(bookingID)},
-				{"Отклонить", telegramhook.CallbackReject(bookingID)},
-			}
-		})
+		telegram = telegram.WithActions(sender.SendWithActions, venueActions)
+	}
+	// Staged migration to @book_eat_restaurants_bot (spec §7). The new bot is
+	// armed for EVERY venue but used only for those whose staff already pressed
+	// Start (telegram_new_bot_ready_at); a 400/403 from it demotes the venue and
+	// the same event goes out through the old bot, so nothing is lost either way.
+	// Absent RESTAURANTS_BOT_TOKEN → this whole block is skipped and the channel
+	// behaves exactly as before the migration.
+	if staff := newStaffBotClient(cfg); staff != nil {
+		telegram = telegram.WithNewBot(staff.Send, staff.SendWithActions, venueActions)
+		log.Info("telegram: staged migration to the restaurants bot is armed")
 	}
 
 	// Guest channel: a THIRD notifier on the same dispatcher — the first one
@@ -1138,25 +1303,15 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	// that consults the guest opt-out gate. Absent GUEST_PUSH_PROVIDER → built
 	// disabled and no-ops (like web push without VAPID keys).
 	var guestSender notifications.MobilePushSender
-	if cfg.Push.GuestPushConfigured() {
-		switch strings.ToLower(strings.TrimSpace(cfg.Push.GuestPushProvider)) {
-		case "expo":
-			guestSender = expopush.NewSender(expopush.Config{
-				AccessToken: cfg.Push.ExpoAccessToken,
-				Endpoint:    cfg.Push.ExpoEndpoint,
-			}).Send
-		default:
-			// An unknown provider name is a config typo, not a reason to crash the
-			// worker: the channel stays a no-op and says so, loudly.
-			log.Error("unknown GUEST_PUSH_PROVIDER — the guest push channel will no-op",
-				slog.String("provider", cfg.Push.GuestPushProvider))
-		}
-	} else {
+	if provider := newGuestPushProvider(cfg, log); provider != nil {
+		guestSender = provider.Send
+	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),
+		notificationrepo.NewPushTickets(db),
 		notifications.NewGuestNotificationGate(consentrepo.NewPreferenceRepository(db)),
 		notificationrepo.NewVenues(db),
 		guestSender,
@@ -1236,6 +1391,61 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 			RetryMaxDelay:  cfg.Push.RetryMaxDelay,
 			MaxAttempts:    cfg.Push.RetryMaxAttempts,
 		}, log, webPush, telegram, guestPush, feedNotifier, whatsAppNotifier)
+}
+
+// newGuestPushProvider builds the mobile push provider client, or nil when none
+// is configured. It is shared by the send path (the guest notifier) and the
+// receipt worker on purpose: those two are the two halves of ONE conversation
+// with the provider, and letting them be configured differently is how you get a
+// service that sends through one project and polls receipts from another.
+func newGuestPushProvider(cfg Config, log *slog.Logger) *expopush.Sender {
+	if !cfg.Push.GuestPushConfigured() {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Push.GuestPushProvider)) {
+	case "expo":
+		return expopush.NewSender(expopush.Config{
+			AccessToken:      cfg.Push.ExpoAccessToken,
+			Endpoint:         cfg.Push.ExpoEndpoint,
+			ReceiptsEndpoint: cfg.Push.ExpoReceiptsEndpoint,
+		})
+	default:
+		// An unknown provider name is a config typo, not a reason to crash the
+		// worker: the channel stays a no-op and says so, loudly.
+		log.Error("unknown GUEST_PUSH_PROVIDER — the guest push channel will no-op",
+			slog.String("provider", cfg.Push.GuestPushProvider))
+		return nil
+	}
+}
+
+// NewPushReceiptWorker wires the guest-push receipt poller, or returns nil when
+// no push provider is configured.
+//
+// Nil rather than a safe-idle loop, which is the OPPOSITE of the rule used for
+// the reconcilers and the dispatcher, and deliberately so: those stay armed
+// because their work exists in the database whether or not a credential is set.
+// Here it cannot — with no provider nothing is ever sent, so push_tickets is
+// permanently empty and the only thing a running loop could produce is a
+// scheduled round-trip to a provider we are not using.
+func NewPushReceiptWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notifications.ReceiptWorker {
+	provider := newGuestPushProvider(cfg, log)
+	if provider == nil {
+		log.Info("push receipt worker not started (no guest push provider configured)")
+		return nil
+	}
+	return notifications.NewReceiptWorker(
+		notificationrepo.NewPushTickets(db),
+		notificationrepo.NewDeviceTokens(db),
+		provider.Receipts,
+		notifications.ReceiptWorkerConfig{
+			TickInterval: cfg.Push.ReceiptsTick,
+			MinAge:       cfg.Push.ReceiptsMinAge,
+			MaxAge:       cfg.Push.ReceiptsMaxAge,
+			BatchSize:    cfg.Push.ReceiptsBatchSize,
+			MaxPerTick:   cfg.Push.ReceiptsMaxPerTick,
+		},
+		log,
+	)
 }
 
 // newOTPSender builds the login-code delivery sender.
@@ -1512,4 +1722,30 @@ func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legac
 		log,
 	)
 	return worker, pool.Close, nil
+}
+
+// staffVenueLister adapts the admin panel's venue picker to the port
+// usecase/auth declares for the mini app. The adapter lives here rather than in
+// either usecase so neither imports the other: usecase/auth keeps depending on
+// domain alone, and "which venues does this person work at" stays one
+// implementation with two callers instead of two implementations that drift.
+type staffVenueLister struct {
+	uc *restaurants.MyRestaurantsUseCase
+}
+
+func (l staffVenueLister) ListForStaff(ctx context.Context, userID uuid.UUID, role domain.Role) ([]auth.StaffVenue, error) {
+	items, err := l.uc.List(ctx, restaurants.Actor{UserID: userID, Role: role})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]auth.StaffVenue, 0, len(items))
+	for _, it := range items {
+		out = append(out, auth.StaffVenue{
+			RestaurantID: it.RestaurantID,
+			Name:         it.Name,
+			NameI18n:     it.NameI18n,
+			Role:         it.Role,
+		})
+	}
+	return out, nil
 }

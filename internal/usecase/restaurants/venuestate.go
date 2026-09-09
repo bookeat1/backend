@@ -74,6 +74,34 @@ type VenueState struct {
 	reader venueStateReader
 	tz     VenueTimezoneResolver
 	clock  func() time.Time
+	// payments answers "can this venue take money online at all". Optional:
+	// unwired, accepts_online_payment is simply absent from the payload — the
+	// guest app then offers no payment button, which is the honest reading of
+	// "this server never said the venue can be paid".
+	payments venuePaymentChecker
+}
+
+// venuePaymentChecker is the minimal slice of the checkout this package needs:
+// one question about a venue, answered by the very code that would create the
+// payment (usecase/payments.CreateUseCase.AcceptsOnlinePayment). Declared here
+// and bound in bootstrap/deps.go to the SAME instance the payment endpoint
+// uses, so the flag and the charge can never run on two different configs.
+//
+// (false, nil) is a definite "no". An error means "could not find out": the
+// enricher then leaves the field nil rather than publishing a guess.
+type venuePaymentChecker interface {
+	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+}
+
+// WithVenuePayments teaches the venue DETAIL read whether the venue can take an
+// online payment (accepts_online_payment).
+//
+// Detail only, on purpose: the listing serves up to a page of venues and the
+// answer costs a per-venue acquirer + split-account lookup that no catalog card
+// renders. The client needs the flag on the screen where the payment button
+// lives, and that screen already reads the detail.
+func WithVenuePayments(p venuePaymentChecker) VenueStateOption {
+	return func(v *VenueState) { v.payments = p }
 }
 
 // VenueStateOption configures optional VenueState dependencies.
@@ -199,7 +227,28 @@ func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggreg
 	st := buildVenueState(data.hours[id], data.overrides[id], data.overridesKnown,
 		v.tz.VenueTimezone(agg.Restaurant),
 		mode, seats, data.tables[id], now)
+	v.attachPayment(ctx, &st, id)
 	agg.VenueState = &st
+}
+
+// attachPayment fills the venue's "can it take money online" flag, asked of the
+// checkout itself. It runs on the DETAIL read only (see WithVenuePayments).
+//
+// Best-effort, like the rest of this enricher, and with the same rule: a venue
+// screen must not fail because an acquirer lookup did. A failed check leaves
+// the field nil — the client sees no flag and offers no payment button, which
+// is what "we do not know" has to look like on a screen with money on it.
+func (v *VenueState) attachPayment(ctx context.Context, st *domain.PublicVenueState, restaurantID uuid.UUID) {
+	if v.payments == nil {
+		return
+	}
+	accepts, err := v.payments.AcceptsOnlinePayment(ctx, restaurantID)
+	if err != nil {
+		slog.Warn("venue online-payment check failed, serving venue without accepts_online_payment",
+			"restaurant_id", restaurantID, "error", err)
+		return
+	}
+	st.AcceptsOnlinePayment = &accepts
 }
 
 // usable reports whether this enricher can do anything at all. A nil receiver

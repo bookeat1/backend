@@ -24,7 +24,7 @@ func TestMenuItemCarriesBothTheLabelAndTheNumericPrice(t *testing.T) {
 		{"4500", 450000},
 	} {
 		m := domain.MenuItem{ID: uuid.New(), RestaurantID: uuid.New(), Name: "Блюдо", Price: tc.price}
-		raw, err := json.Marshal(itemToResponse(&m))
+		raw, err := json.Marshal(itemToResponse(&m, ""))
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
@@ -60,7 +60,7 @@ func TestMenuItemCarriesBothTheLabelAndTheNumericPrice(t *testing.T) {
 // назвать сумму» is honest, «блюдо бесплатное» is a lie about money.
 func TestUnconvertiblePriceIsNullNotZero(t *testing.T) {
 	m := domain.MenuItem{ID: uuid.New(), RestaurantID: uuid.New(), Name: "Блюдо", Price: "по запросу"}
-	raw, err := json.Marshal(itemToResponse(&m))
+	raw, err := json.Marshal(itemToResponse(&m, ""))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestTopPickIsReportedSeparatelyFromIsFeatured(t *testing.T) {
 		IsTopPick       bool `json:"is_top_pick"`
 		TopPickPosition *int `json:"top_pick_position"`
 	}
-	raw, _ := json.Marshal(itemToResponse(&m))
+	raw, _ := json.Marshal(itemToResponse(&m, ""))
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestTopPickIsReportedSeparatelyFromIsFeatured(t *testing.T) {
 	}
 
 	unmarked := domain.MenuItem{ID: uuid.New(), RestaurantID: uuid.New(), Name: "Другое", Price: "1000.00"}
-	raw, _ = json.Marshal(itemToResponse(&unmarked))
+	raw, _ = json.Marshal(itemToResponse(&unmarked, ""))
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}

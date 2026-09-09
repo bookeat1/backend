@@ -687,3 +687,129 @@ func TestVenueStateDegradesWhenOverridesCannotBeRead(t *testing.T) {
 		t.Error("an exceptions window must not be published when the read failed")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// accepts_online_payment — asked of the checkout, on the DETAIL read only
+// ---------------------------------------------------------------------------
+
+// fakeVenuePayments is a hand-written venuePaymentChecker. It records which
+// venues it was asked about, so a test can prove the listing does NOT ask.
+type fakeVenuePayments struct {
+	accepts map[uuid.UUID]bool
+	err     error
+	asked   []uuid.UUID
+}
+
+func (f *fakeVenuePayments) AcceptsOnlinePayment(_ context.Context, restaurantID uuid.UUID) (bool, error) {
+	f.asked = append(f.asked, restaurantID)
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.accepts[restaurantID], nil
+}
+
+func newPaymentFlagFacade(t *testing.T, id uuid.UUID, pay *fakeVenuePayments) Facade {
+	t.Helper()
+	rest := domain.Restaurant{ID: id}
+	repo := &fakeRestaurantRepo{
+		list: []domain.RestaurantListItem{{Restaurant: rest}},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	}
+	state := &fakeVenueState{
+		hours:  map[uuid.UUID][]domain.WorkingHours{id: openEveryDay("11:00", "22:00")},
+		tables: map[uuid.UUID]int{id: 4},
+	}
+	return NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
+		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"}, WithVenuePayments(pay))))
+}
+
+// TestDetailReportsWhetherTheVenueTakesOnlinePayment: both answers are
+// published explicitly, so the app can tell "no" from "we did not say".
+func TestDetailReportsWhetherTheVenueTakesOnlinePayment(t *testing.T) {
+	for _, accepts := range []bool{true, false} {
+		id := uuid.New()
+		pay := &fakeVenuePayments{accepts: map[uuid.UUID]bool{id: accepts}}
+		f := newPaymentFlagFacade(t, id, pay)
+
+		agg, err := f.Get(context.Background(), id)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if agg.VenueState == nil || agg.VenueState.AcceptsOnlinePayment == nil {
+			t.Fatalf("detail must carry accepts_online_payment (wanted %v)", accepts)
+		}
+		if got := *agg.VenueState.AcceptsOnlinePayment; got != accepts {
+			t.Fatalf("accepts_online_payment = %v, want %v", got, accepts)
+		}
+	}
+}
+
+// TestListingDoesNotComputeTheOnlinePaymentFlag: the field stays ABSENT on
+// catalog rows, and — the reason it is absent — the listing never pays for the
+// per-venue acquirer lookup. Absent is a safe reading for the client (no flag →
+// no payment button), while a false would be a claim the listing never checked.
+func TestListingDoesNotComputeTheOnlinePaymentFlag(t *testing.T) {
+	id := uuid.New()
+	pay := &fakeVenuePayments{accepts: map[uuid.UUID]bool{id: true}}
+	f := newPaymentFlagFacade(t, id, pay)
+
+	items, _, err := f.List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if items[0].VenueState == nil {
+		t.Fatal("list item must still carry the rest of the venue state")
+	}
+	if items[0].VenueState.AcceptsOnlinePayment != nil {
+		t.Fatalf("listing must not publish accepts_online_payment, got %v", *items[0].VenueState.AcceptsOnlinePayment)
+	}
+	if len(pay.asked) != 0 {
+		t.Fatalf("listing asked the checkout about %d venues, want 0 (N+1 acquirer lookups)", len(pay.asked))
+	}
+}
+
+// TestOnlinePaymentFlagAbsentWhenTheCheckFails: a failed acquirer lookup leaves
+// the field out entirely rather than publishing "false". The venue screen still
+// renders — money aside, it is the same best-effort rule the rest of the venue
+// state follows.
+func TestOnlinePaymentFlagAbsentWhenTheCheckFails(t *testing.T) {
+	id := uuid.New()
+	pay := &fakeVenuePayments{err: errors.New("acquirer registry unreadable")}
+	f := newPaymentFlagFacade(t, id, pay)
+
+	agg, err := f.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("detail must still succeed: %v", err)
+	}
+	if agg.VenueState == nil {
+		t.Fatal("the rest of the venue state must still be attached")
+	}
+	if agg.VenueState.AcceptsOnlinePayment != nil {
+		t.Fatalf("a failed check must leave the flag absent, got %v", *agg.VenueState.AcceptsOnlinePayment)
+	}
+}
+
+// TestOnlinePaymentFlagAbsentWhenNotWired: a deployment that never wired the
+// checker serves the venue exactly as before, with no flag at all.
+func TestOnlinePaymentFlagAbsentWhenNotWired(t *testing.T) {
+	id := uuid.New()
+	rest := domain.Restaurant{ID: id}
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: rest}}
+	state := &fakeVenueState{
+		hours:  map[uuid.UUID][]domain.WorkingHours{id: openEveryDay("11:00", "22:00")},
+		tables: map[uuid.UUID]int{id: 4},
+	}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{},
+		WithVenueState(NewVenueState(state, fixedTZ{tz: "Asia/Almaty"})))
+
+	agg, err := f.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if agg.VenueState == nil {
+		t.Fatal("the venue state itself must still be attached")
+	}
+	if agg.VenueState.AcceptsOnlinePayment != nil {
+		t.Fatal("an unwired checker must leave the flag absent, not defaulted")
+	}
+}

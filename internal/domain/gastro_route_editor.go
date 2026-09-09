@@ -41,6 +41,10 @@ type GastroRouteAdminDetail struct {
 // partial-update protocol would make "clear the description" and "do not touch
 // the description" indistinguishable.
 //
+// The *I18n maps arrive ALREADY MERGED — the request carries a partial patch
+// (I18nPatch) and the usecase merges it onto the stored map before this struct
+// is built. See GuideCollectionWrite for the full reasoning.
+//
 // Status and PublishedAt are NOT here — publication is its own operation with
 // its own precondition, so a typo fix can never take a route live.
 type GastroRouteWrite struct {

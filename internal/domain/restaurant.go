@@ -50,19 +50,37 @@ func (p PriceCategory) Valid() bool {
 	return p == PriceLow || p == PriceMid || p == PriceHigh
 }
 
-// I18n is a localized field of shape {"ru":...,"kk":...,"en":...}. Nil when the
-// column is NULL.
+// I18n is a localized field of shape {"ru":...,"kk":...,"en":...,"ko":...,
+// "zh":...}. Nil when the column is NULL. A map never has to carry every
+// language: I18n.Resolve falls back to the base column for anything missing.
 type I18n map[string]string
 
 // SupportedLocales lists the language codes the catalog can serve translated
 // text in. ru is the permanent default (the base scalar columns, e.g. `name`,
 // are themselves Russian text) — see LocaleRU.
-var SupportedLocales = []string{"ru", "kk", "en"}
+//
+// This slice is the ONLY place the set of languages is written down. Everything
+// else — request resolution (reqlocale.Resolve), write validation
+// (I18nPatch.Validate), the full-object payloads (fullI18n) and the derived
+// cuisine strings (CuisineI18nFromSet) — reads it or reads IsSupportedLocale.
+// Adding a language here is what makes it servable; nothing else enumerates
+// the set, and nothing in the database constrains it (the *_i18n columns are
+// plain jsonb, deliberately — see migration 0101).
+//
+// ko and zh joined on 2026-09-02: their texts had been sitting in the venue
+// description maps since the legacy import, and until then reqlocale answered
+// ru for both, so nobody could read them.
+var SupportedLocales = []string{"ru", "kk", "en", "ko", "zh"}
 
 const (
 	LocaleRU = "ru"
 	LocaleKK = "kk"
 	LocaleEN = "en"
+	LocaleKO = "ko"
+	// LocaleZH is Chinese as ONE locale. Script subtags collapse into it:
+	// see NormalizeLocale for why zh-Hant is served Simplified rather than
+	// pretending to be a locale of its own.
+	LocaleZH = "zh"
 )
 
 // IsSupportedLocale reports whether lang is one of SupportedLocales.
@@ -87,6 +105,43 @@ func (i I18n) Resolve(lang, base string) string {
 		return v
 	}
 	return base
+}
+
+// WithLocale returns a COPY of i whose lang entry is v, leaving every other
+// language untouched. i itself is never mutated: the map usually comes from a
+// row just read out of the database and may be shared with the caller's
+// aggregate.
+//
+// It exists to keep ONE invariant that the whole i18n scheme silently depends
+// on: the plain column and i[LocaleRU] are the same Russian text. Reads resolve
+// through the map first (Resolve), so a write that touched only the column
+// would land in a value nobody reads back — and the next read would hand the
+// stale translation straight back to the editor (see applyRestaurant).
+//
+// An empty v REMOVES the entry rather than storing "": Resolve already treats
+// an empty translation as missing, and keeping the key would leave a value that
+// reads as absent but shows up in the payload. A map left with no entries at
+// all comes back nil, so the column stays NULL instead of becoming `{}`.
+func (i I18n) WithLocale(lang, v string) I18n {
+	if lang == "" {
+		return i
+	}
+	if len(i) == 0 && v == "" {
+		return nil
+	}
+	out := make(I18n, len(i)+1)
+	for k, val := range i {
+		out[k] = val
+	}
+	if v == "" {
+		delete(out, lang)
+	} else {
+		out[lang] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Restaurant is a venue in the catalog. ID equals the original Supabase id.
@@ -126,8 +181,16 @@ type Restaurant struct {
 	// policy (Wave 3). Nil fields fall back to the BOOKING_DEFAULT_* env values;
 	// resolution lives in usecase/bookings.
 	BookingPolicy BookingPolicyOverride
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total in
+	// int64 MINOR units (restaurants.preorder_min_amount_minor, migration 0042;
+	// the same value PaymentSettingsOverride.PreorderMinAmountMinor carries for
+	// the payment flow, read here directly for the public payload). nil = no
+	// minimum set. Scanned only by the detail read (GetByID, see policyCols'
+	// neighbour preorderCols) — a catalog listing row leaves it nil, which is
+	// what keeps it absent from the listing JSON without a second mechanism.
+	PreorderMinAmountMinor *int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // RestaurantAggregate is a restaurant with its inline collections, matching the
@@ -192,8 +255,18 @@ const CatalogScanLimit = 2000
 
 // RestaurantFilter narrows a listing query. Zero-value fields are ignored.
 type RestaurantFilter struct {
-	City      *City
-	Category  *uuid.UUID
+	City     *City
+	Category *uuid.UUID
+	// IDs restricts the listing to these venues. Nil/empty means no
+	// restriction; a non-empty slice is an OR-set (r.id = ANY(...)).
+	//
+	// It exists for the hand-picked rails, which know WHICH venues they want
+	// and need everything else the catalog listing attaches — images, cuisines,
+	// features, venue state. Note that it does not carry ORDER: the listing
+	// still comes back in catalog order (display_order, name), and a caller
+	// that curated an order re-applies it over the result (see
+	// usecase/homepicks).
+	IDs       []uuid.UUID
 	IsPopular *bool
 	IsNew     *bool
 	Search    string // case-insensitive substring match on name
@@ -222,8 +295,12 @@ type RestaurantFilter struct {
 // catalog listing. Only active restaurants are ever returned.
 type RestaurantSearchFilter struct {
 	// Query is free text matched against the venue's name + description across
-	// ALL locales (base ru columns plus every *_i18n translation). Empty Query
-	// means "no text constraint" — the search degrades to a filtered browse.
+	// ALL locales (base ru columns plus every *_i18n translation) AND against
+	// the names of its AVAILABLE menu items (also across all locales). A venue
+	// therefore answers «паста» either because it says so about itself or
+	// because it cooks it; a dish in the stop list (is_available = false) never
+	// pulls its venue into the result. Empty Query means "no text constraint" —
+	// the search degrades to a filtered browse.
 	Query string
 	// City, Cuisines and Price are AND-combined with the text query. Cuisines is
 	// an OR-set (cuisine_type IN (...)); an empty/nil slice means "any cuisine".
@@ -254,9 +331,11 @@ type RestaurantRepository interface {
 	// Ordering: display_order (NULLs last), then name. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
 	// Search returns active restaurants matching f's text query and filters plus
-	// the total count. When f.Query is non-empty, results are ranked by full-text
-	// relevance then trigram word-similarity, with a deterministic id tie-break
-	// so pagination is stable; when it is empty, ordering matches ListActive.
+	// the total count. When f.Query is non-empty, venues matched by their own
+	// name/description rank above venues matched only through a menu item, then
+	// by full-text relevance, then trigram word-similarity, with a deterministic
+	// id tie-break so pagination is stable; when it is empty, ordering matches
+	// ListActive. Rows matched through the menu carry MatchedDish.
 	Search(ctx context.Context, f RestaurantSearchFilter) ([]RestaurantListItem, int, error)
 	SetActive(ctx context.Context, id uuid.UUID, active bool) error
 	// UpdateBookingPolicy patches the venue's booking-policy overrides: only
@@ -279,6 +358,25 @@ type RestaurantListItem struct {
 	Features []VenueFeature
 	// VenueState — see RestaurantAggregate.VenueState. Nil = not computed.
 	VenueState *PublicVenueState
+	// MatchedDish is the dish that pulled this venue into a SEARCH result, and
+	// is set only by Search and only when the text query matched a menu item.
+	// Nil everywhere else — the catalog listing has no query and therefore no
+	// answer to "why is this here".
+	//
+	// It exists because a venue found by its menu is otherwise inexplicable:
+	// the guest types «паста», gets a venue whose name, description and cuisine
+	// say nothing about pasta, and has to trust it. The card can now say which
+	// dish matched.
+	MatchedDish *MatchedDish
+}
+
+// MatchedDish is the best-matching available menu item behind a search hit —
+// just enough to render a caption, not a menu row (no price, no image: the card
+// explains the match, it does not sell the dish).
+type MatchedDish struct {
+	ID       uuid.UUID
+	Name     string
+	NameI18n I18n
 }
 
 // RestaurantBrief is a minimal (id, localizable name) row. It backs the

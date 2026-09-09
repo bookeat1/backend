@@ -73,7 +73,7 @@ type telegramSettings interface {
 // method takes restaurantID and enforces item ownership against it (IDOR guard
 // lives in menu.Facade / the repo's restaurant_id predicate).
 type menuStore interface {
-	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID, lang *string) ([]domain.MenuItem, error)
+	ListByRestaurant(ctx context.Context, restaurantID uuid.UUID) ([]domain.MenuItem, error)
 	Categories(ctx context.Context) ([]domain.MenuCategory, error)
 	Create(ctx context.Context, restaurantID uuid.UUID, in menu.ItemInput) (*domain.MenuItem, error)
 	Update(ctx context.Context, restaurantID, itemID uuid.UUID, in menu.ItemInput) (*domain.MenuItem, error)

@@ -68,14 +68,22 @@ type Facade interface {
 type CreateInput struct {
 	// RestaurantID is the venue running the offer. nil creates a PLATFORM
 	// promo, which only domain.CanManagePlatformContent roles may do.
-	RestaurantID    *uuid.UUID
-	Title           string
-	TitleI18n       domain.I18n
+	RestaurantID *uuid.UUID
+	Title        string
+	// The *I18n fields are PARTIAL translation updates (domain.I18nPatch): a
+	// named language is written, a null one removed, an unmentioned one kept.
+	// Unlike the scalar fields around them, which this payload replaces whole,
+	// they never wipe a language the request did not mention — a cabinet
+	// editing Kazakh must not have to resend English to keep it. The plain
+	// field is the Russian text and always wins over a `ru` key in the map
+	// (domain.ApplyTranslations).
+	TitleI18n       domain.I18nPatch
 	Description     string
-	DescriptionI18n domain.I18n
+	DescriptionI18n domain.I18nPatch
 	StartsAt        time.Time
 	EndsAt          time.Time
 	Terms           string
+	TermsI18n       domain.I18nPatch
 	CoverImageURL   *string
 	DiscountPercent *int
 	Status          domain.PromoStatus
@@ -91,13 +99,15 @@ type CreateInput struct {
 
 // UpdateInput carries a promo's mutable fields (full replace).
 type UpdateInput struct {
-	Title           string
-	TitleI18n       domain.I18n
+	Title string
+	// PARTIAL translation updates — see CreateInput.
+	TitleI18n       domain.I18nPatch
 	Description     string
-	DescriptionI18n domain.I18n
+	DescriptionI18n domain.I18nPatch
 	StartsAt        time.Time
 	EndsAt          time.Time
 	Terms           string
+	TermsI18n       domain.I18nPatch
 	CoverImageURL   *string
 	DiscountPercent *int
 	Status          domain.PromoStatus
@@ -162,6 +172,9 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if status == "" {
 		status = domain.PromoDraft
 	}
+	if err := validateTranslations(in.TitleI18n, in.DescriptionI18n, in.TermsI18n); err != nil {
+		return nil, err
+	}
 	city, err := f.cityOverride(ctx, in.City)
 	if err != nil {
 		return nil, err
@@ -170,12 +183,13 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 		RestaurantID:    in.RestaurantID,
 		City:            city,
 		Title:           strings.TrimSpace(in.Title),
-		TitleI18n:       in.TitleI18n,
+		TitleI18n:       domain.ApplyTranslations(nil, in.TitleI18n, strings.TrimSpace(in.Title)),
 		Description:     in.Description,
-		DescriptionI18n: in.DescriptionI18n,
+		DescriptionI18n: domain.ApplyTranslations(nil, in.DescriptionI18n, in.Description),
 		StartsAt:        in.StartsAt,
 		EndsAt:          in.EndsAt,
 		Terms:           in.Terms,
+		TermsI18n:       domain.ApplyTranslations(nil, in.TermsI18n, in.Terms),
 		CoverImageURL:   in.CoverImageURL,
 		DiscountPercent: in.DiscountPercent,
 		Status:          status,
@@ -223,6 +237,9 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	if err := f.authorize(ctx, actor, p.RestaurantID); err != nil {
 		return nil, err
 	}
+	if err := validateTranslations(in.TitleI18n, in.DescriptionI18n, in.TermsI18n); err != nil {
+		return nil, err
+	}
 	// Whether the CARD's content actually changed is decided before anything is
 	// overwritten. Update carries Status too, and hiding then re-publishing an
 	// approved promo goes through this same method — demoting for that would
@@ -235,15 +252,25 @@ func (f *facade) Update(ctx context.Context, actor Actor, promoID uuid.UUID, in 
 	// The city override is moderated content too: it decides WHICH city's main
 	// screen the approved card can reach. Compared on the RESOLVED value, so
 	// re-saving «almaty» over a stored «Алматы» is not an edit.
-	contentChanged := promoContentChanged(*p, in) || !cityPtrEqual(city, p.City)
+	// The translation maps are compared as they will BE STORED, not as they
+	// arrived: a patch is partial, so "what the request said" and "what the
+	// card will read" are two different objects, and only the second one tells
+	// a moderator whether the words they approved still stand.
+	title := strings.TrimSpace(in.Title)
+	titleI18n := domain.ApplyTranslations(p.TitleI18n, in.TitleI18n, title)
+	descI18n := domain.ApplyTranslations(p.DescriptionI18n, in.DescriptionI18n, in.Description)
+	termsI18n := domain.ApplyTranslations(p.TermsI18n, in.TermsI18n, in.Terms)
+	contentChanged := promoContentChanged(*p, in, titleI18n, descI18n, termsI18n) ||
+		!cityPtrEqual(city, p.City)
 
-	p.Title = strings.TrimSpace(in.Title)
-	p.TitleI18n = in.TitleI18n
+	p.Title = title
+	p.TitleI18n = titleI18n
 	p.Description = in.Description
-	p.DescriptionI18n = in.DescriptionI18n
+	p.DescriptionI18n = descI18n
 	p.StartsAt = in.StartsAt
 	p.EndsAt = in.EndsAt
 	p.Terms = in.Terms
+	p.TermsI18n = termsI18n
 	p.CoverImageURL = in.CoverImageURL
 	p.DiscountPercent = in.DiscountPercent
 	p.Status = in.Status
@@ -494,7 +521,7 @@ func validatePromo(p *domain.Promo) error {
 // actually reviewed: the words shown on the card and the window it runs in.
 // Status is excluded on purpose — publishing or hiding is the venue's own
 // lever over its card and changes nothing a moderator read.
-func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
+func promoContentChanged(cur domain.Promo, in UpdateInput, titleI18n, descI18n, termsI18n domain.I18n) bool {
 	return strings.TrimSpace(in.Title) != cur.Title ||
 		in.Description != cur.Description ||
 		in.Terms != cur.Terms ||
@@ -502,8 +529,22 @@ func promoContentChanged(cur domain.Promo, in UpdateInput) bool {
 		!intPtrEqual(in.DiscountPercent, cur.DiscountPercent) ||
 		!in.StartsAt.Equal(cur.StartsAt) ||
 		!in.EndsAt.Equal(cur.EndsAt) ||
-		!i18nEqual(in.TitleI18n, cur.TitleI18n) ||
-		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n)
+		!domain.I18nRenderEqual(strings.TrimSpace(in.Title), titleI18n, cur.Title, cur.TitleI18n) ||
+		!domain.I18nRenderEqual(in.Description, descI18n, cur.Description, cur.DescriptionI18n) ||
+		!domain.I18nRenderEqual(in.Terms, termsI18n, cur.Terms, cur.TermsI18n)
+}
+
+// validateTranslations refuses a translation patch nothing could honestly
+// store: an unsupported language, two spellings of the same one, or an attempt
+// to delete `ru` (which lives in the plain column, not in the map).
+func validateTranslations(title, description, terms domain.I18nPatch) error {
+	if err := title.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := description.Validate("description_i18n"); err != nil {
+		return err
+	}
+	return terms.Validate("terms_i18n")
 }
 
 // strPtrEqual compares two optional strings by value: two nils are equal, and a
@@ -522,18 +563,4 @@ func intPtrEqual(a, b *int) bool {
 		return a == b
 	}
 	return *a == *b
-}
-
-// i18nEqual compares two localized maps by content: a nil map and an empty one
-// mean the same thing to a reader, so they must not count as an edit.
-func i18nEqual(a, b domain.I18n) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
 }

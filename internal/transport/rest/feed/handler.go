@@ -374,7 +374,7 @@ func newCardResponse(r domain.RankedFeedItem, lang string) cardResponse {
 		EndsAt:          r.Item.EndsAt.Format(time.RFC3339),
 		CoverImageURL:   r.Item.CoverImageURL,
 		Images:          imagesOrEmpty(r.Item.Images),
-		Terms:           r.Item.Terms,
+		Terms:           r.Item.TermsI18n.Resolve(lang, r.Item.Terms),
 		DiscountPercent: r.Item.DiscountPercent,
 		Score:           r.Score.Total,
 		ScoreReasons:    reasons,

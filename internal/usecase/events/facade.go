@@ -9,6 +9,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -62,6 +63,13 @@ type Facade interface {
 	// domain.CanManagePlatformContent, not by a per-restaurant permission —
 	// there is no restaurant to check one at.
 	ListPlatformAdmin(ctx context.Context, actor Actor, statuses []domain.EventStatus, page, perPage int) ([]domain.Event, int, error)
+	// ResetSeriesContent hands the named content fields of one DATE back to
+	// its series (migration 0097): the series values are copied onto the event
+	// and the override markers for those fields are cleared, so the date
+	// follows the series again. An empty field list resets every content
+	// field. ErrValidation when the event belongs to no series. Requires
+	// PermRestaurantManage at the event's own restaurant.
+	ResetSeriesContent(ctx context.Context, actor Actor, eventID uuid.UUID, fields []domain.EventContentField) (*domain.Event, error)
 	// SetRefundPolicy sets the venue's OWN ticket-refund rules for one event
 	// without going through the full-replace Update. Requires
 	// PermRestaurantManage at the event's own restaurant. A change here applies
@@ -92,14 +100,20 @@ type Facade interface {
 type CreateInput struct {
 	// RestaurantID is the host venue. nil creates a PLATFORM event — one with
 	// no venue at all — which only domain.CanManagePlatformContent roles may do.
-	RestaurantID     *uuid.UUID
-	Title            string
-	TitleI18n        domain.I18n
+	RestaurantID *uuid.UUID
+	Title        string
+	// The *I18n fields are PARTIAL translation updates (domain.I18nPatch): a
+	// named language is written, a null one removed, an unmentioned one kept —
+	// unlike the scalar fields around them, which this payload replaces whole.
+	// The plain field is the Russian text and wins over a `ru` key in the map
+	// (domain.ApplyTranslations).
+	TitleI18n        domain.I18nPatch
 	Description      string
-	DescriptionI18n  domain.I18n
+	DescriptionI18n  domain.I18nPatch
 	StartsAt         time.Time
 	EndsAt           time.Time
 	Venue            string
+	VenueI18n        domain.I18nPatch
 	CoverImageURL    *string
 	Status           domain.EventStatus
 	Ticketed         bool
@@ -128,18 +142,24 @@ type CreateInput struct {
 	// Action with a nil URL is a button onto the event's OWN page; with a URL it
 	// is an external link, validated before it is stored.
 	Action *domain.EventAction
+	// ActionLabelI18n patches the BUTTON's caption translations. Meaningful
+	// only together with Action: a caption that does not exist cannot be
+	// translated (the DB CHECK from migration 0101 says so too).
+	ActionLabelI18n domain.I18nPatch
 }
 
 // UpdateInput carries an event's mutable fields (full replace). Status must be
 // a valid EventStatus.
 type UpdateInput struct {
-	Title            string
-	TitleI18n        domain.I18n
+	Title string
+	// PARTIAL translation updates — see CreateInput.
+	TitleI18n        domain.I18nPatch
 	Description      string
-	DescriptionI18n  domain.I18n
+	DescriptionI18n  domain.I18nPatch
 	StartsAt         time.Time
 	EndsAt           time.Time
 	Venue            string
+	VenueI18n        domain.I18nPatch
 	CoverImageURL    *string
 	Status           domain.EventStatus
 	Ticketed         bool
@@ -173,6 +193,11 @@ type UpdateInput struct {
 	// the safe default for an older cabinet build — it removes a button nobody
 	// could have added from that build, rather than stranding one it cannot see.
 	Action *domain.EventAction
+	// ActionLabelI18n patches the button caption's translations, merged onto
+	// the translations the button ALREADY had. Removing the button removes them
+	// with it: the caption is gone, so a translation of it would be a
+	// translation of nothing.
+	ActionLabelI18n domain.I18nPatch
 }
 
 // occurrenceSkipRecorder tombstones one slot of a recurrence rule so the
@@ -182,6 +207,20 @@ type UpdateInput struct {
 // feedModerator above.
 type occurrenceSkipRecorder interface {
 	RecordSkip(ctx context.Context, recurrenceID uuid.UUID, slot time.Time) error
+}
+
+// seriesContentReader is the minimal slice of the recurrence repository this
+// package needs: "what does the SERIES this date belongs to say?". Declared
+// here and bound in bootstrap (to the event-recurrence repository), so the
+// events usecase never depends on usecase/eventrecurrence — the same one-effect
+// port shape as feedModerator and occurrenceSkipRecorder above.
+//
+// It answers two questions and only those two: which fields of an edited date
+// now differ from its series (and are therefore this date's own — see
+// domain.EventContentDiff), and what content to put back when an override is
+// reset.
+type seriesContentReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.EventRecurrence, error)
 }
 
 // cityResolver is the minimal slice of usecase/cities this package needs:
@@ -206,6 +245,9 @@ type facade struct {
 	// 0084 — the raw string is compared to the stored spelling, and an event's
 	// own city override is validated against the two legacy constants.
 	cities cityResolver
+	// series reads the rule a generated occurrence belongs to (see
+	// WithSeriesContent). Nil unless wired.
+	series seriesContentReader
 	clock  func() time.Time
 }
 
@@ -221,6 +263,21 @@ type Option func(*facade)
 // touch a generated event.
 func WithOccurrenceSkips(r occurrenceSkipRecorder) Option {
 	return func(f *facade) { f.skips = r }
+}
+
+// WithSeriesContent wires the reader of the recurrence rules, which is what
+// lets a single DATE of a series be told apart from the series itself
+// (migration 0097).
+//
+// Without it the facade still works exactly as it did before 0097, with one
+// documented consequence: editing one date of a series no longer records WHICH
+// fields that date now owns, so the next edit of the series would overwrite
+// them. The existing override markers are never dropped in that case — a
+// missing dependency must not silently un-own a venue's poster. bootstrap
+// always supplies it; only tests that never touch a generated occurrence may
+// omit it.
+func WithSeriesContent(r seriesContentReader) Option {
+	return func(f *facade) { f.series = r }
 }
 
 // WithCityResolver teaches the events usecase the city dictionary (migration
@@ -271,20 +328,25 @@ func (f *facade) Create(ctx context.Context, actor Actor, in CreateInput) (*doma
 	if err != nil {
 		return nil, err
 	}
+	if err := validateEventTranslations(in.TitleI18n, in.DescriptionI18n, in.VenueI18n, in.ActionLabelI18n); err != nil {
+		return nil, err
+	}
 	action := in.Action
 	if err := domain.ValidateEventAction(action); err != nil {
 		return nil, err
 	}
+	applyActionLabelTranslations(action, nil, in.ActionLabelI18n)
 	e := &domain.Event{
 		RestaurantID:     in.RestaurantID,
 		Action:           action,
 		Title:            strings.TrimSpace(in.Title),
-		TitleI18n:        in.TitleI18n,
+		TitleI18n:        domain.ApplyTranslations(nil, in.TitleI18n, strings.TrimSpace(in.Title)),
 		Description:      in.Description,
-		DescriptionI18n:  in.DescriptionI18n,
+		DescriptionI18n:  domain.ApplyTranslations(nil, in.DescriptionI18n, in.Description),
 		StartsAt:         in.StartsAt,
 		EndsAt:           in.EndsAt,
 		Venue:            in.Venue,
+		VenueI18n:        domain.ApplyTranslations(nil, in.VenueI18n, in.Venue),
 		City:             city,
 		CoverImageURL:    in.CoverImageURL,
 		Status:           status,
@@ -330,6 +392,9 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
 		return nil, err
 	}
+	if err := validateEventTranslations(in.TitleI18n, in.DescriptionI18n, in.VenueI18n, in.ActionLabelI18n); err != nil {
+		return nil, err
+	}
 	// Decided before anything is overwritten: only a change to what a moderator
 	// actually read counts as an edit. Publishing or hiding an event travels
 	// through this same method, and re-queueing a venue for that would punish
@@ -346,8 +411,18 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	// The button is moderated content as much as the words are: it is what a
 	// guest taps, and repointing it at another site after approval is exactly
 	// the substitution moderation exists to catch.
-	contentChanged := eventContentChanged(*e, in) || !cityPtrEqual(city, e.City) ||
-		!actionEqual(in.Action, e.Action)
+	// The translation maps are compared AS THEY WILL BE STORED: a patch is
+	// partial, so "what the request said" and "what the card will read" are two
+	// different objects, and only the second answers whether the approved words
+	// still stand.
+	title := strings.TrimSpace(in.Title)
+	titleI18n := domain.ApplyTranslations(e.TitleI18n, in.TitleI18n, title)
+	descI18n := domain.ApplyTranslations(e.DescriptionI18n, in.DescriptionI18n, in.Description)
+	venueI18n := domain.ApplyTranslations(e.VenueI18n, in.VenueI18n, in.Venue)
+	action := in.Action
+	applyActionLabelTranslations(action, storedActionLabelI18n(e.Action), in.ActionLabelI18n)
+	contentChanged := eventContentChanged(*e, in, titleI18n, descI18n, venueI18n) ||
+		!cityPtrEqual(city, e.City) || !actionEqual(action, e.Action)
 	// Moving a generated occurrence to another time frees its ORIGINAL slot, so
 	// that slot needs the same tombstone a delete leaves — otherwise the next
 	// pass fills the old date back in and the venue ends up with both.
@@ -357,13 +432,14 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		}
 	}
 
-	e.Title = strings.TrimSpace(in.Title)
-	e.TitleI18n = in.TitleI18n
+	e.Title = title
+	e.TitleI18n = titleI18n
 	e.Description = in.Description
-	e.DescriptionI18n = in.DescriptionI18n
+	e.DescriptionI18n = descI18n
 	e.StartsAt = in.StartsAt
 	e.EndsAt = in.EndsAt
 	e.Venue = in.Venue
+	e.VenueI18n = venueI18n
 	e.City = city
 	e.CoverImageURL = in.CoverImageURL
 	e.Status = in.Status
@@ -371,7 +447,7 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 	e.TicketPriceMinor = in.TicketPriceMinor
 	e.Capacity = in.Capacity
 	e.Tags = normalizeTags(in.Tags)
-	e.Action = in.Action
+	e.Action = action
 	if err := domain.ValidateEventAction(e.Action); err != nil {
 		return nil, err
 	}
@@ -380,6 +456,15 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		e.TicketRefundCutoffMinutes = in.RefundPolicy.CutoffMinutes
 	}
 	if err := validateEvent(e); err != nil {
+		return nil, err
+	}
+	// A date of a series records WHICH content it now owns. Derived from the
+	// diff against the series rather than declared by the client: the cabinet
+	// sends the date as a full replace and always has, so nothing has to change
+	// on the wire for an existing build — and re-typing the series text on a
+	// date hands that field BACK to the series instead of freezing a copy of
+	// today's wording. See domain.EventContentDiff.
+	if err := f.markContentOverrides(ctx, e); err != nil {
 		return nil, err
 	}
 	// Demote BEFORE writing the new content: the platform approved specific
@@ -402,6 +487,92 @@ func (f *facade) Update(ctx context.Context, actor Actor, eventID uuid.UUID, in 
 		return nil, err
 	}
 	e.Images = normalizeImages(in.Images)
+	return e, nil
+}
+
+// markContentOverrides recomputes e.ContentOverrides from the difference
+// between this date's content and its series'.
+//
+// A one-off event (no rule) can own nothing — there is no series to inherit
+// from — so its marker list is cleared. A date whose rule has been deleted
+// (recurrence_id nulled by ON DELETE SET NULL) is left exactly as it is: it is
+// an ordinary event now, and rewriting a marker list nothing reads would be
+// churn. Same for a facade with no series reader wired: keep what is stored
+// rather than silently un-owning a poster (see WithSeriesContent).
+func (f *facade) markContentOverrides(ctx context.Context, e *domain.Event) error {
+	if e.RecurrenceID == nil {
+		e.ContentOverrides = nil
+		return nil
+	}
+	if f.series == nil {
+		return nil
+	}
+	rec, err := f.series.GetByID(ctx, *e.RecurrenceID)
+	if err != nil {
+		// The rule vanished between the read and here: the row is an ordinary
+		// event now and the edit must not fail because of it.
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	e.ContentOverrides = domain.EventContentDiff(rec.Content(), e.Content())
+	return nil
+}
+
+// ResetSeriesContent hands the named content fields of ONE date back to its
+// series: the series values are copied onto the date and the override markers
+// for those fields disappear, so every later edit of the series reaches this
+// date again. An empty field list resets everything.
+//
+// It is a separate operation rather than "send the series text through Update"
+// because the cabinet must be able to say "стоп, эта дата снова как все" in one
+// click, without knowing what the series currently says. The authorization is
+// the same resolve-the-event-then-check-its-restaurant gate every other event
+// mutation uses.
+func (f *facade) ResetSeriesContent(ctx context.Context, actor Actor, eventID uuid.UUID, fields []domain.EventContentField) (*domain.Event, error) {
+	e, err := f.repo.GetByID(ctx, eventID)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.authorize(ctx, actor, e.RestaurantID); err != nil {
+		return nil, err
+	}
+	if e.RecurrenceID == nil {
+		return nil, fmt.Errorf("%w: this event does not belong to a series", domain.ErrValidation)
+	}
+	if f.series == nil {
+		return nil, fmt.Errorf("resetting series content is not available: no recurrence source is wired")
+	}
+	if len(fields) == 0 {
+		fields = domain.EventContentFields
+	}
+	for _, fld := range fields {
+		if !fld.Valid() {
+			return nil, fmt.Errorf("%w: unknown content field %q", domain.ErrValidation, fld)
+		}
+	}
+	rec, err := f.series.GetByID(ctx, *e.RecurrenceID)
+	if err != nil {
+		return nil, err
+	}
+	before := e.Content()
+	domain.ApplyEventContent(e, rec.Content(), fields)
+	e.ContentOverrides = domain.EventContentDiff(rec.Content(), e.Content())
+	// Nothing to do — and, importantly, nothing to re-moderate: a reset that
+	// changes no word must not cost the venue a review.
+	changed := len(domain.EventContentDiff(before, e.Content())) > 0
+	if changed && domain.FeedDemotableAfterContentEdit(e.RestaurantID) {
+		// Same ordering and the same reason as Update: the platform approved
+		// the words that are being replaced.
+		if err := f.feed.DemoteAfterContentEdit(ctx, domain.FeedItemEvent, eventID); err != nil {
+			return nil, err
+		}
+	}
+	if err := f.repo.Update(ctx, e); err != nil {
+		return nil, err
+	}
+	f.attachImages(ctx, e)
 	return e, nil
 }
 
@@ -650,7 +821,7 @@ func cityPtrEqual(a, b *domain.City) bool {
 	return *a == *b
 }
 
-func eventContentChanged(cur domain.Event, in UpdateInput) bool {
+func eventContentChanged(cur domain.Event, in UpdateInput, titleI18n, descI18n, venueI18n domain.I18n) bool {
 	switch {
 	case strings.TrimSpace(in.Title) != cur.Title,
 		in.Description != cur.Description,
@@ -661,8 +832,9 @@ func eventContentChanged(cur domain.Event, in UpdateInput) bool {
 		!strPtrEqual(in.CoverImageURL, cur.CoverImageURL),
 		!int64PtrEqual(in.TicketPriceMinor, cur.TicketPriceMinor),
 		!intPtrEqual(in.Capacity, cur.Capacity),
-		!i18nEqual(in.TitleI18n, cur.TitleI18n),
-		!i18nEqual(in.DescriptionI18n, cur.DescriptionI18n),
+		!domain.I18nRenderEqual(strings.TrimSpace(in.Title), titleI18n, cur.Title, cur.TitleI18n),
+		!domain.I18nRenderEqual(in.Description, descI18n, cur.Description, cur.DescriptionI18n),
+		!domain.I18nRenderEqual(in.Venue, venueI18n, cur.Venue, cur.VenueI18n),
 		!tagsEqual(normalizeTags(in.Tags), cur.Tags):
 		return true
 	}
@@ -706,20 +878,6 @@ func tagsEqual(a, b []string) bool {
 	return true
 }
 
-// i18nEqual compares localized maps by content: nil and empty read the same to a
-// guest, so they must not count as an edit.
-func i18nEqual(a, b domain.I18n) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
 // actionEqual compares two call-to-action buttons. Absent equals absent; a
 // button equals another only when both the caption and the destination match,
 // and "the event's own page" (nil url) is a destination like any other.
@@ -727,7 +885,44 @@ func actionEqual(a, b *domain.EventAction) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return strings.TrimSpace(a.Label) == b.Label && strPtrEqual(a.URL, b.URL)
+	return strPtrEqual(a.URL, b.URL) &&
+		domain.I18nRenderEqual(strings.TrimSpace(a.Label), a.LabelI18n, b.Label, b.LabelI18n)
+}
+
+// validateEventTranslations refuses a translation patch nothing could honestly
+// store: an unsupported language, two spellings of the same one, or an attempt
+// to delete `ru` (which lives in the plain column, not in the map).
+func validateEventTranslations(title, description, venue, actionLabel domain.I18nPatch) error {
+	if err := title.Validate("title_i18n"); err != nil {
+		return err
+	}
+	if err := description.Validate("description_i18n"); err != nil {
+		return err
+	}
+	if err := venue.Validate("venue_i18n"); err != nil {
+		return err
+	}
+	return actionLabel.Validate("action.label_i18n")
+}
+
+// applyActionLabelTranslations writes the button caption's translations onto
+// the action that is about to be stored, merging the patch onto what the button
+// had before. A nil action is left alone: there is no caption to translate, and
+// the DB CHECK from migration 0101 refuses the pair anyway.
+func applyActionLabelTranslations(action *domain.EventAction, stored domain.I18n, patch domain.I18nPatch) {
+	if action == nil {
+		return
+	}
+	action.LabelI18n = domain.ApplyTranslations(stored, patch, strings.TrimSpace(action.Label))
+}
+
+// storedActionLabelI18n is the caption translations the event currently has, or
+// nil when it has no button at all.
+func storedActionLabelI18n(a *domain.EventAction) domain.I18n {
+	if a == nil {
+		return nil
+	}
+	return a.LabelI18n
 }
 
 func strPtrEqual(a, b *string) bool {

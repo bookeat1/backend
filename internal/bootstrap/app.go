@@ -15,6 +15,7 @@ import (
 
 	"backend-core/internal/domain"
 	adminrest "backend-core/internal/transport/rest/admin"
+	appversionrest "backend-core/internal/transport/rest/appversion"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
 	citiesrest "backend-core/internal/transport/rest/cities"
@@ -27,6 +28,7 @@ import (
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
 	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
+	kaspiadminrest "backend-core/internal/transport/rest/kaspiadmin"
 	mediarest "backend-core/internal/transport/rest/media"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
@@ -34,6 +36,7 @@ import (
 	notificationsrest "backend-core/internal/transport/rest/notifications"
 	paymentsrest "backend-core/internal/transport/rest/payments"
 	payoutsrest "backend-core/internal/transport/rest/payouts"
+	platformpagesrest "backend-core/internal/transport/rest/platformpages"
 	preorderrest "backend-core/internal/transport/rest/preorder"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
@@ -122,6 +125,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 
 	api := r.Group("/api/v1")
 	authrest.NewHandler(deps.AuthFacade, deps.AuthOTP).RegisterRoutes(api)
+	// Telegram venue mini app sign-in (spec §5.2 A–C). PUBLIC on purpose: these
+	// three endpoints are how a bearer token is obtained in the first place, so
+	// none of them can sit behind Auth. Registered unconditionally — without
+	// RESTAURANTS_BOT_TOKEN they answer 404, which is the same as not existing
+	// but keeps the wiring in one place. POST /auth/telegram/link is listed as
+	// TierStrict in middleware.routeTiers: it reaches the same password check as
+	// /auth/login and must not be a more generous door to it.
+	authrest.NewTelegramHandler(deps.AuthMiniApp).RegisterRoutes(api)
 
 	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers, deps.FavoritesFacade)
 	// OptionalAuth (not Auth): the catalog itself is public, but a logged-in
@@ -131,6 +142,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	restPublic := api.Group("")
 	restPublic.Use(middleware.OptionalAuth(deps.Issuer, deps.UsersRepo))
 	restHandler.RegisterPublic(restPublic)
+	// «Выбрали для вас» rides the SAME OptionalAuth group as the catalog: its
+	// cards are catalog cards and carry the same is_favorite flag for a
+	// signed-in guest. Mounted here, right after the catalog, so the two static
+	// segments (/restaurants/search, /restaurants/picks) and /restaurants/:id
+	// are declared in one place.
+	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.FavoritesFacade)
+	picksHandler.RegisterPublic(restPublic)
 
 	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and
 	// the venue panel's checkbox list read the same route, so they can never
@@ -145,6 +163,20 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// is exactly why the filter changed nothing at all.
 	venueFeaturesHandler := venuefeaturesrest.NewHandler(deps.VenueFeatures)
 	venueFeaturesHandler.RegisterPublic(api)
+
+	// The mobile update gate. Anonymous and on the plain public group for the
+	// same reason as the dictionaries above — plus one of its own: this is the
+	// FIRST request a cold-started app makes, before any token exists, and its
+	// answer depends only on the query string, so it is cacheable by URL.
+	appVersionHandler := appversionrest.NewHandler(deps.AppVersion)
+	appVersionHandler.RegisterPublic(api)
+
+	// The footer's editable text pages (migration 0105): "Как это работает",
+	// "Отмена брони", "Оферта", "Политика данных", "Контакты", "Вакансии", "О
+	// BookEat". Anonymous read, same posture as the dictionaries above — an
+	// unpublished or unknown slug answers 404, never an empty page.
+	platformPagesHandler := platformpagesrest.NewHandler(deps.PlatformPages)
+	platformPagesHandler.RegisterPublic(api)
 
 	// The city dictionary, on the SAME public path the catalog handler used to
 	// serve GET /cities from. Anonymous, like the cuisine list: the app asks
@@ -169,6 +201,18 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	telegramhook.NewHandler(
 		deps.BookingStatus, deps.NotificationSettings,
 		deps.TelegramAnswerer, deps.TelegramWebhookSecret,
+	).RegisterRoutes(api)
+
+	// The SECOND staff bot (@book_eat_restaurants_bot) during the staged
+	// migration of venue alerts (spec §7). Its own path, its own secret and its
+	// own answerer — a press can only be acknowledged with the token of the bot
+	// that sent the message, so the endpoint above stays mounted for as long as
+	// old alerts with buttons are still sitting in venues' chats. This one also
+	// handles /start and my_chat_member, which is how a venue migrates itself.
+	telegramhook.NewStaffHandler(
+		deps.BookingStatus, deps.NotificationSettings,
+		deps.StaffBotAnswerer, deps.StaffBotWebhookSecret,
+		deps.NotificationSettings, deps.StaffBotMessenger,
 	).RegisterRoutes(api)
 
 	// Merchandising feed (main-screen "Акции"). The guest rail mounts on the
@@ -276,10 +320,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// object that is not already theirs — see media/avatar.go.
 	mediaHandler.RegisterUserRoutes(authed)
 
-	// Gastroguide — the home screen's editorial collections. Plain public group,
-	// NOT OptionalAuth: unlike the feed, nothing here is personalized, so the
-	// user lookup would only cost a query. Guest reads only; the editor cabinet
-	// that fills these collections is a separate task.
+	// Gastroguide — the home screen's editorial collections AND (migration
+	// 0092) the article feed under /articles, which is the same table filtered
+	// by kind and therefore the same handler. Plain public group, NOT
+	// OptionalAuth: unlike the feed, nothing here is personalized, so the user
+	// lookup would only cost a query. Guest reads only.
 	gastroguiderest.NewHandler(deps.GastroguideFacade).RegisterPublic(api)
 	// «Гастропрогулки» — the guide's ordered itineraries, on the same public
 	// group and for the same reason.
@@ -314,6 +359,15 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal := authed.Group("")
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
+	// The curated main-screen rail is platform editorial content (same rule as
+	// the cuisine/feature/city dictionaries and the gastroguide): only the
+	// superadmin picks who is on the main screen.
+	picksHandler.RegisterAdminGlobal(adminGlobal)
+	// Read-only progress report for the Telegram bot migration (spec §7 step 5):
+	// who still receives alerts from the old bot. Superadmin only — it lists
+	// every venue's chat id, which is a target, not a public fact.
+	notificationsrest.NewTelegramMigrationHandler(deps.NotificationSettings).
+		RegisterAdminGlobal(adminGlobal)
 	menuHandler.RegisterAdmin(adminGlobal)
 	// The cuisine dictionary is the PLATFORM's, not a venue's: only the
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that
@@ -324,6 +378,20 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// Same rule for cities (ADR-023): the dictionary is the platform's, a
 	// venue only points at an entry.
 	citiesHandler.RegisterAdminGlobal(adminGlobal)
+	// The mobile update policy: thresholds and wording. Superadmin ONLY, and
+	// for a stronger reason than the dictionaries — min_supported_version puts
+	// a blocking screen in front of every guest on that platform at once. The
+	// usecase re-checks the role.
+	appVersionHandler.RegisterAdminGlobal(adminGlobal)
+	// Editing the seven pages above: superadmin only (domain.PlatformContentRoles),
+	// same rule as the platform's promos/events and the gastroguide.
+	platformPagesHandler.RegisterAdminGlobal(adminGlobal)
+	// Read-only list of the companies on our Kaspi payment service, so the
+	// panel can OFFER the acquirer account a venue is bound to instead of
+	// asking someone to retype an id from another panel. Superadmin only: it
+	// names every merchant on the platform's payment service, and it feeds the
+	// one setting that decides whose till a guest's money lands in.
+	kaspiadminrest.NewHandler(deps.KaspiDirectory, log).RegisterAdminGlobal(adminGlobal)
 
 	// Global role management. This is the endpoint that hands out the rights to
 	// every other admin endpoint, so the usecase checks the caller's role again

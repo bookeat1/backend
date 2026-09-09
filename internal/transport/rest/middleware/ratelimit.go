@@ -211,6 +211,14 @@ var routeTiers = map[string]RateLimitTier{
 	"POST /api/v1/auth/login":       TierStrict,
 	"POST /api/v1/auth/otp/request": TierStrict,
 	"POST /api/v1/auth/otp/verify":  TierStrict,
+	// The Telegram mini app's FIRST sign-in checks the very same email+password
+	// as /auth/login above. On TierDefault it would be a MORE generous door to
+	// the same secret, which is the whole point of listing it here (spec
+	// criterion 14). The passwordless open (/auth/telegram/miniapp) is
+	// deliberately NOT strict: it verifies an HMAC and guesses nothing, and a
+	// venue whose staff share one NAT would trip a 5/min IP budget on an
+	// ordinary shift.
+	"POST /api/v1/auth/telegram/link": TierStrict,
 	// Signed-in phone change is an OTP flow: same money/enumeration profile as
 	// the login OTP routes (a code send costs, and 409 phone_in_use /
 	// 422 phone_unchanged are an account-enumeration oracle worth throttling).
@@ -243,7 +251,12 @@ var routeTiers = map[string]RateLimitTier{
 	"GET /api/v1/cuisines": TierSoft,
 	// Same for the venue-feature dictionary: the app's filter sheet fetches it
 	// once when the sheet opens, and it is a handful of rows.
-	"GET /api/v1/venue-features":               TierSoft,
+	"GET /api/v1/venue-features": TierSoft,
+	// The mobile update gate: one tiny read per app launch, and the answer is
+	// cacheable for five minutes, so the browsing tier is the right ceiling. It
+	// is NOT exempt — it is unauthenticated and would otherwise be the cheapest
+	// unmetered route in the API.
+	"GET /api/v1/app/version-check":            TierSoft,
 	"GET /api/v1/restaurants/:id/menu":         TierSoft,
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,

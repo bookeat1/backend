@@ -390,25 +390,25 @@ func (h *RouteEditorHandler) reorderPoints(c *gin.Context) {
 // --- request DTOs ---
 
 type routeRequest struct {
-	Slug              string      `json:"slug"`
-	Title             string      `json:"title"`
-	TitleI18n         domain.I18n `json:"title_i18n"`
-	Description       string      `json:"description"`
-	DescriptionI18n   domain.I18n `json:"description_i18n"`
-	CoverImageURL     *string     `json:"cover_image_url"`
-	DurationLabel     string      `json:"duration_label"`
-	DurationLabelI18n domain.I18n `json:"duration_label_i18n"`
-	City              *string     `json:"city"`
-	Position          int         `json:"position"`
+	Slug              string             `json:"slug"`
+	Title             string             `json:"title"`
+	TitleI18n         map[string]*string `json:"title_i18n"`
+	Description       string             `json:"description"`
+	DescriptionI18n   map[string]*string `json:"description_i18n"`
+	CoverImageURL     *string            `json:"cover_image_url"`
+	DurationLabel     string             `json:"duration_label"`
+	DurationLabelI18n map[string]*string `json:"duration_label_i18n"`
+	City              *string            `json:"city"`
+	Position          int                `json:"position"`
 }
 
 func (r routeRequest) toInput() uc.RouteInput {
 	in := uc.RouteInput{
-		Slug: r.Slug, Title: r.Title, TitleI18n: r.TitleI18n,
-		Description: r.Description, DescriptionI18n: r.DescriptionI18n,
+		Slug: r.Slug, Title: r.Title, TitleI18n: domain.I18nPatch(r.TitleI18n),
+		Description: r.Description, DescriptionI18n: domain.I18nPatch(r.DescriptionI18n),
 		CoverImageURL:     r.CoverImageURL,
 		DurationLabel:     r.DurationLabel,
-		DurationLabelI18n: r.DurationLabelI18n,
+		DurationLabelI18n: domain.I18nPatch(r.DurationLabelI18n),
 		Position:          r.Position,
 	}
 	// An empty city string is "every city", the same thing a missing field
@@ -426,25 +426,25 @@ type routePointRequest struct {
 	Kind string `json:"kind"`
 	// RestaurantID is required for a restaurant stop and must be absent (or
 	// empty) for a place stop.
-	RestaurantID    string      `json:"restaurant_id"`
-	Title           string      `json:"title"`
-	TitleI18n       domain.I18n `json:"title_i18n"`
-	Description     string      `json:"description"`
-	DescriptionI18n domain.I18n `json:"description_i18n"`
-	PhotoURL        *string     `json:"photo_url"`
-	Address         string      `json:"address"`
-	AddressI18n     domain.I18n `json:"address_i18n"`
-	Latitude        *float64    `json:"latitude"`
-	Longitude       *float64    `json:"longitude"`
+	RestaurantID    string             `json:"restaurant_id"`
+	Title           string             `json:"title"`
+	TitleI18n       map[string]*string `json:"title_i18n"`
+	Description     string             `json:"description"`
+	DescriptionI18n map[string]*string `json:"description_i18n"`
+	PhotoURL        *string            `json:"photo_url"`
+	Address         string             `json:"address"`
+	AddressI18n     map[string]*string `json:"address_i18n"`
+	Latitude        *float64           `json:"latitude"`
+	Longitude       *float64           `json:"longitude"`
 }
 
 func (r routePointRequest) toInput(c *gin.Context) (uc.PointInput, bool) {
 	in := uc.PointInput{
 		Kind:  domain.GuideRoutePointKind(strings.TrimSpace(r.Kind)),
-		Title: r.Title, TitleI18n: r.TitleI18n,
-		Description: r.Description, DescriptionI18n: r.DescriptionI18n,
+		Title: r.Title, TitleI18n: domain.I18nPatch(r.TitleI18n),
+		Description: r.Description, DescriptionI18n: domain.I18nPatch(r.DescriptionI18n),
 		PhotoURL: r.PhotoURL,
-		Address:  r.Address, AddressI18n: r.AddressI18n,
+		Address:  r.Address, AddressI18n: domain.I18nPatch(r.AddressI18n),
 		Latitude: r.Latitude, Longitude: r.Longitude,
 	}
 	if raw := strings.TrimSpace(r.RestaurantID); raw != "" {

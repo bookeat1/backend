@@ -33,9 +33,14 @@ type Story struct {
 	RestaurantID uuid.UUID
 	ImageURL     string
 	Caption      *string
-	ActionURL    *string
-	SortOrder    int
-	IsActive     bool
+	// CaptionI18n carries the caption's translations, Caption itself being the
+	// Russian text. A card with no caption has no translations either: there is
+	// nothing to translate, and a lone Kazakh caption would break the invariant
+	// that i18n["ru"] equals the column.
+	CaptionI18n I18n
+	ActionURL   *string
+	SortOrder   int
+	IsActive    bool
 	// ExpiresAt is an INSTANT, not a wall-clock date: it is compared against
 	// "now" and never re-read in the venue's own zone. Same shape as
 	// Event.EndsAt and otp expiry; see migration 0106 for why the venue's

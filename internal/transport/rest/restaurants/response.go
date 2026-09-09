@@ -4,30 +4,42 @@ import (
 	"time"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/media"
 )
 
 type restaurantResponse struct {
-	ID          string            `json:"id"`
-	CategoryID  *string           `json:"category_id"`
-	Name        string            `json:"name"`
-	NameI18n    map[string]string `json:"name_i18n,omitempty"`
-	Description string            `json:"description"`
+	ID         string            `json:"id"`
+	CategoryID *string           `json:"category_id"`
+	Name       string            `json:"name"`
+	NameI18n   map[string]string `json:"name_i18n,omitempty"`
+	// Description/Address/OpeningHours/CuisineType are resolved into the
+	// caller's language; the raw translation maps next to them are the
+	// CABINET's view and are attached only by aggregateToResponse when the
+	// caller asked for no language at all (see attachRawTranslations). A guest
+	// never needs them — the server already resolved the text — and shipping
+	// three languages of every description with every catalog card would pay
+	// for an editing screen on the hottest read in the app.
+	Description     string            `json:"description"`
+	DescriptionI18n map[string]string `json:"description_i18n,omitempty"`
 	// CuisineType is the LEGACY single-string cuisine field: the venue's
 	// cuisines joined with ", ". It is NOT removed and never will be silently:
 	// the store builds (1.4 live, 1.5 in review) read exactly this string and
 	// send it back as a filter value. `cuisines` below is the structured form
 	// new clients should read.
-	CuisineType string `json:"cuisine_type"`
+	CuisineType     string            `json:"cuisine_type"`
+	CuisineTypeI18n map[string]string `json:"cuisine_type_i18n,omitempty"`
 	// Cuisines is the venue's cuisine set from the platform dictionary, in the
 	// venue's own order (first = main). Omitted entirely when the venue has no
 	// dictionary links yet — a venue whose historical value is still awaiting a
 	// manual split has cuisine_type and nothing here, and an empty array would
 	// read as "this venue declared no cuisine", which is a different statement.
-	Cuisines      []cuisineResponse `json:"cuisines,omitempty"`
-	Address       string            `json:"address"`
-	OpeningHours  string            `json:"opening_hours"`
-	City          string            `json:"city"`
-	PriceCategory string            `json:"price_category"`
+	Cuisines         []cuisineResponse `json:"cuisines,omitempty"`
+	Address          string            `json:"address"`
+	AddressI18n      map[string]string `json:"address_i18n,omitempty"`
+	OpeningHours     string            `json:"opening_hours"`
+	OpeningHoursI18n map[string]string `json:"opening_hours_i18n,omitempty"`
+	City             string            `json:"city"`
+	PriceCategory    string            `json:"price_category"`
 	// PriceRange is the numeric average-check range in whole tenge, shown next
 	// to the categorical PriceCategory. A pointer with omitempty so it is absent
 	// entirely when the venue has not declared a range (both bounds NULL) —
@@ -43,11 +55,24 @@ type restaurantResponse struct {
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
 	PrimaryImage *string             `json:"primary_image,omitempty"`
-	Images       []imageResponse     `json:"images,omitempty"`
-	Features     []featureResponse   `json:"features,omitempty"`
-	Tags         []tagResponse       `json:"tags,omitempty"`
-	SocialLinks  []socialResponse    `json:"social_links,omitempty"`
-	CreatedAt    time.Time           `json:"created_at"`
+	// PrimaryImageCard / PrimaryImageDetail are the resized derivatives of
+	// PrimaryImage (see internal/media). Additive: PrimaryImage keeps naming
+	// the original exactly as before, so an app build that has not been
+	// taught about these fields sees byte-identical output. Empty/omitted
+	// when the derivative has not been generated yet (fresh upload, backfill
+	// not yet run) — the client's contract is to fall back to PrimaryImage.
+	PrimaryImageCard   *string `json:"primary_image_card,omitempty"`
+	PrimaryImageDetail *string `json:"primary_image_detail,omitempty"`
+	// MatchedDish is set ONLY by the search endpoint, and only when the venue
+	// was pulled in by a menu item. Absent from the JSON otherwise — a pointer
+	// so "no dish matched" and "this response has no notion of a query" are
+	// both simply "no field", never an empty object the app has to special-case.
+	MatchedDish *matchedDishResponse `json:"matched_dish,omitempty"`
+	Images      []imageResponse      `json:"images,omitempty"`
+	Features    []featureResponse    `json:"features,omitempty"`
+	Tags        []tagResponse        `json:"tags,omitempty"`
+	SocialLinks []socialResponse     `json:"social_links,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
 	// IsFavorite is nil for an anonymous caller (omitted from the JSON
 	// entirely) and an explicit true/false for an authenticated one — a
 	// pointer so "not favorited" and "we don't know because you're not
@@ -63,6 +88,25 @@ type restaurantResponse struct {
 	// this venue can be booked through the app at all. Absent only when the
 	// server did not compute the venue state (never guessed).
 	AcceptsOnlineBookings *bool `json:"accepts_online_bookings,omitempty"`
+	// AcceptsOnlinePayment tells the guest whether this venue can take money
+	// online at all (payments enabled for it, an acquirer configured and
+	// enabled, and the venue onboarded at that acquirer) — the server's own
+	// answer, computed by the checkout that would take the payment.
+	//
+	// Served by the DETAIL read only; absent from listing rows, where the
+	// server does not compute it. A pointer with omitempty for the same reason
+	// as its neighbour above: absent means "not computed", and the app treats
+	// anything but an explicit true as "no payment button" — so a venue whose
+	// acquirer lookup failed is never advertised as payable, and never as
+	// definitively unpayable either.
+	AcceptsOnlinePayment *bool `json:"accepts_online_payment,omitempty"`
+	// PreorderMinAmountMinor is the venue's optional minimum pre-order total,
+	// in int64 MINOR units (restaurants.preorder_min_amount_minor). Served by
+	// the DETAIL read only, same rule as AcceptsOnlinePayment above: a listing
+	// row never carries it, because the guest cannot act on a minimum before
+	// they have opened the venue's menu. nil/omitted means "no minimum set" —
+	// the client must not read absence as a floor of zero.
+	PreorderMinAmountMinor *int64 `json:"preorder_min_amount_minor,omitempty"`
 }
 
 // scheduleResponse is the venue's regular weekly hours in a shape a client
@@ -130,6 +174,13 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	}
 	accepts := st.AcceptsOnlineBookings
 	resp.AcceptsOnlineBookings = &accepts
+	// Copied, not aliased: the response must not share a pointer with the
+	// domain value. nil stays nil — the field is then absent, which is how
+	// "not computed" travels (see domain.PublicVenueState.AcceptsOnlinePayment).
+	if st.AcceptsOnlinePayment != nil {
+		pay := *st.AcceptsOnlinePayment
+		resp.AcceptsOnlinePayment = &pay
+	}
 	if st.Schedule == nil {
 		return
 	}
@@ -167,10 +218,30 @@ type priceRangeResponse struct {
 	Max int `json:"max"`
 }
 
+// matchedDishResponse explains a SEARCH hit that the venue's own name and
+// description do not explain: the guest typed "pasta" and got a venue that says
+// nothing about pasta because the pasta is in its menu. Present only on
+// /restaurants/search, and only for such rows — the catalog listing has no
+// query and never fills it, so the field is simply not serialized there.
+type matchedDishResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type imageResponse struct {
 	ID        string `json:"id"`
 	ImageURL  string `json:"image_url"`
 	IsPrimary bool   `json:"is_primary"`
+	// CardURL / DetailURL are the resized derivatives of ImageURL (see
+	// internal/media.VariantURLs). Additive, empty when not yet generated —
+	// ImageURL is unchanged and remains the field every client already reads.
+	CardURL   string `json:"card_url,omitempty"`
+	DetailURL string `json:"detail_url,omitempty"`
+}
+
+func newImageResponse(id, imageURL string, isPrimary bool) imageResponse {
+	card, detail := media.VariantURLs(imageURL)
+	return imageResponse{ID: id, ImageURL: imageURL, IsPrimary: isPrimary, CardURL: card, DetailURL: detail}
 }
 
 // featureResponse is one of the venue's features. The shape is unchanged from
@@ -299,6 +370,12 @@ func listItemToResponse(it domain.RestaurantListItem, lang string) restaurantRes
 	// shown under a «Wi-Fi» filter has to be able to say why it matched.
 	resp.Features = featuresToResponse(it.Features, lang)
 	applyVenueState(&resp, it.VenueState)
+	if d := it.MatchedDish; d != nil {
+		resp.MatchedDish = &matchedDishResponse{
+			ID:   d.ID.String(),
+			Name: d.NameI18n.Resolve(lang, d.Name),
+		}
+	}
 	return resp
 }
 
@@ -313,15 +390,41 @@ func PublicListItem(it domain.RestaurantListItem, lang string) any {
 	return listItemToResponse(it, lang)
 }
 
+// attachRawTranslations adds the editable translation maps to a response.
+//
+// It runs ONLY for a caller that asked for no language, which is what the
+// cabinet reads do (aggregateToResponse(agg, "")): whoever edits a venue has to
+// see the translations they are about to patch, and whoever merely reads it has
+// already been served the resolved text. The maps are the WHOLE stored value,
+// including languages this build does not serve (the old import left ko/zh
+// behind) — an editor must be able to see what is actually in the row.
+func attachRawTranslations(resp *restaurantResponse, r domain.Restaurant) {
+	resp.DescriptionI18n = r.DescriptionI18n
+	resp.CuisineTypeI18n = r.CuisineTypeI18n
+	resp.AddressI18n = r.AddressI18n
+	resp.OpeningHoursI18n = r.OpeningHoursI18n
+}
+
 func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantResponse {
 	resp := baseFromDomain(a.Restaurant, lang)
+	if lang == "" {
+		attachRawTranslations(&resp, a.Restaurant)
+	}
+	resp.PreorderMinAmountMinor = a.Restaurant.PreorderMinAmountMinor
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
-		resp.Images = append(resp.Images, imageResponse{ID: i.ID.String(), ImageURL: i.ImageURL, IsPrimary: i.IsPrimary})
+		resp.Images = append(resp.Images, newImageResponse(i.ID.String(), i.ImageURL, i.IsPrimary))
 		if i.IsPrimary && resp.PrimaryImage == nil {
 			u := i.ImageURL
 			resp.PrimaryImage = &u
+			card, detail := media.VariantURLs(i.ImageURL)
+			if card != "" {
+				resp.PrimaryImageCard = &card
+			}
+			if detail != "" {
+				resp.PrimaryImageDetail = &detail
+			}
 		}
 	}
 	resp.Features = featuresToResponse(a.Features, lang)

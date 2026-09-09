@@ -22,6 +22,9 @@ type fakeRepo struct {
 	// that a decision about the series really reached the occurrences.
 	syncs   []syncCall
 	demoted []uuid.UUID
+	// contentSyncs records every SyncOccurrenceContent call: what content the
+	// series pushed down onto the dates it had already generated.
+	contentSyncs []domain.EventContent
 }
 
 type syncCall struct {
@@ -117,6 +120,11 @@ func (f *fakeRepo) DemoteFeedAfterContentEdit(_ context.Context, id uuid.UUID) e
 
 func (f *fakeRepo) SyncOccurrenceFeedStatus(_ context.Context, id uuid.UUID, _ time.Time, from []domain.FeedStatus, upd domain.FeedPlacementUpdate) (int, error) {
 	f.syncs = append(f.syncs, syncCall{recurrenceID: id, from: from, to: upd.Status})
+	return 0, nil
+}
+
+func (f *fakeRepo) SyncOccurrenceContent(_ context.Context, _ uuid.UUID, _ time.Time, c domain.EventContent) (int, error) {
+	f.contentSyncs = append(f.contentSyncs, c)
 	return 0, nil
 }
 
@@ -330,5 +338,158 @@ func TestEmptyTimezoneStaysEmpty(t *testing.T) {
 	}
 	if rec.Timezone != "" {
 		t.Fatalf("want no zone override, got %q", rec.Timezone)
+	}
+}
+
+// --- shared content of a series (migration 0097) ---
+
+// Editing the series text must reach the dates that already exist. Before 0097
+// it did not, and that is why «Афиша Greek Party» took eighteen edits.
+func TestUpdatePushesContentToExistingOccurrences(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	actor := Actor{UserID: actorID, Role: domain.RoleRestaurant}
+	rec, err := f.Create(context.Background(), actor, validInput(rid))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	in := validInput(rid)
+	in.Title = "Greek Party"
+	in.Description = "Сиртаки и узо"
+	cover := "https://cdn.example/greek.jpg"
+	in.CoverImageURL = &cover
+	if _, err := f.Update(context.Background(), actor, rec.ID, in); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if len(repo.contentSyncs) != 1 {
+		t.Fatalf("the new content must be pushed to the dates exactly once, got %d pushes", len(repo.contentSyncs))
+	}
+	got := repo.contentSyncs[0]
+	if got.Title != "Greek Party" || got.Description != "Сиртаки и узо" || got.CoverImageURL == nil || *got.CoverImageURL != cover {
+		t.Fatalf("the pushed content must be what was just saved, got %+v", got)
+	}
+}
+
+// A schedule-only edit changes no words, so it must not rewrite a single date.
+// The occurrences already generated keep their time — moving them is a
+// deliberately separate decision (see the Update doc).
+func TestUpdateWithoutContentChangeTouchesNoOccurrence(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+	actor := Actor{UserID: actorID, Role: domain.RoleRestaurant}
+	rec, err := f.Create(context.Background(), actor, validInput(rid))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	in := validInput(rid)
+	in.Weekdays = []domain.ISOWeekday{4}
+	if _, err := f.Update(context.Background(), actor, rec.ID, in); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(repo.contentSyncs) != 0 {
+		t.Fatalf("a schedule-only edit must not rewrite any date, got %d pushes", len(repo.contentSyncs))
+	}
+}
+
+// A refused edit must not reach the occurrences either: authorization comes
+// first, and a cross-tenant caller may not retitle eighteen live dates.
+func TestUpdateForbiddenPushesNothing(t *testing.T) {
+	venueA, venueB, actorID := uuid.New(), uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, venueA, domain.StaffRoleManager))
+	rec := &domain.EventRecurrence{ID: uuid.New(), RestaurantID: venueB}
+	repo.byID[rec.ID] = rec
+
+	in := validInput(venueB)
+	in.Title = "Чужая афиша"
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected forbidden, got %v", err)
+	}
+	if len(repo.contentSyncs) != 0 {
+		t.Fatalf("a refused edit must push nothing, got %d pushes", len(repo.contentSyncs))
+	}
+}
+
+// --- venue translations on the series template (migration 0101) ---
+
+func strPtr(s string) *string { return &s }
+
+// The rule's venue line is the template every generated date inherits, so its
+// translations have to live on the rule too — otherwise a series could only
+// ever be translated one date at a time.
+func TestCreate_WritesVenueTranslations(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.Venue = "Летняя терраса"
+	in.VenueI18n = domain.I18nPatch{"kk": strPtr("Жазғы террасса")}
+
+	rec, err := f.Create(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if rec.VenueI18n["kk"] != "Жазғы террасса" {
+		t.Errorf("VenueI18n[kk] = %q", rec.VenueI18n["kk"])
+	}
+	if rec.VenueI18n["ru"] != "Летняя терраса" {
+		t.Errorf(`VenueI18n["ru"] = %q, want it equal to the venue column`, rec.VenueI18n["ru"])
+	}
+}
+
+// A Kazakh-only edit keeps the English, and the new map is what gets pushed
+// down onto the dates that have not overridden the field.
+func TestUpdate_VenueTranslationPatchKeepsOtherLanguagesAndSyncsDates(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	rec := &domain.EventRecurrence{
+		ID: uuid.New(), RestaurantID: rid,
+		Title:     "Cocktail Wednesday",
+		Venue:     "Терраса",
+		VenueI18n: domain.I18n{"ru": "Терраса", "en": "Terrace"},
+	}
+	repo.byID[rec.ID] = rec
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.Venue = "Терраса"
+	in.VenueI18n = domain.I18nPatch{"kk": strPtr("Террасса")}
+
+	got, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.VenueI18n["en"] != "Terrace" {
+		t.Errorf("VenueI18n[en] = %q, want the untouched English kept", got.VenueI18n["en"])
+	}
+	if got.VenueI18n["kk"] != "Террасса" {
+		t.Errorf("VenueI18n[kk] = %q", got.VenueI18n["kk"])
+	}
+	if len(repo.contentSyncs) != 1 {
+		t.Fatalf("a translated venue line must be pushed down onto the dates, got %d syncs", len(repo.contentSyncs))
+	}
+	if repo.contentSyncs[0].VenueI18n["kk"] != "Террасса" {
+		t.Errorf("the synced content carries %v, want the new Kazakh venue line", repo.contentSyncs[0].VenueI18n)
+	}
+}
+
+func TestUpdate_RejectsUnsupportedTranslationLanguage(t *testing.T) {
+	rid, actorID := uuid.New(), uuid.New()
+	repo := newFakeRepo()
+	rec := &domain.EventRecurrence{ID: uuid.New(), RestaurantID: rid, Title: "x"}
+	repo.byID[rec.ID] = rec
+	f := NewFacade(repo, permsWith(actorID, rid, domain.StaffRoleManager))
+
+	in := validInput(rid)
+	in.VenueI18n = domain.I18nPatch{"fr": strPtr("Terrasse")}
+
+	if _, err := f.Update(context.Background(), Actor{UserID: actorID, Role: domain.RoleRestaurant}, rec.ID, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("want ErrValidation (→ 422), got %v", err)
 	}
 }

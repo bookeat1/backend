@@ -144,8 +144,11 @@ type FeedItem struct {
 	// (migration 0070). Empty for an item that has no extra photos — the card
 	// then draws the cover alone, never a placeholder.
 	Images []string
-	// Terms is set for promos only (the fine print).
-	Terms string
+	// Terms is set for promos only (the fine print). TermsI18n carries its
+	// translations, Terms itself being the Russian text — an event branch of
+	// the union projects both as empty/NULL.
+	Terms     string
+	TermsI18n I18n
 	// DiscountPercent is the promo card's «−30%» badge value, 0..100. Set for
 	// PROMOS only — events have no discount, so the union projects NULL for them
 	// and this stays nil. Nil (either kind) means "no badge".

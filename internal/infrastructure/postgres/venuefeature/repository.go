@@ -98,11 +98,67 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.VenueFe
 	return vf, err
 }
 
+// selfAliases are the spellings every dictionary entry MUST be findable by:
+// its display name and its machine code. This is the exact pair migration 0082
+// seeds for the nineteen entries that exist today (`lower(btrim(name))` +
+// `lower(btrim(code))`), reproduced here so a feature added through the admin
+// route is born with the same rows instead of being invisible to the catalog
+// filter until someone runs SQL by hand.
+//
+// For features this matters MORE than for cuisines: featureVenueMatchExpr in
+// the restaurant repository resolves a `?features=` key through
+// venue_feature_aliases ONLY — there is no legacy-string fallback branch like
+// the cuisine expression has — so an entry without alias rows is invisible to
+// the filter completely, by code and by name alike.
+//
+// Normalization goes through domain.NormalizeFeatureKey and NOT through SQL
+// `lower(btrim(...))`: the lookup side compares against
+// domain.NormalizeFeatureKeys(f.Features), so the two sides must use one
+// function. NormalizeFeatureKey additionally collapses inner whitespace, which
+// the migration's SQL does not — that is a superset, never a mismatch, and it
+// is pinned by TestFeatureAliasNormalizationMatchesTheSearchKey.
+func selfAliases(vf *domain.VenueFeature) []string {
+	return domain.NormalizeFeatureKeys([]string{vf.Name, vf.Code})
+}
+
+// aliasInsert is the second half of Create/Update: it writes the entry's own
+// spellings into venue_feature_aliases inside the SAME statement as the
+// dictionary write, so a feature can never exist without them. One statement is
+// also one transaction even on a bare pool, which is why this needs no
+// TxManager and still cannot half-apply.
+//
+// The NOT EXISTS makes a repeat harmless: an alias this feature already owns is
+// skipped instead of raising 23505, so re-saving an entry (or PATCHing one that
+// predates this code and therefore has no aliases yet) is idempotent and
+// self-healing.
+//
+// An alias owned by ANOTHER feature is deliberately NOT skipped: the insert
+// then hits the primary key, the whole statement aborts, and the caller gets
+// ErrAlreadyExists. Silently dropping it would leave the new entry unfindable
+// by its own name or code — exactly the failure this code exists to prevent —
+// and silently re-pointing it would steal a search key from a feature that
+// already answers to it.
+//
+// KNOWN, ACCEPTED: two admins saving the SAME entry in the same instant can
+// both pass the NOT EXISTS and the loser gets that conflict too — a spurious
+// 409 on a legitimate save, safe (nothing is written) and fixed by retrying,
+// which is why the error text does not claim another feature owns the
+// spelling. (Same trade-off as the cuisine repository next door.)
+const aliasInsert = `INSERT INTO venue_feature_aliases (alias, feature_id)
+	SELECT a, w.id FROM w CROSS JOIN unnest($7::text[]) AS a
+	 WHERE NOT EXISTS (SELECT 1 FROM venue_feature_aliases fa
+	                    WHERE fa.alias = a AND fa.feature_id = w.id)`
+
 func (r *Repository) Create(ctx context.Context, vf *domain.VenueFeature) error {
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`INSERT INTO venue_features (`+cols+`)
-		 VALUES ($1,$2,$3,$4,$5,$6,now(),now())`,
-		vf.ID, vf.Code, vf.Name, i18nToDB(vf.NameI18n), vf.DisplayOrder, vf.IsActive)
+		`WITH w AS (
+			INSERT INTO venue_features (`+cols+`)
+			VALUES ($1,$2,$3,$4,$5,$6,now(),now())
+			RETURNING id
+		)
+		`+aliasInsert,
+		vf.ID, vf.Code, vf.Name, i18nToDB(vf.NameI18n), vf.DisplayOrder, vf.IsActive,
+		selfAliases(vf))
 	if err != nil {
 		return mapWrite(err, "create venue feature")
 	}
@@ -112,17 +168,35 @@ func (r *Repository) Create(ctx context.Context, vf *domain.VenueFeature) error 
 	return nil
 }
 
+// Update rewrites the entry and ADDS the aliases of its current name/code. It
+// never removes the old ones: venue_feature_aliases is the set of spellings
+// that MEAN this feature, not a projection of its current name. A former name
+// is still a spelling — it sits in the chips an already-installed app scraped
+// out of the catalog — and it also holds the hand-curated synonyms migration
+// 0082 seeded («бизнес ланч» → business_lunch), which a rename has no business
+// deleting.
 func (r *Repository) Update(ctx context.Context, vf *domain.VenueFeature) error {
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`UPDATE venue_features SET code=$2, name=$3, name_i18n=$4,
-		        display_order=$5, is_active=$6, updated_at=now()
-		 WHERE id=$1`,
-		vf.ID, vf.Code, vf.Name, i18nToDB(vf.NameI18n), vf.DisplayOrder, vf.IsActive)
+	// The command tag of the statement below counts ALIAS rows, not feature
+	// rows (0 is normal — the aliases are usually already there), so "does the
+	// id exist" has to come from the UPDATE's own RETURNING.
+	var id uuid.UUID
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`WITH w AS (
+			UPDATE venue_features SET code=$2, name=$3, name_i18n=$4,
+			       display_order=$5, is_active=$6, updated_at=now()
+			 WHERE id=$1
+			RETURNING id
+		), a AS (
+			`+aliasInsert+`
+		)
+		SELECT id FROM w`,
+		vf.ID, vf.Code, vf.Name, i18nToDB(vf.NameI18n), vf.DisplayOrder, vf.IsActive,
+		selfAliases(vf)).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
 	if err != nil {
 		return mapWrite(err, "update venue feature")
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
 	}
 	return nil
 }
@@ -254,12 +328,21 @@ func prefixed(list, alias string) string {
 	return strings.Join(parts, ", ")
 }
 
+// aliasPK is the primary key of venue_feature_aliases (one row per spelling).
+// It is named explicitly so a taken spelling can be reported as such instead of
+// as "code or name already used", which would send the admin looking at the
+// wrong table.
+const aliasPK = "venue_feature_aliases_pkey"
+
 // mapWrite turns a unique-index violation into domain.ErrAlreadyExists. The
-// two unique indexes (code, normalized name) are the ONLY duplicate guard:
+// unique indexes (code, normalized name, alias) are the ONLY duplicate guard:
 // checking first and inserting after loses the race between two admins.
 func mapWrite(err error, ctxMsg string) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
+		if pgErr.ConstraintName == aliasPK {
+			return fmt.Errorf("%w: venue feature spelling already taken", domain.ErrAlreadyExists)
+		}
 		return fmt.Errorf("%w: venue feature code or name already used", domain.ErrAlreadyExists)
 	}
 	return fmt.Errorf("%s: %w", ctxMsg, err)

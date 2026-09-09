@@ -1,5 +1,13 @@
 name: Deploy
 
+# Branch model (product owner's decision, 2026-09-08):
+#   develop -> test server, automatically on every push;
+#   main    -> production, manually (workflow_dispatch) and ONLY from main.
+# `main` is a plain fast-forward/merge of `develop` — what ran on test is what
+# goes to prod. The `preflight` job below refuses a prod dispatch from any
+# other ref before an image is even built, and `deploy-prod` repeats the same
+# check on its own `if:` so the two cannot drift apart.
+
 on:
   push:
     branches: [develop]
@@ -11,7 +19,7 @@ on:
         type: choice
         options: [test, prod]
       confirm:
-        description: 'For prod only: type exactly "deploy-to-prod" to confirm'
+        description: 'For prod only: type exactly "deploy-to-prod" to confirm (and run the workflow from main)'
         required: false
         default: ""
 
@@ -20,7 +28,34 @@ permissions:
   packages: write
 
 jobs:
+  # Loud, early refusal for a wrong manual dispatch. A silent `if:` skip on
+  # deploy-prod alone would still build and push an image from a feature
+  # branch and leave a green-looking run with nothing deployed.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the dispatch target against the branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TARGET: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          echo "event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} target=${TARGET} actor=${GITHUB_ACTOR}"
+          if [ "$TARGET" = "prod" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "::error::Refusing: production deploys only from main (got '${GITHUB_REF}'). Re-run with 'Use workflow from: main'."
+              exit 1
+            fi
+            if [ "$CONFIRM" != "deploy-to-prod" ]; then
+              echo "::error::Refusing: the confirm input must be exactly 'deploy-to-prod'."
+              exit 1
+            fi
+            echo "Confirmed production release of ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7} by ${GITHUB_ACTOR}"
+          fi
+
   build-and-push:
+    needs: preflight
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
@@ -117,8 +152,11 @@ jobs:
 
   deploy-prod:
     needs: build-and-push
+    # Same three conditions `preflight` already enforced, restated here so the
+    # job itself is safe even if someone edits the preflight step later.
     if: >-
       github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
       inputs.environment == 'prod' &&
       inputs.confirm == 'deploy-to-prod'
     runs-on: ubuntu-latest

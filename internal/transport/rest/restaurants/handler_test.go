@@ -447,3 +447,153 @@ func TestListEchoesNormalizedPaging(t *testing.T) {
 		t.Errorf("per_page = %d, want the cap %d", page.PerPage, domain.MaxPerPage)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// accepts_online_payment — the flag the app gates the Kaspi button on
+// ---------------------------------------------------------------------------
+
+// TestDetailPayloadCarriesAcceptsOnlinePayment: the venue detail publishes the
+// server's own answer, both ways round, under exactly the key the merged mobile
+// client reads (bookeat1/frontend#112). The name is a CONTRACT: renaming it
+// silently hides the payment button on every installed build.
+func TestDetailPayloadCarriesAcceptsOnlinePayment(t *testing.T) {
+	for _, accepts := range []bool{true, false} {
+		id := uuid.New()
+		rest := activeVenue(id)
+		st := &domain.PublicVenueState{AcceptsOnlineBookings: true, AcceptsOnlinePayment: &accepts}
+		r := newTestRouter(&fakeFacade{
+			item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+			agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+		})
+
+		raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+		field, ok := raw["accepts_online_payment"]
+		if !ok {
+			t.Fatalf("accepts_online_payment missing from the detail payload (wanted %v)", accepts)
+		}
+		var got bool
+		if err := json.Unmarshal(field, &got); err != nil {
+			t.Fatalf("accepts_online_payment is not a boolean: %v (%s)", err, field)
+		}
+		if got != accepts {
+			t.Fatalf("accepts_online_payment = %v, want %v", got, accepts)
+		}
+	}
+}
+
+// TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed: the field disappears
+// when the server did not compute it — on the listing, which never does, and on
+// a detail read whose acquirer lookup failed. "Not computed" must never reach
+// the client as `false`: the app can safely hide a button on a missing field,
+// but a false is a claim about a venue nobody checked.
+func TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	// The venue state IS computed — only the payment flag is not (nil pointer),
+	// which is exactly what a failed acquirer check leaves behind.
+	st := &domain.PublicVenueState{AcceptsOnlineBookings: true}
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+		"/api/v1/restaurants/" + id.String(),
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["accepts_online_payment"]; ok {
+				t.Fatalf("accepts_online_payment must be omitted when not computed, got %s", v)
+			}
+			// The neighbouring flag is unaffected: this is an additive field.
+			if _, ok := raw["accepts_online_bookings"]; !ok {
+				t.Error("accepts_online_bookings must still be published")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// preorder_min_amount_minor — the web pre-order minimum (spec D1)
+// ---------------------------------------------------------------------------
+
+// TestDetailPayloadCarriesPreorderMinAmountMinor: the venue detail publishes
+// restaurants.preorder_min_amount_minor verbatim, in minor units, when the
+// venue has set one.
+func TestDetailPayloadCarriesPreorderMinAmountMinor(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	var min int64 = 10_000_00
+	rest.PreorderMinAmountMinor = &min
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+	field, ok := raw["preorder_min_amount_minor"]
+	if !ok {
+		t.Fatalf("preorder_min_amount_minor missing from the detail payload (wanted %d)", min)
+	}
+	var got int64
+	if err := json.Unmarshal(field, &got); err != nil {
+		t.Fatalf("preorder_min_amount_minor is not a number: %v (%s)", err, field)
+	}
+	if got != min {
+		t.Fatalf("preorder_min_amount_minor = %d, want %d", got, min)
+	}
+}
+
+// TestPayloadOmitsPreorderMinAmountMinorWhenNotSet: the field disappears on
+// the listing (which never reads the column at all) and on a detail read for
+// a venue with no minimum set — never a false floor of 0.
+func TestPayloadOmitsPreorderMinAmountMinorWhenNotSet(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+		"/api/v1/restaurants/" + id.String(),
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["preorder_min_amount_minor"]; ok {
+				t.Fatalf("preorder_min_amount_minor must be omitted when not set, got %s", v)
+			}
+		})
+	}
+}
+
+// TestListingPayloadOmitsPreorderMinAmountMinorEvenWhenSet: the minimum is a
+// DETAIL-only field, same rule as accepts_online_payment — a listing row must
+// not leak it even if the domain value happens to be populated (e.g. a future
+// caller that reuses the same domain.Restaurant for both reads).
+func TestListingPayloadOmitsPreorderMinAmountMinorEvenWhenSet(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	var min int64 = 5_000_00
+	rest.PreorderMinAmountMinor = &min
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest},
+	})
+
+	for _, path := range []string{
+		"/api/v1/restaurants",
+		"/api/v1/restaurants/search?q=x",
+	} {
+		t.Run(path, func(t *testing.T) {
+			raw := rawVenue(t, r, path)
+			if v, ok := raw["preorder_min_amount_minor"]; ok {
+				t.Fatalf("preorder_min_amount_minor must be listing-absent, got %s", v)
+			}
+		})
+	}
+}
