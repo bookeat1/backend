@@ -34,9 +34,9 @@ const selCols = `id, restaurant_id, image_url, caption, action_url, sort_order, 
 // anything later — sees the same truth:
 //
 //	is_active                              the venue's manual switch
-//	expires_at IS NULL OR expires_at > now  the optional lifetime (0088)
+//	expires_at IS NULL OR expires_at > now  the optional lifetime (0106)
 //
-// The NULL branch is the load-bearing half: every story written before 0088 has
+// The NULL branch is the load-bearing half: every story written before 0106 has
 // expires_at IS NULL and must keep being served exactly as before. Writing this
 // as a plain `expires_at > now` would silently retire the entire existing
 // catalogue, because NULL > now is NULL, not true.
@@ -49,7 +49,7 @@ func (r *Repository) ListActiveByRestaurant(ctx context.Context, restaurantID uu
 	// same-sort_order cards would not be stable between reads. The listing index
 	// carries all three sort columns so this stays an index-ordered scan; the
 	// expires_at predicate is a recheck on the handful of rows a venue has (see
-	// migration 0088 on why it is not in the index).
+	// migration 0106 on why it is not in the index).
 	q := `SELECT ` + selCols + ` FROM restaurant_stories
 	      WHERE restaurant_id=$1 AND is_active
 	        AND (expires_at IS NULL OR expires_at > $2)

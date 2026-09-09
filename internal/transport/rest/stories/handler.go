@@ -221,7 +221,7 @@ type createStoryRequest struct {
 	ActionURL *string `json:"action_url"`
 	// expires_at is the OPTIONAL "show until" instant, RFC3339. Omitted, null
 	// or blank ⇒ the story never expires — which is what the guest app has
-	// always seen and what every pre-0088 row carries. The cabinet pre-fills
+	// always seen and what every pre-0106 row carries. The cabinet pre-fills
 	// +24h as a suggestion; the API imposes no default, so an integration that
 	// does not know about expiry keeps creating permanent stories.
 	ExpiresAt *string `json:"expires_at"`

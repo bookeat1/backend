@@ -27,7 +27,7 @@ import (
 // next to IsActive: IsActive is the venue's hand on the switch, ExpiresAt is the
 // timer it may set instead of remembering to flip that switch. nil means "no
 // timer, this card never expires" — which is what every story written before
-// migration 0088 carries, and what a venue gets when it clears the field.
+// migration 0106 carries, and what a venue gets when it clears the field.
 type Story struct {
 	ID           uuid.UUID
 	RestaurantID uuid.UUID
@@ -38,7 +38,7 @@ type Story struct {
 	IsActive     bool
 	// ExpiresAt is an INSTANT, not a wall-clock date: it is compared against
 	// "now" and never re-read in the venue's own zone. Same shape as
-	// Event.EndsAt and otp expiry; see migration 0088 for why the venue's
+	// Event.EndsAt and otp expiry; see migration 0106 for why the venue's
 	// timezone is not part of it.
 	ExpiresAt *time.Time
 	CreatedAt time.Time
@@ -46,7 +46,7 @@ type Story struct {
 
 // IsExpired reports whether the story's lifetime has run out at now. A story
 // with no expiry (nil) is NEVER expired — that is the whole meaning of nil, and
-// the reason existing cards survived migration 0088 untouched.
+// the reason existing cards survived migration 0106 untouched.
 //
 // The comparison is strict (expires_at > now is still alive), matching the SQL
 // predicate in the repository exactly, so a story cannot be alive to the

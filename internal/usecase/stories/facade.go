@@ -75,7 +75,7 @@ type CreateInput struct {
 	// ExpiresAt is the OPTIONAL lifetime — an RFC3339 instant after which
 	// guests stop being served the card. nil or a blank string means "no
 	// expiry, show it until the venue says otherwise", which is also what every
-	// story predating migration 0088 carries. The cabinet OFFERS +24h as a
+	// story predating migration 0106 carries. The cabinet OFFERS +24h as a
 	// default; that default is a product decision of the panel's form, not a
 	// rule of this usecase, which would otherwise start expiring stories
 	// created by API clients that never asked for it.

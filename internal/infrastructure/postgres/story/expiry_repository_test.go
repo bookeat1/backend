@@ -11,11 +11,11 @@ import (
 	"backend-core/internal/infrastructure/postgres/testdb"
 )
 
-// The story lifetime (migration 0088) against a real Postgres. Three claims,
+// The story lifetime (migration 0106) against a real Postgres. Three claims,
 // and the middle one is the one a careless implementation breaks:
 //
 //  1. a story whose expires_at has passed is NOT served to guests;
-//  2. a story with NO expiry (NULL — every row that existed before 0088) IS
+//  2. a story with NO expiry (NULL — every row that existed before 0106) IS
 //     still served, exactly as before;
 //  3. the venue cabinet still lists the expired one, so it can be extended or
 //     deleted instead of silently vanishing from the venue's own screen.
@@ -77,7 +77,7 @@ func TestListActiveByRestaurantHidesExpiredStories(t *testing.T) {
 	}
 
 	// Claim 2, stated on its own so a regression names itself: the NULL card is
-	// the shape every pre-0088 story has, and it must survive the deploy.
+	// the shape every pre-0106 story has, and it must survive the deploy.
 	var served bool
 	for _, s := range got {
 		if s.ImageURL == "https://cdn/never.jpg" {

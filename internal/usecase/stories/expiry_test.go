@@ -174,7 +174,7 @@ func TestCreateWithoutExpiresAtIsPermanent(t *testing.T) {
 	}
 }
 
-// The nil expiry is the state every pre-0088 row carries, so IsExpired must
+// The nil expiry is the state every pre-0106 row carries, so IsExpired must
 // never call one expired — that single wrong answer would empty the platform's
 // story rails on deploy day.
 func TestStoryIsExpired(t *testing.T) {
