@@ -1,16 +1,22 @@
 name: Deploy
 
-# Branch model (product owner's decision, 2026-09-08):
+# Branch model (product owner's decision, 2026-09-10, supersedes 2026-09-08):
 #   develop -> test server, automatically on every push;
-#   main    -> production, manually (workflow_dispatch) and ONLY from main.
+#   main    -> production, automatically on every push (i.e. the moment a
+#              develop -> main merge lands). No manual button, no typed
+#              confirmation: merging into main IS the release decision.
 # `main` is a plain fast-forward/merge of `develop` — what ran on test is what
-# goes to prod. The `preflight` job below refuses a prod dispatch from any
-# other ref before an image is even built, and `deploy-prod` repeats the same
-# check on its own `if:` so the two cannot drift apart.
+# goes to prod. The manual `workflow_dispatch` path is kept as a fallback (to
+# re-release the same SHA after an incident, or to push a build to test); when
+# it targets prod it still refuses any ref but `main` and still requires the
+# typed confirmation, both in `preflight` and again in `deploy-prod`'s `if:`.
+# Everything else is unchanged: the server-side health check in
+# remote-deploy.sh still gates the deploy, and `current`/`previous` in GHCR are
+# still only moved after that check passed — see the promote step below.
 
 on:
   push:
-    branches: [develop]
+    branches: [develop, main]
   workflow_dispatch:
     inputs:
       environment:
@@ -19,7 +25,7 @@ on:
         type: choice
         options: [test, prod]
       confirm:
-        description: 'For prod only: type exactly "deploy-to-prod" to confirm (and run the workflow from main)'
+        description: 'Prod fallback only: type exactly "deploy-to-prod" (and run from main). A push to main already deploys prod on its own.'
         required: false
         default: ""
 
@@ -31,6 +37,9 @@ jobs:
   # Loud, early refusal for a wrong manual dispatch. A silent `if:` skip on
   # deploy-prod alone would still build and push an image from a feature
   # branch and leave a green-looking run with nothing deployed.
+  # Push events pass through untouched: a push can only come from `develop` or
+  # `main` (see `on:` above), and which of the two it is already decides the
+  # target environment.
   preflight:
     runs-on: ubuntu-latest
     steps:
@@ -152,13 +161,17 @@ jobs:
 
   deploy-prod:
     needs: build-and-push
-    # Same three conditions `preflight` already enforced, restated here so the
-    # job itself is safe even if someone edits the preflight step later.
+    # Two ways in, and both mean "main":
+    #   1. a push to main — the develop -> main merge itself;
+    #   2. a manual dispatch from main with the typed confirmation (fallback),
+    #      the same three conditions `preflight` already enforced, restated
+    #      here so the job is safe even if someone edits that step later.
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main' &&
-      inputs.environment == 'prod' &&
-      inputs.confirm == 'deploy-to-prod'
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       inputs.environment == 'prod' &&
+       inputs.confirm == 'deploy-to-prod')
     runs-on: ubuntu-latest
     environment: prod
     steps:
