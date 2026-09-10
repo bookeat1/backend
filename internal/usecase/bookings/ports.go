@@ -79,6 +79,22 @@ type managerChecker interface {
 	Manages(ctx context.Context, userID, restaurantID uuid.UUID) (bool, error)
 }
 
+// promoReader is the minimal slice of the promos context this package needs:
+// confirm that a promotion_id someone attaches to a booking names a REAL,
+// currently live campaign — never trust a client-supplied id (see
+// validatePromotion in create.go). Bound to usecase/promos.Facade in
+// bootstrap/deps.go; that facade already implements this method, so no change
+// to the promos package was needed.
+//
+// GetPublicDetail's own visibility rule (published, window contains now) is
+// exactly "a real, currently active promo" for this purpose — the same rule a
+// guest browsing promo cards is held to, and stricter than merely "the id
+// exists in the table" (a draft, hidden or expired promo answers
+// domain.ErrNotFound here, same as an absent one).
+type promoReader interface {
+	GetPublicDetail(ctx context.Context, promoID uuid.UUID) (*domain.PromoListItem, error)
+}
+
 // Config is the global (level-1) booking policy plus anti-fraud thresholds. A
 // restaurant may override the policy fields per venue; see resolvePolicy.
 type Config struct {

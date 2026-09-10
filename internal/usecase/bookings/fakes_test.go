@@ -446,6 +446,30 @@ func (f *fakeManagers) Manages(_ context.Context, userID, restaurantID uuid.UUID
 	return f.pairs[[2]uuid.UUID{userID, restaurantID}], nil
 }
 
+// fakePromos answers GetPublicDetail from a fixed set of "live" promo ids —
+// the promoReader port validatePromotion (create.go) consumes. Any id not in
+// the set answers domain.ErrNotFound, exactly like the real facade's
+// visibility rule rejecting a draft/hidden/expired/absent promo.
+type fakePromos struct {
+	live map[uuid.UUID]domain.PromoListItem
+}
+
+func newFakePromos(ids ...uuid.UUID) *fakePromos {
+	f := &fakePromos{live: map[uuid.UUID]domain.PromoListItem{}}
+	for _, id := range ids {
+		f.live[id] = domain.PromoListItem{Promo: domain.Promo{ID: id, Title: "Марафон Алматы"}}
+	}
+	return f
+}
+
+func (f *fakePromos) GetPublicDetail(_ context.Context, id uuid.UUID) (*domain.PromoListItem, error) {
+	it, ok := f.live[id]
+	if !ok {
+		return nil, fmt.Errorf("get public promo: %w", domain.ErrNotFound)
+	}
+	return &it, nil
+}
+
 // fakeTx runs fn inline; it records that it was entered so tests can assert
 // the mutation happened inside a transaction.
 type fakeTx struct{ calls int }

@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -25,6 +26,7 @@ type createHarness struct {
 	blacklist *fakeBlacklist
 	rateLog   *fakeRateLog
 	schedule  *fakeSchedule
+	promos    *fakePromos
 	tx        *fakeTx
 
 	restaurantID uuid.UUID
@@ -33,6 +35,9 @@ type createHarness struct {
 	tableBig     domain.RestaurantTable
 	tableSmall   domain.RestaurantTable
 	startsAt     time.Time
+	// promoID is the one promo fakePromos knows as "live" — the marathon-style
+	// campaign tag a booking may carry. See TestCreatePromotionID.
+	promoID uuid.UUID
 }
 
 func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *createHarness {
@@ -40,6 +45,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 	loc := mustLoad(t, "Asia/Almaty")
 	rid := uuid.New()
 	big, small := table("big", 4), table("small", 2)
+	promoID := uuid.New()
 
 	h := &createHarness{
 		bookings:  newFakeBookings(),
@@ -54,12 +60,14 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 			hours:  openAllWeek("12:00", "22:00"),
 			tables: []domain.RestaurantTable{big, small},
 		},
+		promos:       newFakePromos(promoID),
 		tx:           &fakeTx{},
 		restaurantID: rid,
 		guest:        Actor{UserID: uuid.New(), Role: domain.RoleUser},
 		manager:      Actor{UserID: uuid.New(), Role: domain.RoleRestaurant},
 		tableBig:     big,
 		tableSmall:   small,
+		promoID:      promoID,
 	}
 	day := time.Now().In(loc).AddDate(0, 0, 2)
 	h.startsAt = time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
@@ -71,7 +79,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 		}}},
 		h.schedule,
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, rid}),
-		h.tx, testConfig(),
+		h.promos, h.tx, testConfig(),
 	)
 	return h
 }
@@ -169,6 +177,63 @@ func TestCreateWithItems(t *testing.T) {
 	if len(got.Items) != 1 || got.Items[0].Currency != "KZT" ||
 		got.Items[0].Status != domain.BookingItemPending || got.Items[0].TotalMinor() != 700000 {
 		t.Fatalf("items = %+v", got.Items)
+	}
+}
+
+// A promotion_id that names a real, live promo (fakePromos knows it) is
+// accepted, stored on the booking, and reaches the outbox payload — the tag
+// consumers (today: the analytics mapper) read to attribute the booking to a
+// campaign. Twin of "a random uuid is not a real promotion" in
+// TestCreateRejections, which covers the ugly path this one is the happy path
+// for.
+func TestCreatePromotionID(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	in := h.input()
+	in.PromotionID = &h.promoID
+
+	got, err := h.uc.Create(context.Background(), h.guest, in)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got.Booking.PromotionID == nil || *got.Booking.PromotionID != h.promoID {
+		t.Fatalf("booking.PromotionID = %v, want %s", got.Booking.PromotionID, h.promoID)
+	}
+	if len(h.outbox.created) != 1 {
+		t.Fatalf("outbox events = %d, want 1", len(h.outbox.created))
+	}
+	var payload struct {
+		PromotionID *uuid.UUID `json:"promotion_id"`
+	}
+	if err := json.Unmarshal(h.outbox.created[0].Payload, &payload); err != nil {
+		t.Fatalf("decode outbox payload: %v", err)
+	}
+	if payload.PromotionID == nil || *payload.PromotionID != h.promoID {
+		t.Fatalf("outbox payload promotion_id = %v, want %s", payload.PromotionID, h.promoID)
+	}
+}
+
+// No promoReader wired at all (an older bootstrap, a misconfigured test) must
+// refuse a promotion_id rather than silently accept it — the same "safe
+// failure over a silent skip" the port doc on createUseCase.promos calls for.
+func TestCreatePromotionIDWithoutPromosConfigured(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	h.uc = NewCreateUseCase(
+		h.bookings, h.links, h.capacity, h.items, h.history, h.outbox, h.blacklist, h.rateLog,
+		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+			ID: h.restaurantID, IsActive: true,
+		}}},
+		h.schedule,
+		newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}),
+		nil, h.tx, testConfig(),
+	)
+	in := h.input()
+	in.PromotionID = &h.promoID
+
+	if _, err := h.uc.Create(context.Background(), h.guest, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Create = %v, want ErrValidation", err)
+	}
+	if len(h.bookings.created) != 0 {
+		t.Fatalf("a rejected request must not create a booking")
 	}
 }
 
@@ -288,6 +353,17 @@ func TestCreateRejections(t *testing.T) {
 				return Actor{UserID: uuid.New(), Role: domain.RoleRestaurant}
 			},
 			wantErr: domain.ErrForbidden,
+		},
+		{
+			// The spoofing hole this check exists to close: a guest cannot make a
+			// booking read as if it came from a real campaign by pasting an
+			// arbitrary uuid into promotion_id.
+			name: "a random uuid is not a real promotion",
+			mutate: func(_ *createHarness, in *CreateInput) {
+				id := uuid.New()
+				in.PromotionID = &id
+			},
+			wantErr: domain.ErrValidation,
 		},
 	}
 
@@ -444,7 +520,7 @@ func TestCreateInactiveRestaurant(t *testing.T) {
 		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
 		&fakeBlacklist{}, &fakeRateLog{},
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid}}},
-		&fakeSchedule{}, newFakeManagers(), &fakeTx{}, testConfig(),
+		&fakeSchedule{}, newFakeManagers(), nil, &fakeTx{}, testConfig(),
 	)
 	_, err := uc.Create(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleUser}, CreateInput{
 		RestaurantID: rid, Name: "x", Phone: "+77071234567", Guests: 2,

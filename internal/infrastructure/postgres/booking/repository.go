@@ -146,6 +146,9 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 	if f.UserID != nil {
 		add("user_id = $%d", *f.UserID)
 	}
+	if f.PromotionID != nil {
+		add("promotion_id = $%d", *f.PromotionID)
+	}
 	if len(f.Statuses) > 0 {
 		add("status = ANY($%d)", statusStrings(f.Statuses))
 	}

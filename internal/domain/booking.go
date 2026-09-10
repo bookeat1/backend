@@ -232,9 +232,15 @@ type Booking struct {
 type BookingFilter struct {
 	RestaurantID *uuid.UUID
 	UserID       *uuid.UUID
-	Statuses     []BookingStatus
-	From         *time.Time // starts_at >= From
-	To           *time.Time // starts_at <  To
+	// PromotionID narrows to bookings tagged with one campaign (e.g. the
+	// Almaty marathon's platform promo) — the "all bookings from campaign X"
+	// list a merch handout or a marketing report needs. Unlike RestaurantID
+	// and UserID, the facade never overwrites this: it is orthogonal to "whose
+	// bookings" and "which venue's bookings" and composes with both.
+	PromotionID *uuid.UUID
+	Statuses    []BookingStatus
+	From        *time.Time // starts_at >= From
+	To          *time.Time // starts_at <  To
 	// CalendarDate is "the venue's day", still unresolved: a date carries no
 	// zone, so only the usecase — which knows WHOSE calendar is being asked
 	// about — may turn it into From/To. It never reaches a repository; the
