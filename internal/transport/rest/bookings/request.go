@@ -160,6 +160,13 @@ func (r blacklistRequest) toInput() (uc.BlacklistInput, error) {
 // misspelled status must not get the unfiltered list back.
 func bookingFilter(c *gin.Context) (domain.BookingFilter, error) {
 	var f domain.BookingFilter
+	if v := strings.TrimSpace(c.Query("promotion_id")); v != "" {
+		id, err := parseUUID(v, "promotion_id")
+		if err != nil {
+			return f, err
+		}
+		f.PromotionID = &id
+	}
 	for _, raw := range c.QueryArray("status") {
 		for _, s := range strings.Split(raw, ",") {
 			if s = strings.TrimSpace(s); s != "" {

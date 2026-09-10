@@ -404,7 +404,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
-		restRelated, restaurantManagers, txm, bookingCfg)
+		restRelated, restaurantManagers, promosFacade, txm, bookingCfg)
 
 	paymentsRepo := paymentrepo.New(db)
 	paymentRefundsRepo := paymentrepo.NewRefunds(db)

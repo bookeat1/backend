@@ -82,8 +82,13 @@ type createUseCase struct {
 	restaurants restaurantReader
 	schedule    scheduleReader
 	managers    managerChecker
-	tx          domain.TxManager
-	cfg         Config
+	// promos is nil-able ON PURPOSE: a caller who has not wired promos yet
+	// (an older bootstrap, a test) still gets a working Create, just one that
+	// refuses any promotion_id at all — the safe failure, never a silent skip
+	// of the check. See validatePromotion.
+	promos promoReader
+	tx     domain.TxManager
+	cfg    Config
 }
 
 // NewCreateUseCase constructs the booking creation usecase.
@@ -99,13 +104,14 @@ func NewCreateUseCase(
 	restaurants restaurantReader,
 	schedule scheduleReader,
 	managers managerChecker,
+	promos promoReader,
 	tx domain.TxManager,
 	cfg Config,
 ) CreateUseCase {
 	return &createUseCase{
 		bookings: bookings, links: links, capacity: capacity, items: items, history: history,
 		outbox: outbox, blacklist: blacklist, rateLog: rateLog,
-		restaurants: restaurants, schedule: schedule, managers: managers,
+		restaurants: restaurants, schedule: schedule, managers: managers, promos: promos,
 		tx: tx, cfg: cfg.withDefaults(),
 	}
 }
@@ -118,6 +124,9 @@ func NewCreateUseCase(
 //	items + history + outbox), plus auto-confirmation.
 func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput) (*BookingDetails, error) {
 	if err := validateCreate(in); err != nil {
+		return nil, err
+	}
+	if err := u.validatePromotion(ctx, in.PromotionID); err != nil {
 		return nil, err
 	}
 	acc, err := resolveAccess(ctx, u.managers, actor, in.RestaurantID)
@@ -588,6 +597,40 @@ func (u *createUseCase) selectTables(
 				domain.ErrAlreadyExists, in.Guests))
 	}
 	return picked, nil
+}
+
+// validatePromotion confirms a caller-supplied promotion_id is a REAL,
+// currently live campaign before it is allowed anywhere near a booking row.
+//
+// The guest route (createMine) does not strip promotion_id the way it strips
+// TableIDs/Force/Overbook — a guest is EXPECTED to say "I came from campaign
+// X" — but before this check nothing stopped a guest from pasting any uuid at
+// all and having the booking come out tagged as if it were a real campaign
+// participant (a marathon merch list, a discount attribution report). This is
+// the one check that makes that tag mean something.
+//
+// "Live" is deliberately the promos public-visibility rule (published, window
+// contains now) rather than merely "the row exists": a draft or an expired
+// promo is not a campaign a guest could honestly be participating in today.
+// There is, as of this check, no notion of a promo being scoped to specific
+// restaurants or requiring "first use per account" — those are the fuller
+// promo_codes model the marathon spec describes for a later pass; this is the
+// minimum that closes the spoofing hole for the ONE mechanism the product
+// actually shipped (bookings.promotion_id, migration 0004).
+func (u *createUseCase) validatePromotion(ctx context.Context, promotionID *uuid.UUID) error {
+	if promotionID == nil {
+		return nil
+	}
+	if u.promos == nil {
+		return fmt.Errorf("%w: promotions are not available", domain.ErrValidation)
+	}
+	if _, err := u.promos.GetPublicDetail(ctx, *promotionID); err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return fmt.Errorf("%w: promotion is not active", domain.ErrValidation)
+		}
+		return err
+	}
+	return nil
 }
 
 func validateCreate(in CreateInput) error {
