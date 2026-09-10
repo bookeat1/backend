@@ -118,7 +118,9 @@ func newConflictHarness(t *testing.T) *conflictHarness {
 		bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool),
-		fakeManagers{manages: true}, txm, conflictConfig(),
+		// nil promoReader: no test in this file books with a promotion_id, so
+		// the nil-safe "promotions are not available" branch never fires.
+		fakeManagers{manages: true}, nil, txm, conflictConfig(),
 	)
 	idempotent := uc.NewIdempotentCreateUseCase(create, idemrepo.New(pool), txm)
 

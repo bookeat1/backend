@@ -161,6 +161,23 @@ func TestBookingCRUDAndList(t *testing.T) {
 		t.Errorf("list by user total=%d err=%v", total, err)
 	}
 
+	// PromotionID filter: the "all bookings tagged with campaign X" list a
+	// merch handout needs. Only `b` was ever given a promotion_id (via Update
+	// below); the other two bookings in this venue carry none, so they must
+	// not appear.
+	promoID := uuid.New()
+	b.PromotionID = &promoID
+	if err := repo.Update(ctx, b); err != nil {
+		t.Fatalf("update with promotion_id: %v", err)
+	}
+	byPromo, total, err := repo.List(ctx, domain.BookingFilter{PromotionID: &promoID})
+	if err != nil || total != 1 || len(byPromo) != 1 || byPromo[0].ID != b.ID {
+		t.Errorf("list by promotion_id total=%d err=%v, want the single tagged booking", total, err)
+	}
+	if _, total, err = repo.List(ctx, domain.BookingFilter{PromotionID: ptr(uuid.New())}); err != nil || total != 0 {
+		t.Errorf("list by an unused promotion_id total=%d err=%v, want 0", total, err)
+	}
+
 	all, total, err := repo.List(ctx, domain.BookingFilter{RestaurantID: &rid, PerPage: 2})
 	if err != nil || total != 3 || len(all) != 2 {
 		t.Fatalf("paginated list: rows=%d total=%d err=%v", len(all), total, err)

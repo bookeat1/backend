@@ -3,6 +3,7 @@ package stories
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -75,9 +76,12 @@ func (h *Handler) listAdmin(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
+	// One instant for the whole page, so two cards expiring in the same second
+	// cannot be badged differently within a single response.
+	now := time.Now()
 	out := make([]adminStoryResponse, 0, len(items))
 	for i := range items {
-		out = append(out, adminStoryToResponse(&items[i]))
+		out = append(out, adminStoryToResponse(&items[i], now))
 	}
 	response.OK(c.Writer, out)
 }
@@ -102,6 +106,7 @@ func (h *Handler) create(c *gin.Context) {
 		Caption:      req.Caption,
 		CaptionI18n:  domain.I18nPatch(req.CaptionI18n),
 		ActionURL:    req.ActionURL,
+		ExpiresAt:    req.ExpiresAt,
 		SortOrder:    req.SortOrder,
 		IsActive:     req.IsActive,
 	})
@@ -109,7 +114,7 @@ func (h *Handler) create(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, adminStoryToResponse(s))
+	response.OK(c.Writer, adminStoryToResponse(s, time.Now()))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -131,6 +136,7 @@ func (h *Handler) update(c *gin.Context) {
 		Caption:     req.Caption,
 		CaptionI18n: domain.I18nPatch(req.CaptionI18n),
 		ActionURL:   req.ActionURL,
+		ExpiresAt:   req.ExpiresAt,
 		SortOrder:   req.SortOrder,
 		IsActive:    req.IsActive,
 	})
@@ -138,7 +144,7 @@ func (h *Handler) update(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, adminStoryToResponse(s))
+	response.OK(c.Writer, adminStoryToResponse(s, time.Now()))
 }
 
 func (h *Handler) delete(c *gin.Context) {
@@ -224,6 +230,12 @@ type createStoryRequest struct {
 	// Optional; when present it must be an http(s) link (validated in the
 	// usecase by domain.ValidateExternalActionURL).
 	ActionURL *string `json:"action_url"`
+	// expires_at is the OPTIONAL "show until" instant, RFC3339. Omitted, null
+	// or blank ⇒ the story never expires — which is what the guest app has
+	// always seen and what every pre-0106 row carries. The cabinet pre-fills
+	// +24h as a suggestion; the API imposes no default, so an integration that
+	// does not know about expiry keeps creating permanent stories.
+	ExpiresAt *string `json:"expires_at"`
 	SortOrder *int    `json:"sort_order"`
 	IsActive  *bool   `json:"is_active"`
 }
@@ -238,6 +250,9 @@ type updateStoryRequest struct {
 	// Same three states as caption: omitted ⇒ unchanged, empty ⇒ the link is
 	// removed, otherwise validated and stored.
 	ActionURL *string `json:"action_url"`
+	// Same three states again: omitted ⇒ the expiry is unchanged, an empty
+	// string ⇒ the story becomes permanent, otherwise an RFC3339 instant.
+	ExpiresAt *string `json:"expires_at"`
 	SortOrder *int    `json:"sort_order"`
 	IsActive  *bool   `json:"is_active"`
 }

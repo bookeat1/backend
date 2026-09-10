@@ -37,6 +37,12 @@ type bookingProps struct {
 	Guests       int        `json:"guests"`
 	Status       string     `json:"status"`
 	Source       string     `json:"source"`
+	// PromotionID is the campaign tag a booking was created with (e.g. the
+	// Almaty marathon's platform promo) — see
+	// usecase/bookings.bookingPayload.PromotionID, already validated as a
+	// real, live promo before the booking existed. Nil for the vast majority
+	// of bookings that carry no campaign.
+	PromotionID *uuid.UUID `json:"promotion_id"`
 }
 
 func bookingEventType(t string) (EventType, bool) {
@@ -70,18 +76,28 @@ func mapBooking(row SourceRow) (Event, bool, error) {
 	if p.UserID != nil && *p.UserID != uuid.Nil {
 		userID = p.UserID.String()
 	}
+	props := map[string]any{
+		"restaurant_id": p.RestaurantID.String(),
+		"guests":        p.Guests,
+		"status":        p.Status,
+		"source":        p.Source,
+	}
+	// promotion_id: only on the two funnel steps a campaign is actually
+	// measured over (a guest booked, a venue confirmed it) — the same pair a
+	// "how many marathon bookings turned into confirmed visits" chart needs.
+	// Omitted rather than sent empty for every OTHER booking: an Amplitude
+	// property that is absent on 99% of events reads as "not applicable",
+	// nil/"" would read as "campaign unknown".
+	if p.PromotionID != nil && (et == EventBookingCreated || et == EventBookingConfirmed) {
+		props["promotion_id"] = p.PromotionID.String()
+	}
 	return Event{
-		Type:     et,
-		UserID:   userID,
-		DeviceID: deviceIDForBooking(p.ID),
-		InsertID: row.ID.String(),
-		Time:     row.CreatedAt,
-		Properties: map[string]any{
-			"restaurant_id": p.RestaurantID.String(),
-			"guests":        p.Guests,
-			"status":        p.Status,
-			"source":        p.Source,
-		},
+		Type:       et,
+		UserID:     userID,
+		DeviceID:   deviceIDForBooking(p.ID),
+		InsertID:   row.ID.String(),
+		Time:       row.CreatedAt,
+		Properties: props,
 	}, true, nil
 }
 

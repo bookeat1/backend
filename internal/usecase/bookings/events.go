@@ -147,6 +147,14 @@ type bookingPayload struct {
 	// from one the guest performed themselves — the guest-facing notifier does
 	// not echo the latter back at them. Empty on every non-cancel event.
 	CancelledBy domain.CancelledBy `json:"cancelled_by,omitempty"`
+	// PromotionID tags the booking with the campaign it was attached to at
+	// creation (e.g. the Almaty marathon's platform promo) — see
+	// createUseCase.validatePromotion, which already confirmed it names a real,
+	// live promo before the booking was ever written. Omitted for the vast
+	// majority of bookings that carry no campaign. Consumers of this outbox
+	// (today: the analytics mapper) read it through an allow-list, same as
+	// every other field here — nothing about how it got here changes that.
+	PromotionID *uuid.UUID `json:"promotion_id,omitempty"`
 }
 
 func newBookingPayload(b *domain.Booking) bookingPayload {
@@ -154,6 +162,7 @@ func newBookingPayload(b *domain.Booking) bookingPayload {
 		ID: b.ID, RestaurantID: b.RestaurantID, UserID: b.UserID, Name: b.Name,
 		Phone: b.PhoneNormalized, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: b.Status, Source: b.Source,
+		PromotionID: b.PromotionID,
 	}
 	if b.CancelledBy != nil {
 		p.CancelledBy = *b.CancelledBy

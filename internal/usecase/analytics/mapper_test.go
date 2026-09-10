@@ -105,6 +105,72 @@ func TestMapBookingNoUserID_EmptyUser(t *testing.T) {
 	}
 }
 
+// TestMapBookingPromotionID covers the Almaty-marathon-style campaign tag:
+// present on booking_created/booking_confirmed (the two funnel steps a
+// campaign is measured over), absent from the properties map — not sent as
+// null — on every OTHER booking, and absent from cancelled/no_show even when
+// the payload carries one (a deliberate scope limit, not an oversight — see
+// mapBooking).
+func TestMapBookingPromotionID(t *testing.T) {
+	promotionID := uuid.New()
+	payloadWith := func(t *testing.T, status string) json.RawMessage {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{
+			"id": uuid.New(), "restaurant_id": uuid.New(), "user_id": uuid.New(),
+			"name": "Damir", "phone": "+77011234567", "email": "guest@example.com",
+			"guests": 2, "status": status, "source": "guest_app",
+			"promotion_id": promotionID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	for _, tc := range []struct {
+		eventType string
+		wantProp  bool
+	}{
+		{"booking.created", true},
+		{"booking.confirmed", true},
+		{"booking.cancelled", false},
+		{"booking.no_show", false},
+	} {
+		ev, tracked, err := mapRow(SourceBookingOutbox, SourceRow{
+			ID: uuid.New(), EventType: tc.eventType, Payload: payloadWith(t, "x"), CreatedAt: time.Now(),
+		})
+		if err != nil || !tracked {
+			t.Fatalf("%s: unexpected err=%v tracked=%v", tc.eventType, err, tracked)
+		}
+		got, present := ev.Properties["promotion_id"]
+		if present != tc.wantProp {
+			t.Fatalf("%s: promotion_id present = %v, want %v", tc.eventType, present, tc.wantProp)
+		}
+		if tc.wantProp && got != promotionID.String() {
+			t.Fatalf("%s: promotion_id = %v, want %v", tc.eventType, got, promotionID)
+		}
+	}
+
+	// A booking with NO campaign must not carry a null/empty promotion_id: the
+	// property is simply absent.
+	noPromoPayload, err := json.Marshal(map[string]any{
+		"id": uuid.New(), "restaurant_id": uuid.New(), "guests": 2,
+		"status": "x", "source": "guest_app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, _, err := mapRow(SourceBookingOutbox, SourceRow{
+		ID: uuid.New(), EventType: "booking.created", Payload: noPromoPayload, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := ev.Properties["promotion_id"]; present {
+		t.Fatalf("promotion_id must be absent for a booking with no campaign, got %v", ev.Properties["promotion_id"])
+	}
+}
+
 func TestMapBookingUntracked(t *testing.T) {
 	_, _, payload := bookingPayloadWithPII(t, nil, "waitlisted")
 	for _, et := range []string{"booking.waitlisted", "booking.arrived", "booking.completed", "booking.updated", "booking.message_created"} {

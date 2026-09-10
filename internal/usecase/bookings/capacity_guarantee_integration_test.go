@@ -103,7 +103,7 @@ func newGuaranteeHarness(t *testing.T, mode string, seats int) *guaranteeHarness
 		create: NewCreateUseCase(bookings, bookingrepo.NewTables(pool), capacity,
 			bookingrepo.NewItems(pool), bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 			bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool), rr, related,
-			managers, txm, testConfig()),
+			managers, nil, txm, testConfig()),
 		restaurantID: rid,
 		manager:      Actor{UserID: managerID, Role: domain.RoleRestaurant},
 		guest:        Actor{UserID: guestID, Role: domain.RoleUser},
