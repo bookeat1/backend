@@ -2,6 +2,8 @@ package otp
 
 import (
 	"context"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,8 +29,10 @@ func TestCreateLatestActiveAndUse(t *testing.T) {
 		t.Fatalf("LatestActiveByPhone = %+v, %v", got, err)
 	}
 
-	if err := repo.IncrementAttempts(ctx, c.ID); err != nil {
+	if attempts, err := repo.IncrementAttempts(ctx, c.ID); err != nil {
 		t.Fatalf("IncrementAttempts: %v", err)
+	} else if attempts != 1 {
+		t.Fatalf("IncrementAttempts returned %d, want 1", attempts)
 	}
 	if err := repo.MarkUsed(ctx, c.ID); err != nil {
 		t.Fatalf("MarkUsed: %v", err)
@@ -40,6 +44,65 @@ func TestCreateLatestActiveAndUse(t *testing.T) {
 	n, err := repo.CountSince(ctx, "+77070000000", time.Now().Add(-time.Hour))
 	if err != nil || n != 1 {
 		t.Fatalf("CountSince = %d, %v", n, err)
+	}
+}
+
+// TestIncrementAttemptsConcurrentReturnsDistinctSequentialValues is the
+// building-block proof for the usecase-level atomicity fix: N goroutines
+// hitting the SAME row's IncrementAttempts concurrently must each get a
+// DIFFERENT return value, and together those values must be exactly 1..N —
+// Postgres's row lock on UPDATE ... RETURNING serializes them, so no two
+// callers can ever observe the same "new" count and no count can be skipped
+// or repeated. This is what usecase/auth relies on instead of a local
+// "rec.Attempts + 1" snapshot.
+func TestIncrementAttemptsConcurrentReturnsDistinctSequentialValues(t *testing.T) {
+	db := testdb.Connect(t)
+	testdb.Truncate(t, db, "otp_codes")
+	repo := New(db)
+	ctx := context.Background()
+
+	c := &domain.OTPCode{ID: uuid.New(), Phone: "+77070000099", CodeHash: "h", Channel: "stub", ExpiresAt: time.Now().Add(5 * time.Minute)}
+	if err := repo.Create(ctx, c); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	const n = 20
+	results := make([]int, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	var startWG sync.WaitGroup
+	startWG.Add(1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			startWG.Wait() // maximise actual overlap against the real connection pool
+			results[i], errs[i] = repo.IncrementAttempts(context.Background(), c.ID)
+		}(i)
+	}
+	startWG.Done()
+	wg.Wait()
+
+	got := make([]int, 0, n)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("IncrementAttempts goroutine %d: %v", i, err)
+		}
+		got = append(got, results[i])
+	}
+	sort.Ints(got)
+	for i, v := range got {
+		if want := i + 1; v != want {
+			t.Fatalf("returned values = %v, want exactly 1..%d (position %d was %d)", got, n, i, v)
+		}
+	}
+
+	var attempts int
+	if err := db.QueryRow(ctx, `SELECT attempts FROM otp_codes WHERE id = $1`, c.ID).Scan(&attempts); err != nil {
+		t.Fatalf("query attempts: %v", err)
+	}
+	if attempts != n {
+		t.Fatalf("attempts = %d, want %d", attempts, n)
 	}
 }
 

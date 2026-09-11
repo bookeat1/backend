@@ -68,7 +68,17 @@ type OTPRepository interface {
 	// or ErrNotFound.
 	LatestActiveByPhone(ctx context.Context, phone string) (*OTPCode, error)
 	MarkUsed(ctx context.Context, id uuid.UUID) error
-	IncrementAttempts(ctx context.Context, id uuid.UUID) error
+	// IncrementAttempts atomically bumps the row's attempt counter by one and
+	// returns the counter AFTER the increment, in one round trip (UPDATE ...
+	// SET attempts = attempts + 1 ... RETURNING attempts). The returned value,
+	// not a locally-computed "old value + 1", is what a caller must compare
+	// against maxOTPAttempts: two concurrent wrong guesses on the same code
+	// both read the same pre-increment snapshot, and if each then reasoned from
+	// ITS OWN snapshot + 1, both could land under the limit even though the row
+	// crossed it (a read-modify-write race). Returning the post-increment value
+	// from the same statement that did the increment closes that race — every
+	// caller decides off a number the database itself just produced.
+	IncrementAttempts(ctx context.Context, id uuid.UUID) (int, error)
 	// CountSince counts codes created for phone at or after ts (for rate limits).
 	CountSince(ctx context.Context, phone string, ts time.Time) (int, error)
 	// InvalidateActiveByPhone marks every still-active (unused, unexpired) code

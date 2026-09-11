@@ -90,8 +90,8 @@ func (f *memOTP) Create(context.Context, *domain.OTPCode) error { return nil }
 func (f *memOTP) LatestActiveByPhone(context.Context, string) (*domain.OTPCode, error) {
 	return nil, domain.ErrNotFound
 }
-func (f *memOTP) MarkUsed(context.Context, uuid.UUID) error          { return nil }
-func (f *memOTP) IncrementAttempts(context.Context, uuid.UUID) error { return nil }
+func (f *memOTP) MarkUsed(context.Context, uuid.UUID) error                 { return nil }
+func (f *memOTP) IncrementAttempts(context.Context, uuid.UUID) (int, error) { return 0, nil }
 func (f *memOTP) CountSince(context.Context, string, time.Time) (int, error) {
 	return 0, nil
 }
