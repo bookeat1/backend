@@ -86,6 +86,14 @@ func (r *Repository) Update(ctx context.Context, p *domain.Promo) error {
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, `DELETE FROM promos WHERE id = $1`, id)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
+			// A promo code still points at this promo (promo_codes.promotion_id,
+			// ON DELETE RESTRICT — migration 0108). Answer 409 with a code the
+			// cabinet can act on instead of letting the FK error become a 500.
+			return domain.WithCode(domain.CodePromoInUseByPromoCode,
+				fmt.Errorf("delete promo: a promo code still points at it: %w", domain.ErrAlreadyExists))
+		}
 		return fmt.Errorf("delete promo: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
