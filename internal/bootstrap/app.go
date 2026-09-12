@@ -367,6 +367,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal := authed.Group("")
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
+	// Promo-code cabinet. Superadmin-only for the same reason the gastroguide
+	// and the main-screen rail are: a code may point at a PLATFORM campaign, so
+	// there is no single restaurant to authorize against.
+	promocodesrest.NewAdminHandler(deps.PromoCodesEditor).RegisterAdminRoutes(adminGlobal)
 	// The curated main-screen rail is platform editorial content (same rule as
 	// the cuisine/feature/city dictionaries and the gastroguide): only the
 	// superadmin picks who is on the main screen.
