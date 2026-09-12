@@ -1,6 +1,7 @@
 package promocodes
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -187,20 +188,42 @@ func (r createPromoCodeRequest) toUsecase() (uc.CreatePromoCodeInput, error) {
 }
 
 // patchPromoCodeRequest carries only what the cabinet wants to change. Absent
-// fields are absent, not zero: max_uses_total uses a double pointer so that
-// "no overall limit" (explicit null) is distinguishable from "don't touch it".
+// fields are absent, not zero: max_uses_total is decoded as raw JSON so that
+// "field not sent" (raw stays nil), "no overall limit" (explicit JSON null,
+// raw == "null") and "set to N" (raw == "5") are three distinguishable cases.
+// A plain **int can't do this: encoding/json sets the OUTER pointer to nil for
+// a JSON null exactly like it does for an absent field, so a double pointer
+// alone never tells the two apart — see MaxUsesTotal() below.
 type patchPromoCodeRequest struct {
-	Code           *string `json:"code"`
-	StartsAt       *string `json:"starts_at"`
-	ExpiresAt      *string `json:"expires_at"`
-	MaxUsesTotal   **int   `json:"max_uses_total"`
-	MaxUsesPerUser *int    `json:"max_uses_per_user"`
-	Status         *string `json:"status"`
+	Code           *string         `json:"code"`
+	StartsAt       *string         `json:"starts_at"`
+	ExpiresAt      *string         `json:"expires_at"`
+	MaxUsesTotal   json.RawMessage `json:"max_uses_total"`
+	MaxUsesPerUser *int            `json:"max_uses_per_user"`
+	Status         *string         `json:"status"`
+}
+
+// maxUsesTotal decodes the raw max_uses_total field into the usecase's
+// double-pointer shape: nil when the field was absent, a pointer to nil when
+// it was explicit JSON null (clear the limit), a pointer to a value otherwise.
+func (r patchPromoCodeRequest) maxUsesTotal() (**int, error) {
+	if r.MaxUsesTotal == nil {
+		return nil, nil
+	}
+	var v *int
+	if err := json.Unmarshal(r.MaxUsesTotal, &v); err != nil {
+		return nil, validation("max_uses_total must be an integer or null")
+	}
+	return &v, nil
 }
 
 func (r patchPromoCodeRequest) toUsecase() (uc.PatchPromoCodeInput, error) {
+	maxUsesTotal, err := r.maxUsesTotal()
+	if err != nil {
+		return uc.PatchPromoCodeInput{}, err
+	}
 	in := uc.PatchPromoCodeInput{
-		Code: r.Code, MaxUsesTotal: r.MaxUsesTotal, MaxUsesPerUser: r.MaxUsesPerUser,
+		Code: r.Code, MaxUsesTotal: maxUsesTotal, MaxUsesPerUser: r.MaxUsesPerUser,
 	}
 	if r.StartsAt != nil {
 		t, err := parseTime(*r.StartsAt)
