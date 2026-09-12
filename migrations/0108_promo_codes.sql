@@ -88,10 +88,17 @@ CREATE TABLE promo_codes
     -- platform_pages.updated_by (0105) и payment_providers: десятки чужих
     -- интеграционных пакетов делают `testdb.Truncate(t, pool, ..., "users")`,
     -- а `TRUNCATE ... CASCADE` чистит ЛЮБУЮ таблицу с FK на усекаемую и НЕ
-    -- смотрит на ON DELETE SET NULL. С настоящим FK строки кодов исчезали бы
-    -- посреди `go test -p 1 ./...` от никак не связанного теста
-    -- (conventions/bookeat-backend.md, «TEST-DB POLLUTION TRAP»). Ценность
-    -- здесь — атрибуция, а не ссылочная целостность.
+    -- смотрит на ON DELETE SET NULL (conventions/bookeat-backend.md,
+    -- «TEST-DB POLLUTION TRAP»). Ценность здесь — атрибуция, а не ссылочная
+    -- целостность.
+    --
+    -- ЧЕСТНАЯ ОГОВОРКА: отсутствие ЭТОГО FK не делает таблицу неуязвимой.
+    -- promo_codes обязана ссылаться на promos, а promos.feed_reviewed_by уже
+    -- ссылается на users, и TRUNCATE ... CASCADE идёт по цепочке транзитивно —
+    -- `testdb.Truncate(..., "users")` уносит promos и вместе с ними коды.
+    -- Проверено тестом TestCreatedByCarriesNoForeignKey. Практический вывод:
+    -- promo_codes НЕ справочник, засеянных строк, которые должны пережить весь
+    -- прогон, здесь быть не должно — каждый тест заводит свои коды.
     created_by        uuid,
 
     created_at        timestamptz NOT NULL DEFAULT now(),
