@@ -133,8 +133,11 @@ type Deps struct {
 	EventsFacade      events.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
-	EventRecurrences  eventrecurrence.Facade
-	PromosFacade      promos.Facade
+	EventRecurrences eventrecurrence.Facade
+	PromosFacade     promos.Facade
+	// PromoCodesFacade backs the guest precheck route and the cabinet's code
+	// CRUD; booking creation gets the same instance through NewCreateUseCase.
+	PromoCodesFacade  promocodesuc.Facade
 	HomePicks         homepicks.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
@@ -596,6 +599,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		EventsFacade:          eventsFacade,
 		EventRecurrences:      eventRecurrences,
 		PromosFacade:          promosFacade,
+		PromoCodesFacade:      promoCodesFacade,
 		GastroguideFacade:     gastroguideFacade,
 		GastroguideEditor:     gastroguideEditor,
 		GastroRoutes:          gastroRoutes,

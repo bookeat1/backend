@@ -38,6 +38,7 @@ import (
 	payoutsrest "backend-core/internal/transport/rest/payouts"
 	platformpagesrest "backend-core/internal/transport/rest/platformpages"
 	preorderrest "backend-core/internal/transport/rest/preorder"
+	promocodesrest "backend-core/internal/transport/rest/promocodes"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -303,6 +304,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler := promosrest.NewHandler(deps.PromosFacade)
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
+
+	// Guest promo codes. The precheck route is on the AUTHENTICATED group, not
+	// the public one: the verdict includes "have you already used this code",
+	// which is meaningless without a user, and an anonymous version of it would
+	// be a free oracle for guessing codes.
+	promoCodesHandler := promocodesrest.NewHandler(deps.PromoCodesFacade)
+	promoCodesHandler.RegisterGuestRoutes(authed)
 
 	// Admin image upload (R2). Mounts on the authed group; a further RequireRole
 	// gate (staff or superadmin) is applied inside RegisterRoutes. deps.MediaStore
