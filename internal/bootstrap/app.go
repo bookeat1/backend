@@ -38,6 +38,7 @@ import (
 	payoutsrest "backend-core/internal/transport/rest/payouts"
 	platformpagesrest "backend-core/internal/transport/rest/platformpages"
 	preorderrest "backend-core/internal/transport/rest/preorder"
+	promocodesrest "backend-core/internal/transport/rest/promocodes"
 	promosrest "backend-core/internal/transport/rest/promos"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
@@ -304,6 +305,13 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
 
+	// Guest promo codes. The precheck route is on the AUTHENTICATED group, not
+	// the public one: the verdict includes "have you already used this code",
+	// which is meaningless without a user, and an anonymous version of it would
+	// be a free oracle for guessing codes.
+	promoCodesHandler := promocodesrest.NewHandler(deps.PromoCodesFacade)
+	promoCodesHandler.RegisterGuestRoutes(authed)
+
 	// Admin image upload (R2). Mounts on the authed group; a further RequireRole
 	// gate (staff or superadmin) is applied inside RegisterRoutes. deps.MediaStore
 	// is a *mediastore.Store that may be nil when R2 is unconfigured — pass it
@@ -359,6 +367,10 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	adminGlobal := authed.Group("")
 	adminGlobal.Use(middleware.RequireRole(domain.RoleAdmin))
 	restHandler.RegisterAdminGlobal(adminGlobal)
+	// Promo-code cabinet. Superadmin-only for the same reason the gastroguide
+	// and the main-screen rail are: a code may point at a PLATFORM campaign, so
+	// there is no single restaurant to authorize against.
+	promocodesrest.NewAdminHandler(deps.PromoCodesEditor).RegisterAdminRoutes(adminGlobal)
 	// The curated main-screen rail is platform editorial content (same rule as
 	// the cuisine/feature/city dictionaries and the gastroguide): only the
 	// superadmin picks who is on the main screen.

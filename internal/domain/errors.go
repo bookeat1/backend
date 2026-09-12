@@ -588,6 +588,25 @@ const (
 	// list — the thing the merch is handed out by — stops meaning "guests who
 	// joined".
 	CodePromoCodeForbiddenForStaff ErrorCode = "promo_code_forbidden_for_staff"
+
+	// CodePromoCodeActivated — the cabinet tried to delete a code at least one
+	// guest has already redeemed, or to rewrite the code STRING after that.
+	// Both would rewrite history: the booking keeps promo_code_id and the
+	// string as of the booking, and the participant list is counted from those
+	// rows. Archiving (status = archived) is the supported way to retire such
+	// a code.
+	CodePromoCodeActivated ErrorCode = "promo_code_activated"
+
+	// CodePromoCodeBadTransition — the requested status move is not allowed
+	// (PromoCodeStatus.CanTransitionTo), e.g. reviving an archived code.
+	CodePromoCodeBadTransition ErrorCode = "promo_code_bad_transition"
+
+	// CodePromoInUseByPromoCode — a promo cannot be deleted while a promo code
+	// points at it (ON DELETE RESTRICT, migration 0108). Deleting it would
+	// leave codes tagging bookings into a campaign that no longer exists, so
+	// the cabinet must delete or re-point the code first. Without this the
+	// Postgres FK error would surface as a 500.
+	CodePromoInUseByPromoCode ErrorCode = "promo_in_use_by_promo_code"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps
