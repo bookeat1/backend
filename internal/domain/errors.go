@@ -523,6 +523,71 @@ const (
 	// This one is a client bug worth surfacing rather than hiding behind a
 	// silent "do nothing".
 	CodeAppPlatformUnknown ErrorCode = "app_platform_unknown"
+
+	// Promo codes a guest types on the booking confirmation step (spec
+	// promo-codes-existing-guests, ADR-047). Every one of them shares a single
+	// client contract: the booking itself is NOT blocked — the app drops the
+	// code, keeps the form and books without it — so what the code selects is
+	// only WHICH sentence the guest reads. They are separate codes rather than
+	// one promo_code_invalid because "this campaign is over", "all places are
+	// taken" and "you already joined" lead a guest to three different actions,
+	// and the message text is the client's to write, never ours.
+
+	// CodePromoCodeNotFound — no such code exists (after normalization). Also
+	// the answer for a string that cannot BE a code (too short, wrong
+	// alphabet): telling a guest "that is not a valid code shape" versus "no
+	// such code" only helps somebody enumerating codes.
+	CodePromoCodeNotFound ErrorCode = "promo_code_not_found"
+
+	// CodePromoCodeInactive — the code exists but is draft, paused or
+	// archived, or the campaign behind it is not live right now. "We stopped
+	// accepting it", not "you were too slow" — a paused code may come back,
+	// which is why it is not folded into promo_code_expired.
+	CodePromoCodeInactive ErrorCode = "promo_code_inactive"
+
+	// CodePromoCodeExpired — the code's own acceptance window has closed.
+	// Permanent: no retry, no other venue, no other time helps.
+	CodePromoCodeExpired ErrorCode = "promo_code_expired"
+
+	// CodePromoCodeNotStarted — the window has not opened yet. The mirror of
+	// expired and the one promo-code refusal where "come back later" is true.
+	CodePromoCodeNotStarted ErrorCode = "promo_code_not_started"
+
+	// CodePromoCodeLimitReached — the campaign's overall limit is spent: this
+	// many DIFFERENT guests already joined (max_uses_total). Decided under the
+	// promo_codes row lock inside the booking transaction, so it is also the
+	// answer the loser of a race gets — nothing was booked for them, and the
+	// client repeats the SAME request without the code (with a FRESH
+	// Idempotency-Key, or the idempotent decorator replays this refusal).
+	CodePromoCodeLimitReached ErrorCode = "promo_code_limit_reached"
+
+	// CodePromoCodeAlreadyUsed — THIS guest already used the code as many
+	// times as max_uses_per_user allows. Separate from limit_reached because
+	// nothing about the campaign changed: the guest is not competing with
+	// anybody, and a retry never helps.
+	CodePromoCodeAlreadyUsed ErrorCode = "promo_code_already_used"
+
+	// CodePromoCodeWrongVenue — the campaign behind the code belongs to a
+	// different restaurant than the one being booked. A campaign with no
+	// restaurant is platform-wide and matches every venue, so this is only
+	// ever raised for a real mismatch.
+	CodePromoCodeWrongVenue ErrorCode = "promo_code_wrong_venue"
+
+	// CodePromoConflict — the request carries BOTH a promo code and a
+	// promotion_id naming a different campaign. Refused rather than silently
+	// preferring one: whichever we picked, the booking would be tagged with a
+	// campaign the guest did not choose, and campaign attribution is the whole
+	// point of the feature.
+	CodePromoConflict ErrorCode = "promo_conflict"
+
+	// CodePromoCodeForbiddenForStaff — a code arrived on a booking created by
+	// venue staff, or on one with no guest account at all. Both are refused in
+	// the usecase (not in transport: the guest route and the staff route parse
+	// ONE request struct): a code redeemed for an account-less booking spends a
+	// per-guest limit that belongs to nobody, and the campaign's participant
+	// list — the thing the merch is handed out by — stops meaning "guests who
+	// joined".
+	CodePromoCodeForbiddenForStaff ErrorCode = "promo_code_forbidden_for_staff"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

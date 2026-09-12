@@ -39,7 +39,16 @@ type CreateInput struct {
 	Source      domain.BookingSource
 	PromotionID *uuid.UUID
 	EventID     *uuid.UUID
-	Items       []ItemInput
+	// PromoCode is the code as the guest typed it (any spelling — it is
+	// normalized here, domain.NormalizePromoCode). Empty means "no code", and
+	// a booking without a code NEVER fails for a promo-code reason: every
+	// refusal below is reachable only while this string is non-empty.
+	//
+	// Staff-only? The opposite: it is guest-only, and the check for that lives
+	// in this usecase rather than in transport, because the guest route and
+	// the staff route parse one and the same request struct.
+	PromoCode string
+	Items     []ItemInput
 
 	// TableIDs pins the booking to specific tables (manual placement by staff).
 	TableIDs []uuid.UUID
@@ -87,8 +96,13 @@ type createUseCase struct {
 	// refuses any promotion_id at all — the safe failure, never a silent skip
 	// of the check. See validatePromotion.
 	promos promoReader
-	tx     domain.TxManager
-	cfg    Config
+	// promoCodes is nil-able for the same reason promos is: a bootstrap that
+	// has not wired the module still creates bookings, it just refuses any
+	// promo_code outright instead of silently ignoring one (which would tag
+	// nothing while telling the guest they joined the campaign).
+	promoCodes promoCodeRedeemer
+	tx         domain.TxManager
+	cfg        Config
 }
 
 // NewCreateUseCase constructs the booking creation usecase.
@@ -105,6 +119,7 @@ func NewCreateUseCase(
 	schedule scheduleReader,
 	managers managerChecker,
 	promos promoReader,
+	promoCodes promoCodeRedeemer,
 	tx domain.TxManager,
 	cfg Config,
 ) CreateUseCase {
@@ -112,7 +127,7 @@ func NewCreateUseCase(
 		bookings: bookings, links: links, capacity: capacity, items: items, history: history,
 		outbox: outbox, blacklist: blacklist, rateLog: rateLog,
 		restaurants: restaurants, schedule: schedule, managers: managers, promos: promos,
-		tx: tx, cfg: cfg.withDefaults(),
+		promoCodes: promoCodes, tx: tx, cfg: cfg.withDefaults(),
 	}
 }
 

@@ -95,6 +95,24 @@ type promoReader interface {
 	GetPublicDetail(ctx context.Context, promoID uuid.UUID) (*domain.PromoListItem, error)
 }
 
+// promoCodeRedeemer is the minimal slice of the promo-code context this
+// package needs: turn the string a guest typed into the campaign the booking
+// joins, and spend one activation of it under the code's row lock inside the
+// creation transaction. Bound to usecase/promocodes.Facade in deps.
+//
+// Two methods and not one, because they happen at two different moments and
+// only the second one may be trusted: everything stable about a code (it
+// exists, it is active, the campaign is live and runs at this venue) is
+// resolved BEFORE the transaction, while the limit — the only part another
+// booking can change under us — is decided inside it, holding the lock
+// (ADR-047).
+type promoCodeRedeemer interface {
+	ResolveForBooking(ctx context.Context, code string, restaurantID uuid.UUID, userID uuid.UUID) (*domain.PromoCodeResolution, error)
+	// ConsumeTx MUST be called inside the creation transaction and BEFORE the
+	// venue lock. LOCK ORDER: promo_code → venue, one-way.
+	ConsumeTx(ctx context.Context, promoCodeID uuid.UUID, userID uuid.UUID) error
+}
+
 // Config is the global (level-1) booking policy plus anti-fraud thresholds. A
 // restaurant may override the policy fields per venue; see resolvePolicy.
 type Config struct {

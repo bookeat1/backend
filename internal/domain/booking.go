@@ -195,21 +195,33 @@ type BookingPolicyOverride struct {
 // migrated rows. PromotionID and EventID carry no FK on purpose: the promotion
 // or event may be deleted, the booking must survive as a historical fact.
 type Booking struct {
-	ID                     uuid.UUID
-	RestaurantID           uuid.UUID
-	UserID                 *uuid.UUID // nil = guest booking
-	Name                   string
-	Phone                  string // as typed by the guest
-	Email                  string // lower-cased
-	PhoneNormalized        string // E.164
-	Guests                 int
-	StartsAt               time.Time
-	EndsAt                 time.Time
-	Status                 BookingStatus
-	Source                 BookingSource
-	Notes                  *string
-	PromotionID            *uuid.UUID
-	EventID                *uuid.UUID
+	ID              uuid.UUID
+	RestaurantID    uuid.UUID
+	UserID          *uuid.UUID // nil = guest booking
+	Name            string
+	Phone           string // as typed by the guest
+	Email           string // lower-cased
+	PhoneNormalized string // E.164
+	Guests          int
+	StartsAt        time.Time
+	EndsAt          time.Time
+	Status          BookingStatus
+	Source          BookingSource
+	Notes           *string
+	PromotionID     *uuid.UUID
+	EventID         *uuid.UUID
+	// PromoCodeID is the promo code the guest typed to get PromotionID onto
+	// this booking, nil for every other path (including the ?promo= link).
+	// No FK, exactly like PromotionID: the booking outlives the code's row.
+	//
+	// Both promo fields are written ONLY by the INSERT (ADR-047): "the code as
+	// of this booking" is immutable by definition, so Update does not list
+	// them — see infrastructure/postgres/booking.Repository.Update.
+	PromoCodeID *uuid.UUID
+	// PromoCode is the normalized code string as of this booking, kept so a
+	// listing or an export can show it without joining promo_codes and after
+	// the code's row is gone.
+	PromoCode              *string
 	CreatedByAdmin         bool
 	ForcedPlacement        bool // manager placed it despite an occupied table
 	ConfirmedAt            *time.Time
@@ -286,6 +298,17 @@ type BookingRepository interface {
 	// makes decisions whose outcome depends on the order it walks the set in,
 	// and a retry of the same operation must reach the same answer.
 	ListLiveForReconcile(ctx context.Context, restaurantID uuid.UUID, from time.Time, statuses []BookingStatus, limit int) ([]Booking, error)
+	// CountPromoCodeUsage answers, in ONE statement, both questions a promo
+	// code's limits ask: how many DISTINCT guests already carry this code, and
+	// how many bookings this ONE guest carries with it. Bookings in
+	// cancelled/no_show are excluded, which is what makes "a cancellation frees
+	// its place" true with no decrement path anywhere (ADR-047).
+	//
+	// It is the counter promo_codes deliberately does not have, so it must be
+	// called INSIDE the booking-creation transaction and AFTER
+	// PromoCodeRepository.LockByID — outside that lock the answer is a
+	// snapshot two concurrent bookings can both pass.
+	CountPromoCodeUsage(ctx context.Context, promoCodeID uuid.UUID, userID uuid.UUID) (PromoCodeUsage, error)
 }
 
 // MaxReconcileBookings is the hard cap on how many bookings one whole-set

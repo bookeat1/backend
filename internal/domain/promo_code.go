@@ -266,3 +266,40 @@ type PromoCodeRepository interface {
 	// (archiving is the answer there) — the repository only executes.
 	Delete(ctx context.Context, id uuid.UUID) error
 }
+
+// PromoCodeUsage is how much of a code's limits is already spent, counted
+// from the bookings themselves (ADR-047 — there is no counter column).
+type PromoCodeUsage struct {
+	// DistinctUsers is how many different guests already hold a live booking
+	// with this code. It is what MaxUsesTotal limits: "how many people may
+	// join the campaign", not "how many bookings".
+	DistinctUsers int
+	// ByUser is how many live bookings ONE given guest holds with this code —
+	// what MaxUsesPerUser limits.
+	ByUser int
+}
+
+// PromoCodeResolution is what a resolved code means for a booking: which
+// campaign it tags the booking with, plus the text a client shows next to the
+// code field. It carries no limit verdict — limits are decided under the row
+// lock inside the booking transaction, never by a value read before it.
+type PromoCodeResolution struct {
+	PromoCodeID uuid.UUID
+	// Code is the NORMALIZED string, which is what gets snapshotted onto the
+	// booking — not whatever spelling the guest typed.
+	Code        string
+	PromotionID uuid.UUID
+	// Title and Terms come from the linked promo, never duplicated on the
+	// code itself, so a code and its campaign card cannot drift apart. The
+	// *I18n maps travel with them because the guest-facing precheck resolves
+	// the language at the transport edge (reqlocale), exactly like the promo
+	// card does.
+	Title     string
+	TitleI18n I18n
+	Terms     string
+	TermsI18n I18n
+	// ValidUntil is the EARLIER of the code's own expires_at and the promo's
+	// end: a client that shows the later of the two would promise a window
+	// that does not work.
+	ValidUntil time.Time
+}
