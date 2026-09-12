@@ -82,7 +82,7 @@ func newRealCreateHarness(t *testing.T) *realCreateHarness {
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool),
 		newFakeManagers(), // the actor is a plain guest
-		nil, txm, testConfig(),
+		nil, nil, txm, testConfig(),
 	)
 
 	loc, err := time.LoadLocation("Asia/Almaty")

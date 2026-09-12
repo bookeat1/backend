@@ -8,19 +8,23 @@ import (
 )
 
 type bookingResponse struct {
-	ID                     string     `json:"id"`
-	RestaurantID           string     `json:"restaurant_id"`
-	UserID                 *string    `json:"user_id"`
-	Name                   string     `json:"name"`
-	Phone                  string     `json:"phone"`
-	Email                  string     `json:"email"`
-	Guests                 int        `json:"guests"`
-	StartsAt               time.Time  `json:"starts_at"`
-	EndsAt                 time.Time  `json:"ends_at"`
-	Status                 string     `json:"status"`
-	Source                 string     `json:"source"`
-	Notes                  *string    `json:"notes"`
-	PromotionID            *string    `json:"promotion_id"`
+	ID           string    `json:"id"`
+	RestaurantID string    `json:"restaurant_id"`
+	UserID       *string   `json:"user_id"`
+	Name         string    `json:"name"`
+	Phone        string    `json:"phone"`
+	Email        string    `json:"email"`
+	Guests       int       `json:"guests"`
+	StartsAt     time.Time `json:"starts_at"`
+	EndsAt       time.Time `json:"ends_at"`
+	Status       string    `json:"status"`
+	Source       string    `json:"source"`
+	Notes        *string   `json:"notes"`
+	PromotionID  *string   `json:"promotion_id"`
+	// PromoCode is the normalized code this booking was created with, null for
+	// every booking that carries none. Written once, at creation: a later PATCH
+	// of the booking cannot change it.
+	PromoCode              *string    `json:"promo_code"`
 	EventID                *string    `json:"event_id"`
 	CreatedByAdmin         bool       `json:"created_by_admin"`
 	ForcedPlacement        bool       `json:"forced_placement"`
@@ -155,7 +159,8 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 		ID: b.ID.String(), RestaurantID: b.RestaurantID.String(), UserID: idPtr(b.UserID),
 		Name: b.Name, Phone: b.Phone, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: string(b.Status), Source: string(b.Source),
-		Notes: b.Notes, PromotionID: idPtr(b.PromotionID), EventID: idPtr(b.EventID),
+		Notes: b.Notes, PromotionID: idPtr(b.PromotionID), PromoCode: b.PromoCode,
+		EventID:        idPtr(b.EventID),
 		CreatedByAdmin: b.CreatedByAdmin, ForcedPlacement: b.ForcedPlacement,
 		ConfirmedAt: b.ConfirmedAt, ArrivedAt: b.ArrivedAt, CancelledAt: b.CancelledAt,
 		CancelledBy: cancelledBy, CancellationReasonCode: b.CancellationReasonCode,

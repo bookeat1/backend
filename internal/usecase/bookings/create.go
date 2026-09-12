@@ -166,6 +166,22 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		return nil, fmt.Errorf("%w: forced placement requires the tables to seat the party at", domain.ErrValidation)
 	}
 
+	// The promo code, if one was typed. Everything here is reachable ONLY for
+	// a non-empty code: a booking without one can never be refused for a
+	// promo-code reason, which is the product rule the whole feature hangs on
+	// (the client drops the code and repeats the request, and that repeat must
+	// not be able to fail the same way).
+	var promo *domain.PromoCodeResolution
+	if strings.TrimSpace(in.PromoCode) != "" {
+		if promo, err = u.resolvePromoCode(ctx, acc, in); err != nil {
+			return nil, err
+		}
+		// The code IS the campaign tag: from here on the booking carries the
+		// promo the code stands for, whether or not the client also sent it.
+		promotionID := promo.PromotionID
+		in.PromotionID = &promotionID
+	}
+
 	rest, err := u.restaurants.GetByID(ctx, in.RestaurantID)
 	if err != nil {
 		return nil, err
@@ -277,6 +293,7 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		StartsAt: startsAt, EndsAt: startsAt.Add(policy.Duration),
 		Status: domain.BookingPending, Source: in.Source, Notes: in.Notes,
 		PromotionID: in.PromotionID, EventID: in.EventID,
+		PromoCodeID: promoCodeID(promo), PromoCode: promoCodeString(promo),
 		// An overbooked party was placed against the venue's own rules just as a
 		// forced one was, so it carries the same flag — every listing and export
 		// that already surfaces forced_placement surfaces this too, instead of
@@ -300,6 +317,21 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	// reservations instead of picking another time.
 	var slotConflict bool
 	err = u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// LOCK ORDER — promo_code FIRST, venue (capacity.LockVenue, below)
+		// SECOND, and one-way: two concurrent bookings that took them in
+		// opposite orders deadlock (ADR-047). This is why the code is spent
+		// here, at the very top of the transaction, and not next to the other
+		// promo handling above.
+		//
+		// Nothing is written by this call: "spending" the code IS the booking
+		// insert two lines down. What it does is hold the code's row until
+		// this transaction ends, so the count it just checked cannot be stale
+		// by the time the booking lands.
+		if promo != nil {
+			if err := u.promoCodes.ConsumeTx(ctx, promo.PromoCodeID, *in.UserID); err != nil {
+				return err
+			}
+		}
 		if err := u.bookings.Create(ctx, b); err != nil {
 			return err
 		}
@@ -646,6 +678,64 @@ func (u *createUseCase) validatePromotion(ctx context.Context, promotionID *uuid
 		return err
 	}
 	return nil
+}
+
+// resolvePromoCode validates a guest-typed code and returns the campaign the
+// booking should join. Every refusal carries a machine-readable code from the
+// spec's dictionary (domain.CodePromoCode*): the client picks the sentence the
+// guest reads by code, never by our message text, and in every one of these
+// cases it may repeat the request WITHOUT the code and get a booking.
+//
+// The "no staff, no account-less booking" rule lives here rather than in
+// transport because createMine and createByStaff parse one and the same
+// request struct (transport/rest/bookings/handler.go): a check in transport
+// would close one route of the two. A code on a booking with no user_id would
+// spend a per-guest limit that belongs to nobody and put a row into the
+// campaign's participant list that no merch can be handed to.
+func (u *createUseCase) resolvePromoCode(ctx context.Context, acc access, in CreateInput) (*domain.PromoCodeResolution, error) {
+	if acc.staff() || in.UserID == nil {
+		return nil, domain.WithCode(domain.CodePromoCodeForbiddenForStaff,
+			fmt.Errorf("%w: a promo code can only be redeemed by the guest whose account holds the booking",
+				domain.ErrForbidden))
+	}
+	if u.promoCodes == nil {
+		// Same posture as validatePromotion with promos unwired: refuse the
+		// code loudly rather than create a booking that silently joined
+		// nothing while the guest was told it did.
+		return nil, fmt.Errorf("%w: promo codes are not available", domain.ErrValidation)
+	}
+	res, err := u.promoCodes.ResolveForBooking(ctx, in.PromoCode, in.RestaurantID, *in.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Both a code and a promotion_id naming a DIFFERENT campaign: refused
+	// rather than silently preferring one, because either choice tags the
+	// booking with a campaign the guest did not pick. The same campaign twice
+	// (the guest opened a promo card and typed its code) is not a conflict.
+	if in.PromotionID != nil && *in.PromotionID != res.PromotionID {
+		return nil, domain.WithCode(domain.CodePromoConflict,
+			fmt.Errorf("%w: the booking already carries a different campaign", domain.ErrValidation))
+	}
+	return res, nil
+}
+
+func promoCodeID(res *domain.PromoCodeResolution) *uuid.UUID {
+	if res == nil {
+		return nil
+	}
+	id := res.PromoCodeID
+	return &id
+}
+
+// promoCodeString snapshots the NORMALIZED code onto the booking — not the
+// spelling the guest typed: the snapshot is what an export and the cabinet
+// show, and "marathon 26" next to "MARATHON26" would read as two campaigns.
+func promoCodeString(res *domain.PromoCodeResolution) *string {
+	if res == nil {
+		return nil
+	}
+	code := res.Code
+	return &code
 }
 
 func validateCreate(in CreateInput) error {

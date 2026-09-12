@@ -98,7 +98,7 @@ func newOverrideHarness(t *testing.T, seats int) *overrideHarness {
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
 		restrepo.New(pool), restrepo.NewRelated(pool),
 		newFakeManagers([2]uuid.UUID{managerID, rid}),
-		nil, txm, testConfig(),
+		nil, nil, txm, testConfig(),
 	)
 
 	loc, err := time.LoadLocation("Asia/Almaty")

@@ -17,20 +17,25 @@ import (
 // POST /restaurants/{id}/bookings. Fields the caller is not allowed to set are
 // not stripped here but in the handler, where the caller's role is known.
 type createBookingRequest struct {
-	RestaurantID string               `json:"restaurant_id"`
-	UserID       *string              `json:"user_id"`
-	Name         string               `json:"name"`
-	Phone        string               `json:"phone"`
-	Email        string               `json:"email"`
-	Guests       int                  `json:"guests"`
-	StartsAt     time.Time            `json:"starts_at"`
-	Notes        *string              `json:"notes"`
-	Source       *string              `json:"source"`
-	PromotionID  *string              `json:"promotion_id"`
-	EventID      *string              `json:"event_id"`
-	Items        []bookingItemRequest `json:"items"`
-	TableIDs     []string             `json:"table_ids"`
-	Force        bool                 `json:"force"`
+	RestaurantID string    `json:"restaurant_id"`
+	UserID       *string   `json:"user_id"`
+	Name         string    `json:"name"`
+	Phone        string    `json:"phone"`
+	Email        string    `json:"email"`
+	Guests       int       `json:"guests"`
+	StartsAt     time.Time `json:"starts_at"`
+	Notes        *string   `json:"notes"`
+	Source       *string   `json:"source"`
+	PromotionID  *string   `json:"promotion_id"`
+	// PromoCode is the code as typed, any spelling: the usecase normalizes it
+	// (domain.NormalizePromoCode). Deliberately NOT blanked on the staff route
+	// the way Force/Overbook are — the refusal belongs in the usecase, which
+	// covers both routes and every other caller; see resolvePromoCode.
+	PromoCode string               `json:"promo_code"`
+	EventID   *string              `json:"event_id"`
+	Items     []bookingItemRequest `json:"items"`
+	TableIDs  []string             `json:"table_ids"`
+	Force     bool                 `json:"force"`
 	// Overbook: seat this party even though a table-less venue's declared
 	// capacity does not fit it. Staff-only and blanked on the guest route, like
 	// Force — see createMine.
@@ -50,7 +55,7 @@ func (r createBookingRequest) toInput() (uc.CreateInput, error) {
 	in := uc.CreateInput{
 		Name: r.Name, Phone: r.Phone, Email: r.Email, Guests: r.Guests,
 		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force, Overbook: r.Overbook,
-		Source: domain.SourceApp,
+		PromoCode: r.PromoCode, Source: domain.SourceApp,
 	}
 	var err error
 	if in.RestaurantID, err = parseUUID(r.RestaurantID, "restaurant_id"); err != nil {

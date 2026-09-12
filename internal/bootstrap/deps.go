@@ -47,6 +47,7 @@ import (
 	payoutrepo "backend-core/internal/infrastructure/postgres/payout"
 	platformpagesrepo "backend-core/internal/infrastructure/postgres/platformpages"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
+	promocoderepo "backend-core/internal/infrastructure/postgres/promocode"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
@@ -89,6 +90,7 @@ import (
 	"backend-core/internal/usecase/payouts"
 	platformpagesuc "backend-core/internal/usecase/platformpages"
 	"backend-core/internal/usecase/preorder"
+	promocodesuc "backend-core/internal/usecase/promocodes"
 	"backend-core/internal/usecase/promos"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
@@ -402,9 +404,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingCfg := newBookingConfig(cfg)
 
+	// Guest promo codes. The facade reads its limits from the BOOKINGS
+	// (bookingRepo) rather than from a counter column — ADR-047 — so the same
+	// repository is on both sides of the create transaction here.
+	promoCodesFacade := promocodesuc.NewFacade(promocoderepo.New(db), promosFacade, bookingRepo)
+
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
-		restRelated, restaurantManagers, promosFacade, txm, bookingCfg)
+		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg)
 
 	paymentsRepo := paymentrepo.New(db)
 	paymentRefundsRepo := paymentrepo.NewRefunds(db)

@@ -16,18 +16,19 @@ import (
 // createHarness wires the create usecase over fakes, with a venue that is open
 // 12:00–22:00 every day in Asia/Almaty and has one 4-seat and one 2-seat table.
 type createHarness struct {
-	uc        CreateUseCase
-	bookings  *fakeBookings
-	links     *fakeLinks
-	capacity  *fakeCapacity
-	items     *fakeItems
-	history   *fakeHistory
-	outbox    *fakeOutbox
-	blacklist *fakeBlacklist
-	rateLog   *fakeRateLog
-	schedule  *fakeSchedule
-	promos    *fakePromos
-	tx        *fakeTx
+	uc         CreateUseCase
+	bookings   *fakeBookings
+	links      *fakeLinks
+	capacity   *fakeCapacity
+	items      *fakeItems
+	history    *fakeHistory
+	outbox     *fakeOutbox
+	blacklist  *fakeBlacklist
+	rateLog    *fakeRateLog
+	schedule   *fakeSchedule
+	promos     *fakePromos
+	promoCodes *fakePromoCodes
+	tx         *fakeTx
 
 	restaurantID uuid.UUID
 	guest        Actor
@@ -69,6 +70,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 		tableSmall:   small,
 		promoID:      promoID,
 	}
+	h.promoCodes = newFakePromoCodes("MARATHON26", promoID, h.tx)
 	day := time.Now().In(loc).AddDate(0, 0, 2)
 	h.startsAt = time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
 
@@ -79,7 +81,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 		}}},
 		h.schedule,
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, rid}),
-		h.promos, h.tx, testConfig(),
+		h.promos, h.promoCodes, h.tx, testConfig(),
 	)
 	return h
 }
@@ -224,7 +226,7 @@ func TestCreatePromotionIDWithoutPromosConfigured(t *testing.T) {
 		}}},
 		h.schedule,
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}),
-		nil, h.tx, testConfig(),
+		nil, nil, h.tx, testConfig(),
 	)
 	in := h.input()
 	in.PromotionID = &h.promoID
@@ -520,7 +522,7 @@ func TestCreateInactiveRestaurant(t *testing.T) {
 		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
 		&fakeBlacklist{}, &fakeRateLog{},
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid}}},
-		&fakeSchedule{}, newFakeManagers(), nil, &fakeTx{}, testConfig(),
+		&fakeSchedule{}, newFakeManagers(), nil, nil, &fakeTx{}, testConfig(),
 	)
 	_, err := uc.Create(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleUser}, CreateInput{
 		RestaurantID: rid, Name: "x", Phone: "+77071234567", Guests: 2,
