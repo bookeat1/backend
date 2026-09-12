@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,25 @@ import (
 // racers is how many guests press «Забронировать» at the same instant. The
 // code's limit is racers-1, so exactly one of them must lose.
 const racers = 6
+
+// uniqueCode returns a fresh normalized code string per test run. Codes are
+// globally unique (promo_codes_code_key) and this package's convention is to
+// seed fresh ids instead of truncating shared tables, so a fixed "MARATHON26"
+// makes the second run of the day fail on the seed rather than on the logic.
+// The returned value is already in normalized form; typedSpelling turns it
+// back into something a human would type.
+func uniqueCode() string {
+	return strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", ""))[:16]
+}
+
+// typedSpelling is the same code the sloppy way: lower case, a dash in the
+// middle and stray spaces around it. Passing this through the booking path
+// exercises domain.NormalizePromoCode end to end (spec criterion 5) instead of
+// only in its own unit test.
+func typedSpelling(code string) string {
+	low := strings.ToLower(code)
+	return " " + low[:8] + "-" + low[8:] + " "
+}
 
 // TestPromoCodeLimitUnderConcurrentBookings is spec criterion 7: N guests book
 // the same slot with the same code at the same moment, the code allows N-1,
@@ -71,11 +91,12 @@ func TestPromoCodeLimitUnderConcurrentBookings(t *testing.T) {
 		t.Fatalf("seed promo: %v", err)
 	}
 	limit := racers - 1
+	code := uniqueCode()
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO promo_codes (id, code, promotion_id, starts_at, expires_at,
 			max_uses_total, max_uses_per_user, status)
-		 VALUES ($1,'MARATHON26',$2,$3,$4,$5,1,'active')`,
-		codeID, promoID, now.Add(-time.Hour), now.Add(30*24*time.Hour), limit); err != nil {
+		 VALUES ($1,$6,$2,$3,$4,$5,1,'active')`,
+		codeID, promoID, now.Add(-time.Hour), now.Add(30*24*time.Hour), limit, code); err != nil {
 		t.Fatalf("seed promo code: %v", err)
 	}
 
@@ -133,7 +154,7 @@ func TestPromoCodeLimitUnderConcurrentBookings(t *testing.T) {
 				Actor{UserID: uid, Role: domain.RoleUser}, CreateInput{
 					RestaurantID: rid, UserID: &uid, Name: "Гость", Phone: phones[i],
 					Guests: 2, StartsAt: startsAt, Source: domain.SourceApp,
-					PromoCode: "marathon-26",
+					PromoCode: typedSpelling(code),
 				})
 		}(i)
 	}
@@ -146,9 +167,9 @@ func TestPromoCodeLimitUnderConcurrentBookings(t *testing.T) {
 		case err == nil:
 			ok++
 		default:
-			code, _ := domain.CodeOf(err)
-			if code != domain.CodePromoCodeLimitReached {
-				t.Fatalf("racer %d failed for the wrong reason: code=%q err=%v", i, code, err)
+			errCode, _ := domain.CodeOf(err)
+			if errCode != domain.CodePromoCodeLimitReached {
+				t.Fatalf("racer %d failed for the wrong reason: code=%q err=%v", i, errCode, err)
 			}
 			refused++
 		}
@@ -212,11 +233,12 @@ func TestBookingWithoutPromoCodePassesWhenTheCodeIsExhausted(t *testing.T) {
 	}
 	// A code nobody may use any more: the campaign-wide limit is spent by a
 	// booking that already exists.
+	code := uniqueCode()
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO promo_codes (id, code, promotion_id, starts_at, expires_at,
 			max_uses_total, max_uses_per_user, status)
-		 VALUES ($1,'MARATHON26',$2,$3,$4,1,1,'active')`,
-		codeID, promoID, now.Add(-time.Hour), now.Add(30*24*time.Hour)); err != nil {
+		 VALUES ($1,$5,$2,$3,$4,1,1,'active')`,
+		codeID, promoID, now.Add(-time.Hour), now.Add(30*24*time.Hour), code); err != nil {
 		t.Fatalf("seed promo code: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
@@ -224,16 +246,21 @@ func TestBookingWithoutPromoCodePassesWhenTheCodeIsExhausted(t *testing.T) {
 		uid, uid.String()+"@example.com", "+77070000099"); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
+	// The guest who already spent the code's only place. bookings.user_id DOES
+	// carry a foreign key on users, so this row has to exist.
 	other := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO users (id, email, phone, full_name) VALUES ($1,$2,$3,'First')`,
+		other, other.String()+"@example.com", "+77070000098"); err != nil {
+		t.Fatalf("seed the other guest: %v", err)
+	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO bookings (id, restaurant_id, user_id, name, phone, email,
 			phone_normalized, guests, starts_at, ends_at, status, source,
 			promotion_id, promo_code_id, promo_code)
 		 VALUES ($1,$2,$3,'Первый','+77070000098','a@b.c','+77070000098',2,
-			now()+interval '2 day', now()+interval '2 day 2 hour','confirmed','app',$4,$5,'MARATHON26')`,
-		uuid.New(), rid, other, promoID, codeID); err != nil {
-		// The other guest has no users row on purpose: bookings carry no FK to
-		// users, and seeding one would make this test depend on that.
+			now()+interval '2 day', now()+interval '2 day 2 hour','confirmed','app',$4,$5,$6)`,
+		uuid.New(), rid, other, promoID, codeID, code); err != nil {
 		t.Fatalf("seed the booking that spends the limit: %v", err)
 	}
 	t.Cleanup(func() {
@@ -242,6 +269,7 @@ func TestBookingWithoutPromoCodePassesWhenTheCodeIsExhausted(t *testing.T) {
 		_, _ = pool.Exec(bg, `DELETE FROM promos WHERE id=$1`, promoID)
 		_, _ = pool.Exec(bg, `DELETE FROM restaurants WHERE id=$1`, rid)
 		_, _ = pool.Exec(bg, `DELETE FROM users WHERE id=$1`, uid)
+		_, _ = pool.Exec(bg, `DELETE FROM users WHERE id=$1`, other)
 	})
 
 	txm := sqltx.NewManager(pool)
@@ -261,13 +289,13 @@ func TestBookingWithoutPromoCodePassesWhenTheCodeIsExhausted(t *testing.T) {
 	startsAt := time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
 	in := CreateInput{
 		RestaurantID: rid, UserID: &uid, Name: "Гость", Phone: "+77070000099",
-		Guests: 2, StartsAt: startsAt, Source: domain.SourceApp, PromoCode: "MARATHON26",
+		Guests: 2, StartsAt: startsAt, Source: domain.SourceApp, PromoCode: code,
 	}
 	actor := Actor{UserID: uid, Role: domain.RoleUser}
 
 	_, err := create.Create(ctx, actor, in)
-	if code, _ := domain.CodeOf(err); code != domain.CodePromoCodeLimitReached {
-		t.Fatalf("code = %q, want %q (err %v)", code, domain.CodePromoCodeLimitReached, err)
+	if errCode, _ := domain.CodeOf(err); errCode != domain.CodePromoCodeLimitReached {
+		t.Fatalf("code = %q, want %q (err %v)", errCode, domain.CodePromoCodeLimitReached, err)
 	}
 
 	in.PromoCode = ""
