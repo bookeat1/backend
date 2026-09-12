@@ -403,3 +403,51 @@ func ids(bs []domain.Booking) []uuid.UUID {
 	}
 	return out
 }
+
+// TestBookingUpdateKeepsPromoCodeSnapshot pins the INSERT-only rule of
+// ADR-047: promo_code_id / promo_code are written when the booking is created
+// and never again. Update lists its columns explicitly, so this test is what
+// fails if somebody "completes" that list — a rewritten snapshot would silently
+// move a booking out of a campaign's participant count, or into one.
+func TestBookingUpdateKeepsPromoCodeSnapshot(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	uid := seedUser(t, pool)
+	repo := New(pool)
+
+	// promo_code_id carries no foreign key on purpose (migration 0108), so a
+	// bare uuid is enough here and this test does not depend on promos.
+	codeID, promoID := uuid.New(), uuid.New()
+	b := newBooking(rid, time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	b.UserID = &uid
+	b.PromotionID = &promoID
+	b.PromoCodeID = &codeID
+	b.PromoCode = ptr("MARATHON26")
+	if err := repo.Create(ctx, b); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A caller that re-saves a booking it read WITHOUT the promo fields — the
+	// shape an admin PATCH that only knows about guests/notes ends up in.
+	stale := *b
+	stale.PromoCodeID = nil
+	stale.PromoCode = nil
+	stale.Guests = 5
+	if err := repo.Update(ctx, &stale); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Guests != 5 {
+		t.Errorf("guests = %d, want the update to have landed", got.Guests)
+	}
+	if got.PromoCodeID == nil || *got.PromoCodeID != codeID {
+		t.Errorf("promo_code_id = %v, want %v — Update must not rewrite it", got.PromoCodeID, codeID)
+	}
+	if got.PromoCode == nil || *got.PromoCode != "MARATHON26" {
+		t.Errorf("promo_code = %v, want MARATHON26", got.PromoCode)
+	}
+}
