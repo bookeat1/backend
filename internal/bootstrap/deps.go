@@ -133,8 +133,14 @@ type Deps struct {
 	EventsFacade      events.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
-	EventRecurrences  eventrecurrence.Facade
-	PromosFacade      promos.Facade
+	EventRecurrences eventrecurrence.Facade
+	PromosFacade     promos.Facade
+	// PromoCodesFacade backs the guest precheck route and the cabinet's code
+	// CRUD; booking creation gets the same instance through NewCreateUseCase.
+	PromoCodesFacade promocodesuc.Facade
+	// PromoCodesEditor is the cabinet side of the same table; it is a separate
+	// interface because only the superadmin route group reaches it.
+	PromoCodesEditor  promocodesuc.Editor
 	HomePicks         homepicks.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
@@ -407,7 +413,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// Guest promo codes. The facade reads its limits from the BOOKINGS
 	// (bookingRepo) rather than from a counter column — ADR-047 — so the same
 	// repository is on both sides of the create transaction here.
-	promoCodesFacade := promocodesuc.NewFacade(promocoderepo.New(db), promosFacade, bookingRepo)
+	promoCodeRepo := promocoderepo.New(db)
+	promoCodesFacade := promocodesuc.NewFacade(promoCodeRepo, promosFacade, bookingRepo)
+	// The cabinet reads the promo through the REPOSITORY, not through
+	// promosFacade.GetPublicDetail: it must see draft/hidden/ended campaigns to
+	// show that a code points at one.
+	promoCodesEditor := promocodesuc.NewEditor(promoCodeRepo, promorepo.New(db), bookingRepo)
 
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
@@ -596,6 +607,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		EventsFacade:          eventsFacade,
 		EventRecurrences:      eventRecurrences,
 		PromosFacade:          promosFacade,
+		PromoCodesFacade:      promoCodesFacade,
+		PromoCodesEditor:      promoCodesEditor,
 		GastroguideFacade:     gastroguideFacade,
 		GastroguideEditor:     gastroguideEditor,
 		GastroRoutes:          gastroRoutes,
