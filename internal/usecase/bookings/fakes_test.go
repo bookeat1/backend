@@ -93,6 +93,31 @@ type reconcileCall struct {
 	limit        int
 }
 
+// CountPromoCodeUsage mirrors the real statement's predicates — same promo
+// code, same "not cancelled, not no_show" exclusion, distinct guests for the
+// total and one guest's own bookings for the per-guest limit — so a usecase
+// that reads the two numbers the wrong way round fails here too.
+func (f *fakeBookings) CountPromoCodeUsage(_ context.Context, promoCodeID uuid.UUID, userID uuid.UUID) (domain.PromoCodeUsage, error) {
+	var u domain.PromoCodeUsage
+	seen := map[uuid.UUID]bool{}
+	for _, b := range f.list {
+		if b.PromoCodeID == nil || *b.PromoCodeID != promoCodeID {
+			continue
+		}
+		if b.Status == domain.BookingCancelled || b.Status == domain.BookingNoShow {
+			continue
+		}
+		if b.UserID != nil && !seen[*b.UserID] {
+			seen[*b.UserID] = true
+			u.DistinctUsers++
+		}
+		if b.UserID != nil && *b.UserID == userID {
+			u.ByUser++
+		}
+	}
+	return u, nil
+}
+
 // ListLiveForReconcile mirrors the real query rather than returning f.list
 // wholesale: same predicates (venue, status, starts_at >= from), same total
 // ascending order, same cap. A fake that ignored the filter would let a usecase
@@ -470,12 +495,71 @@ func (f *fakePromos) GetPublicDetail(_ context.Context, id uuid.UUID) (*domain.P
 	return &it, nil
 }
 
+// fakePromoCodes stands in for usecase/promocodes.Facade. It knows ONE code
+// and records the order in which the create path called it, because "the code
+// is consumed inside the transaction, before the venue lock" is the property
+// the whole feature's correctness rests on (ADR-047) and a fake that only
+// returned values could not show it.
+type fakePromoCodes struct {
+	code       string
+	resolution domain.PromoCodeResolution
+	// resolveErr / consumeErr let a test play the two moments a code can be
+	// refused at: before the transaction and under the lock.
+	resolveErr error
+	consumeErr error
+
+	resolved   int
+	consumedID *uuid.UUID
+	consumedBy *uuid.UUID
+	// consumedInTx is set from the tx fake's counter at call time: a ConsumeTx
+	// that ran outside the transaction holds no lock and guarantees nothing.
+	consumedInTx bool
+	tx           *fakeTx
+}
+
+func newFakePromoCodes(code string, promotionID uuid.UUID, tx *fakeTx) *fakePromoCodes {
+	return &fakePromoCodes{
+		code: code,
+		resolution: domain.PromoCodeResolution{
+			PromoCodeID: uuid.New(), Code: code, PromotionID: promotionID,
+			Title: "Марафон Алматы", ValidUntil: time.Now().Add(30 * 24 * time.Hour),
+		},
+		tx: tx,
+	}
+}
+
+func (f *fakePromoCodes) ResolveForBooking(_ context.Context, code string, _ uuid.UUID, _ uuid.UUID) (*domain.PromoCodeResolution, error) {
+	f.resolved++
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	if domain.NormalizePromoCode(code) != f.code {
+		return nil, domain.WithCode(domain.CodePromoCodeNotFound,
+			fmt.Errorf("promo code: %w", domain.ErrNotFound))
+	}
+	res := f.resolution
+	return &res, nil
+}
+
+func (f *fakePromoCodes) ConsumeTx(_ context.Context, id uuid.UUID, userID uuid.UUID) error {
+	f.consumedID, f.consumedBy = &id, &userID
+	f.consumedInTx = f.tx != nil && f.tx.inTx
+	return f.consumeErr
+}
+
 // fakeTx runs fn inline; it records that it was entered so tests can assert
 // the mutation happened inside a transaction.
-type fakeTx struct{ calls int }
+type fakeTx struct {
+	calls int
+	// inTx is true only while the closure runs, so a fake collaborator can
+	// report whether it was called inside the transaction or beside it.
+	inTx bool
+}
 
 func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) error {
 	f.calls++
+	f.inTx = true
+	defer func() { f.inTx = false }()
 	return fn(ctx)
 }
 

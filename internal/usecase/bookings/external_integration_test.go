@@ -102,7 +102,7 @@ func newExternalHarness(t *testing.T) *externalHarness {
 		bookingrepo.NewItems(pool),
 		bookingrepo.NewHistory(pool), bookingrepo.NewOutbox(pool),
 		bookingrepo.NewBlacklist(pool), bookingrepo.NewRateLog(pool),
-		restrepo.New(pool), restrepo.NewRelated(pool), newFakeManagers(), nil, txm, cfg,
+		restrepo.New(pool), restrepo.NewRelated(pool), newFakeManagers(), nil, nil, txm, cfg,
 	)
 	external := NewExternalReservationUseCase(
 		bookingrepo.NewExternalReservations(pool), restrepo.New(pool),

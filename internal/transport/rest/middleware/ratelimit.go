@@ -261,7 +261,12 @@ var routeTiers = map[string]RateLimitTier{
 	"GET /api/v1/menu-categories":              TierSoft,
 	"GET /api/v1/restaurants/:id/availability": TierSoft,
 	"GET /api/v1/bookings/:id/payment":         TierSoft,
-	"GET /api/v1/payments/:id":                 TierSoft,
+	// Promo-code precheck: one cheap read per keystroke-finished code, and the
+	// client is expected to call it before every booking with a code. Soft
+	// rather than exempt — it is a lookup by a guessable string, so an
+	// unmetered version would let an authenticated client enumerate codes.
+	"GET /api/v1/promo-codes/:code": TierSoft,
+	"GET /api/v1/payments/:id":      TierSoft,
 
 	// Acquirer webhooks — see RateLimit's doc for why this is its own tier.
 	"POST /webhooks/payments/freedompay":      TierWebhook,
