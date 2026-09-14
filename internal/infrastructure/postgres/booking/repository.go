@@ -28,7 +28,7 @@ const cols = `id, restaurant_id, user_id, name, phone, email, phone_normalized,
 	cancelled_by, cancellation_reason_code, cancellation_reason,
 	late_notification_sent, user_notified_late_at, user_late_message,
 	reminder_60_sent_at, reminder_30_sent_at, original_booking_time_text,
-	created_at, updated_at`
+	promo_code_id, promo_code, created_at, updated_at`
 
 func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	now := time.Now()
@@ -38,7 +38,7 @@ func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	b.UpdatedAt = now
 	q := `INSERT INTO bookings (` + cols + `) VALUES
 		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`
+		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)`
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(b)...); err != nil {
 		return mapWrite(err, "create booking")
 	}
@@ -309,7 +309,12 @@ func (r *Repository) args(b *domain.Booking) []any {
 		b.ArrivedAt, b.CancelledAt, cancelledByToDB(b.CancelledBy),
 		b.CancellationReasonCode, b.CancellationReason, b.LateNotificationSent,
 		b.UserNotifiedLateAt, b.UserLateMessage, b.Reminder60SentAt,
-		b.Reminder30SentAt, b.OriginalBookingTime, b.CreatedAt, b.UpdatedAt,
+		b.Reminder30SentAt, b.OriginalBookingTime,
+		// Promo code fields are INSERT-only (ADR-047): Update below does not
+		// list them, so "the code as of this booking" cannot be rewritten by a
+		// later edit of the booking.
+		b.PromoCodeID, b.PromoCode,
+		b.CreatedAt, b.UpdatedAt,
 	}
 }
 
@@ -336,7 +341,8 @@ func scanBooking(row scanner) (*domain.Booking, error) {
 		&b.ConfirmedAt, &b.ArrivedAt, &b.CancelledAt, &cancelledBy,
 		&b.CancellationReasonCode, &b.CancellationReason, &b.LateNotificationSent,
 		&b.UserNotifiedLateAt, &b.UserLateMessage, &b.Reminder60SentAt,
-		&b.Reminder30SentAt, &b.OriginalBookingTime, &b.CreatedAt, &b.UpdatedAt,
+		&b.Reminder30SentAt, &b.OriginalBookingTime, &b.PromoCodeID, &b.PromoCode,
+		&b.CreatedAt, &b.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -362,4 +368,34 @@ func cancelledByToDB(c *domain.CancelledBy) any {
 		return nil
 	}
 	return string(*c)
+}
+
+// CountPromoCodeUsage counts how much of a promo code's limits is spent. It is
+// the counter promo_codes deliberately does not have (ADR-047): the bookings
+// ARE the source of truth, so a cancellation or a no-show frees its place with
+// no decrement path that could drift.
+//
+// Both numbers come from ONE statement: two round trips could see two
+// different snapshots even inside a transaction if anything committed between
+// them, and the caller decides "does this booking fit?" from both at once.
+//
+// MUST be called inside the booking-creation transaction and AFTER
+// promocode.Repository.LockByID — without that lock two concurrent bookings
+// read the same count and both pass a limit of one.
+//
+// The partial index idx_bookings_promo_code (migration 0108) is what keeps
+// this off a growing table scan.
+func (r *Repository) CountPromoCodeUsage(ctx context.Context, promoCodeID uuid.UUID, userID uuid.UUID) (domain.PromoCodeUsage, error) {
+	var u domain.PromoCodeUsage
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT count(DISTINCT user_id),
+		        count(*) FILTER (WHERE user_id = $2)
+		   FROM bookings
+		  WHERE promo_code_id = $1
+		    AND status NOT IN ('cancelled', 'no_show')`,
+		promoCodeID, userID).Scan(&u.DistinctUsers, &u.ByUser)
+	if err != nil {
+		return domain.PromoCodeUsage{}, fmt.Errorf("count promo code usage: %w", err)
+	}
+	return u, nil
 }

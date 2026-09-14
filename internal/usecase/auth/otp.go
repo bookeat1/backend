@@ -370,12 +370,17 @@ func (o *otpUseCase) VerifyOTP(ctx context.Context, rawPhone, code string) (*Tok
 		// guest to retype into a code that is already dead — but only if the
 		// attempt was actually recorded, or the lockout would be a claim about
 		// state we failed to write.
-		// Counted BEFORE the write: rec is this caller's snapshot, and reading
-		// it back after the repository has touched the row makes the answer
-		// depend on whether that repository happens to hand out live rows.
-		attempts := rec.Attempts + 1
-		if err := o.otp.IncrementAttempts(ctx, rec.ID); err == nil &&
-			attempts >= maxOTPAttempts {
+		//
+		// The decision uses the value IncrementAttempts RETURNS, not
+		// rec.Attempts+1: rec is a snapshot taken before this write, and two
+		// concurrent wrong guesses on the same code both start from the same
+		// snapshot. Reasoning from "my snapshot + 1" would let both requests
+		// believe they are, say, attempt 5 of 5 when the row is actually at 6 —
+		// the exact race that let a login be brute-forced past maxOTPAttempts
+		// under concurrency (the atomic UPDATE...RETURNING is what makes each
+		// caller's number the database's, not a stale guess).
+		attempts, err := o.otp.IncrementAttempts(ctx, rec.ID)
+		if err == nil && attempts >= maxOTPAttempts {
 			return nil, errOTPTooManyAttempts()
 		}
 		return nil, errOTPInvalid()
@@ -559,18 +564,16 @@ func (o *otpUseCase) VerifyPhoneChange(ctx context.Context, userID uuid.UUID, ra
 	if err != nil {
 		return nil, err
 	}
-	// TODO(security): the read + IncrementAttempts here is not atomic (the same
-	// pre-existing gap as login VerifyOTP: two concurrent guesses can both read
-	// the same Attempts snapshot and each spend one of the same budget slot).
-	// Deferred as a separate hardening task that must fix BOTH paths together —
-	// do not diverge this one from VerifyOTP in the meantime.
 	if rec.Attempts >= maxOTPAttempts {
 		return nil, errOTPTooManyAttempts()
 	}
 	if otpcode.Hash(code) != rec.CodeHash {
-		attempts := rec.Attempts + 1
-		if err := o.otp.IncrementAttempts(ctx, rec.ID); err == nil &&
-			attempts >= maxOTPAttempts {
+		// Same reasoning as VerifyOTP: decide off the value IncrementAttempts
+		// RETURNS (atomic UPDATE...RETURNING), not off rec.Attempts+1 — see the
+		// comment at that call site for why a locally-computed value lets
+		// concurrent guesses race past maxOTPAttempts.
+		attempts, err := o.otp.IncrementAttempts(ctx, rec.ID)
+		if err == nil && attempts >= maxOTPAttempts {
 			return nil, errOTPTooManyAttempts()
 		}
 		return nil, errOTPInvalid()

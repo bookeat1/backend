@@ -16,18 +16,19 @@ import (
 // createHarness wires the create usecase over fakes, with a venue that is open
 // 12:00–22:00 every day in Asia/Almaty and has one 4-seat and one 2-seat table.
 type createHarness struct {
-	uc        CreateUseCase
-	bookings  *fakeBookings
-	links     *fakeLinks
-	capacity  *fakeCapacity
-	items     *fakeItems
-	history   *fakeHistory
-	outbox    *fakeOutbox
-	blacklist *fakeBlacklist
-	rateLog   *fakeRateLog
-	schedule  *fakeSchedule
-	promos    *fakePromos
-	tx        *fakeTx
+	uc         CreateUseCase
+	bookings   *fakeBookings
+	links      *fakeLinks
+	capacity   *fakeCapacity
+	items      *fakeItems
+	history    *fakeHistory
+	outbox     *fakeOutbox
+	blacklist  *fakeBlacklist
+	rateLog    *fakeRateLog
+	schedule   *fakeSchedule
+	promos     *fakePromos
+	promoCodes *fakePromoCodes
+	tx         *fakeTx
 
 	restaurantID uuid.UUID
 	guest        Actor
@@ -69,6 +70,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 		tableSmall:   small,
 		promoID:      promoID,
 	}
+	h.promoCodes = newFakePromoCodes("MARATHON26", promoID, h.tx)
 	day := time.Now().In(loc).AddDate(0, 0, 2)
 	h.startsAt = time.Date(day.Year(), day.Month(), day.Day(), 13, 0, 0, 0, loc).UTC()
 
@@ -79,7 +81,7 @@ func newCreateHarness(t *testing.T, override domain.BookingPolicyOverride) *crea
 		}}},
 		h.schedule,
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, rid}),
-		h.promos, h.tx, testConfig(),
+		h.promos, h.promoCodes, h.tx, testConfig(),
 	)
 	return h
 }
@@ -224,7 +226,7 @@ func TestCreatePromotionIDWithoutPromosConfigured(t *testing.T) {
 		}}},
 		h.schedule,
 		newFakeManagers([2]uuid.UUID{h.manager.UserID, h.restaurantID}),
-		nil, h.tx, testConfig(),
+		nil, nil, h.tx, testConfig(),
 	)
 	in := h.input()
 	in.PromotionID = &h.promoID
@@ -520,7 +522,7 @@ func TestCreateInactiveRestaurant(t *testing.T) {
 		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
 		&fakeBlacklist{}, &fakeRateLog{},
 		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid}}},
-		&fakeSchedule{}, newFakeManagers(), nil, &fakeTx{}, testConfig(),
+		&fakeSchedule{}, newFakeManagers(), nil, nil, &fakeTx{}, testConfig(),
 	)
 	_, err := uc.Create(context.Background(), Actor{UserID: uuid.New(), Role: domain.RoleUser}, CreateInput{
 		RestaurantID: rid, Name: "x", Phone: "+77071234567", Guests: 2,
@@ -590,4 +592,165 @@ func TestCreateConflictCodes(t *testing.T) {
 			t.Fatalf("code = %q (ok=%v), want %q", code, ok, domain.CodeNoTableAvailable)
 		}
 	})
+}
+
+// TestCreateWithPromoCode: the happy path. The booking comes out carrying the
+// campaign the code stands for AND the normalized code string, and the code
+// was spent INSIDE the transaction (outside it the lock guarantees nothing).
+func TestCreateWithPromoCode(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+
+	details, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt,
+		Source: domain.SourceApp, PromoCode: " marathon 26 ",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if details.Booking.PromotionID == nil || *details.Booking.PromotionID != h.promoID {
+		t.Fatalf("promotion_id = %v, want the code's campaign %v", details.Booking.PromotionID, h.promoID)
+	}
+	if details.Booking.PromoCode == nil || *details.Booking.PromoCode != "MARATHON26" {
+		t.Fatalf("promo_code = %v, want the NORMALIZED code", details.Booking.PromoCode)
+	}
+	if details.Booking.PromoCodeID == nil || *details.Booking.PromoCodeID != h.promoCodes.resolution.PromoCodeID {
+		t.Fatalf("promo_code_id = %v, want %v", details.Booking.PromoCodeID, h.promoCodes.resolution.PromoCodeID)
+	}
+	if h.promoCodes.consumedID == nil {
+		t.Fatal("the code was never consumed")
+	}
+	if !h.promoCodes.consumedInTx {
+		t.Fatal("the code was consumed OUTSIDE the create transaction: the row lock guarantees nothing there")
+	}
+	if h.promoCodes.consumedBy == nil || *h.promoCodes.consumedBy != h.guest.UserID {
+		t.Fatalf("consumed for %v, want the booking's guest %v", h.promoCodes.consumedBy, h.guest.UserID)
+	}
+}
+
+// TestCreateWithoutPromoCodeIgnoresTheModule is the product rule the whole
+// feature hangs on: a booking with no code never touches the promo-code path,
+// so it cannot fail for a promo-code reason (spec criterion 9).
+func TestCreateWithoutPromoCodeIgnoresTheModule(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	// Every promo-code call would fail if it happened at all.
+	h.promoCodes.resolveErr = fmt.Errorf("must not be called: %w", domain.ErrValidation)
+	h.promoCodes.consumeErr = fmt.Errorf("must not be called: %w", domain.ErrValidation)
+
+	details, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt, Source: domain.SourceApp,
+	})
+	if err != nil {
+		t.Fatalf("a booking without a code must always go through: %v", err)
+	}
+	if details.Booking.PromoCodeID != nil || details.Booking.PromoCode != nil {
+		t.Fatalf("booking without a code carries %v/%v", details.Booking.PromoCodeID, details.Booking.PromoCode)
+	}
+	if h.promoCodes.resolved != 0 {
+		t.Fatalf("the promo-code module was consulted %d time(s) for a booking without a code", h.promoCodes.resolved)
+	}
+}
+
+// TestCreatePromoCodeRefusedForStaff — the check lives in the usecase because
+// createMine and createByStaff parse ONE request struct; a transport check
+// would cover one route of the two.
+func TestCreatePromoCodeRefusedForStaff(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	guestID := uuid.New()
+
+	for _, tc := range []struct {
+		name   string
+		actor  Actor
+		userID *uuid.UUID
+	}{
+		{name: "staff booking for a guest", actor: h.manager, userID: &guestID},
+		{name: "booking with no account at all", actor: h.manager, userID: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.uc.Create(context.Background(), tc.actor, CreateInput{
+				RestaurantID: h.restaurantID, UserID: tc.userID, Name: "Гость",
+				Phone: "+77071234599", Guests: 2, StartsAt: h.startsAt,
+				Source: domain.SourceApp, PromoCode: "MARATHON26",
+			})
+			if !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("err = %v, want ErrForbidden", err)
+			}
+			if got, _ := domain.CodeOf(err); got != domain.CodePromoCodeForbiddenForStaff {
+				t.Fatalf("code = %q, want %q", got, domain.CodePromoCodeForbiddenForStaff)
+			}
+		})
+	}
+}
+
+// TestCreatePromoCodeConflictsWithAnotherCampaign: both a code and a
+// promotion_id naming a DIFFERENT campaign. Refused rather than silently
+// preferring one — either choice tags the booking with a campaign the guest
+// did not pick. The SAME campaign twice is not a conflict.
+func TestCreatePromoCodeConflictsWithAnotherCampaign(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	other := uuid.New()
+	// The other campaign is LIVE: otherwise validatePromotion refuses it first
+	// and the test would pass without ever reaching the conflict rule.
+	h.promos.live[other] = domain.PromoListItem{Promo: domain.Promo{ID: other, Title: "Другая акция"}}
+
+	_, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt,
+		Source: domain.SourceApp, PromoCode: "MARATHON26", PromotionID: &other,
+	})
+	if got, _ := domain.CodeOf(err); got != domain.CodePromoConflict {
+		t.Fatalf("code = %q, want %q (err %v)", got, domain.CodePromoConflict, err)
+	}
+
+	same := h.promoID
+	if _, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt.Add(time.Hour),
+		Source: domain.SourceApp, PromoCode: "MARATHON26", PromotionID: &same,
+	}); err != nil {
+		t.Fatalf("the same campaign named twice is not a conflict: %v", err)
+	}
+}
+
+// TestCreatePromoCodeLimitRefusesTheBooking: a refusal under the lock rolls
+// the whole booking back and reaches the client with its own code, so the app
+// can offer "book without the code".
+func TestCreatePromoCodeLimitRefusesTheBooking(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	h.promoCodes.consumeErr = domain.WithCode(domain.CodePromoCodeLimitReached,
+		fmt.Errorf("full: %w", domain.ErrValidation))
+
+	_, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt,
+		Source: domain.SourceApp, PromoCode: "MARATHON26",
+	})
+	if got, _ := domain.CodeOf(err); got != domain.CodePromoCodeLimitReached {
+		t.Fatalf("code = %q, want %q (err %v)", got, domain.CodePromoCodeLimitReached, err)
+	}
+	if len(h.bookings.list) != 0 {
+		t.Fatalf("the booking survived a refused code: %d row(s)", len(h.bookings.list))
+	}
+}
+
+// TestCreatePromoCodeUnwiredRefusesLoudly: an unwired module refuses the code
+// instead of quietly creating a booking that joined nothing while the guest
+// was told it joined (same posture as an unwired promos port).
+func TestCreatePromoCodeUnwiredRefusesLoudly(t *testing.T) {
+	rid := uuid.New()
+	uc := NewCreateUseCase(
+		newFakeBookings(), &fakeLinks{}, newFakeCapacity(), &fakeItems{}, &fakeHistory{}, &fakeOutbox{},
+		&fakeBlacklist{}, &fakeRateLog{},
+		&fakeRestaurants{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{ID: rid, IsActive: true}}},
+		&fakeSchedule{hours: openAllWeek("00:00", "23:59")}, newFakeManagers(), nil, nil, &fakeTx{}, testConfig(),
+	)
+	guest := uuid.New()
+	_, err := uc.Create(context.Background(), Actor{UserID: guest, Role: domain.RoleUser}, CreateInput{
+		RestaurantID: rid, UserID: &guest, Name: "Гость", Phone: "+77071234567", Guests: 2,
+		StartsAt: time.Now().Add(48 * time.Hour), Source: domain.SourceApp, PromoCode: "MARATHON26",
+	})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
 }

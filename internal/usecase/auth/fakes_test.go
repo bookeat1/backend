@@ -165,13 +165,14 @@ func (f *fakeOTP) MarkUsed(_ context.Context, id uuid.UUID) error {
 	}
 	return nil
 }
-func (f *fakeOTP) IncrementAttempts(_ context.Context, id uuid.UUID) error {
+func (f *fakeOTP) IncrementAttempts(_ context.Context, id uuid.UUID) (int, error) {
 	for _, c := range f.codes {
 		if c.ID == id {
 			c.Attempts++
+			return c.Attempts, nil
 		}
 	}
-	return nil
+	return 0, domain.ErrNotFound
 }
 func (f *fakeOTP) CountSince(_ context.Context, phone string, ts time.Time) (int, error) {
 	n := 0

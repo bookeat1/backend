@@ -97,6 +97,14 @@ func OptionalAuth(issuer auth.TokenIssuer, users domain.UserRepository) gin.Hand
 // a typed key (not a string) so lookups are type-safe and decoupled from gin.
 type authUserKey struct{}
 
+// WithAuthUser puts an AuthUser on ctx under the same private key Auth uses.
+// It exists so a handler test can exercise a route end to end without a real
+// token issuer and user repository; production code has no reason to call it —
+// Auth and OptionalAuth are the only places a request becomes authenticated.
+func WithAuthUser(ctx context.Context, au AuthUser) context.Context {
+	return context.WithValue(ctx, authUserKey{}, au)
+}
+
 // GetAuthUser returns the AuthUser stored by Auth on the request context.
 func GetAuthUser(ctx context.Context) (AuthUser, bool) {
 	au, ok := ctx.Value(authUserKey{}).(AuthUser)

@@ -605,6 +605,26 @@ func (u *UseCase) NoShowBooking(ctx context.Context, actor Actor, restaurantID, 
 	return u.bookingTx.NoShow(ctx, actor.bookingActor(), bookingID, reason)
 }
 
+// ArriveBooking marks a confirmed booking's guest as physically present
+// (confirmed → arrived). Any staff role — same permission as every other
+// booking-status action in this panel.
+//
+// WHY THIS EXISTS ON TOP OF THE ALREADY-SHIPPED POST /bookings/:id/arrive
+// (transport/rest/bookings). That route is authorized inside
+// usecase/bookings itself and reachable by any staff member of the booking's
+// restaurant, so functionally nothing changes here. This method exists so
+// the cabinet's admin API client has ONE consistent family of booking
+// actions (confirm/reject/cancel/no-show/arrive), all shaped
+// (actor, restaurantID, bookingID) and all going through h.panel — mirroring
+// that shape is what let the hostess UI grow a "Пришёл" button next to the
+// other three without a second client or a second auth path to reason about.
+func (u *UseCase) ArriveBooking(ctx context.Context, actor Actor, restaurantID, bookingID uuid.UUID) (*domain.Booking, error) {
+	if err := u.authorize(ctx, actor, restaurantID, domain.PermBookingManage); err != nil {
+		return nil, err
+	}
+	return u.bookingTx.Arrive(ctx, actor.bookingActor(), bookingID)
+}
+
 // ---- Guests ----------------------------------------------------------------
 
 // ListGuests returns the venue's aggregated guest list (read-only, from

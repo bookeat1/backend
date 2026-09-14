@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -122,6 +123,94 @@ func TestVerifyOTPWrongCodePersistsAttemptAcrossRealTx(t *testing.T) {
 	}
 	if attempts != maxOTPAttempts {
 		t.Fatalf("attempts = %d, want unchanged %d once locked out", attempts, maxOTPAttempts)
+	}
+}
+
+// TestVerifyOTPAttemptsAreAtomicUnderConcurrency is a regression test for the
+// non-atomic read-modify-write race in the wrong-code path of VerifyOTP:
+// concurrent guesses used to compute "rec.Attempts + 1" off a snapshot taken
+// BEFORE any of them wrote, so many of them could believe they were still
+// under maxOTPAttempts even after the row had actually crossed it -- the row
+// could be brute-forced past the limit by racing requests. The fix makes the
+// usecase decide off the value IncrementAttempts itself RETURNS (UPDATE ...
+// RETURNING), which Postgres's row lock serializes into a strictly increasing
+// sequence, so AT MOST maxOTPAttempts-1 concurrent guesses can ever be told
+// "not locked out yet", no matter how many race in at once.
+//
+// Before the fix: this reliably fails the "invalid <= maxOTPAttempts-1"
+// assertion below when n concurrent goroutines all read the same
+// pre-increment snapshot (the startWG barrier below is there specifically to
+// maximise that overlap against the real connection pool).
+func TestVerifyOTPAttemptsAreAtomicUnderConcurrency(t *testing.T) {
+	uc, otpRepo, db := newRealTestOTP(t)
+	ctx := context.Background()
+
+	const phone = "+77010000099"
+	rec := &domain.OTPCode{
+		ID:        uuid.New(),
+		Phone:     phone,
+		CodeHash:  otpcode.Hash("111111"),
+		Channel:   "test",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := otpRepo.Create(ctx, rec); err != nil {
+		t.Fatalf("seed OTP: %v", err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	var startWG sync.WaitGroup
+	startWG.Add(1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			startWG.Wait() // maximise actual overlap against the real connection pool
+			_, errs[i] = uc.VerifyOTP(context.Background(), phone, "000000")
+		}(i)
+	}
+	startWG.Done()
+	wg.Wait()
+
+	invalid, lockedOut := 0, 0
+	for i, err := range errs {
+		if !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("guess %d: err = %v, want ErrUnauthorized", i, err)
+		}
+		code, ok := domain.CodeOf(err)
+		if !ok {
+			t.Fatalf("guess %d: no machine-readable code on %v", i, err)
+		}
+		switch code {
+		case domain.CodeOTPInvalid:
+			invalid++
+		case domain.CodeOTPTooManyAttempts:
+			lockedOut++
+		default:
+			t.Fatalf("guess %d: unexpected code %q", i, code)
+		}
+	}
+
+	// The invariant the race broke: no more than maxOTPAttempts-1 concurrent
+	// guesses may ever be told "try again" for the same code.
+	if invalid > maxOTPAttempts-1 {
+		t.Fatalf("invalid (not-locked-out) responses = %d, want <= %d (attempt counter raced past the limit)",
+			invalid, maxOTPAttempts-1)
+	}
+	if invalid+lockedOut != n {
+		t.Fatalf("invalid(%d) + lockedOut(%d) = %d, want %d", invalid, lockedOut, invalid+lockedOut, n)
+	}
+	if lockedOut == 0 {
+		t.Fatalf("lockedOut = 0, want at least one of %d concurrent guesses on a %d-attempt budget to hit the lockout", n, maxOTPAttempts)
+	}
+
+	var attempts int
+	if err := db.QueryRow(ctx, `SELECT attempts FROM otp_codes WHERE id = $1`, rec.ID).Scan(&attempts); err != nil {
+		t.Fatalf("query attempts: %v", err)
+	}
+	if attempts < maxOTPAttempts || attempts > n {
+		t.Fatalf("attempts = %d, want between %d and %d", attempts, maxOTPAttempts, n)
 	}
 }
 

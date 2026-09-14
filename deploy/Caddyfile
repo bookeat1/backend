@@ -84,3 +84,145 @@
 		health_timeout 3s
 	}
 }
+
+# ===========================================================================
+# PRODUCTION-ONLY SITE BLOCKS (213.155.20.76, /opt/bookeat/deploy/Caddyfile)
+#
+# Copied verbatim out of the live production file on 2026-09-12. They were
+# missing from this repository entirely: anyone who copied this file onto the
+# prod host would have wiped both the guest site and the venue panel. The
+# reverse also holds — the /preview, /admin-preview and /web-preview handles
+# above exist only on the TEST host (213.155.20.122), whose live file is
+# byte-identical to this one minus this section.
+#
+# Nothing in CI writes this file: .github/workflows/deploy.yml only scp's
+# deploy/scripts/remote-deploy.sh and runs docker compose with the files
+# already on the host. The host copies are edited BY HAND, so this file is a
+# reference that must be re-synced whenever a host changes.
+#
+# Applying a change to a host (never with sed -i: a new inode is invisible to
+# the running container, incident of 2026-08-24):
+#   cp /opt/bookeat/deploy/Caddyfile /opt/bookeat/deploy/Caddyfile.bak.$(date -u +%Y%m%d-%H%M%S)
+#   cat new-file > /opt/bookeat/deploy/Caddyfile
+#   docker exec deploy-caddy-1 caddy validate --config /etc/caddy/Caddyfile
+#   docker exec deploy-caddy-1 caddy reload  --config /etc/caddy/Caddyfile
+#
+# Neither host's .env sets WEB_SITE_ADDRESS or ADMIN_SITE_ADDRESS (checked
+# 2026-09-12), so the literal defaults below are what prod serves. On the test
+# host these two blocks would claim book-eat.com / admin.book-eat.com and fail
+# ACME (DNS points at prod), so before copying this file there give both
+# variables a hostname that resolves to the test box — or drop this section.
+#
+# Do NOT set them to an empty string to "switch the block off": an empty
+# address makes the whole file unadaptable, Caddy refuses to start. Verified
+# with caddy 2.9 on 2026-09-12:
+#   WEB_SITE_ADDRESS= ADMIN_SITE_ADDRESS= caddy validate --config Caddyfile
+#   -> Error: server block without any key is global configuration, and if
+#      used, it must be first
+# (The comment above the ADMIN_SITE_ADDRESS block, inherited from the test
+# host, claims the opposite. It is wrong.)
+# ===========================================================================
+
+# Кабинет заведения (apps/admin). Статика: Next.js собран с output: "export",
+# поэтому сервер отдаёт готовые файлы и никакого Node здесь не нужно.
+#
+# Адрес берётся из ADMIN_SITE_ADDRESS, как и у бэкенда: пока DNS не делегирован,
+# значение можно оставить пустым и блок просто не поднимется, а не сломает
+# остальной конфиг.
+{$ADMIN_SITE_ADDRESS:admin.book-eat.com} {
+	encode gzip zstd
+
+	log {
+		output stdout
+		format json
+	}
+
+	root * /srv/admin/current
+	# Панель — одностраничное приложение со статическими маршрутами: у каждого
+	# экрана свой .html. try_files отдаёт его, а всё непонятное уводит на 404
+	# самой панели, а не на голую страницу Caddy.
+	try_files {path} {path}.html {path}/index.html /index.html
+	file_server
+}
+
+# ---------------------------------------------------------------------------
+# book-eat.com — guest site. ONE domain, TWO origins picked per request
+# (ADR-046, frontend deploy/web-prod/caddy-book-eat.com.snippet):
+#   robots and crawler files      -> desktop Next  (web-prod:3100,   /opt/bookeat/web)
+#   cookie bookeat_view=mobile    -> mobile Expo   (web-mobile:3200, /opt/bookeat/mobile-web)
+#   cookie bookeat_view=desktop   -> desktop Next
+#   mobile User-Agent             -> mobile Expo
+#   everything else               -> desktop Next
+# Both origins are separate compose projects ("webprod", "mobileprod") that
+# only join this stack's network; if one is down only its share of the domain
+# answers 502, the API and the panel on the sibling hostnames are unaffected.
+# `handle` blocks are mutually exclusive and evaluated in the order written.
+# Added by hand 2026-09-08 (cutover). Not managed by any pipeline.
+# ---------------------------------------------------------------------------
+{$WEB_SITE_ADDRESS:book-eat.com} {
+	encode zstd gzip
+
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options SAMEORIGIN
+		-Server
+		# Dynamic serving: the same URL answers with a different origin by
+		# User-Agent / cookie, so every cache in between must key on both.
+		# `+` appends to whatever the upstream already sent (Next sets its
+		# own Vary for RSC), `defer` applies it after the upstream answered.
+		+Vary "User-Agent, Cookie"
+		defer
+	}
+
+	# 1. Crawlers' files ALWAYS come from the desktop app (robots/sitemap
+	#    live in Next), whatever answers the rest of the domain.
+	@crawler_files path /robots.txt /sitemap.xml
+	handle @crawler_files {
+		reverse_proxy web-prod:3100
+	}
+
+	# 2. Mobile web (Expo web export of apps/mobile). Robots never match:
+	#    the SPA is noindex and the desktop app is the indexable one.
+	@forced_mobile {
+		not header_regexp ua_bot User-Agent (?i)(bot|crawl|spider|slurp|facebookexternalhit|preview|lighthouse)
+		header Cookie *bookeat_view=mobile*
+	}
+	@mobile {
+		not header_regexp ua_bot User-Agent (?i)(bot|crawl|spider|slurp|facebookexternalhit|preview|lighthouse)
+		not header Cookie *bookeat_view=desktop*
+		header_regexp ua_mobile User-Agent (?i)(android|iphone|ipod|mobile)
+	}
+	handle @forced_mobile {
+		reverse_proxy web-mobile:3200 {
+			health_uri /release.txt
+			health_interval 15s
+			health_timeout 3s
+		}
+	}
+	handle @mobile {
+		reverse_proxy web-mobile:3200 {
+			health_uri /release.txt
+			health_interval 15s
+			health_timeout 3s
+		}
+	}
+
+	# 3. Desktop guest site (apps/web) — the fall-through.
+	handle {
+		reverse_proxy web-prod:3100 {
+			health_uri /
+			health_interval 15s
+			health_timeout 3s
+		}
+	}
+}
+
+www.{$WEB_SITE_ADDRESS:book-eat.com} {
+	redir https://{$WEB_SITE_ADDRESS:book-eat.com}{uri} permanent
+}

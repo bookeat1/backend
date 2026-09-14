@@ -57,10 +57,22 @@ func (r *Repository) MarkUsed(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-func (r *Repository) IncrementAttempts(ctx context.Context, id uuid.UUID) error {
-	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = $1`, id)
-	return err
+// IncrementAttempts bumps attempts and returns the post-increment value in
+// the SAME statement (UPDATE ... RETURNING), so the row-level lock Postgres
+// already takes for the UPDATE also fixes the value the caller reasons about —
+// two concurrent callers on the same id get two DIFFERENT, correctly ordered
+// answers (e.g. 4 and 5), never the same one twice. See the interface doc on
+// domain.OTPRepository for why the caller must use this return value instead
+// of a locally-computed one.
+func (r *Repository) IncrementAttempts(ctx context.Context, id uuid.UUID) (int, error) {
+	var attempts int
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts`, id).
+		Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("increment otp attempts: %w", err)
+	}
+	return attempts, nil
 }
 
 func (r *Repository) CountSince(ctx context.Context, phone string, ts time.Time) (int, error) {
