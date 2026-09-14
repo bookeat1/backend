@@ -117,7 +117,7 @@ func (f *fakeBookingList) ListByRestaurant(_ context.Context, _ bookings.Actor, 
 	return nil, 0, nil
 }
 
-type fakeBookingTx struct{ confirmed, rejected, cancelled, noShow bool }
+type fakeBookingTx struct{ confirmed, rejected, cancelled, noShow, arrived bool }
 
 func (f *fakeBookingTx) Confirm(_ context.Context, _ bookings.Actor, id uuid.UUID, _ *string) (*domain.Booking, error) {
 	f.confirmed = true
@@ -133,6 +133,10 @@ func (f *fakeBookingTx) Cancel(_ context.Context, _ bookings.Actor, id uuid.UUID
 }
 func (f *fakeBookingTx) NoShow(_ context.Context, _ bookings.Actor, id uuid.UUID, _ *string) (*domain.Booking, error) {
 	f.noShow = true
+	return &domain.Booking{ID: id}, nil
+}
+func (f *fakeBookingTx) Arrive(_ context.Context, _ bookings.Actor, id uuid.UUID) (*domain.Booking, error) {
+	f.arrived = true
 	return &domain.Booking{ID: id}, nil
 }
 
@@ -329,6 +333,29 @@ func TestHostessAllowedStopListAndBookings(t *testing.T) {
 	}
 	if !h.bookTx.confirmed {
 		t.Fatal("hostess confirm did not reach the transition delegate")
+	}
+	if _, err := h.uc.ArriveBooking(ctx, actor, rid, uuid.New()); err != nil {
+		t.Fatalf("hostess ArriveBooking: unexpected error %v", err)
+	}
+	if !h.bookTx.arrived {
+		t.Fatal("hostess arrive did not reach the transition delegate")
+	}
+}
+
+// TestArriveBookingRequiresBookingManage: an actor without booking.manage on
+// this restaurant (e.g. a hostess of a DIFFERENT venue) is refused before the
+// transition delegate is ever reached — same gate as every other booking
+// action in this panel.
+func TestArriveBookingRequiresBookingManage(t *testing.T) {
+	uid, rid := uuid.New(), uuid.New()
+	h := newHarness(map[string]bool{}) // no grants at all
+	actor := staffActor(uid)
+
+	if _, err := h.uc.ArriveBooking(context.Background(), actor, rid, uuid.New()); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("ArriveBooking without booking.manage: got %v, want ErrForbidden", err)
+	}
+	if h.bookTx.arrived {
+		t.Fatal("ArriveBooking reached the transition delegate despite no grant")
 	}
 }
 

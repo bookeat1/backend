@@ -163,6 +163,9 @@ func (f *fakeBookingTx) Cancel(_ context.Context, _ bookings.Actor, id uuid.UUID
 func (f *fakeBookingTx) NoShow(_ context.Context, _ bookings.Actor, id uuid.UUID, _ *string) (*domain.Booking, error) {
 	return f.result(id)
 }
+func (f *fakeBookingTx) Arrive(_ context.Context, _ bookings.Actor, id uuid.UUID) (*domain.Booking, error) {
+	return f.result(id)
+}
 
 // harness bundles the fakes with a built router.
 type harness struct {
@@ -251,6 +254,7 @@ func TestHappyPaths(t *testing.T) {
 		{"reject booking", http.MethodPost, b + "/bookings/" + bid.String() + "/reject", gin.H{}, http.StatusOK},
 		{"cancel booking", http.MethodPost, b + "/bookings/" + bid.String() + "/cancel", gin.H{}, http.StatusOK},
 		{"no-show booking", http.MethodPost, b + "/bookings/" + bid.String() + "/no-show", gin.H{}, http.StatusOK},
+		{"arrive booking", http.MethodPost, b + "/bookings/" + bid.String() + "/arrive", nil, http.StatusOK},
 		{"list guests", http.MethodGet, b + "/guests", nil, http.StatusOK},
 	}
 	for _, tc := range cases {
@@ -279,6 +283,7 @@ func TestBadPathUUID(t *testing.T) {
 		{"bad item id (availability)", http.MethodPatch, gb + "/menu-items/not-a-uuid/availability"},
 		{"bad booking id (confirm)", http.MethodPost, gb + "/bookings/not-a-uuid/confirm"},
 		{"bad booking id (cancel)", http.MethodPost, gb + "/bookings/not-a-uuid/cancel"},
+		{"bad booking id (arrive)", http.MethodPost, gb + "/bookings/not-a-uuid/arrive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -413,6 +418,14 @@ func TestErrorMapping(t *testing.T) {
 			h := newHarness(true, true)
 			h.bookTx.err = tc.err
 			w := do(h.router, http.MethodPost, base(uuid.New())+"/bookings/"+uuid.New().String()+"/confirm", gin.H{}, nil, uuid.New())
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d (body %s)", w.Code, tc.want, w.Body)
+			}
+		})
+		t.Run("arriveBooking/"+tc.name, func(t *testing.T) {
+			h := newHarness(true, true)
+			h.bookTx.err = tc.err
+			w := do(h.router, http.MethodPost, base(uuid.New())+"/bookings/"+uuid.New().String()+"/arrive", nil, nil, uuid.New())
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d (body %s)", w.Code, tc.want, w.Body)
 			}

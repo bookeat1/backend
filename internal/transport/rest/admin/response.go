@@ -157,6 +157,7 @@ type bookingResponse struct {
 	CancelledBy        *string    `json:"cancelled_by"`
 	CancellationReason *string    `json:"cancellation_reason"`
 	ConfirmedAt        *time.Time `json:"confirmed_at"`
+	ArrivedAt          *time.Time `json:"arrived_at"`
 	CreatedAt          time.Time  `json:"created_at"`
 	// Предзаказ гостя. Пустой массив, а не null: список блюд у брони без
 	// предзаказа существует, он просто пуст, и клиенту не нужно разбирать
@@ -209,7 +210,7 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 		Name: b.Name, Phone: b.Phone, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: string(b.Status), Source: string(b.Source),
 		Notes: b.Notes, CancelledBy: cancelledBy, CancellationReason: b.CancellationReason,
-		ConfirmedAt: b.ConfirmedAt, CreatedAt: b.CreatedAt,
+		ConfirmedAt: b.ConfirmedAt, ArrivedAt: b.ArrivedAt, CreatedAt: b.CreatedAt,
 	}
 }
 

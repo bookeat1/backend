@@ -110,4 +110,5 @@ type bookingTransitioner interface {
 	Reject(ctx context.Context, actor bookings.Actor, id uuid.UUID, reason *string) (*domain.Booking, error)
 	Cancel(ctx context.Context, actor bookings.Actor, id uuid.UUID, in bookings.CancelInput) (*domain.Booking, error)
 	NoShow(ctx context.Context, actor bookings.Actor, id uuid.UUID, reason *string) (*domain.Booking, error)
+	Arrive(ctx context.Context, actor bookings.Actor, id uuid.UUID) (*domain.Booking, error)
 }
