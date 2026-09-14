@@ -55,10 +55,13 @@ func bookingEventType(t string) (EventType, bool) {
 		return EventBookingCancelled, true
 	case "booking.no_show":
 		return EventNoShow, true
+	case "booking.arrived":
+		return EventBookingArrived, true
+	case "booking.completed":
+		return EventBookingCompleted, true
 	default:
-		// waitlisted / arrived / completed / updated / escalated /
-		// message_created are real booking events but not shipped as product
-		// analytics in this initial set.
+		// waitlisted / updated / escalated / message_created are real booking
+		// events but not shipped as product analytics in this initial set.
 		return "", false
 	}
 }
@@ -82,13 +85,13 @@ func mapBooking(row SourceRow) (Event, bool, error) {
 		"status":        p.Status,
 		"source":        p.Source,
 	}
-	// promotion_id: only on the two funnel steps a campaign is actually
-	// measured over (a guest booked, a venue confirmed it) — the same pair a
-	// "how many marathon bookings turned into confirmed visits" chart needs.
+	// promotion_id: only on the funnel steps a campaign is actually measured
+	// over (booked, confirmed, showed up, visit completed) — the four points
+	// the marathon's "saw QR -> installed -> booked -> came" chart needs.
 	// Omitted rather than sent empty for every OTHER booking: an Amplitude
 	// property that is absent on 99% of events reads as "not applicable",
 	// nil/"" would read as "campaign unknown".
-	if p.PromotionID != nil && (et == EventBookingCreated || et == EventBookingConfirmed) {
+	if p.PromotionID != nil && (et == EventBookingCreated || et == EventBookingConfirmed || et == EventBookingArrived || et == EventBookingCompleted) {
 		props["promotion_id"] = p.PromotionID.String()
 	}
 	return Event{
