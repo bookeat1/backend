@@ -80,6 +80,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.POST("/admin/restaurants/:id/bookings/:bookingId/reject", h.rejectBooking)
 	rg.POST("/admin/restaurants/:id/bookings/:bookingId/cancel", h.cancelBooking)
 	rg.POST("/admin/restaurants/:id/bookings/:bookingId/no-show", h.noShowBooking)
+	rg.POST("/admin/restaurants/:id/bookings/:bookingId/arrive", h.arriveBooking)
 
 	// Guests.
 	rg.GET("/admin/restaurants/:id/guests", h.listGuests)
@@ -649,6 +650,22 @@ func (h *Handler) noShowBooking(c *gin.Context) {
 	var req reasonRequest
 	_ = c.ShouldBindJSON(&req)
 	b, err := h.panel.NoShowBooking(c.Request.Context(), actor, rid, bid, req.Reason)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, bookingToResponse(*b))
+}
+
+// arriveBooking marks the guest as arrived (confirmed → arrived). No body:
+// unlike confirm/reject/cancel/no-show, arrival carries no reason — it is a
+// fact ("the guest is standing at the door"), not a refusal that needs one.
+func (h *Handler) arriveBooking(c *gin.Context) {
+	actor, rid, bid, ok := actorRIDBooking(c)
+	if !ok {
+		return
+	}
+	b, err := h.panel.ArriveBooking(c.Request.Context(), actor, rid, bid)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
