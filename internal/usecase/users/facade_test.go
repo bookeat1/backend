@@ -266,6 +266,17 @@ func TestDeleteMeAnonymizesAndInvalidatesSessions(t *testing.T) {
 	f, refresh, otp := newTestFacade(repo)
 	ctx := context.Background()
 
+	// Seed a non-empty foodie profile (religious diet + a medical allergy) so
+	// DeleteMe has something to scrub — regression coverage for the PR #135
+	// review finding that DeleteMe left these tables untouched.
+	if _, err := f.ReplaceFoodieProfile(ctx, id, ReplaceFoodieProfileInput{
+		Cuisines:  []string{domain.FoodieCuisineKazakh},
+		Diets:     []string{domain.FoodieDietHalal},
+		Allergies: []string{domain.FoodieAllergyNuts},
+	}); err != nil {
+		t.Fatalf("seed ReplaceFoodieProfile: %v", err)
+	}
+
 	if err := f.DeleteMe(ctx, id); err != nil {
 		t.Fatalf("DeleteMe: %v", err)
 	}
@@ -284,6 +295,14 @@ func TestDeleteMeAnonymizesAndInvalidatesSessions(t *testing.T) {
 	}
 	if otp.invalidatedFor[phone] != 1 {
 		t.Errorf("expected InvalidateActiveByPhone called once for %q, got %d", phone, otp.invalidatedFor[phone])
+	}
+
+	profile, err := f.GetFoodieProfile(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFoodieProfile after delete: %v", err)
+	}
+	if len(profile.Cuisines) != 0 || len(profile.Diets) != 0 || len(profile.Allergies) != 0 {
+		t.Errorf("expected foodie profile scrubbed on delete, got %+v", profile)
 	}
 
 	// Idempotent: a second call succeeds and does not re-run session

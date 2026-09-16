@@ -173,6 +173,14 @@ func validateBirthDate(bd time.Time) error {
 // invalidates any outstanding OTP code for its (pre-anonymization) phone — all
 // inside one transaction so a partial failure never leaves a half-deleted
 // account with live sessions.
+//
+// It also clears the foodie-profile preference tables (user_foodie_diets,
+// user_foodie_allergies, user_foodie_cuisines): users.Delete only
+// soft-deletes the row (DeletedAt set), it never hard-deletes it, so the
+// ON DELETE CASCADE on those tables never fires. Diets/allergies can encode
+// religious and medical data, so they must not survive an account deletion
+// even though the row itself is only anonymized, not removed. The old
+// user_cuisine_preferences table has the same gap but is out of scope here.
 func (f *facade) DeleteMe(ctx context.Context, id uuid.UUID) error {
 	return f.tx.WithinTx(ctx, func(ctx context.Context) error {
 		u, err := f.users.GetByID(ctx, id)
@@ -186,6 +194,9 @@ func (f *facade) DeleteMe(ctx context.Context, id uuid.UUID) error {
 		phone := u.Phone
 
 		if err := f.users.Delete(ctx, id); err != nil {
+			return err
+		}
+		if err := f.foodie.Replace(ctx, id, domain.FoodieProfilePreferences{}); err != nil {
 			return err
 		}
 		if err := f.refresh.RevokeAllByUser(ctx, id); err != nil {
