@@ -44,3 +44,18 @@ type HomePicksRepository interface {
 	// sequence of writes another request could interleave with.
 	Replace(ctx context.Context, city string, restaurantIDs []uuid.UUID) error
 }
+
+// HomePicksMode names which of the rail's three resolution steps (see
+// usecase/homepicks's package doc) actually produced an answer — "editorial"
+// when a manual list (the city's own, or the all-cities one) supplied it,
+// "popular" when the automatic is_popular rule did. This is the vocabulary
+// spec foodie-personalization-v1-20260916.md's data.mode field uses for the
+// two non-personalized states (§5.6/§5.8); BE-2 (/restaurants/picks) adds its
+// own third value, "for_you", which is NOT a HomePicksMode — this package has
+// no notion of a guest's taste, only of "was this venue hand-picked or not".
+type HomePicksMode string
+
+const (
+	HomePicksModeEditorial HomePicksMode = "editorial"
+	HomePicksModePopular   HomePicksMode = "popular"
+)

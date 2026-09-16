@@ -148,7 +148,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// signed-in guest. Mounted here, right after the catalog, so the two static
 	// segments (/restaurants/search, /restaurants/picks) and /restaurants/:id
 	// are declared in one place.
-	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.FavoritesFacade)
+	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.ForYou, deps.FavoritesFacade)
 	picksHandler.RegisterPublic(restPublic)
 
 	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and

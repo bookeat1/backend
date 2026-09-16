@@ -82,6 +82,7 @@ import (
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
+	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
 	"backend-core/internal/usecase/legacysync"
@@ -98,6 +99,7 @@ import (
 	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/stories"
+	"backend-core/internal/usecase/tastematch"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
@@ -141,8 +143,12 @@ type Deps struct {
 	PromoCodesFacade promocodesuc.Facade
 	// PromoCodesEditor is the cabinet side of the same table; it is a separate
 	// interface because only the superadmin route group reaches it.
-	PromoCodesEditor  promocodesuc.Editor
-	HomePicks         homepicks.Facade
+	PromoCodesEditor promocodesuc.Editor
+	HomePicks        homepicks.Facade
+	// ForYou is GET /restaurants/picks' personalization (BE-2): the SAME
+	// route, wired under OptionalAuth, resolves through this when the caller
+	// has an active taste profile.
+	ForYou            *foryou.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
 	// GastroRoutes / GastroRouteEditor — «Гастропрогулки» (migration 0078): the
@@ -538,6 +544,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// quietly fail to appear for exactly the guests it was curated for.
 	homePicksFacade := homepicks.NewFacade(homepicksrepo.New(db, txm), restaurantsFacade,
 		homepicks.WithCityResolver(citiesUC))
+	// Personalization on top of the rail above (spec
+	// foodie-personalization-v1-20260916.md, BE-2): LoadTasteProfile is the
+	// ONE shared read of a guest's taste (BE-1, usecase/tastematch) — BE-3
+	// (/feed) and BE-4 (/events?sort=for_you) build their own Loader from the
+	// same three repos when their turn comes, never a second assembly of
+	// "this guest's taste". homePicksFacade doubles as BOTH the fallback rail
+	// AND the editorial-pick membership source, so a guest whose profile
+	// scores nothing sees the identical rail an anonymous guest does.
+	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	forYouFacade := foryou.NewFacade(tasteLoader, restaurantsFacade, homePicksFacade)
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
@@ -592,6 +608,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
 		HomePicks:             homePicksFacade,
+		ForYou:                forYouFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
 		AuthMiniApp:           authMiniApp,
