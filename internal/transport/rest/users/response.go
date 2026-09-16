@@ -31,6 +31,30 @@ type userResponse struct {
 	CuisineIDs []string `json:"cuisine_ids"`
 }
 
+// foodieProfileResponse is the wire shape of GET/PUT
+// /users/me/foodie-profile. Arrays are always present (never null) even when
+// empty, so a client never has to null-check before iterating.
+type foodieProfileResponse struct {
+	Cuisines  []string `json:"cuisines"`
+	Diets     []string `json:"diets"`
+	Allergies []string `json:"allergies"`
+	Budget    *string  `json:"budget" example:"mid"`
+}
+
+func foodieProfileFromDomain(p domain.FoodieProfile) foodieProfileResponse {
+	cuisines, diets, allergies := p.Cuisines, p.Diets, p.Allergies
+	if cuisines == nil {
+		cuisines = []string{}
+	}
+	if diets == nil {
+		diets = []string{}
+	}
+	if allergies == nil {
+		allergies = []string{}
+	}
+	return foodieProfileResponse{Cuisines: cuisines, Diets: diets, Allergies: allergies, Budget: p.Budget}
+}
+
 // phoneChangeRequestedResponse mirrors the auth OTP request response: Sent is
 // always true on the 200, Code is populated only under AUTH_OTP_DEV_EXPOSE.
 type phoneChangeRequestedResponse struct {

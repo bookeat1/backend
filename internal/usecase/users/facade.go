@@ -36,11 +36,21 @@ type Facade interface {
 	// what the transport layer can be given without also handing it the ability
 	// to rewrite a name, a city or a birth date.
 	SetAvatarURL(ctx context.Context, id uuid.UUID, url string) error
+	// GetFoodieProfile returns the caller's "Фуди-профиль" wizard state
+	// (mobile PR #222): cuisines/diets/allergies picks plus the optional
+	// budget tier. A user who never opened the wizard gets empty slices and
+	// a nil Budget, never ErrNotFound.
+	GetFoodieProfile(ctx context.Context, id uuid.UUID) (domain.FoodieProfile, error)
+	// ReplaceFoodieProfile overwrites the caller's ENTIRE foodie profile in
+	// one call — replace semantics, matching the wizard saving its whole
+	// draft on the last screen rather than one field at a time.
+	ReplaceFoodieProfile(ctx context.Context, id uuid.UUID, in ReplaceFoodieProfileInput) (domain.FoodieProfile, error)
 }
 
 type facade struct {
 	users    domain.UserRepository
 	cuisines domain.UserCuisinePreferenceRepository
+	foodie   domain.FoodieProfileRepository
 	refresh  domain.RefreshTokenRepository
 	otp      domain.OTPRepository
 	tx       domain.TxManager
@@ -50,11 +60,12 @@ type facade struct {
 func NewFacade(
 	repo domain.UserRepository,
 	cuisines domain.UserCuisinePreferenceRepository,
+	foodie domain.FoodieProfileRepository,
 	refresh domain.RefreshTokenRepository,
 	otp domain.OTPRepository,
 	tx domain.TxManager,
 ) Facade {
-	return &facade{users: repo, cuisines: cuisines, refresh: refresh, otp: otp, tx: tx}
+	return &facade{users: repo, cuisines: cuisines, foodie: foodie, refresh: refresh, otp: otp, tx: tx}
 }
 
 // UpdateInput carries the mutable profile fields. A nil pointer leaves the
@@ -162,6 +173,14 @@ func validateBirthDate(bd time.Time) error {
 // invalidates any outstanding OTP code for its (pre-anonymization) phone — all
 // inside one transaction so a partial failure never leaves a half-deleted
 // account with live sessions.
+//
+// It also clears the foodie-profile preference tables (user_foodie_diets,
+// user_foodie_allergies, user_foodie_cuisines): users.Delete only
+// soft-deletes the row (DeletedAt set), it never hard-deletes it, so the
+// ON DELETE CASCADE on those tables never fires. Diets/allergies can encode
+// religious and medical data, so they must not survive an account deletion
+// even though the row itself is only anonymized, not removed. The old
+// user_cuisine_preferences table has the same gap but is out of scope here.
 func (f *facade) DeleteMe(ctx context.Context, id uuid.UUID) error {
 	return f.tx.WithinTx(ctx, func(ctx context.Context) error {
 		u, err := f.users.GetByID(ctx, id)
@@ -177,6 +196,9 @@ func (f *facade) DeleteMe(ctx context.Context, id uuid.UUID) error {
 		if err := f.users.Delete(ctx, id); err != nil {
 			return err
 		}
+		if err := f.foodie.Replace(ctx, id, domain.FoodieProfilePreferences{}); err != nil {
+			return err
+		}
 		if err := f.refresh.RevokeAllByUser(ctx, id); err != nil {
 			return err
 		}
@@ -187,4 +209,138 @@ func (f *facade) DeleteMe(ctx context.Context, id uuid.UUID) error {
 		}
 		return nil
 	})
+}
+
+// ReplaceFoodieProfileInput is the whole "Фуди-профиль" wizard draft, saved
+// in one PUT (replace semantics: every field is overwritten, never merged).
+// Budget is a *string (not a plain string) so "field omitted" would be
+// distinguishable from "explicitly cleared" if the wire layer ever needs
+// that — today the wizard has no partial-save mode, so the transport layer
+// always passes it, nil meaning "no budget picked".
+type ReplaceFoodieProfileInput struct {
+	Cuisines  []string
+	Diets     []string
+	Allergies []string
+	Budget    *string
+}
+
+// GetFoodieProfile returns the caller's foodie profile. Empty slices and a
+// nil Budget for a user who never opened the wizard — never ErrNotFound,
+// same convention as CuisinePreferences.
+func (f *facade) GetFoodieProfile(ctx context.Context, id uuid.UUID) (domain.FoodieProfile, error) {
+	u, err := f.users.GetByID(ctx, id)
+	if err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	prefs, err := f.foodie.Get(ctx, id)
+	if err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	return domain.FoodieProfile{
+		Cuisines: prefs.Cuisines, Diets: prefs.Diets, Allergies: prefs.Allergies,
+		Budget: u.FoodieBudgetTier,
+	}, nil
+}
+
+// ReplaceFoodieProfile validates in against the wizard's own rules (option
+// ids exist, the 5-cuisine cap, no_diet's exclusivity, a known budget tier)
+// and then overwrites the caller's whole foodie profile atomically: the
+// users.foodie_budget_tier column and all three preference tables are
+// written inside ONE transaction, so a rejected write never leaves budget
+// updated but preferences stale (or vice versa).
+func (f *facade) ReplaceFoodieProfile(ctx context.Context, id uuid.UUID, in ReplaceFoodieProfileInput) (domain.FoodieProfile, error) {
+	if err := validateFoodieCuisines(in.Cuisines); err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	if err := validateFoodieDiets(in.Diets); err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	if err := validateFoodieAllergies(in.Allergies); err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	if err := validateFoodieBudget(in.Budget); err != nil {
+		return domain.FoodieProfile{}, err
+	}
+
+	var out domain.FoodieProfile
+	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		u, err := f.users.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		u.FoodieBudgetTier = in.Budget
+		if err := f.users.Update(ctx, u); err != nil {
+			return err
+		}
+		prefs := domain.FoodieProfilePreferences{Cuisines: in.Cuisines, Diets: in.Diets, Allergies: in.Allergies}
+		if err := f.foodie.Replace(ctx, id, prefs); err != nil {
+			return err
+		}
+		out, err = f.GetFoodieProfile(ctx, id)
+		return err
+	})
+	if err != nil {
+		return domain.FoodieProfile{}, err
+	}
+	return out, nil
+}
+
+// validateFoodieCuisines rejects an unknown cuisine id or more than
+// domain.FoodieCuisineSelectionLimit entries. The 5-tile cap is a hard block
+// on the client too (foodie-profile-selection.ts) — this is the
+// server-side backstop against a client bug or a hand-rolled request.
+func validateFoodieCuisines(ids []string) error {
+	if len(ids) > domain.FoodieCuisineSelectionLimit {
+		return fmt.Errorf("%w: cuisines: at most %d allowed, got %d",
+			domain.ErrValidation, domain.FoodieCuisineSelectionLimit, len(ids))
+	}
+	for _, id := range ids {
+		if !domain.ValidFoodieCuisineID(id) {
+			return fmt.Errorf("%w: cuisines: unknown id %q", domain.ErrValidation, id)
+		}
+	}
+	return nil
+}
+
+// validateFoodieDiets rejects an unknown diet id, and rejects
+// domain.FoodieDietExclusiveID ("no_diet") appearing alongside any other
+// diet — the two are mutually exclusive by definition.
+func validateFoodieDiets(ids []string) error {
+	hasExclusive := false
+	for _, id := range ids {
+		if !domain.ValidFoodieDietID(id) {
+			return fmt.Errorf("%w: diets: unknown id %q", domain.ErrValidation, id)
+		}
+		if id == domain.FoodieDietExclusiveID {
+			hasExclusive = true
+		}
+	}
+	if hasExclusive && len(ids) > 1 {
+		return fmt.Errorf("%w: diets: %q cannot be combined with any other diet",
+			domain.ErrValidation, domain.FoodieDietExclusiveID)
+	}
+	return nil
+}
+
+// validateFoodieAllergies rejects an unknown allergy id. No limit, no
+// exclusivity.
+func validateFoodieAllergies(ids []string) error {
+	for _, id := range ids {
+		if !domain.ValidFoodieAllergyID(id) {
+			return fmt.Errorf("%w: allergies: unknown id %q", domain.ErrValidation, id)
+		}
+	}
+	return nil
+}
+
+// validateFoodieBudget rejects a non-nil tier that is not one of
+// domain.FoodieBudgetTierIDs. nil (the step was skipped) is always valid.
+func validateFoodieBudget(tier *string) error {
+	if tier == nil {
+		return nil
+	}
+	if !domain.ValidFoodieBudgetTier(*tier) {
+		return fmt.Errorf("%w: budget: unknown tier %q", domain.ErrValidation, *tier)
+	}
+	return nil
 }

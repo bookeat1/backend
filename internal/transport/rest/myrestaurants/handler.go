@@ -37,12 +37,15 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 }
 
 // restaurantResponse is one entry of the picker: the restaurant id, its name
-// localized to the request locale, and the caller's role there
-// ("owner"/"manager"/"hostess", or "admin" for a superadmin).
+// localized to the request locale, the caller's role there
+// ("owner"/"manager"/"hostess", or "admin" for a superadmin), and whether the
+// venue is currently active. IsActive is informational only — the picker
+// still lists inactive/hidden venues, just labeled, it never filters them out.
 type restaurantResponse struct {
-	ID   uuid.UUID `json:"id"`
-	Name string    `json:"name"`
-	Role string    `json:"role"`
+	ID       uuid.UUID `json:"id"`
+	Name     string    `json:"name"`
+	Role     string    `json:"role"`
+	IsActive bool      `json:"is_active"`
 }
 
 // list returns the restaurants the authenticated caller is staff of.
@@ -71,9 +74,10 @@ func (h *Handler) list(c *gin.Context) {
 	out := make([]restaurantResponse, 0, len(items))
 	for _, it := range items {
 		out = append(out, restaurantResponse{
-			ID:   it.RestaurantID,
-			Name: it.NameI18n.Resolve(lang, it.Name),
-			Role: it.Role,
+			ID:       it.RestaurantID,
+			Name:     it.NameI18n.Resolve(lang, it.Name),
+			Role:     it.Role,
+			IsActive: it.IsActive,
 		})
 	}
 	response.OK(c.Writer, gin.H{"restaurants": out})

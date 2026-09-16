@@ -3,6 +3,7 @@ package users
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -227,6 +228,84 @@ func TestPhoneChangeRoutesRequireAuth(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("%s status = %d, want 401", path, w.Code)
 		}
+	}
+}
+
+func TestGetFoodieProfileReturnsOwnProfile(t *testing.T) {
+	id := uuid.New()
+	budget := "mid"
+	f := &fakeFacade{foodieProfile: domain.FoodieProfile{
+		Cuisines: []string{"kazakh", "asian"}, Diets: []string{"halal"},
+		Allergies: []string{"nuts"}, Budget: &budget,
+	}}
+	w := do(newRouter(f), http.MethodGet, "/api/v1/users/me/foodie-profile", nil, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if f.lastGetFoodieID != id {
+		t.Errorf("GetFoodieProfile called with %v, want %v", f.lastGetFoodieID, id)
+	}
+	var env response.Envelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	raw, _ := json.Marshal(env.Data)
+	var got foodieProfileResponse
+	_ = json.Unmarshal(raw, &got)
+	if len(got.Cuisines) != 2 || got.Cuisines[0] != "kazakh" {
+		t.Errorf("cuisines = %v", got.Cuisines)
+	}
+	if got.Budget == nil || *got.Budget != "mid" {
+		t.Errorf("budget = %v, want mid", got.Budget)
+	}
+}
+
+func TestGetFoodieProfileRequiresAuth(t *testing.T) {
+	f := &fakeFacade{}
+	w := do(newRouter(f), http.MethodGet, "/api/v1/users/me/foodie-profile", nil, "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestReplaceFoodieProfileForwardsOwnIDAndBody(t *testing.T) {
+	id := uuid.New()
+	f := &fakeFacade{foodieProfile: domain.FoodieProfile{
+		Cuisines: []string{"kazakh"}, Diets: []string{}, Allergies: []string{},
+	}}
+	body := map[string]any{
+		"cuisines": []string{"kazakh"}, "diets": []string{}, "allergies": []string{}, "budget": "premium",
+	}
+	w := do(newRouter(f), http.MethodPut, "/api/v1/users/me/foodie-profile", body, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if f.lastReplaceFoodieID != id {
+		t.Errorf("ReplaceFoodieProfile called with %v, want %v", f.lastReplaceFoodieID, id)
+	}
+	if len(f.lastReplaceFoodieIn.Cuisines) != 1 || f.lastReplaceFoodieIn.Cuisines[0] != "kazakh" {
+		t.Errorf("cuisines not forwarded: %+v", f.lastReplaceFoodieIn)
+	}
+	if f.lastReplaceFoodieIn.Budget == nil || *f.lastReplaceFoodieIn.Budget != "premium" {
+		t.Errorf("budget not forwarded: %+v", f.lastReplaceFoodieIn)
+	}
+}
+
+func TestReplaceFoodieProfileMapsValidationErrorTo422(t *testing.T) {
+	id := uuid.New()
+	f := &fakeFacade{err: fmt.Errorf("%w: cuisines: unknown id %q", domain.ErrValidation, "not-an-id")}
+	body := map[string]any{"cuisines": []string{"not-an-id"}}
+	w := do(newRouter(f), http.MethodPut, "/api/v1/users/me/foodie-profile", body, id.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplaceFoodieProfileRequiresAuth(t *testing.T) {
+	f := &fakeFacade{}
+	w := do(newRouter(f), http.MethodPut, "/api/v1/users/me/foodie-profile", map[string]any{}, "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
 

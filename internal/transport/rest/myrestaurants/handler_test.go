@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,7 +113,7 @@ func TestMyRestaurants_StaffHappyPath_Localized(t *testing.T) {
 	m := fakeMemberships{byUser: map[uuid.UUID][]domain.StaffMembership{
 		user: {{
 			RestaurantID: restA, Name: "Альфа", NameI18n: domain.I18n{"en": "Alpha"},
-			Role: domain.StaffRoleOwner,
+			Role: domain.StaffRoleOwner, IsActive: false,
 		}},
 	}}
 	r := newRouter(domain.RoleRestaurant, m, fakeBriefs{})
@@ -134,6 +135,14 @@ func TestMyRestaurants_StaffHappyPath_Localized(t *testing.T) {
 	}
 	if got.Name != "Alpha" {
 		t.Errorf("name = %q, want localized 'Alpha' (Accept-Language: en)", got.Name)
+	}
+	// IsActive is a label, not a filter: an inactive venue the caller is still
+	// staff of must still be returned, carrying is_active=false verbatim.
+	if got.IsActive {
+		t.Errorf("is_active = %v, want false (propagated from the membership row, venue still listed)", got.IsActive)
+	}
+	if !strings.Contains(w.Body.String(), `"is_active":false`) {
+		t.Errorf("body = %s, want literal JSON field \"is_active\":false", w.Body.String())
 	}
 }
 
@@ -162,7 +171,10 @@ func containsEmptyArray(body string) bool {
 func TestMyRestaurants_Superadmin_AllVenues(t *testing.T) {
 	admin := uuid.New()
 	restA, restB := uuid.New(), uuid.New()
-	b := fakeBriefs{all: []domain.RestaurantBrief{{ID: restA, Name: "Alpha"}, {ID: restB, Name: "Bravo"}}}
+	b := fakeBriefs{all: []domain.RestaurantBrief{
+		{ID: restA, Name: "Alpha", IsActive: true},
+		{ID: restB, Name: "Bravo", IsActive: false},
+	}}
 	// No memberships for the admin: the result must come from the brief reader.
 	r := newRouter(domain.RoleAdmin, fakeMemberships{}, b)
 
@@ -177,9 +189,14 @@ func TestMyRestaurants_Superadmin_AllVenues(t *testing.T) {
 	if len(env.Data.Restaurants) != 2 {
 		t.Fatalf("restaurants = %+v, want 2 venues for superadmin", env.Data.Restaurants)
 	}
+	active := map[uuid.UUID]bool{}
 	for _, it := range env.Data.Restaurants {
 		if it.Role != string(domain.RoleAdmin) {
 			t.Errorf("role = %q, want %q", it.Role, domain.RoleAdmin)
 		}
+		active[it.ID] = it.IsActive
+	}
+	if !active[restA] || active[restB] {
+		t.Errorf("is_active = %+v, want {A:true, B:false} propagated from the brief reader", active)
 	}
 }

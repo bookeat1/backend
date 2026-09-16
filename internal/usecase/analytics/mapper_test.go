@@ -171,9 +171,14 @@ func TestMapBookingPromotionID(t *testing.T) {
 	}
 }
 
+// TestMapBookingUntracked used to also list booking.arrived/booking.completed
+// here as deliberately untracked. The Almaty marathon funnel (Trello
+// CdwfIzDh / kvMSxhSl) needs "did the guest actually show up", so those two
+// were promoted to tracked events — see TestMapBookingArrivedCompletedTracked
+// below. waitlisted/updated/message_created are still out of scope.
 func TestMapBookingUntracked(t *testing.T) {
 	_, _, payload := bookingPayloadWithPII(t, nil, "waitlisted")
-	for _, et := range []string{"booking.waitlisted", "booking.arrived", "booking.completed", "booking.updated", "booking.message_created"} {
+	for _, et := range []string{"booking.waitlisted", "booking.updated", "booking.message_created"} {
 		_, tracked, err := mapRow(SourceBookingOutbox, SourceRow{
 			ID: uuid.New(), EventType: et, Payload: payload, CreatedAt: time.Now(),
 		})
@@ -183,6 +188,52 @@ func TestMapBookingUntracked(t *testing.T) {
 		if tracked {
 			t.Fatalf("%s must NOT be tracked in the initial set", et)
 		}
+	}
+}
+
+// TestMapBookingArrivedCompletedTracked covers the Almaty marathon funnel's
+// last two steps: a hostess confirming "guest arrived" (PR #133) and the
+// worker later closing the visit out as completed. Both must be tracked, and
+// both must carry promotion_id when the booking has one, the same as
+// created/confirmed, so a "campaign booking -> actual visit" chart is
+// possible.
+func TestMapBookingArrivedCompletedTracked(t *testing.T) {
+	promotionID := uuid.New()
+	userID := uuid.New()
+
+	for _, tc := range []struct {
+		eventType string
+		wantType  EventType
+	}{
+		{"booking.arrived", EventBookingArrived},
+		{"booking.completed", EventBookingCompleted},
+	} {
+		rowID := uuid.New()
+		payload, err := json.Marshal(map[string]any{
+			"id": uuid.New(), "restaurant_id": uuid.New(), "user_id": userID,
+			"name": "Damir", "phone": "+77011234567", "email": "guest@example.com",
+			"guests": 2, "status": "x", "source": "guest_app",
+			"promotion_id": promotionID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev, tracked, err := mapRow(SourceBookingOutbox, SourceRow{
+			ID: rowID, EventType: tc.eventType, Payload: payload, CreatedAt: time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v", tc.eventType, err)
+		}
+		if !tracked {
+			t.Fatalf("%s must be tracked", tc.eventType)
+		}
+		if ev.Type != tc.wantType {
+			t.Fatalf("%s: type = %q, want %q", tc.eventType, ev.Type, tc.wantType)
+		}
+		if got := ev.Properties["promotion_id"]; got != promotionID.String() {
+			t.Fatalf("%s: promotion_id = %v, want %v", tc.eventType, got, promotionID)
+		}
+		assertNoPII(t, ev)
 	}
 }
 
