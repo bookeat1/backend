@@ -375,11 +375,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// The shared taste-match assembly (BE-1's usecase/tastematch): the ONE
 	// read of "this guest's taste" GET /restaurants/picks (BE-2), GET /feed
 	// (BE-3) and GET /events?sort=for_you (BE-4) all use, so the three
-	// surfaces can never quietly disagree about what it means. cuisinerepo.New
-	// here is a second, independent instance of the same stateless
-	// pool-wrapper cuisinesUC already holds one of — constructing another
-	// costs nothing and keeps this wiring block self-contained.
-	eventsTasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	// surfaces can never quietly disagree about what it means. Constructed
+	// once here and reused below for feed/picks — three independent copies
+	// (one per BE task, before they were integrated) collided on the name
+	// `tasteLoader` and failed to build; there is nothing per-surface in the
+	// Loader itself, so one instance is correct, not just convenient.
+	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -397,19 +398,17 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// editorial_pick — independent from homePicksFacade's own instance
 		// below for the same "stateless, cheap to construct twice" reason as
 		// eventsTasteLoader's cuisine reader.
-		events.WithTasteMatch(eventsTasteLoader, restRepo, homepicksrepo.New(db, txm)))
+		events.WithTasteMatch(tasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
 		// The same dictionary the events listing uses: a promo's own city
 		// override (migration 0085) and ?city= must mean the same thing in both
 		// listings, or the two halves of one screen would disagree.
 		promos.WithCityResolver(citiesUC))
-	// The shared taste-profile assembler (BE-1, spec
-	// foodie-personalization-v1-20260916.md §8): /feed reuses the exact same
-	// Loader /restaurants/picks and /events?sort=for_you build their input
-	// with, so no surface can quietly disagree about what "this guest's
-	// taste" means (criterion 15).
-	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	// /feed reuses the exact same `tasteLoader` constructed above that
+	// /restaurants/picks and /events?sort=for_you build their input with, so
+	// no surface can quietly disagree about what "this guest's taste" means
+	// (criterion 15).
 	feedFacade := feed.NewFacade(feedRepo, restaurantManagers, tasteLoader)
 
 	// Gastroguide (migration 0061): editorial collections of venues. Two halves
@@ -567,14 +566,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	homePicksFacade := homepicks.NewFacade(homepicksrepo.New(db, txm), restaurantsFacade,
 		homepicks.WithCityResolver(citiesUC))
 	// Personalization on top of the rail above (spec
-	// foodie-personalization-v1-20260916.md, BE-2): LoadTasteProfile is the
-	// ONE shared read of a guest's taste (BE-1, usecase/tastematch) — BE-3
-	// (/feed) and BE-4 (/events?sort=for_you) build their own Loader from the
-	// same three repos when their turn comes, never a second assembly of
-	// "this guest's taste". homePicksFacade doubles as BOTH the fallback rail
-	// AND the editorial-pick membership source, so a guest whose profile
-	// scores nothing sees the identical rail an anonymous guest does.
-	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	// foodie-personalization-v1-20260916.md, BE-2): reuses the same
+	// `tasteLoader` /feed and /events?sort=for_you build their input with —
+	// never a second assembly of "this guest's taste". homePicksFacade
+	// doubles as BOTH the fallback rail AND the editorial-pick membership
+	// source, so a guest whose profile scores nothing sees the identical
+	// rail an anonymous guest does.
 	forYouFacade := foryou.NewFacade(tasteLoader, restaurantsFacade, homePicksFacade)
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
