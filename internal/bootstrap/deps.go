@@ -98,6 +98,7 @@ import (
 	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/stories"
+	"backend-core/internal/usecase/tastematch"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
@@ -366,6 +367,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// manager and no other usecase: one row per slug, the row set itself is
 	// fixed by the migration's seed.
 	platformPagesUC := platformpagesuc.NewUseCase(platformpagesrepo.New(db))
+	// The shared taste-match assembly (BE-1's usecase/tastematch): the ONE
+	// read of "this guest's taste" GET /restaurants/picks (BE-2), GET /feed
+	// (BE-3) and GET /events?sort=for_you (BE-4) all use, so the three
+	// surfaces can never quietly disagree about what it means. cuisinerepo.New
+	// here is a second, independent instance of the same stateless
+	// pool-wrapper cuisinesUC already holds one of — constructing another
+	// costs nothing and keeps this wiring block self-contained.
+	eventsTasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -375,7 +384,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		events.WithSeriesContent(recurrenceRepo),
 		// Same seam as the catalog: ?city=almaty, a historical spelling or a
 		// renamed city resolve to the one spelling the listing compares.
-		events.WithCityResolver(citiesUC))
+		events.WithCityResolver(citiesUC),
+		// GET /events?sort=for_you (spec foodie-personalization-v1-20260916.md
+		// §5.6, criterion 19): restRepo doubles as the bulk venue-signals read
+		// (domain.RestaurantFilter.IDs + Unpaginated, same shape homepicks
+		// uses for its rail), and a second homepicksrepo instance resolves
+		// editorial_pick — independent from homePicksFacade's own instance
+		// below for the same "stateless, cheap to construct twice" reason as
+		// eventsTasteLoader's cuisine reader.
+		events.WithTasteMatch(eventsTasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
 		// The same dictionary the events listing uses: a promo's own city

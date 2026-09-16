@@ -292,6 +292,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// identifies the target).
 	eventsHandler := eventsrest.NewHandler(deps.EventsFacade)
 	eventsHandler.RegisterPublic(api)
+	// GET /events (the cross-venue Explore listing) rides the SAME OptionalAuth
+	// group as the catalog and the feed: it is public, but a signed-in guest
+	// asking for ?sort=for_you gets it ranked by taste match instead of date
+	// (spec foodie-personalization-v1-20260916.md §5.6, criterion 19, BE-4).
+	eventsHandler.RegisterExplore(restPublic)
 	eventsHandler.RegisterAdminRoutes(authed)
 
 	// Recurring-event RULES (migration 0074). Admin only, guarded by exactly the
