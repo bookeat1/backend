@@ -35,6 +35,7 @@ import (
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
+	foodieprofilerepo "backend-core/internal/infrastructure/postgres/foodieprofile"
 	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
@@ -262,6 +263,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	refreshRepo := rtrepo.New(db)
 	otpRepo := otprepo.New(db)
 	userCuisineRepo := usercuisinerepo.New(db)
+	foodieProfileRepo := foodieprofilerepo.New(db)
 	// Built here, ahead of the other booking wiring below, because the OTP
 	// usecase needs it: a successful phone verification hands the guest the
 	// bookings that were made for their number before they had an account.
@@ -586,7 +588,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	return &Deps{
 		AuthFacade:            authFacade,
 		AuthOTP:               authOTP,
-		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, refreshRepo, otpRepo, txm),
+		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
 		HomePicks:             homePicksFacade,

@@ -89,6 +89,7 @@ func TestCreateAndUpdatePersistProfileExtensions(t *testing.T) {
 	bd := time.Date(1998, 5, 4, 0, 0, 0, 0, time.UTC)
 	u.CountryCode = strp("KZ")
 	u.BirthDate = &bd
+	u.FoodieBudgetTier = strp("mid")
 	if err := repo.Update(ctx, u); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -102,6 +103,9 @@ func TestCreateAndUpdatePersistProfileExtensions(t *testing.T) {
 	}
 	if got.BirthDate == nil || !got.BirthDate.Equal(bd) {
 		t.Errorf("birth_date not persisted: %+v", got)
+	}
+	if got.FoodieBudgetTier == nil || *got.FoodieBudgetTier != "mid" {
+		t.Errorf("foodie_budget_tier not persisted: %+v", got)
 	}
 	if got.DeletedAt != nil {
 		t.Errorf("expected DeletedAt nil for a live user, got %v", got.DeletedAt)
@@ -120,6 +124,7 @@ func TestDeleteAnonymizesAndFreesPhoneForReuse(t *testing.T) {
 		ID: uuid.New(), Email: strp("del@b.com"), Phone: &phone, FullName: "Deleted Guy",
 		Role: domain.RoleUser, IsActive: true, AvatarURL: strp("https://cdn/x.png"),
 		PreferredLanguage: "ru", City: strp("almaty"), CountryCode: strp("KZ"), BirthDate: &bd,
+		FoodieBudgetTier: strp("premium"),
 	}
 	if err := repo.Create(ctx, u); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -137,7 +142,8 @@ func TestDeleteAnonymizesAndFreesPhoneForReuse(t *testing.T) {
 		t.Error("expected DeletedAt set")
 	}
 	if got.Email != nil || got.Phone != nil || got.FullName != "" || got.AvatarURL != nil ||
-		got.City != nil || got.CountryCode != nil || got.BirthDate != nil || got.IsActive {
+		got.City != nil || got.CountryCode != nil || got.BirthDate != nil || got.IsActive ||
+		got.FoodieBudgetTier != nil {
 		t.Errorf("expected fully anonymized user, got %+v", got)
 	}
 

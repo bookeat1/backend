@@ -54,18 +54,22 @@ func (fakeUsers) Delete(context.Context, uuid.UUID) error    { return nil }
 // called with, so handler tests can assert the handler never leaks another
 // user's id into the facade call.
 type fakeFacade struct {
-	user       *domain.User
-	cuisineIDs []uuid.UUID
-	err        error
+	user          *domain.User
+	cuisineIDs    []uuid.UUID
+	foodieProfile domain.FoodieProfile
+	err           error
 
-	lastMeID         uuid.UUID
-	lastUpdateID     uuid.UUID
-	lastUpdateIn     uc.UpdateInput
-	lastDeleteID     uuid.UUID
-	deleteCalled     int
-	cuisineCalledFor uuid.UUID
-	lastAvatarID     uuid.UUID
-	lastAvatarURL    string
+	lastMeID            uuid.UUID
+	lastUpdateID        uuid.UUID
+	lastUpdateIn        uc.UpdateInput
+	lastDeleteID        uuid.UUID
+	deleteCalled        int
+	cuisineCalledFor    uuid.UUID
+	lastAvatarID        uuid.UUID
+	lastAvatarURL       string
+	lastGetFoodieID     uuid.UUID
+	lastReplaceFoodieID uuid.UUID
+	lastReplaceFoodieIn uc.ReplaceFoodieProfileInput
 }
 
 func (f *fakeFacade) Me(_ context.Context, id uuid.UUID) (*domain.User, error) {
@@ -102,6 +106,23 @@ func (f *fakeFacade) DeleteMe(_ context.Context, id uuid.UUID) error {
 func (f *fakeFacade) SetAvatarURL(_ context.Context, id uuid.UUID, url string) error {
 	f.lastAvatarID, f.lastAvatarURL = id, url
 	return f.err
+}
+
+func (f *fakeFacade) GetFoodieProfile(_ context.Context, id uuid.UUID) (domain.FoodieProfile, error) {
+	f.lastGetFoodieID = id
+	if f.err != nil {
+		return domain.FoodieProfile{}, f.err
+	}
+	return f.foodieProfile, nil
+}
+
+func (f *fakeFacade) ReplaceFoodieProfile(_ context.Context, id uuid.UUID, in uc.ReplaceFoodieProfileInput) (domain.FoodieProfile, error) {
+	f.lastReplaceFoodieID = id
+	f.lastReplaceFoodieIn = in
+	if f.err != nil {
+		return domain.FoodieProfile{}, f.err
+	}
+	return f.foodieProfile, nil
 }
 
 // fakeOTP is a scriptable authuc.OTPUseCase. Only the two phone-change methods

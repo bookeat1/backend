@@ -66,6 +66,32 @@ func (f *memCuisines) Replace(_ context.Context, userID uuid.UUID, ids []uuid.UU
 	return nil
 }
 
+// memFoodie is an in-memory domain.FoodieProfileRepository.
+type memFoodie struct {
+	m map[uuid.UUID]domain.FoodieProfilePreferences
+}
+
+func newMemFoodie() *memFoodie { return &memFoodie{m: map[uuid.UUID]domain.FoodieProfilePreferences{}} }
+func (f *memFoodie) Get(_ context.Context, userID uuid.UUID) (domain.FoodieProfilePreferences, error) {
+	prefs, ok := f.m[userID]
+	if !ok {
+		return domain.FoodieProfilePreferences{Cuisines: []string{}, Diets: []string{}, Allergies: []string{}}, nil
+	}
+	return domain.FoodieProfilePreferences{
+		Cuisines:  append([]string{}, prefs.Cuisines...),
+		Diets:     append([]string{}, prefs.Diets...),
+		Allergies: append([]string{}, prefs.Allergies...),
+	}, nil
+}
+func (f *memFoodie) Replace(_ context.Context, userID uuid.UUID, prefs domain.FoodieProfilePreferences) error {
+	f.m[userID] = domain.FoodieProfilePreferences{
+		Cuisines:  append([]string{}, prefs.Cuisines...),
+		Diets:     append([]string{}, prefs.Diets...),
+		Allergies: append([]string{}, prefs.Allergies...),
+	}
+	return nil
+}
+
 // memRefresh is an in-memory domain.RefreshTokenRepository, tracking only what
 // this package's tests need: whether RevokeAllByUser was called.
 type memRefresh struct{ revokedFor map[uuid.UUID]int }
@@ -114,7 +140,7 @@ func strp(s string) *string { return &s }
 func newTestFacade(users *memUsers) (Facade, *memRefresh, *memOTP) {
 	refresh := newMemRefresh()
 	otp := newMemOTP()
-	f := NewFacade(users, newMemCuisines(), refresh, otp, noTx{})
+	f := NewFacade(users, newMemCuisines(), newMemFoodie(), refresh, otp, noTx{})
 	return f, refresh, otp
 }
 
@@ -268,6 +294,120 @@ func TestDeleteMeAnonymizesAndInvalidatesSessions(t *testing.T) {
 	}
 	if refresh.revokedFor[id] != 1 {
 		t.Errorf("expected RevokeAllByUser still called once after idempotent retry, got %d", refresh.revokedFor[id])
+	}
+}
+
+func TestGetFoodieProfileEmptyForNewUser(t *testing.T) {
+	id := uuid.New()
+	repo := &memUsers{m: map[uuid.UUID]*domain.User{
+		id: {ID: id, FullName: "Old", Role: domain.RoleUser, PreferredLanguage: "ru"},
+	}}
+	f, _, _ := newTestFacade(repo)
+	ctx := context.Background()
+
+	got, err := f.GetFoodieProfile(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFoodieProfile: %v", err)
+	}
+	if len(got.Cuisines) != 0 || len(got.Diets) != 0 || len(got.Allergies) != 0 || got.Budget != nil {
+		t.Errorf("expected an empty profile for a new user, got %+v", got)
+	}
+}
+
+func TestReplaceFoodieProfileSucceedsAndRoundTrips(t *testing.T) {
+	id := uuid.New()
+	repo := &memUsers{m: map[uuid.UUID]*domain.User{
+		id: {ID: id, FullName: "Old", Role: domain.RoleUser, PreferredLanguage: "ru"},
+	}}
+	f, _, _ := newTestFacade(repo)
+	ctx := context.Background()
+
+	budget := "mid"
+	in := ReplaceFoodieProfileInput{
+		Cuisines:  []string{domain.FoodieCuisineKazakh, domain.FoodieCuisineAsian},
+		Diets:     []string{domain.FoodieDietHalal},
+		Allergies: []string{domain.FoodieAllergyNuts},
+		Budget:    &budget,
+	}
+	got, err := f.ReplaceFoodieProfile(ctx, id, in)
+	if err != nil {
+		t.Fatalf("ReplaceFoodieProfile: %v", err)
+	}
+	if len(got.Cuisines) != 2 || len(got.Diets) != 1 || len(got.Allergies) != 1 {
+		t.Fatalf("ReplaceFoodieProfile result = %+v, want 2/1/1 entries", got)
+	}
+	if got.Budget == nil || *got.Budget != "mid" {
+		t.Errorf("budget = %v, want mid", got.Budget)
+	}
+
+	// A second, smaller replace fully overwrites — nothing from the first
+	// call survives (replace semantics, not merge).
+	got, err = f.ReplaceFoodieProfile(ctx, id, ReplaceFoodieProfileInput{Cuisines: []string{domain.FoodieCuisineVegan}})
+	if err != nil {
+		t.Fatalf("second ReplaceFoodieProfile: %v", err)
+	}
+	if len(got.Cuisines) != 1 || got.Cuisines[0] != domain.FoodieCuisineVegan {
+		t.Errorf("cuisines after second replace = %v", got.Cuisines)
+	}
+	if len(got.Diets) != 0 || len(got.Allergies) != 0 || got.Budget != nil {
+		t.Errorf("expected diets/allergies/budget cleared by full replace, got %+v", got)
+	}
+
+	fromRead, err := f.GetFoodieProfile(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFoodieProfile after replace: %v", err)
+	}
+	if len(fromRead.Cuisines) != 1 || fromRead.Cuisines[0] != domain.FoodieCuisineVegan {
+		t.Errorf("GetFoodieProfile after replace = %+v", fromRead)
+	}
+}
+
+func TestReplaceFoodieProfileRejectsTooManyCuisines(t *testing.T) {
+	id := uuid.New()
+	repo := &memUsers{m: map[uuid.UUID]*domain.User{id: {ID: id, Role: domain.RoleUser}}}
+	f, _, _ := newTestFacade(repo)
+
+	six := make([]string, 0, domain.FoodieCuisineSelectionLimit+1)
+	six = append(six, domain.FoodieCuisineIDs[:domain.FoodieCuisineSelectionLimit+1]...)
+	_, err := f.ReplaceFoodieProfile(context.Background(), id, ReplaceFoodieProfileInput{Cuisines: six})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("cuisines over the limit: err = %v, want ErrValidation", err)
+	}
+}
+
+func TestReplaceFoodieProfileRejectsUnknownIDs(t *testing.T) {
+	id := uuid.New()
+	repo := &memUsers{m: map[uuid.UUID]*domain.User{id: {ID: id, Role: domain.RoleUser}}}
+	f, _, _ := newTestFacade(repo)
+	ctx := context.Background()
+
+	cases := []ReplaceFoodieProfileInput{
+		{Cuisines: []string{"not-a-cuisine"}},
+		{Diets: []string{"not-a-diet"}},
+		{Allergies: []string{"not-an-allergy"}},
+		{Budget: strp("not-a-budget")},
+	}
+	for _, in := range cases {
+		if _, err := f.ReplaceFoodieProfile(ctx, id, in); !errors.Is(err, domain.ErrValidation) {
+			t.Errorf("input %+v: err = %v, want ErrValidation", in, err)
+		}
+	}
+}
+
+func TestReplaceFoodieProfileRejectsNoDietWithOtherDiets(t *testing.T) {
+	id := uuid.New()
+	repo := &memUsers{m: map[uuid.UUID]*domain.User{id: {ID: id, Role: domain.RoleUser}}}
+	f, _, _ := newTestFacade(repo)
+	ctx := context.Background()
+
+	in := ReplaceFoodieProfileInput{Diets: []string{domain.FoodieDietExclusiveID, domain.FoodieDietHalal}}
+	if _, err := f.ReplaceFoodieProfile(ctx, id, in); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("no_diet + halal: err = %v, want ErrValidation", err)
+	}
+
+	// no_diet alone is fine.
+	if _, err := f.ReplaceFoodieProfile(ctx, id, ReplaceFoodieProfileInput{Diets: []string{domain.FoodieDietExclusiveID}}); err != nil {
+		t.Fatalf("no_diet alone: %v", err)
 	}
 }
 

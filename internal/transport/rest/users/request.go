@@ -43,6 +43,26 @@ type phoneChangeRequestRequest struct {
 	NewPhone string `json:"new_phone" example:"+77011234567"`
 }
 
+// replaceFoodieProfileRequest is the wizard's whole draft, saved in one call.
+// Every field is a plain (non-pointer) slice/pointer: PUT is replace, not
+// merge, so there is no "field omitted, leave unchanged" case to distinguish
+// — an omitted array is simply empty (nil unmarshals to a nil slice, which
+// toInput treats the same as []).
+type replaceFoodieProfileRequest struct {
+	Cuisines  []string `json:"cuisines"`
+	Diets     []string `json:"diets"`
+	Allergies []string `json:"allergies"`
+	// Budget is one of "budget"/"mid"/"premium", or omitted/null when the
+	// guest skipped the (optional) budget step.
+	Budget *string `json:"budget" example:"mid"`
+}
+
+func (r replaceFoodieProfileRequest) toInput() uc.ReplaceFoodieProfileInput {
+	return uc.ReplaceFoodieProfileInput{
+		Cuisines: r.Cuisines, Diets: r.Diets, Allergies: r.Allergies, Budget: r.Budget,
+	}
+}
+
 // phoneChangeVerifyRequest submits the code delivered to the new number.
 type phoneChangeVerifyRequest struct {
 	NewPhone string `json:"new_phone" example:"+77011234567"`
