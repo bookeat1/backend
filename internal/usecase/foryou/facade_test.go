@@ -246,6 +246,31 @@ func TestGuestAllCandidatesZeroCoreScoreDegradesToFallback(t *testing.T) {
 	}
 }
 
+// criterion 11: an unknown/empty city yields no candidates at all (the
+// catalog filters literally, never "no filter") — same degrade path as
+// criterion 9, exercised here with an EMPTY candidate set rather than a
+// zero-scoring one.
+func TestGuestUnknownCityHasNoCandidatesDegradesToFallback(t *testing.T) {
+	profile := domain.TasteProfile{CuisineCodes: []string{"italian"}}
+	loader := &fakeLoader{profile: profile}
+	catalog := &fakeCatalog{items: nil} // the real catalog filters by city; nothing matches "Атлантида"
+	popular := venueItem("Популярное", nil, "", true, nil)
+	rail := &fakeRail{manual: map[uuid.UUID]bool{}, items: []domain.RestaurantListItem{popular}, mode: domain.HomePicksModePopular}
+	f := NewFacade(loader, catalog, rail)
+
+	userID := uuid.New()
+	res, err := f.Guest(context.Background(), &userID, "Атлантида", 8)
+	if err != nil {
+		t.Fatalf("guest: %v", err)
+	}
+	if res.Mode != ModePopular {
+		t.Fatalf("mode = %q, want popular (fallback)", res.Mode)
+	}
+	if catalog.gotFilter.City == nil || string(*catalog.gotFilter.City) != "Атлантида" {
+		t.Fatalf("city filter = %v, want the literal query value passed through", catalog.gotFilter.City)
+	}
+}
+
 // criterion 8/§3.7: fewer matched candidates than limit → the tail is padded
 // from the fallback rail, in its own order, minus anything already shown,
 // each padding card carrying fallback_popular at 0 points.
