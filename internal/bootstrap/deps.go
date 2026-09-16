@@ -98,6 +98,7 @@ import (
 	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/stories"
+	"backend-core/internal/usecase/tastematch"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
@@ -382,7 +383,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// override (migration 0085) and ?city= must mean the same thing in both
 		// listings, or the two halves of one screen would disagree.
 		promos.WithCityResolver(citiesUC))
-	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
+	// The shared taste-profile assembler (BE-1, spec
+	// foodie-personalization-v1-20260916.md §8): /feed reuses the exact same
+	// Loader /restaurants/picks and /events?sort=for_you build their input
+	// with, so no surface can quietly disagree about what "this guest's
+	// taste" means (criterion 15).
+	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	feedFacade := feed.NewFacade(feedRepo, restaurantManagers, tasteLoader)
 
 	// Gastroguide (migration 0061): editorial collections of venues. Two halves
 	// with two postures — the guest facade is read-only and takes no RBAC port

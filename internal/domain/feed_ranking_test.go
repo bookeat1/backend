@@ -30,11 +30,10 @@ func TestScoreFeedItem(t *testing.T) {
 			},
 			want: 0,
 			wantReason: map[FeedSignalCode]int{
-				FeedSignalPlacement:    0,
-				FeedSignalFreshness:    0,
-				FeedSignalEndingSoon:   0,
-				FeedSignalVenueRating:  0,
-				FeedSignalCuisineMatch: 0,
+				FeedSignalPlacement:   0,
+				FeedSignalFreshness:   0,
+				FeedSignalEndingSoon:  0,
+				FeedSignalVenueRating: 0,
 			},
 		},
 		{
@@ -182,67 +181,31 @@ func TestScoreFeedItem(t *testing.T) {
 			wantReason: map[FeedSignalCode]int{FeedSignalVenueRating: 0},
 		},
 		{
-			name: "a cuisine match is the strongest organic signal",
-			signals: FeedSignals{
-				CreatedAt:                rankNow.Add(-30 * 24 * time.Hour),
-				EndsAt:                   rankNow.Add(30 * 24 * time.Hour),
-				HasCuisinePreferences:    true,
-				MatchesCuisinePreference: true,
-			},
-			want:       400,
-			wantReason: map[FeedSignalCode]int{FeedSignalCuisineMatch: 400},
-		},
-		{
-			name: "a guest with preferences gets nothing for a non-matching item",
-			signals: FeedSignals{
-				CreatedAt:             rankNow.Add(-30 * 24 * time.Hour),
-				EndsAt:                rankNow.Add(30 * 24 * time.Hour),
-				HasCuisinePreferences: true,
-			},
-			want:       0,
-			wantReason: map[FeedSignalCode]int{FeedSignalCuisineMatch: 0},
-		},
-		{
-			// The "preferences absent" path: an anonymous guest, or one who
-			// never picked a cuisine. Every item scores 0 here, so the rest of
-			// the signals keep their relative order untouched.
-			name: "no preferences at all is neutral, not a mismatch",
-			signals: FeedSignals{
-				CreatedAt:                rankNow.Add(-30 * 24 * time.Hour),
-				EndsAt:                   rankNow.Add(30 * 24 * time.Hour),
-				MatchesCuisinePreference: true, // stale flag without preferences
-			},
-			want:       0,
-			wantReason: map[FeedSignalCode]int{FeedSignalCuisineMatch: 0},
-		},
-		{
 			// Everything at once: the sum is the point of an additive score.
 			name: "signals add up",
 			signals: FeedSignals{
-				PlacementWeight:          30,
-				CreatedAt:                rankNow.Add(-time.Hour),
-				EndsAt:                   rankNow.Add(2 * time.Hour),
-				Rating:                   4.5,
-				ReviewCount:              20,
-				HasCuisinePreferences:    true,
-				MatchesCuisinePreference: true,
+				PlacementWeight: 30,
+				CreatedAt:       rankNow.Add(-time.Hour),
+				EndsAt:          rankNow.Add(2 * time.Hour),
+				Rating:          4.5,
+				ReviewCount:     20,
 			},
-			want: 300 + 300 + 250 + 150 + 400,
+			want: 300 + 300 + 250 + 150,
 		},
 		{
-			// The intended balance: a maxed-out paid placement loses to a card
-			// that is fresh, urgent, well-rated AND personally relevant. Money
-			// buys reach, not immunity.
-			name: "a maxed paid placement does not outrank every organic signal at once",
+			// ScoreFeedItem's own four signals, all maxed at once, still fall
+			// short of a full paid placement (1000): 300+250+200 = 750. The
+			// balance that CAN outweigh a maxed placement (freshness+ending+
+			// rating+taste, §5.3) is ScoreFeedCard's property, not this pure
+			// four-signal function's — see TestScoreFeedCard_TasteCanOutweighAMaxedPlacement.
+			name: "every ScoreFeedItem signal maxed still falls short of a full placement",
 			signals: FeedSignals{
-				CreatedAt:                rankNow.Add(-time.Hour),
-				EndsAt:                   rankNow.Add(2 * time.Hour),
-				Rating:                   5,
-				ReviewCount:              50,
-				HasCuisinePreferences:    true,
-				MatchesCuisinePreference: true,
+				CreatedAt:   rankNow.Add(-time.Hour),
+				EndsAt:      rankNow.Add(2 * time.Hour),
+				Rating:      5,
+				ReviewCount: 50,
 			},
-			want: 1150,
+			want: 750,
 		},
 	}
 
@@ -256,7 +219,7 @@ func TestScoreFeedItem(t *testing.T) {
 			// order — that is the contract the API exposes.
 			wantOrder := []FeedSignalCode{
 				FeedSignalPlacement, FeedSignalFreshness, FeedSignalEndingSoon,
-				FeedSignalVenueRating, FeedSignalCuisineMatch,
+				FeedSignalVenueRating,
 			}
 			if len(got.Reasons) != len(wantOrder) {
 				t.Fatalf("breakdown must report every signal, got %d reasons", len(got.Reasons))
@@ -303,6 +266,138 @@ func feedItemFixture(kind FeedItemKind, id uuid.UUID) FeedItem {
 	}
 }
 
+// tasteVenueFixture is a venue-bound card carrying its own taste signals, so a
+// ScoreFeedCard case can set exactly the axis it is about.
+func tasteVenueFixture(cuisines []string, price PriceCategory, features []string) FeedItem {
+	it := feedItemFixture(FeedItemPromo, uuid.New())
+	rid := uuid.New()
+	it.RestaurantID = &rid
+	it.RestaurantCuisineCodes = cuisines
+	it.RestaurantPriceCategory = price
+	it.RestaurantFeatureCodes = features
+	return it
+}
+
+// TestScoreFeedCard_TasteBlockReplacesDeadCuisineMatch is criterion 15: the
+// taste block's codes and points come from domain.ScoreTasteMatch fed by a
+// domain.TasteProfile, not from FeedItem.RestaurantID/user_cuisine_preferences
+// (which no longer exist on FeedItem at all — see feed.go).
+func TestScoreFeedCard_TasteBlockReplacesDeadCuisineMatch(t *testing.T) {
+	it := tasteVenueFixture([]string{"italian"}, PriceMid, nil)
+	profile := TasteProfile{CuisineCodes: []string{"italian"}, Budget: ptrPrice(PriceMid)}
+
+	got := ScoreFeedCard(it, profile, rankNow)
+
+	want := map[FeedSignalCode]int{
+		FeedSignalCode(TasteSignalCuisineMatch):  tasteCuisineMatchPoints,
+		FeedSignalCode(TasteSignalBudgetMatch):   tasteBudgetSameTierPoints,
+		FeedSignalCode(TasteSignalDietMatch):     0,
+		FeedSignalCode(TasteSignalBookedSimilar): 0,
+	}
+	seen := map[FeedSignalCode]bool{}
+	counts := map[FeedSignalCode]int{}
+	for _, r := range got.Reasons {
+		seen[r.Code] = true
+		counts[r.Code]++
+		if wantPts, ok := want[r.Code]; ok && r.Points != wantPts {
+			t.Fatalf("signal %s = %d points, want %d", r.Code, r.Points, wantPts)
+		}
+	}
+	for code := range want {
+		if !seen[code] {
+			t.Fatalf("taste signal %s missing from the feed card's breakdown", code)
+		}
+	}
+	// editorial_pick/popular are /restaurants/picks-only ScoreTasteMatch
+	// signals and must never appear on a feed card at all.
+	for _, forbidden := range []TasteSignalCode{TasteSignalEditorialPick, TasteSignalPopular} {
+		if seen[FeedSignalCode(forbidden)] {
+			t.Fatalf("ScoreFeedCard must never report %s (a /restaurants/picks-only signal)", forbidden)
+		}
+	}
+	// venue_rating IS a legitimate base ScoreFeedItem signal (FeedSignalVenueRating
+	// shares the exact string "venue_rating" with TasteSignalVenueRating) — it
+	// must appear EXACTLY ONCE, never twice (that would be the double-count
+	// feedTasteReasonCodes exists to prevent).
+	if counts[FeedSignalCode(TasteSignalVenueRating)] != 1 {
+		t.Fatalf("venue_rating must appear exactly once (from ScoreFeedItem, never duplicated by the taste block), got %d", counts[FeedSignalCode(TasteSignalVenueRating)])
+	}
+	wantTotal := tasteCuisineMatchPoints + tasteBudgetSameTierPoints
+	if got.Total != wantTotal {
+		t.Fatalf("total = %d, want %d (breakdown %+v)", got.Total, wantTotal, got.Reasons)
+	}
+}
+
+// TestScoreFeedCard_TasteCanOutweighAMaxedPlacement is the balance
+// TestScoreFeedItem's old cuisine-inclusive case used to prove: money buys
+// reach, never immunity from a card that is ALSO relevant to this guest.
+func TestScoreFeedCard_TasteCanOutweighAMaxedPlacement(t *testing.T) {
+	maxedPlacement := feedItemFixture(FeedItemPromo, uuid.New())
+	maxedPlacement.Placement.PlacementWeight = 100 // 1000 points
+
+	relevant := tasteVenueFixture([]string{"italian"}, PriceMid, nil)
+	relevant.CreatedAt = rankNow.Add(-time.Hour)                                           // freshness 300
+	relevant.EndsAt = rankNow.Add(2 * time.Hour)                                           // ending soon 250
+	profile := TasteProfile{CuisineCodes: []string{"italian"}, Budget: ptrPrice(PriceMid)} // 400 + 200
+
+	maxedScore := ScoreFeedCard(maxedPlacement, TasteProfile{}, rankNow)
+	relevantScore := ScoreFeedCard(relevant, profile, rankNow)
+
+	if maxedScore.Total != 1000 {
+		t.Fatalf("maxed placement = %d, want 1000", maxedScore.Total)
+	}
+	wantRelevant := 300 + 250 + 400 + 200
+	if relevantScore.Total != wantRelevant {
+		t.Fatalf("relevant card = %d, want %d (breakdown %+v)", relevantScore.Total, wantRelevant, relevantScore.Reasons)
+	}
+	if relevantScore.Total <= maxedScore.Total {
+		t.Fatalf("a fresh, urgent, personally relevant card (%d) must be able to outrank a maxed placement (%d)",
+			relevantScore.Total, maxedScore.Total)
+	}
+}
+
+// TestScoreFeedCard_PlatformItemScoresZeroTasteWithItsOwnDetail is criterion
+// 16: a card with no venue (RestaurantID nil) never disappears from the feed
+// and scores 0 on every taste signal with the "platform item" detail, not
+// ScoreTasteMatch's own per-signal wording (which assumes a venue exists).
+func TestScoreFeedCard_PlatformItemScoresZeroTasteWithItsOwnDetail(t *testing.T) {
+	it := feedItemFixture(FeedItemPromo, uuid.New())
+	it.RestaurantID = nil // platform item, migration 0085
+
+	profile := TasteProfile{CuisineCodes: []string{"italian"}, Budget: ptrPrice(PriceMid),
+		Diets: []string{FoodieDietHalal}, BookedRestaurantIDs: []uuid.UUID{uuid.New()}}
+
+	got := ScoreFeedCard(it, profile, rankNow)
+
+	tasteCodes := map[TasteSignalCode]bool{
+		TasteSignalCuisineMatch: true, TasteSignalCuisineMatchImplicit: true,
+		TasteSignalDietMatch: true, TasteSignalBudgetMatch: true, TasteSignalBookedSimilar: true,
+	}
+	found := 0
+	for _, r := range got.Reasons {
+		if !tasteCodes[TasteSignalCode(r.Code)] {
+			continue
+		}
+		found++
+		if r.Points != 0 {
+			t.Fatalf("platform item must score 0 on %s, got %d", r.Code, r.Points)
+		}
+		if r.Detail != feedPlatformTasteDetail {
+			t.Fatalf("platform item's %s detail = %q, want %q", r.Code, r.Detail, feedPlatformTasteDetail)
+		}
+	}
+	if found == 0 {
+		t.Fatal("a platform card must still report the taste signals, all at 0 — not omit them")
+	}
+	// The card is never dropped: it still contributes its own organic score.
+	if got.Total < 0 {
+		t.Fatalf("a platform card's total must never go negative, got %d", got.Total)
+	}
+}
+
+// ptrPrice is the fixture helper for domain.TasteProfile.Budget.
+func ptrPrice(p PriceCategory) *PriceCategory { return &p }
+
 func TestRankFeedItems_OrdersByScoreThenDeadline(t *testing.T) {
 	paid := feedItemFixture(FeedItemPromo, uuid.MustParse("11111111-1111-1111-1111-111111111111"))
 	paid.Placement.PlacementWeight = 50
@@ -312,7 +407,7 @@ func TestRankFeedItems_OrdersByScoreThenDeadline(t *testing.T) {
 
 	dull := feedItemFixture(FeedItemEvent, uuid.MustParse("33333333-3333-3333-3333-333333333333"))
 
-	got := RankFeedItems([]FeedItem{dull, urgent, paid}, rankNow)
+	got := RankFeedItems([]FeedItem{dull, urgent, paid}, TasteProfile{}, rankNow)
 	want := []uuid.UUID{paid.ID, urgent.ID, dull.ID}
 	for i, id := range want {
 		if got[i].Item.ID != id {
@@ -343,7 +438,7 @@ func TestRankFeedItems_TieBreakIsStableAcrossInputOrder(t *testing.T) {
 	want := []uuid.UUID{e.ID, a.ID, b.ID}
 
 	for i, perm := range permutations {
-		got := RankFeedItems(perm, rankNow)
+		got := RankFeedItems(perm, TasteProfile{}, rankNow)
 		for pos, id := range want {
 			if got[pos].Item.ID != id {
 				t.Fatalf("permutation %d: position %d = %s, want %s", i, pos, got[pos].Item.ID, id)
@@ -353,12 +448,94 @@ func TestRankFeedItems_TieBreakIsStableAcrossInputOrder(t *testing.T) {
 }
 
 func TestRankFeedItems_EmptyAndSingle(t *testing.T) {
-	if got := RankFeedItems(nil, rankNow); len(got) != 0 {
+	if got := RankFeedItems(nil, TasteProfile{}, rankNow); len(got) != 0 {
 		t.Fatalf("ranking nothing must yield nothing, got %d", len(got))
 	}
 	one := feedItemFixture(FeedItemPromo, uuid.New())
-	if got := RankFeedItems([]FeedItem{one}, rankNow); len(got) != 1 || got[0].Item.ID != one.ID {
+	if got := RankFeedItems([]FeedItem{one}, TasteProfile{}, rankNow); len(got) != 1 || got[0].Item.ID != one.ID {
 		t.Fatalf("ranking one item must yield that item, got %+v", got)
+	}
+}
+
+// TestRankFeedItems_NoMoreThanTwoConsecutiveCardsOfOneRestaurant is criterion
+// 17: three same-restaurant cards outscoring everything else must not run
+// three (or more) in a row on the ranked order — the pass runs over the WHOLE
+// order, before any paging.
+func TestRankFeedItems_NoMoreThanTwoConsecutiveCardsOfOneRestaurant(t *testing.T) {
+	rid := uuid.New()
+	other := uuid.New()
+
+	// Four cards of the SAME restaurant, all scoring higher (paid placement)
+	// than one card of a DIFFERENT restaurant with no placement at all — so
+	// the priority order alone would run all four of rid's cards first.
+	mk := func(r uuid.UUID, weight int) FeedItem {
+		it := feedItemFixture(FeedItemPromo, uuid.New())
+		it.RestaurantID = &r
+		it.Placement.PlacementWeight = weight
+		return it
+	}
+	a := mk(rid, 90)
+	b := mk(rid, 80)
+	c := mk(rid, 70)
+	d := mk(rid, 60)
+	e := mk(other, 0)
+
+	got := RankFeedItems([]FeedItem{a, b, c, d, e}, TasteProfile{}, rankNow)
+	if len(got) != 5 {
+		t.Fatalf("expected 5 ranked cards, got %d", len(got))
+	}
+	run := 0
+	var lastID uuid.UUID
+	var haveLast bool
+	for _, r := range got {
+		rest := r.Item.RestaurantID
+		if rest != nil && haveLast && *rest == lastID {
+			run++
+			if run >= 2 {
+				t.Fatalf("three or more consecutive cards of restaurant %s: %+v", *rest, got)
+			}
+		} else {
+			run = 0
+		}
+		if rest != nil {
+			lastID, haveLast = *rest, true
+		} else {
+			haveLast = false
+		}
+	}
+	// e (the other restaurant) must have been pulled forward to break the run.
+	if got[0].Item.RestaurantID == nil || *got[0].Item.RestaurantID != rid {
+		t.Fatalf("the priority order must still lead with %s's highest card, got %+v", rid, got[0].Item)
+	}
+	foundOther := false
+	for i := 0; i < 3; i++ {
+		if got[i].Item.RestaurantID != nil && *got[i].Item.RestaurantID == other {
+			foundOther = true
+		}
+	}
+	if !foundOther {
+		t.Fatalf("the other restaurant's card must be pulled forward within the first 3 positions, got %+v", got)
+	}
+}
+
+// TestRankFeedItems_PlatformCardsAreNeverGroupedWithEachOther guards the
+// feedDiversityKey choice: two UNRELATED platform cards (both RestaurantID
+// nil) must not be treated as "the same venue" and reshuffled away from each
+// other, the way two real cards of the same restaurant would be.
+func TestRankFeedItems_PlatformCardsAreNeverGroupedWithEachOther(t *testing.T) {
+	mk := func(weight int) FeedItem {
+		it := feedItemFixture(FeedItemPromo, uuid.New())
+		it.Placement.PlacementWeight = weight
+		return it
+	}
+	a, b, c := mk(90), mk(80), mk(70)
+
+	got := RankFeedItems([]FeedItem{a, b, c}, TasteProfile{}, rankNow)
+	want := []uuid.UUID{a.ID, b.ID, c.ID}
+	for i, id := range want {
+		if got[i].Item.ID != id {
+			t.Fatalf("platform cards must keep their priority order untouched by the venue-diversity pass, got %+v", got)
+		}
 	}
 }
 

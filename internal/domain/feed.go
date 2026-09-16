@@ -93,9 +93,9 @@ type FeedPlacement struct {
 // follow-up.
 //
 // The same struct serves the guest feed and the venue/platform state views;
-// the ranking-only fields (RestaurantRating, ReviewCount,
-// MatchesCuisinePreference, HasCuisinePreferences) are zero on the state views,
-// which never rank anything.
+// the ranking-only fields (RestaurantRating, RestaurantReviewCount,
+// RestaurantCuisineCodes, RestaurantPriceCategory, RestaurantFeatureCodes) are
+// zero on the state views, which never rank anything.
 type FeedItem struct {
 	Kind FeedItemKind
 	// ID is the underlying promo/event id. It is unique only WITHIN a kind —
@@ -166,13 +166,21 @@ type FeedItem struct {
 	// ScoreFeedItem).
 	RestaurantRating      float64
 	RestaurantReviewCount int
-	// MatchesCuisinePreference is true when the signed-in guest listed this
-	// venue's category among their cuisine preferences (migration 0021).
-	MatchesCuisinePreference bool
-	// HasCuisinePreferences distinguishes "the guest has preferences and this
-	// item does not match" from "the guest has no preferences at all". Without
-	// it every anonymous feed would look like a universal mismatch.
-	HasCuisinePreferences bool
+	// RestaurantCuisineCodes / RestaurantPriceCategory / RestaurantFeatureCodes
+	// are the venue's own taste signals — spec foodie-personalization-v1-
+	// 20260916.md §5.3/§8 (BE-3): ScoreFeedCard feeds them into
+	// domain.ScoreTasteMatch as the card's domain.VenueTasteSignals, replacing
+	// the dead cuisine_match signal that used to read user_cuisine_preferences
+	// (empty, never written by the wizard). RestaurantCuisineCodes is in
+	// restaurant_cuisines' own link POSITION order — position 0 is the venue's
+	// main cuisine, same convention domain.VenueTasteSignals.CuisineCodes
+	// documents. All three are the zero value for a PLATFORM item
+	// (RestaurantID nil): there is no venue to have a cuisine, a price tier or
+	// a feature, and ScoreFeedCard special-cases that item shape rather than
+	// scoring a venue that does not exist (criterion 16).
+	RestaurantCuisineCodes  []string
+	RestaurantPriceCategory PriceCategory
+	RestaurantFeatureCodes  []string
 
 	CreatedAt time.Time
 }
@@ -183,8 +191,10 @@ type FeedQuery struct {
 	// "distance" this schema can express (restaurants carry lat/lng but the
 	// guest's position is not part of any request today).
 	City City
-	// UserID is the signed-in guest, nil for an anonymous one. Its only effect
-	// is the cuisine-preference signal.
+	// UserID is the signed-in guest, nil for an anonymous one. The repository
+	// itself no longer reads it (the taste block is scored in Go from
+	// usecase/tastematch.Loader's own read, §8 BE-1/BE-3); it stays on the
+	// query for callers that still need to know who is asking.
 	UserID *uuid.UUID
 	// Now is the instant the eligibility windows are evaluated against, passed
 	// in so the read is reproducible in tests.
