@@ -90,7 +90,7 @@ func TestScoreFeedItem_PlatformCardScoresNeutralVenueRating(t *testing.T) {
 			t.Fatalf("a card with no venue must score 0 for venue rating, got %d", r.Points)
 		}
 	}
-	if len(RankFeedItems([]FeedItem{it}, rankNow)) != 1 {
+	if len(RankFeedItems([]FeedItem{it}, TasteProfile{}, rankNow)) != 1 {
 		t.Fatal("ranking a platform card must yield that card")
 	}
 }

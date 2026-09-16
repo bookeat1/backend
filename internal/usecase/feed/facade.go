@@ -5,8 +5,12 @@
 //
 // Three actors, three postures:
 //   - the GUEST reads Main. No auth required; a signed-in guest additionally
-//     gets their cuisine preferences folded into the ranking. One repository
-//     call, no per-card follow-up query.
+//     gets their foodie-profile taste folded into the ranking via
+//     usecase/tastematch.Loader (spec foodie-personalization-v1-20260916.md
+//     §8 BE-3) — the SAME assembler /restaurants/picks and
+//     /events?sort=for_you use, so the three surfaces never disagree about
+//     what "this guest's taste" means. One repository call, no per-card
+//     follow-up query.
 //   - the VENUE submits one of its own items and watches its state. Gated by
 //     PermRestaurantManage at the item's OWN restaurant (superadmin bypasses) —
 //     the same posture as every other admin endpoint here. A venue can neither
@@ -23,12 +27,14 @@ package feed
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/usecase/tastematch"
 )
 
 // maxFeedCandidates caps the candidate window the ranking sorts. The feed is a
@@ -133,12 +139,17 @@ type ItemState struct {
 type facade struct {
 	repo  domain.FeedRepository
 	perms permissionChecker
+	taste tastematch.Loader
 	clock func() time.Time
 }
 
-// NewFacade constructs the feed Facade.
-func NewFacade(repo domain.FeedRepository, perms permissionChecker) Facade {
-	return &facade{repo: repo, perms: perms, clock: time.Now}
+// NewFacade constructs the feed Facade. taste is the shared
+// usecase/tastematch.Loader (BE-1) — nil is fine for every call that never
+// reaches Main with a signed-in UserID (all the venue/platform operations,
+// and every existing test that only exercises those); Main itself only
+// dereferences it when in.UserID is set.
+func NewFacade(repo domain.FeedRepository, perms permissionChecker, taste tastematch.Loader) Facade {
+	return &facade{repo: repo, perms: perms, taste: taste, clock: time.Now}
 }
 
 func (f *facade) Main(ctx context.Context, in MainInput) (*MainResult, error) {
@@ -149,7 +160,7 @@ func (f *facade) Main(ctx context.Context, in MainInput) (*MainResult, error) {
 	now := f.clock()
 
 	// ONE query: the repository returns the eligible candidates already carrying
-	// the venue's rating aggregate and the guest's preference match, so no card
+	// the venue's rating aggregate and its own taste signals, so no card
 	// triggers a follow-up read.
 	candidates, err := f.repo.ListCandidates(ctx, domain.FeedQuery{
 		City:   in.City,
@@ -161,10 +172,27 @@ func (f *facade) Main(ctx context.Context, in MainInput) (*MainResult, error) {
 		return nil, err
 	}
 
+	// The guest's taste — zero value for an anonymous guest or one with no
+	// UserID (criterion 18: today's order, every taste signal 0). A read
+	// failure degrades to that same zero value rather than failing the whole
+	// main screen: the feed opening is worth more than one guest's
+	// personalization on one request (same posture picks_handler documents
+	// for /restaurants/picks, §4 criterion 10).
+	var taste domain.TasteProfile
+	if in.UserID != nil && f.taste != nil {
+		loaded, err := f.taste.LoadTasteProfile(ctx, *in.UserID)
+		if err != nil {
+			slog.Warn("feed: taste profile load failed, falling back to today's order",
+				"user_id", in.UserID.String(), "error", err)
+		} else {
+			taste = loaded
+		}
+	}
+
 	// Ranking is a pure domain function over the whole candidate set, and the
 	// page is a slice of its total order. Paginating BEFORE ranking would let a
 	// card appear on two pages (or on none) as scores shift between requests.
-	ranked := domain.RankFeedItems(candidates, now)
+	ranked := domain.RankFeedItems(candidates, taste, now)
 	return &MainResult{
 		Items:   pageOf(ranked, page, perPage),
 		Total:   len(ranked),

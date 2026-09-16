@@ -9,7 +9,24 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/usecase/tastematch"
 )
+
+// fakeTasteLoader is an in-memory stand-in for usecase/tastematch.Loader —
+// tests set exactly the domain.TasteProfile one guest should get back,
+// keyed by user id. A lookup miss returns the zero TasteProfile (same
+// "no profile" convention the real Loader documents), never an error.
+type fakeTasteLoader struct {
+	profiles map[uuid.UUID]domain.TasteProfile
+	err      error
+}
+
+func (f *fakeTasteLoader) LoadTasteProfile(_ context.Context, userID uuid.UUID) (domain.TasteProfile, error) {
+	if f.err != nil {
+		return domain.TasteProfile{}, f.err
+	}
+	return f.profiles[userID], nil
+}
 
 // testNow is the frozen clock every case is anchored to; the facade's clock is
 // overridden with it so a window boundary never depends on when CI runs.
@@ -71,12 +88,6 @@ func (f *fakeFeedRepo) ListCandidates(_ context.Context, q domain.FeedQuery) ([]
 		it := *f.items[k]
 		if !domain.FeedEligible(it, q.City, q.Now) {
 			continue
-		}
-		// The repository resolves the preference match in SQL; the fake mirrors
-		// the contract: no signed-in guest means no preferences at all.
-		if q.UserID == nil {
-			it.HasCuisinePreferences = false
-			it.MatchesCuisinePreference = false
 		}
 		out = append(out, it)
 		if q.Limit > 0 && len(out) >= q.Limit {
@@ -205,9 +216,19 @@ func permsWith(userID, rid uuid.UUID, role domain.StaffRole) *fakePerms {
 	return &fakePerms{roles: map[[2]uuid.UUID]domain.StaffRole{{userID, rid}: role}}
 }
 
-// newFacadeAt builds the facade with the frozen clock.
+// newFacadeAt builds the facade with the frozen clock. taste is nil: every
+// case that uses this helper never sets MainInput.UserID, so Main never
+// dereferences it.
 func newFacadeAt(repo domain.FeedRepository, perms permissionChecker) *facade {
-	f := NewFacade(repo, perms).(*facade)
+	f := NewFacade(repo, perms, nil).(*facade)
+	f.clock = func() time.Time { return testNow }
+	return f
+}
+
+// newFacadeAtWithTaste is newFacadeAt plus a taste loader, for the cases that
+// DO sign a guest in.
+func newFacadeAtWithTaste(repo domain.FeedRepository, perms permissionChecker, taste tastematch.Loader) *facade {
+	f := NewFacade(repo, perms, taste).(*facade)
 	f.clock = func() time.Time { return testNow }
 	return f
 }
@@ -310,12 +331,16 @@ func TestMain_PaidPlacementOutranksAnOrganicItem(t *testing.T) {
 	}
 }
 
+// TestMain_AnonymousGuestGetsNoPreferenceBoost is criterion 18's anonymous
+// half: a venue that WOULD match a guest's taste (italian, ₸₸) still scores 0
+// on every taste signal when nobody is signed in, because Main never calls
+// the taste loader at all without a UserID.
 func TestMain_AnonymousGuestGetsNoPreferenceBoost(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()
 	it := livePromo(rid)
-	it.HasCuisinePreferences = true
-	it.MatchesCuisinePreference = true
+	it.RestaurantCuisineCodes = []string{"italian"}
+	it.RestaurantPriceCategory = domain.PriceMid
 	repo.put(it)
 
 	f := newFacadeAt(repo, &fakePerms{})
@@ -325,6 +350,69 @@ func TestMain_AnonymousGuestGetsNoPreferenceBoost(t *testing.T) {
 	}
 	if res.Items[0].Score.Total != 0 {
 		t.Fatalf("an anonymous guest must get no personalization, scored %d", res.Items[0].Score.Total)
+	}
+}
+
+// TestMain_NoProfileSignedInGuestGetsTodaysOrderToo is criterion 18's other
+// half: a signed-in guest who never filled a foodie profile (the loader
+// returns the zero TasteProfile) must ALSO score 0 on every taste signal —
+// "signed in" alone must not change the order.
+func TestMain_NoProfileSignedInGuestGetsTodaysOrderToo(t *testing.T) {
+	rid := uuid.New()
+	userID := uuid.New()
+	repo := newFakeRepo()
+	it := livePromo(rid)
+	it.RestaurantCuisineCodes = []string{"italian"}
+	it.RestaurantPriceCategory = domain.PriceMid
+	repo.put(it)
+
+	taste := &fakeTasteLoader{profiles: map[uuid.UUID]domain.TasteProfile{}}
+	f := newFacadeAtWithTaste(repo, &fakePerms{}, taste)
+	res, err := f.Main(context.Background(), MainInput{City: domain.CityAlmaty, UserID: &userID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Items[0].Score.Total != 0 {
+		t.Fatalf("a signed-in guest with no foodie profile must get no personalization, scored %d", res.Items[0].Score.Total)
+	}
+}
+
+// TestMain_MatchingGuestGetsTheTasteBoost is the positive counterpart: a
+// signed-in guest whose profile matches the venue's cuisine/budget actually
+// scores those signals, and a read failure degrades to the same "no
+// personalization" order rather than a 5xx.
+func TestMain_MatchingGuestGetsTheTasteBoost(t *testing.T) {
+	rid := uuid.New()
+	userID := uuid.New()
+	repo := newFakeRepo()
+	it := livePromo(rid)
+	it.RestaurantCuisineCodes = []string{"italian"}
+	it.RestaurantPriceCategory = domain.PriceMid
+	repo.put(it)
+
+	mid := domain.PriceMid
+	taste := &fakeTasteLoader{profiles: map[uuid.UUID]domain.TasteProfile{
+		userID: {CuisineCodes: []string{"italian"}, Budget: &mid},
+	}}
+	f := newFacadeAtWithTaste(repo, &fakePerms{}, taste)
+	res, err := f.Main(context.Background(), MainInput{City: domain.CityAlmaty, UserID: &userID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Items[0].Score.Total != 600 { // cuisine_match 400 + budget_match 200
+		t.Fatalf("a matching guest must get the taste boost, scored %d (%+v)", res.Items[0].Score.Total, res.Items[0].Score.Reasons)
+	}
+
+	// A profile-load failure must degrade to the fallback order (§4 criterion
+	// 10's posture, reused here), not a 5xx.
+	failing := &fakeTasteLoader{err: errors.New("db down")}
+	f2 := newFacadeAtWithTaste(repo, &fakePerms{}, failing)
+	res2, err := f2.Main(context.Background(), MainInput{City: domain.CityAlmaty, UserID: &userID})
+	if err != nil {
+		t.Fatalf("a taste-profile read failure must not fail the feed: %v", err)
+	}
+	if res2.Items[0].Score.Total != 0 {
+		t.Fatalf("a taste-profile read failure must degrade to no personalization, scored %d", res2.Items[0].Score.Total)
 	}
 }
 

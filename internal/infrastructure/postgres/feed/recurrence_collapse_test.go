@@ -209,7 +209,7 @@ func TestMain_TotalMatchesTheCollapsedSet(t *testing.T) {
 	seedPromo(ctx, t, pool, venue, "Скидка 20%", domain.PromoPublished,
 		now.Add(-time.Hour), now.Add(72*time.Hour), domain.FeedApproved, 0)
 
-	res, err := usecasefeed.NewFacade(New(pool), nil).Main(ctx, usecasefeed.MainInput{
+	res, err := usecasefeed.NewFacade(New(pool), nil, nil).Main(ctx, usecasefeed.MainInput{
 		City: domain.CityAlmaty, Page: 1, PerPage: 20,
 	})
 	if err != nil {

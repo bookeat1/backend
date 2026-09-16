@@ -26,6 +26,7 @@ var feedNow = time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 // cannot make another test pass.
 var feedTables = []string{"promos", "events", "reviews", "user_cuisine_preferences",
 	"restaurant_cuisines", "cuisine_aliases", "cuisines",
+	"restaurant_venue_features", "venue_feature_aliases", "venue_features",
 	"restaurant_categories", "restaurants", "users"}
 
 func seedUser(ctx context.Context, t *testing.T, pool sqltx.Querier, name string) uuid.UUID {
@@ -58,14 +59,15 @@ func seedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code, na
 	return id
 }
 
-// linkCuisine ties a venue to a dictionary cuisine — the link the feed's
-// cuisine_match signal now reads (it used to compare restaurants.category_id,
-// the VENUE TYPE, which no venue ever had; see migration 0079).
-func linkCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, venue, cuisine uuid.UUID) {
+// linkCuisineAt ties a venue to a dictionary cuisine at the given link
+// position — position 0 is the venue's main cuisine, the order
+// domain.VenueTasteSignals.CuisineCodes documents and ScoreFeedCard's taste
+// block reads.
+func linkCuisineAt(ctx context.Context, t *testing.T, pool sqltx.Querier, venue, cuisine uuid.UUID, position int) {
 	t.Helper()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO restaurant_cuisines (restaurant_id, cuisine_id, position) VALUES ($1,$2,0)`,
-		venue, cuisine); err != nil {
+		`INSERT INTO restaurant_cuisines (restaurant_id, cuisine_id, position) VALUES ($1,$2,$3)`,
+		venue, cuisine, position); err != nil {
 		t.Fatalf("link cuisine: %v", err)
 	}
 }
@@ -213,24 +215,58 @@ func TestListCandidates_SQLAgreesWithDomainFeedEligible(t *testing.T) {
 	}
 }
 
-func TestListCandidates_CarriesRatingAndPreferences(t *testing.T) {
+// seedVenueFeature inserts a dictionary entry (migration 0082) and returns
+// its id.
+func seedVenueFeature(ctx context.Context, t *testing.T, pool sqltx.Querier, code, name string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO venue_features (id, code, name) VALUES ($1,$2,$3)`, id, code, name); err != nil {
+		t.Fatalf("seed venue feature: %v", err)
+	}
+	return id
+}
+
+// linkVenueFeature ties a venue to a dictionary feature at the given link
+// position — the order domain.VenueTasteSignals.FeatureCodes is read in.
+func linkVenueFeature(ctx context.Context, t *testing.T, pool sqltx.Querier, venue, feature uuid.UUID, position int) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurant_venue_features (restaurant_id, feature_id, position) VALUES ($1,$2,$3)`,
+		venue, feature, position); err != nil {
+		t.Fatalf("link venue feature: %v", err)
+	}
+}
+
+// TestListCandidates_CarriesRatingAndVenueTasteSignals is BE-3's own read
+// model test: ListCandidates must carry each candidate's rating aggregate
+// AND its own taste signals (cuisine codes in link position order, price
+// category, feature codes) — domain.ScoreFeedCard scores those against the
+// guest's domain.TasteProfile in Go, replacing the dead cuisine_match signal
+// that used to read user_cuisine_preferences (spec
+// foodie-personalization-v1-20260916.md §5.1/§8 BE-3).
+func TestListCandidates_CarriesRatingAndVenueTasteSignals(t *testing.T) {
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, feedTables...)
 	ctx := context.Background()
 
 	italian := seedCuisine(ctx, t, pool, "italian", "Итальянская")
-	sushi := seedCuisine(ctx, t, pool, "japanese", "Японская")
+	seafood := seedCuisine(ctx, t, pool, "seafood", "Морепродукты")
+	halal := seedVenueFeature(ctx, t, pool, "halal", "Халяль")
+
 	matching := seedVenue(ctx, t, pool, "Trattoria", venueOpts{city: domain.CityAlmaty, isActive: true})
-	other := seedVenue(ctx, t, pool, "Sushi bar", venueOpts{city: domain.CityAlmaty, isActive: true})
-	linkCuisine(ctx, t, pool, matching, italian)
-	linkCuisine(ctx, t, pool, other, sushi)
+	// Two cuisines, linked in a SPECIFIC order — seafood first — so the test
+	// can pin that RestaurantCuisineCodes preserves LINK POSITION, not
+	// dictionary or insertion order.
+	linkCuisineAt(ctx, t, pool, matching, seafood, 0)
+	linkCuisineAt(ctx, t, pool, matching, italian, 1)
+	linkVenueFeature(ctx, t, pool, matching, halal, 0)
 
 	open, close := feedNow.Add(-time.Hour), feedNow.Add(48*time.Hour)
 	seedPromo(ctx, t, pool, matching, "pasta week", domain.PromoPublished, open, close, domain.FeedApproved, 0)
-	seedPromo(ctx, t, pool, other, "roll week", domain.PromoPublished, open, close, domain.FeedApproved, 0)
 
-	// Two published reviews for the Italian venue, one hidden — the hidden one
-	// must not move the average.
+	// Two published reviews for the venue, one hidden — the hidden one must
+	// not move the average.
 	reviews := reviewrepo.New(pool)
 	for _, rating := range []int{5, 4} {
 		uid := seedUser(ctx, t, pool, "Guest")
@@ -248,46 +284,40 @@ func TestListCandidates_CarriesRatingAndPreferences(t *testing.T) {
 		t.Fatalf("hide review: %v", err)
 	}
 
-	guest := seedUser(ctx, t, pool, "Foodie")
-	if _, err := pool.Exec(ctx,
-		`INSERT INTO user_cuisine_preferences (user_id, cuisine_id) VALUES ($1, $2)`, guest, italian); err != nil {
-		t.Fatalf("seed preference: %v", err)
-	}
-
 	repo := New(pool)
-
-	signedIn, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, UserID: &guest, Now: feedNow, Limit: 100})
+	got, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
 	if err != nil {
-		t.Fatalf("ListCandidates (signed in): %v", err)
+		t.Fatalf("ListCandidates: %v", err)
 	}
-	if len(signedIn) != 2 {
-		t.Fatalf("expected both promos, got %d", len(signedIn))
+	if len(got) != 1 {
+		t.Fatalf("expected the one promo, got %d", len(got))
 	}
-	for _, it := range signedIn {
-		if !it.HasCuisinePreferences {
-			t.Fatal("a guest with preferences must be reported as having them")
-		}
-		wantMatch := it.RestaurantID != nil && *it.RestaurantID == matching
-		if it.MatchesCuisinePreference != wantMatch {
-			t.Fatalf("venue %s: match=%v, want %v", it.RestaurantName, it.MatchesCuisinePreference, wantMatch)
-		}
-		if it.RestaurantID != nil && *it.RestaurantID == matching {
-			if it.RestaurantReviewCount != 2 || it.RestaurantRating != 4.5 {
-				t.Fatalf("rating aggregate must count published reviews only, got %.2f over %d",
-					it.RestaurantRating, it.RestaurantReviewCount)
-			}
-		}
+	it := got[0]
+
+	if len(it.RestaurantCuisineCodes) != 2 || it.RestaurantCuisineCodes[0] != "seafood" || it.RestaurantCuisineCodes[1] != "italian" {
+		t.Fatalf("cuisine codes must be in LINK POSITION order (seafood, italian), got %v", it.RestaurantCuisineCodes)
+	}
+	if it.RestaurantPriceCategory != domain.PriceMid {
+		t.Fatalf("price category = %q, want %q", it.RestaurantPriceCategory, domain.PriceMid)
+	}
+	if len(it.RestaurantFeatureCodes) != 1 || it.RestaurantFeatureCodes[0] != "halal" {
+		t.Fatalf("feature codes = %v, want [halal]", it.RestaurantFeatureCodes)
+	}
+	if it.RestaurantReviewCount != 2 || it.RestaurantRating != 4.5 {
+		t.Fatalf("rating aggregate must count published reviews only, got %.2f over %d",
+			it.RestaurantRating, it.RestaurantReviewCount)
 	}
 
-	// The "preferences absent" path: an anonymous guest.
-	anon, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, Now: feedNow, Limit: 100})
+	// q.UserID is accepted but no longer read by the SQL at all — the taste
+	// block is scored in Go now (usecase/feed.facade.Main), so passing one
+	// must not change a single row.
+	guest := seedUser(ctx, t, pool, "Foodie")
+	withUser, err := repo.ListCandidates(ctx, domain.FeedQuery{City: domain.CityAlmaty, UserID: &guest, Now: feedNow, Limit: 100})
 	if err != nil {
-		t.Fatalf("ListCandidates (anonymous): %v", err)
+		t.Fatalf("ListCandidates (with UserID): %v", err)
 	}
-	for _, it := range anon {
-		if it.HasCuisinePreferences || it.MatchesCuisinePreference {
-			t.Fatalf("an anonymous guest must carry no preference signal, got %+v", it)
-		}
+	if len(withUser) != 1 || withUser[0].RestaurantCuisineCodes[0] != "seafood" {
+		t.Fatalf("UserID must not change the candidate set or its taste signals, got %+v", withUser)
 	}
 }
 

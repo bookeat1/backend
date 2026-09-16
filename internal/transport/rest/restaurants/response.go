@@ -5,6 +5,7 @@ import (
 
 	"backend-core/internal/domain"
 	"backend-core/internal/media"
+	"backend-core/internal/usecase/foryou"
 )
 
 type restaurantResponse struct {
@@ -107,6 +108,49 @@ type restaurantResponse struct {
 	// they have opened the venue's menu. nil/omitted means "no minimum set" —
 	// the client must not read absence as a floor of zero.
 	PreorderMinAmountMinor *int64 `json:"preorder_min_amount_minor,omitempty"`
+	// Match is this card's taste-match explanation (spec
+	// foodie-personalization-v1-20260916.md §5.6) — set ONLY by
+	// GET /restaurants/picks' guest read (picks_handler.go), and only when
+	// data.mode = "for_you". Absent (omitted from the JSON) on every other
+	// card and every other endpoint, including a picks card served in
+	// editorial/popular mode.
+	Match *matchResponse `json:"match,omitempty"`
+}
+
+// matchResponse is one card's taste-match block: the total score plus every
+// signal that produced it, in domain.ScoreTasteMatch's own fixed order —
+// criterion 2's "always returns causes with zero" means Reasons is never
+// filtered down to only the positive ones.
+type matchResponse struct {
+	Score   int                   `json:"score"`
+	Reasons []matchReasonResponse `json:"reasons"`
+}
+
+// matchReasonResponse is one domain.TasteMatchReason as the client reads it.
+// Params is the machine-readable extra (e.g. which cuisine codes matched);
+// Detail is an English debugging string the UI never shows (spec §5.6) — the
+// client localizes by Code + Params instead.
+type matchReasonResponse struct {
+	Code   string         `json:"code"`
+	Points int            `json:"points"`
+	Params map[string]any `json:"params,omitempty"`
+	Detail string         `json:"detail"`
+}
+
+// matchToResponse renders a foryou.Match. Nil in, nil out — the field is then
+// simply omitted (see restaurantResponse.Match's omitempty), which is how
+// "no match block" travels for editorial/popular cards.
+func matchToResponse(m *foryou.Match) *matchResponse {
+	if m == nil {
+		return nil
+	}
+	reasons := make([]matchReasonResponse, 0, len(m.Reasons))
+	for _, r := range m.Reasons {
+		reasons = append(reasons, matchReasonResponse{
+			Code: string(r.Code), Points: r.Points, Params: r.Params, Detail: r.Detail,
+		})
+	}
+	return &matchResponse{Score: m.Score, Reasons: reasons}
 }
 
 // scheduleResponse is the venue's regular weekly hours in a shape a client

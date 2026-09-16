@@ -148,7 +148,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// signed-in guest. Mounted here, right after the catalog, so the two static
 	// segments (/restaurants/search, /restaurants/picks) and /restaurants/:id
 	// are declared in one place.
-	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.FavoritesFacade)
+	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.ForYou, deps.FavoritesFacade)
 	picksHandler.RegisterPublic(restPublic)
 
 	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and
@@ -292,6 +292,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// identifies the target).
 	eventsHandler := eventsrest.NewHandler(deps.EventsFacade)
 	eventsHandler.RegisterPublic(api)
+	// GET /events (the cross-venue Explore listing) rides the SAME OptionalAuth
+	// group as the catalog and the feed: it is public, but a signed-in guest
+	// asking for ?sort=for_you gets it ranked by taste match instead of date
+	// (spec foodie-personalization-v1-20260916.md §5.6, criterion 19, BE-4).
+	eventsHandler.RegisterExplore(restPublic)
 	eventsHandler.RegisterAdminRoutes(authed)
 
 	// Recurring-event RULES (migration 0074). Admin only, guarded by exactly the
