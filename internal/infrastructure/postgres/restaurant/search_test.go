@@ -67,6 +67,47 @@ func TestSearchRankingAndTypoTolerance(t *testing.T) {
 	}
 }
 
+// TestSearchNormalizedFuzzyMatch covers the production gap where a venue
+// name with no internal space ("TomYumBar") failed to match a query typed
+// WITH a space ("Tom Yum") — word_similarity treats the space as changing
+// the trigram sequence, so the two scored as unrelated strings even for an
+// exact, correctly-spelled query. It also covers a one-vowel typo of the
+// same query ("tomyam" for "tomyum"), which needs the lowered
+// normalizedMatchThreshold since it scores just under the pg_trgm default
+// (0.6). Both must find the venue; a short, genuinely unrelated query must
+// not turn into noise across the whole seeded set.
+func TestSearchNormalizedFuzzyMatch(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
+	repo := New(pool)
+	ctx := context.Background()
+
+	tomYum := seedSearch(t, repo, "TomYumBar", "Thai street food and noodle bowls", "Тайская", domain.CityAlmaty)
+	seedSearch(t, repo, "Paris Cafe", "French bistro in the city center", "Французская", domain.CityAlmaty)
+	seedSearch(t, repo, "Coffeeshka", "coffee and cakes", "Кофейня", domain.CityAlmaty)
+
+	for _, q := range []string{"tomyam", "Tom Yum", "tomyum"} {
+		items, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: q})
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		if !containsID(items, tomYum) {
+			t.Errorf("query %q did not find TomYumBar; got %d results", q, len(items))
+		}
+	}
+
+	// A short, unrelated query must not fuzzy-match everything in the
+	// seeded set via the lowered normalized threshold — this is the noise
+	// regression the lowered threshold could introduce if picked too high.
+	noise, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: "aaa"})
+	if err != nil {
+		t.Fatalf("noise search: %v", err)
+	}
+	if len(noise) != 0 {
+		t.Errorf("unrelated short query %q matched %d venues, want 0 (noise regression): %v", "aaa", len(noise), ids(noise))
+	}
+}
+
 func TestSearchFiltersNarrow(t *testing.T) {
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
