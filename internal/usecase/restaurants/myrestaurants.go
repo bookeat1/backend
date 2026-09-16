@@ -37,6 +37,7 @@ type MyRestaurant struct {
 	Name         string
 	NameI18n     domain.I18n
 	Role         string
+	IsActive     bool
 }
 
 // MyRestaurantsUseCase answers "which restaurants am I staff of" for the
@@ -79,6 +80,7 @@ func (u *MyRestaurantsUseCase) List(ctx context.Context, actor Actor) ([]MyResta
 				Name:         b.Name,
 				NameI18n:     b.NameI18n,
 				Role:         string(domain.RoleAdmin),
+				IsActive:     b.IsActive,
 			})
 		}
 		return out, nil
@@ -95,6 +97,7 @@ func (u *MyRestaurantsUseCase) List(ctx context.Context, actor Actor) ([]MyResta
 			Name:         m.Name,
 			NameI18n:     m.NameI18n,
 			Role:         string(m.Role),
+			IsActive:     m.IsActive,
 		})
 	}
 	return out, nil

@@ -49,8 +49,8 @@ func TestMyRestaurants_ManagesTwo_ReturnsBothWithRoles(t *testing.T) {
 	restA, restB := uuid.New(), uuid.New()
 	mr := &fakeMembershipReader{byUser: map[uuid.UUID][]domain.StaffMembership{
 		userA: {
-			{RestaurantID: restA, Name: "Alpha", Role: domain.StaffRoleOwner},
-			{RestaurantID: restB, Name: "Bravo", Role: domain.StaffRoleHostess},
+			{RestaurantID: restA, Name: "Alpha", Role: domain.StaffRoleOwner, IsActive: true},
+			{RestaurantID: restB, Name: "Bravo", Role: domain.StaffRoleHostess, IsActive: false},
 		},
 	}}
 	br := &fakeBriefReader{}
@@ -67,11 +67,16 @@ func TestMyRestaurants_ManagesTwo_ReturnsBothWithRoles(t *testing.T) {
 		t.Fatalf("non-admin caller must not trigger the platform-wide brief read")
 	}
 	roles := map[uuid.UUID]string{}
+	active := map[uuid.UUID]bool{}
 	for _, r := range got {
 		roles[r.RestaurantID] = r.Role
+		active[r.RestaurantID] = r.IsActive
 	}
 	if len(roles) != 2 || roles[restA] != "owner" || roles[restB] != "hostess" {
 		t.Fatalf("want {A:owner, B:hostess}, got %+v", roles)
+	}
+	if !active[restA] || active[restB] {
+		t.Fatalf("want IsActive propagated 1:1 ({A:true, B:false}), got %+v", active)
 	}
 }
 
@@ -121,8 +126,8 @@ func TestMyRestaurants_Superadmin_GetsAllVenuesAsAdmin(t *testing.T) {
 	restA, restB := uuid.New(), uuid.New()
 	mr := &fakeMembershipReader{byUser: map[uuid.UUID][]domain.StaffMembership{}}
 	br := &fakeBriefReader{all: []domain.RestaurantBrief{
-		{ID: restA, Name: "Alpha"},
-		{ID: restB, Name: "Bravo"},
+		{ID: restA, Name: "Alpha", IsActive: true},
+		{ID: restB, Name: "Bravo", IsActive: false},
 	}}
 	uc := NewMyRestaurantsUseCase(mr, br)
 
@@ -139,10 +144,15 @@ func TestMyRestaurants_Superadmin_GetsAllVenuesAsAdmin(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("want 2 venues, got %d", len(got))
 	}
+	active := map[uuid.UUID]bool{}
 	for _, r := range got {
 		if r.Role != string(domain.RoleAdmin) {
 			t.Fatalf("superadmin entries must carry role %q, got %q", domain.RoleAdmin, r.Role)
 		}
+		active[r.RestaurantID] = r.IsActive
+	}
+	if !active[restA] || active[restB] {
+		t.Fatalf("want IsActive propagated 1:1 from the brief reader ({A:true, B:false}), got %+v", active)
 	}
 }
 

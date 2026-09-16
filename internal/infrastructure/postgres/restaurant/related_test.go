@@ -195,9 +195,11 @@ func TestManagersCreateAndList(t *testing.T) {
 }
 
 // TestListMembershipsByUser proves the my-restaurants read: the join returns
-// only the caller's own memberships with the venue name + role, an unrelated
-// user gets nothing (no cross-tenant leak), and ListManageableBrief spans every
-// venue (the superadmin picker).
+// only the caller's own memberships with the venue name + role + is_active, an
+// unrelated user gets nothing (no cross-tenant leak), and ListManageableBrief
+// spans every venue (the superadmin picker). restB is seeded inactive so both
+// reads are proven to carry is_active through unfiltered (the picker must
+// still list it, just labeled).
 func TestListMembershipsByUser(t *testing.T) {
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, "restaurants", "users")
@@ -206,6 +208,8 @@ func TestListMembershipsByUser(t *testing.T) {
 	mgrs := NewManagers(pool)
 
 	// Two venues (names chosen so ORDER BY name yields Alpha before Bravo).
+	// restB is inactive so we can prove is_active is carried through, not
+	// used to filter the picker.
 	restA, restB := uuid.New(), uuid.New()
 	if err := repo.Create(ctx, &domain.Restaurant{
 		ID: restA, Name: "Alpha", NameI18n: domain.I18n{"en": "Alpha EN"},
@@ -214,7 +218,7 @@ func TestListMembershipsByUser(t *testing.T) {
 		t.Fatalf("create restA: %v", err)
 	}
 	if err := repo.Create(ctx, &domain.Restaurant{
-		ID: restB, Name: "Bravo", City: domain.CityAstana, PriceCategory: domain.PriceLow, IsActive: true,
+		ID: restB, Name: "Bravo", City: domain.CityAstana, PriceCategory: domain.PriceLow, IsActive: false,
 	}); err != nil {
 		t.Fatalf("create restB: %v", err)
 	}
@@ -255,8 +259,14 @@ func TestListMembershipsByUser(t *testing.T) {
 	if got[0].NameI18n["en"] != "Alpha EN" {
 		t.Errorf("name_i18n not joined through: %+v", got[0].NameI18n)
 	}
+	if !got[0].IsActive {
+		t.Errorf("first.IsActive = %v, want true (Alpha is active)", got[0].IsActive)
+	}
 	if got[1].RestaurantID != restB || got[1].Role != domain.StaffRoleHostess {
 		t.Errorf("second = %+v, want Bravo/hostess", got[1])
+	}
+	if got[1].IsActive {
+		t.Errorf("second.IsActive = %v, want false (Bravo is inactive, still listed for its staff member)", got[1].IsActive)
 	}
 	// No cross-tenant leak: userB is staff of restB only and must NOT see restA
 	// (userA's owner venue), even though both share restB.
@@ -289,6 +299,15 @@ func TestListMembershipsByUser(t *testing.T) {
 	}
 	if len(briefs) != 2 || briefs[0].Name != "Alpha" || briefs[1].Name != "Bravo" {
 		t.Fatalf("briefs = %+v, want [Alpha, Bravo]", briefs)
+	}
+	// The superadmin picker deliberately includes inactive venues (it manages
+	// the whole platform), but must still report is_active accurately so the
+	// admin panel can label them.
+	if !briefs[0].IsActive {
+		t.Errorf("briefs[0] (Alpha).IsActive = %v, want true", briefs[0].IsActive)
+	}
+	if briefs[1].IsActive {
+		t.Errorf("briefs[1] (Bravo).IsActive = %v, want false", briefs[1].IsActive)
 	}
 }
 
