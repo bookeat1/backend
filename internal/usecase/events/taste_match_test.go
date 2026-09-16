@@ -283,15 +283,27 @@ func TestListPublicUpcomingForYou_InvertedRangeRejected(t *testing.T) {
 
 // A restaurant-signals read failure propagates as a real error — a broken
 // ranking read must not silently become an empty or unranked page.
-func TestListPublicUpcomingForYou_VenueSignalsErrorPropagates(t *testing.T) {
+// A venue-signals read failure must degrade to date order, not fail the
+// whole listing — same posture as a profile-load failure just above it.
+// The event list itself already loaded successfully; losing the ranking
+// nicety is not a reason to take the home surface down (PR #138 review).
+func TestListPublicUpcomingForYou_VenueSignalsErrorDegradesToUnranked(t *testing.T) {
 	repo := newFakeRepo()
 	rid := uuid.New()
-	repo.publicItems = []domain.EventListItem{eventItem(uuid.New(), rid, time.Now(), domain.CityAlmaty)}
+	starts := time.Now().Add(time.Hour)
+	repo.publicItems = []domain.EventListItem{eventItem(uuid.New(), rid, starts, domain.CityAlmaty)}
 	venues := &fakeVenueSignals{err: errors.New("db down")}
 	f := NewFacade(repo, &fakePerms{}, &fakeFeed{}, WithTasteMatch(&fakeTasteLoader{}, venues, nil))
 
-	if _, _, err := f.ListPublicUpcomingForYou(context.Background(), domain.PublicEventFilter{}, uuid.New()); err == nil {
-		t.Fatal("a venue-signals failure must not be swallowed")
+	items, total, err := f.ListPublicUpcomingForYou(context.Background(), domain.PublicEventFilter{}, uuid.New())
+	if err != nil {
+		t.Fatalf("a venue-signals failure must degrade, not fail the listing: %v", err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Fatalf("items = %+v, total = %d, want the one seeded event still returned", items, total)
+	}
+	if items[0].Match.Score != 0 || len(items[0].Match.Reasons) != 0 {
+		t.Errorf("degraded item should carry no taste match, got %+v", items[0].Match)
 	}
 }
 

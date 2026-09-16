@@ -179,7 +179,7 @@ func (f *facade) Main(ctx context.Context, in MainInput) (*MainResult, error) {
 	// personalization on one request (same posture picks_handler documents
 	// for /restaurants/picks, §4 criterion 10).
 	var taste domain.TasteProfile
-	if in.UserID != nil {
+	if in.UserID != nil && f.taste != nil {
 		loaded, err := f.taste.LoadTasteProfile(ctx, *in.UserID)
 		if err != nil {
 			slog.Warn("feed: taste profile load failed, falling back to today's order",

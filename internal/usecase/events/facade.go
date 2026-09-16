@@ -811,7 +811,15 @@ func (f *facade) ListPublicUpcomingForYou(ctx context.Context, flt domain.Public
 
 	signals, err := f.loadVenueTasteSignals(ctx, items)
 	if err != nil {
-		return nil, 0, err
+		// Same posture as the profile-load failure above: the event list
+		// itself already loaded successfully, so a venue-signals read
+		// failure degrades to date order, not a 5xx over a ranking nicety
+		// (review of PR #138 caught this returning err before the fix —
+		// every other personalization path on this surface already
+		// degrades this way, this one should too).
+		slog.Warn("taste-match: failed to load venue taste signals for events ranking",
+			slog.String("error", err.Error()))
+		return unranked(items), total, nil
 	}
 
 	ranked := make([]RankedEventListItem, 0, len(items))

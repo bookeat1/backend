@@ -397,7 +397,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// uses for its rail), and a second homepicksrepo instance resolves
 		// editorial_pick — independent from homePicksFacade's own instance
 		// below for the same "stateless, cheap to construct twice" reason as
-		// eventsTasteLoader's cuisine reader.
+		// the shared tasteLoader's own cuisine reader above.
 		events.WithTasteMatch(tasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
