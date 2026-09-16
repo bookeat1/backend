@@ -373,13 +373,16 @@ func (m *Managers) ListByUser(ctx context.Context, uid uuid.UUID) ([]domain.Rest
 }
 
 // ListMembershipsByUser returns every restaurant uid is staff of, joined to the
-// venue's display name, ordered by name. It is the read behind
+// venue's display name and active flag, ordered by name. It is the read behind
 // GET /admin/my-restaurants: one query scoped to the caller's own user id, so a
-// caller can never see a restaurant they have no membership in. Returns an
-// empty (non-nil-safe) slice, not an error, when the user manages nothing.
+// caller can never see a restaurant they have no membership in. IsActive is
+// carried through so the picker can label hidden/inactive venues, not to
+// filter them out — a staff member still needs to see (and reach) their own
+// inactive restaurant. Returns an empty (non-nil-safe) slice, not an error,
+// when the user manages nothing.
 func (m *Managers) ListMembershipsByUser(ctx context.Context, uid uuid.UUID) ([]domain.StaffMembership, error) {
 	rows, err := sqltx.From(ctx, m.pool).Query(ctx,
-		`SELECT rm.restaurant_id, r.name, r.name_i18n, rm.role
+		`SELECT rm.restaurant_id, r.name, r.name_i18n, rm.role, r.is_active
 		 FROM restaurant_managers rm
 		 JOIN restaurants r ON r.id = rm.restaurant_id
 		 WHERE rm.user_id=$1
@@ -393,7 +396,7 @@ func (m *Managers) ListMembershipsByUser(ctx context.Context, uid uuid.UUID) ([]
 		var sm domain.StaffMembership
 		var role string
 		var nameI18n []byte
-		if err := rows.Scan(&sm.RestaurantID, &sm.Name, &nameI18n, &role); err != nil {
+		if err := rows.Scan(&sm.RestaurantID, &sm.Name, &nameI18n, &role, &sm.IsActive); err != nil {
 			return nil, err
 		}
 		sm.NameI18n = i18nFromDB(nameI18n)

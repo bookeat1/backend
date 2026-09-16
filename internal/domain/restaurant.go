@@ -387,4 +387,5 @@ type RestaurantBrief struct {
 	ID       uuid.UUID
 	Name     string
 	NameI18n I18n
+	IsActive bool
 }

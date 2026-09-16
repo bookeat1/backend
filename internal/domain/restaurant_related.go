@@ -106,6 +106,7 @@ type StaffMembership struct {
 	Name         string
 	NameI18n     I18n
 	Role         StaffRole
+	IsActive     bool
 }
 
 type RestaurantCategory struct {
