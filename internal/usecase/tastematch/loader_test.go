@@ -10,6 +10,7 @@ import (
 	"backend-core/internal/domain"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	cuisinerepo "backend-core/internal/infrastructure/postgres/cuisine"
+	foodieoptionrepo "backend-core/internal/infrastructure/postgres/foodieoption"
 	"backend-core/internal/infrastructure/postgres/foodieprofile"
 	restaurantrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	"backend-core/internal/infrastructure/postgres/testdb"
@@ -19,17 +20,30 @@ import (
 
 // loaderTables lists every table these tests own, children first. Truncated
 // before each test so one test's leftovers cannot pass another.
+//
+// foodie_options is included DESPITE being a migration-seeded dictionary
+// (0110), not per-test data: `go test ./...` runs different packages'
+// integration tests concurrently against the SAME Postgres (no -p 1 in
+// CLAUDE.md's `make test`), and internal/infrastructure/postgres/foodieoption's
+// own repository tests ALSO truncate this table for their own isolation —
+// relying on the migration seed surviving until this package's tests run
+// would make this suite's outcome depend on test ORDER/timing across
+// packages. Truncating it here too and having seedCuisine/
+// seedFoodieBudgetOption below (re)create exactly the rows each test needs
+// makes this package self-contained, same as it already is for cuisines/
+// restaurants/users. foodie_option_cuisines needs no separate entry: it
+// CASCADEs from either cuisines or foodie_options being truncated.
 var loaderTables = []string{
 	"user_foodie_cuisines", "user_foodie_diets", "user_foodie_allergies",
 	"bookings", "restaurant_cuisines", "cuisine_aliases", "cuisines",
-	"restaurants", "users",
+	"foodie_options", "restaurants", "users",
 }
 
 func setup(t *testing.T) (Loader, sqltx.Querier, context.Context) {
 	t.Helper()
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, loaderTables...)
-	l := NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool))
+	l := NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool), foodieoptionrepo.New(pool))
 	ctx := context.Background()
 	return l, pool, ctx
 }
@@ -44,13 +58,61 @@ func seedUser(ctx context.Context, t *testing.T, pool sqltx.Querier, budget *str
 	return id
 }
 
-func seedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code string) uuid.UUID {
+// seedCuisine inserts a cuisine-dictionary entry. tileCodes are OPTIONAL:
+// pass a wizard cuisine-tile code (usually the same string as code, e.g.
+// "italian") to also link this cuisine to that tile's foodie_options row —
+// creating the row if it does not exist, since loaderTables above truncates
+// foodie_options for this package's own isolation, so there is no
+// migration-seeded tile row to rely on. Omit tileCodes entirely for a
+// cuisine used only as an IMPLICIT signal (booking history) or as a
+// deliberately non-matching decoy, where no tile mapping is exercised.
+func seedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code string, tileCodes ...string) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	if _, err := pool.Exec(ctx, `INSERT INTO cuisines (id, code, name) VALUES ($1,$2,$3)`, id, code, code); err != nil {
 		t.Fatalf("seed cuisine %s: %v", code, err)
 	}
+	for _, tile := range tileCodes {
+		linkFoodieCuisineTile(ctx, t, pool, tile, id)
+	}
 	return id
+}
+
+// linkFoodieCuisineTile ensures a cuisine-kind foodie_options row for tile
+// exists (creating it on first use, (kind, code) unique so a repeat call
+// with the same tile in the same test reuses it) and links it to cuisineID
+// in foodie_option_cuisines.
+func linkFoodieCuisineTile(ctx context.Context, t *testing.T, pool sqltx.Querier, tile string, cuisineID uuid.UUID) {
+	t.Helper()
+	var optionID uuid.UUID
+	err := pool.QueryRow(ctx,
+		`INSERT INTO foodie_options (id, kind, code, name, is_active)
+		 VALUES ($1, 'cuisine', $2, $2, true)
+		 ON CONFLICT (kind, code) DO UPDATE SET updated_at = now()
+		 RETURNING id`, uuid.New(), tile).Scan(&optionID)
+	if err != nil {
+		t.Fatalf("seed foodie option tile %s: %v", tile, err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO foodie_option_cuisines (option_id, cuisine_id) VALUES ($1,$2)
+		 ON CONFLICT (option_id, cuisine_id) DO NOTHING`, optionID, cuisineID); err != nil {
+		t.Fatalf("link foodie cuisine tile %s: %v", tile, err)
+	}
+}
+
+// seedFoodieBudgetOption inserts a budget-kind foodie_options row mapping
+// code (a users.foodie_budget_tier value) to priceCategory — the fixture
+// LoadTasteProfile's budget lookup needs, replacing the migration seed row
+// this package's own Truncate("foodie_options") removes (see loaderTables).
+func seedFoodieBudgetOption(ctx context.Context, t *testing.T, pool sqltx.Querier, code string, priceCategory domain.PriceCategory) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO foodie_options (id, kind, code, name, price_category, is_active)
+		 VALUES ($1, 'budget', $2, $2, $3, true)
+		 ON CONFLICT (kind, code) DO UPDATE SET price_category = EXCLUDED.price_category`,
+		uuid.New(), code, string(priceCategory)); err != nil {
+		t.Fatalf("seed foodie budget option %s: %v", code, err)
+	}
 }
 
 func seedRestaurant(ctx context.Context, t *testing.T, pool sqltx.Querier, name string, cuisineIDs ...uuid.UUID) uuid.UUID {
@@ -85,11 +147,17 @@ func seedBooking(ctx context.Context, t *testing.T, pool sqltx.Querier, userID, 
 
 // TestLoadTasteProfile_ExplicitCuisines: a guest who filled the wizard's
 // cuisine step never needs booking history — CuisineCodes come straight from
-// FoodieCuisineDictionaryCodes, budget from users.foodie_budget_tier.
+// the foodie_option_cuisines tile -> cuisine-code mapping (migration 0110),
+// budget from users.foodie_budget_tier via foodie_options.price_category.
 func TestLoadTasteProfile_ExplicitCuisines(t *testing.T) {
 	loader, pool, ctx := setup(t)
 	budget := domain.FoodieBudgetTierMid
 	uid := seedUser(ctx, t, pool, &budget)
+	// Both fixtures this test's LoadTasteProfile call resolves through:
+	// tile -> cuisine-code and budget-tier -> PriceCategory.
+	seedCuisine(ctx, t, pool, "italian", "italian")
+	seedCuisine(ctx, t, pool, "kazakh", "kazakh")
+	seedFoodieBudgetOption(ctx, t, pool, domain.FoodieBudgetTierMid, domain.PriceMid)
 	if err := foodieprofile.New(pool).Replace(ctx, uid, domain.FoodieProfilePreferences{
 		Cuisines: []string{domain.FoodieCuisineItalian, domain.FoodieCuisineKazakh},
 		Diets:    []string{domain.FoodieDietHalal},

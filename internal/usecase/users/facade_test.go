@@ -92,6 +92,66 @@ func (f *memFoodie) Replace(_ context.Context, userID uuid.UUID, prefs domain.Fo
 	return nil
 }
 
+// testFoodieCuisineCodes mirrors the deleted domain.FoodieCuisineIDs (spec
+// foodie-profile-admin-dictionaries-20260916.md removed it along with
+// ValidFoodieCuisineID — the closed set is now a DB table, not a Go slice) —
+// kept here purely as fixture data for memOptions below and the cuisine-cap
+// test, not as anything authoritative.
+var testFoodieCuisineCodes = []string{
+	domain.FoodieCuisineKazakh, domain.FoodieCuisineAsian, domain.FoodieCuisineEuropean, domain.FoodieCuisineJapanese,
+	domain.FoodieCuisineItalian, domain.FoodieCuisineKorean, domain.FoodieCuisineSeafood, domain.FoodieCuisineMeat,
+	domain.FoodieCuisineVegan, domain.FoodieCuisineDesserts, domain.FoodieCuisineCoffee, domain.FoodieCuisineHealthy,
+	domain.FoodieCuisineFastfood, domain.FoodieCuisineSpicy, domain.FoodieCuisineBBQ,
+}
+
+// memOptions is an in-memory domain.FoodieOptionRepository. This package's
+// tests only ever ask AllExistingCodes (ReplaceFoodieProfile's one dependency
+// on the dictionary, criterion 9) — the CRUD methods are unused stubs so
+// memOptions satisfies the interface.
+type memOptions struct {
+	codes map[domain.FoodieOptionKind]map[string]struct{}
+}
+
+func newMemOptions() *memOptions {
+	return &memOptions{codes: map[domain.FoodieOptionKind]map[string]struct{}{
+		domain.FoodieOptionKindCuisine: codeSet(testFoodieCuisineCodes...),
+		domain.FoodieOptionKindDiet: codeSet(
+			domain.FoodieDietExclusiveID, domain.FoodieDietVegan, domain.FoodieDietPescetarian, domain.FoodieDietHalal,
+			domain.FoodieDietKosher, domain.FoodieDietKeto, domain.FoodieDietLowCarb, domain.FoodieDietPaleo,
+			domain.FoodieDietNoLactose, domain.FoodieDietNoGluten,
+		),
+		domain.FoodieOptionKindAllergy: codeSet(
+			domain.FoodieAllergyNuts, domain.FoodieAllergyDairy, domain.FoodieAllergyEggs, domain.FoodieAllergySeafood,
+			domain.FoodieAllergySoy, domain.FoodieAllergyWheat, domain.FoodieAllergyShellfish, domain.FoodieAllergySesame,
+		),
+		domain.FoodieOptionKindBudget: codeSet(domain.FoodieBudgetTierBudget, domain.FoodieBudgetTierMid, domain.FoodieBudgetTierPremium),
+	}}
+}
+
+func codeSet(codes ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(codes))
+	for _, c := range codes {
+		out[c] = struct{}{}
+	}
+	return out
+}
+
+func (m *memOptions) List(context.Context, domain.FoodieOptionFilter) ([]domain.FoodieOption, error) {
+	return nil, nil
+}
+func (m *memOptions) GetByID(context.Context, uuid.UUID) (*domain.FoodieOption, error) {
+	return nil, domain.ErrNotFound
+}
+func (m *memOptions) Create(context.Context, *domain.FoodieOption) error            { return nil }
+func (m *memOptions) Update(context.Context, *domain.FoodieOption) error            { return nil }
+func (m *memOptions) SetCuisineLinks(context.Context, uuid.UUID, []uuid.UUID) error { return nil }
+func (m *memOptions) CountActive(context.Context, domain.FoodieOptionKind) (int, error) {
+	return 0, nil
+}
+func (m *memOptions) AllExistingCodes(context.Context) (map[domain.FoodieOptionKind]map[string]struct{}, error) {
+	return m.codes, nil
+}
+
 // memRefresh is an in-memory domain.RefreshTokenRepository, tracking only what
 // this package's tests need: whether RevokeAllByUser was called.
 type memRefresh struct{ revokedFor map[uuid.UUID]int }
@@ -140,7 +200,7 @@ func strp(s string) *string { return &s }
 func newTestFacade(users *memUsers) (Facade, *memRefresh, *memOTP) {
 	refresh := newMemRefresh()
 	otp := newMemOTP()
-	f := NewFacade(users, newMemCuisines(), newMemFoodie(), refresh, otp, noTx{})
+	f := NewFacade(users, newMemCuisines(), newMemFoodie(), newMemOptions(), refresh, otp, noTx{})
 	return f, refresh, otp
 }
 
@@ -387,7 +447,7 @@ func TestReplaceFoodieProfileRejectsTooManyCuisines(t *testing.T) {
 	f, _, _ := newTestFacade(repo)
 
 	six := make([]string, 0, domain.FoodieCuisineSelectionLimit+1)
-	six = append(six, domain.FoodieCuisineIDs[:domain.FoodieCuisineSelectionLimit+1]...)
+	six = append(six, testFoodieCuisineCodes[:domain.FoodieCuisineSelectionLimit+1]...)
 	_, err := f.ReplaceFoodieProfile(context.Background(), id, ReplaceFoodieProfileInput{Cuisines: six})
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("cuisines over the limit: err = %v, want ErrValidation", err)

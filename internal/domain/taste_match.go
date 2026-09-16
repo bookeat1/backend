@@ -2,6 +2,7 @@ package domain
 
 import (
 	"math"
+	"reflect"
 
 	"github.com/google/uuid"
 )
@@ -17,18 +18,20 @@ import (
 // never quietly disagree about what "this guest's taste" means.
 type TasteProfile struct {
 	// CuisineCodes are the guest's EXPLICIT wizard cuisine picks, already
-	// expanded through FoodieCuisineDictionaryCodes (§5.2) into cuisine
+	// expanded through MapFoodieCuisinesToDictionaryCodes (§5.2) into cuisine
 	// dictionary codes, de-duplicated. Empty when the guest never picked a
-	// cuisine tile, OR picked only tiles with no dictionary mapping
-	// (korean/desserts/coffee/healthy/fastfood/spicy/meat/bbq before 🔴2) —
-	// ScoreTasteMatch cannot and must not tell the two apart, both mean "no
-	// explicit signal, fall back to implicit".
+	// cuisine tile, OR picked only tiles with no admin-configured dictionary
+	// link (foodie_option_cuisines, spec
+	// foodie-profile-admin-dictionaries-20260916.md 🔴1 = A) — ScoreTasteMatch
+	// cannot and must not tell the two apart, both mean "no explicit signal,
+	// fall back to implicit".
 	CuisineCodes []string
 	// Budget is the guest's wizard budget tier translated to PriceCategory
-	// (FoodieBudgetTierToPriceCategory). Nil when the guest never answered
-	// the budget step.
+	// via the foodie_options.price_category column (kind=budget). Nil when
+	// the guest never answered the budget step, or answered with a tier that
+	// has no ₸-equivalent set (spec 3.10).
 	Budget *PriceCategory
-	// Diets are the guest's wizard diet ids (FoodieDietIDs), verbatim. May
+	// Diets are the guest's wizard diet ids, verbatim. May
 	// include FoodieDietExclusiveID ("no_diet"), which ScoreTasteMatch
 	// deliberately never scores (§5.2: "no_diet → сигнал не считается").
 	Diets []string
@@ -211,36 +214,45 @@ var dietAxes = []dietAxis{
 
 func noVenueDietAxis(VenueTasteSignals) (int, string) { return 0, "no venue axis" }
 
-// FoodieCuisineDictionaryCodes maps a wizard cuisine tile id
-// (FoodieCuisineIDs) to the cuisine-dictionary codes (Cuisine.Code) it
-// stands for, per spec §5.2. A tile absent from this map — korean (dictionary
-// code does not exist yet, 🔴2), meat/bbq/desserts/coffee/healthy/fastfood/
-// spicy (no axis at all) — has NO entry, on purpose: MapFoodieCuisinesToDictionaryCodes
-// and ScoreTasteMatch treat a missing key exactly like an empty slice (0
-// points, never a panic or an error), which is what criterion 3 requires.
-//
-// This is the ONLY place the wizard-tile ↔ dictionary mapping is written
-// down; changing it (e.g. once the superadmin adds `korean` to the
-// dictionary) is a one-line, no-migration change (§0 answer 2).
-var FoodieCuisineDictionaryCodes = map[string][]string{
-	FoodieCuisineKazakh:   {"kazakh"},
-	FoodieCuisineAsian:    {"pan_asian", "japanese", "indian"},
-	FoodieCuisineEuropean: {"european", "french", "mediterranean", "greek"},
-	FoodieCuisineJapanese: {"japanese"},
-	FoodieCuisineItalian:  {"italian"},
-	FoodieCuisineSeafood:  {"seafood"},
-	FoodieCuisineVegan:    {"vegan"},
+// FoodieDietHasVenueAxis reports whether id is one of the diets dietAxes
+// actually scores against a real venue signal (today: halal, vegan,
+// no_gluten, pescetarian — the rows above whose score func is NOT
+// noVenueDietAxis). It exists for FoodieOption.AffectsMatching's "Влияет на
+// подбор" column (spec criterion 5) to ask "does a rule exist for this
+// code" WITHOUT reimplementing or exposing what the rule computes — 🔴2 = A
+// keeps that rule exclusively in dietAxes above, this only reports its
+// domain (the set of ids it is defined for), not its range. Compares the
+// axis's score func by pointer against noVenueDietAxis rather than probing
+// it with a synthetic venue, so it stays correct even if a future axis needs
+// several signals at once to ever score above 0.
+func FoodieDietHasVenueAxis(id string) bool {
+	noAxis := reflect.ValueOf(noVenueDietAxis).Pointer()
+	for _, axis := range dietAxes {
+		if axis.id == id {
+			return reflect.ValueOf(axis.score).Pointer() != noAxis
+		}
+	}
+	return false
 }
 
-// MapFoodieCuisinesToDictionaryCodes expands wizard tile ids through
-// FoodieCuisineDictionaryCodes into cuisine-dictionary codes, de-duplicated.
-// A tile with no entry in the table (unmapped tile, or an unknown id)
-// contributes nothing — never an error, matching criterion 3.
-func MapFoodieCuisinesToDictionaryCodes(tiles []string) []string {
+// MapFoodieCuisinesToDictionaryCodes expands wizard cuisine-tile ids through
+// mapping (tile code -> cuisine-dictionary codes) into cuisine-dictionary
+// codes, de-duplicated. A tile absent from mapping (unmapped tile, e.g.
+// korean/meat/bbq/desserts/coffee/healthy/fastfood/spicy before an admin
+// links it — spec foodie-profile-admin-dictionaries-20260916.md 🔴1 = A — or
+// simply an unknown id) contributes nothing — never an error, matching
+// criterion 3 of the parent taste-match spec.
+//
+// mapping used to be the package-level constant FoodieCuisineDictionaryCodes;
+// since migration 0110 the tile -> cuisine-codes link is admin-editable data
+// (foodie_option_cuisines), so the caller (usecase/tastematch.Loader) reads
+// it from domain.FoodieOptionRepository and passes it in — this function
+// stays a pure, allocation-only mapper with no repository of its own.
+func MapFoodieCuisinesToDictionaryCodes(tiles []string, mapping map[string][]string) []string {
 	out := make([]string, 0, len(tiles))
 	seen := make(map[string]struct{}, len(tiles))
 	for _, tile := range tiles {
-		for _, code := range FoodieCuisineDictionaryCodes[tile] {
+		for _, code := range mapping[tile] {
 			if _, dup := seen[code]; dup {
 				continue
 			}
@@ -249,15 +261,6 @@ func MapFoodieCuisinesToDictionaryCodes(tiles []string) []string {
 		}
 	}
 	return out
-}
-
-// FoodieBudgetTierToPriceCategory bridges the wizard's budget tier ids
-// (FoodieBudgetTierIDs) to the venue-side PriceCategory scale, per §5.2:
-// "budget ↔ ₸, mid ↔ ₸₸, premium ↔ ₸₸₸".
-var FoodieBudgetTierToPriceCategory = map[string]PriceCategory{
-	FoodieBudgetTierBudget:  PriceLow,
-	FoodieBudgetTierMid:     PriceMid,
-	FoodieBudgetTierPremium: PriceHigh,
 }
 
 // priceCategoryTier orders PriceCategory for the budget_match "adjacent

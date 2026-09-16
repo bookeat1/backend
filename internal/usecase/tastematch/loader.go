@@ -52,6 +52,22 @@ type cuisineReader interface {
 	ListByRestaurants(ctx context.Context, restaurantIDs []uuid.UUID) (map[uuid.UUID][]domain.Cuisine, error)
 }
 
+// optionMappingReader is the minimal slice of the foodie-option dictionary
+// repository this package needs: the tile -> cuisine-dictionary-codes and
+// budget-tier -> PriceCategory links (spec
+// foodie-profile-admin-dictionaries-20260916.md, 🔴1 = A), which used to be
+// the Go maps domain.FoodieCuisineDictionaryCodes/FoodieBudgetTierToPriceCategory
+// and are now admin-editable data. A local port, not
+// domain.FoodieOptionRepository directly: that interface's shape (List/
+// Create/Update/...) is for the admin CRUD usecase, and matching it exactly
+// here would pull in methods this package never calls. Bound in
+// bootstrap/deps.go to *foodieoption.Repository's own LoadTasteMappings,
+// which reads both maps in ONE query — see that method's doc for why it is
+// not List() twice.
+type optionMappingReader interface {
+	LoadTasteMappings(ctx context.Context) (cuisineTiles map[string][]string, budgetTiers map[string]domain.PriceCategory, err error)
+}
+
 // bookingReader is the minimal slice of the booking repository this package
 // needs. See domain.BookingRepository.ListBookedRestaurantIDs for the
 // "бронировал" definition (status ∉ {cancelled}).
@@ -64,28 +80,33 @@ type loader struct {
 	users    userReader
 	cuisines cuisineReader
 	bookings bookingReader
+	options  optionMappingReader
 }
 
 // NewLoader constructs a Loader. foodie is domain.FoodieProfileRepository
 // directly (not a local port): it is domain's own contract for exactly this
 // data, the same dependency usecase/users already takes unwrapped.
-func NewLoader(foodie domain.FoodieProfileRepository, users userReader, cuisines cuisineReader, bookings bookingReader) Loader {
-	return &loader{foodie: foodie, users: users, cuisines: cuisines, bookings: bookings}
+func NewLoader(foodie domain.FoodieProfileRepository, users userReader, cuisines cuisineReader, bookings bookingReader, options optionMappingReader) Loader {
+	return &loader{foodie: foodie, users: users, cuisines: cuisines, bookings: bookings, options: options}
 }
 
 // LoadTasteProfile reads the caller's foodie profile (explicit cuisines
-// mapped through domain.FoodieCuisineDictionaryCodes, diets verbatim, budget
-// translated to a PriceCategory) and the cuisines of every restaurant they
-// have a non-cancelled booking at.
+// mapped through the admin-editable foodie_option_cuisines link, diets
+// verbatim, budget translated to a PriceCategory via foodie_options.
+// price_category) and the cuisines of every restaurant they have a
+// non-cancelled booking at.
 //
-// Four reads, not fewer: the foodie-profile multi-value tables, the user row
-// (budget), the booking list, and (only when there IS a booking) the
-// cuisine-dictionary lookup for those restaurants. BE-2's own per-request
-// budget (spec criterion 13, "не более 4 SQL-запросов на ответ") is a
+// Five reads, not fewer: the foodie-profile multi-value tables, the user row
+// (budget), the booking list, the tile/budget mapping (ONE query — see
+// LoadTasteMappings), and (only when there IS a booking) the cuisine-
+// dictionary lookup for those restaurants. BE-2's own per-request budget
+// (spec criterion 13 of foodie-personalization-v1-20260916.md, "не более 4
+// SQL-запросов на ответ", amended by criterion 13 of
+// foodie-profile-admin-dictionaries-20260916.md to "+1, 15 -> ≤16") is a
 // DIFFERENT budget that also has to cover candidate venues and the manual
 // pick list — reconciling the two is BE-2's job, not this function's; this
-// function does the minimum work ITS OWN four inputs require and no more
-// (the cuisine lookup is skipped entirely for a guest with no bookings).
+// function does the minimum work ITS OWN inputs require and no more (the
+// cuisine lookup is skipped entirely for a guest with no bookings).
 func (l *loader) LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain.TasteProfile, error) {
 	prefs, err := l.foodie.Get(ctx, userID)
 	if err != nil {
@@ -96,9 +117,14 @@ func (l *loader) LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain
 		return domain.TasteProfile{}, err
 	}
 
+	cuisineTiles, budgetTiers, err := l.options.LoadTasteMappings(ctx)
+	if err != nil {
+		return domain.TasteProfile{}, err
+	}
+
 	var budget *domain.PriceCategory
 	if u.FoodieBudgetTier != nil {
-		if pc, ok := domain.FoodieBudgetTierToPriceCategory[*u.FoodieBudgetTier]; ok {
+		if pc, ok := budgetTiers[*u.FoodieBudgetTier]; ok {
 			budget = &pc
 		}
 	}
@@ -118,7 +144,7 @@ func (l *loader) LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain
 	}
 
 	return domain.TasteProfile{
-		CuisineCodes:        domain.MapFoodieCuisinesToDictionaryCodes(prefs.Cuisines),
+		CuisineCodes:        domain.MapFoodieCuisinesToDictionaryCodes(prefs.Cuisines, cuisineTiles),
 		Budget:              budget,
 		Diets:               prefs.Diets,
 		BookedCuisineCodes:  bookedCuisineCodes,

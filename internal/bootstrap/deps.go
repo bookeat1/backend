@@ -35,6 +35,7 @@ import (
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
+	foodieoptionrepo "backend-core/internal/infrastructure/postgres/foodieoption"
 	foodieprofilerepo "backend-core/internal/infrastructure/postgres/foodieprofile"
 	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
@@ -82,6 +83,7 @@ import (
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
+	foodieoptionsuc "backend-core/internal/usecase/foodieoptions"
 	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
@@ -120,6 +122,10 @@ type Deps struct {
 	AuthMiniApp *auth.MiniAppUseCase
 	Cities      citiesuc.UseCase
 	Cuisines    cuisinesuc.UseCase
+	// FoodieOptions is the "Фуди-профиль" option dictionary (migration 0110):
+	// the public GET /foodie-profile/options the wizard reads plus the
+	// superadmin CRUD behind it.
+	FoodieOptions foodieoptionsuc.UseCase
 	// AppVersion is the mobile update gate: the public launch check and the
 	// superadmin screen behind it (migration 0103).
 	AppVersion appversionuc.UseCase
@@ -270,6 +276,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	otpRepo := otprepo.New(db)
 	userCuisineRepo := usercuisinerepo.New(db)
 	foodieProfileRepo := foodieprofilerepo.New(db)
+	// The foodie-profile OPTION dictionary (migration 0110, spec
+	// foodie-profile-admin-dictionaries-20260916.md) — distinct from
+	// foodieProfileRepo above, which holds a GUEST's picks; this one is the
+	// platform's list of what can be picked. Built here (not next to
+	// cuisinesUC below) because usersuc.NewFacade needs it for
+	// ReplaceFoodieProfile's code validation, ahead of the admin usecase.
+	foodieOptionRepo := foodieoptionrepo.New(db)
 	// Built here, ahead of the other booking wiring below, because the OTP
 	// usecase needs it: a successful phone verification hands the guest the
 	// bookings that were made for their number before they had an account.
@@ -380,7 +393,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// (one per BE task, before they were integrated) collided on the name
 	// `tasteLoader` and failed to build; there is nothing per-surface in the
 	// Loader itself, so one instance is correct, not just convenient.
-	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo)
+	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo, foodieOptionRepo)
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -543,6 +556,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// cuisine_type string (UpdateCuisineTypeString) and restaurantManagers as
 	// the venue permission check, so the usecase depends on neither package.
 	cuisinesUC := cuisinesuc.NewUseCase(cuisinerepo.New(db), restRepo, restaurantManagers, txm)
+	// The foodie-profile OPTION dictionary's admin CRUD + public read (spec
+	// foodie-profile-admin-dictionaries-20260916.md, BE-2). cuisinerepo.New(db)
+	// again here is the cuisine-tile link's resolver (🔴1 = A) — a stateless,
+	// cheap-to-construct-twice repo, same reasoning as tasteLoader's own
+	// cuisine reader above.
+	foodieOptionsUC := foodieoptionsuc.NewUseCase(foodieOptionRepo, cuisinerepo.New(db), txm)
 	// The venue-feature dictionary (migration 0082). Unlike cuisines it has NO
 	// derived scalar column to keep in step — the free-text restaurant_features
 	// table it replaces was dropped, not kept as a rendering — so it needs no
@@ -623,7 +642,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	return &Deps{
 		AuthFacade:            authFacade,
 		AuthOTP:               authOTP,
-		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, refreshRepo, otpRepo, txm),
+		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, foodieOptionRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
 		HomePicks:             homePicksFacade,
@@ -635,6 +654,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		AppVersion:            appVersionUC,
 		PlatformPages:         platformPagesUC,
 		Cuisines:              cuisinesUC,
+		FoodieOptions:         foodieOptionsUC,
 		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,

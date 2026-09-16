@@ -14,6 +14,7 @@ import (
 	"backend-core/internal/domain"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	cuisinerepo "backend-core/internal/infrastructure/postgres/cuisine"
+	foodieoptionrepo "backend-core/internal/infrastructure/postgres/foodieoption"
 	"backend-core/internal/infrastructure/postgres/foodieprofile"
 	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
 	restaurantrepo "backend-core/internal/infrastructure/postgres/restaurant"
@@ -33,10 +34,17 @@ import (
 // real Postgres, wired exactly like bootstrap/deps.go wires them (minus
 // WithVenueState — see TestQueryBudget's own comment on why).
 
+// foodie_options is truncated here for the same reason
+// usecase/tastematch/loader_test.go's own loaderTables truncates it: `go
+// test ./...` runs packages concurrently against one shared Postgres, and
+// infrastructure/postgres/foodieoption's tests also truncate this table —
+// relying on the migration-0110 seed surviving until THIS package's tests
+// run would make the outcome depend on inter-package test order/timing.
+// h.seedCuisine below (re)creates exactly the tile rows each test needs.
 var foryouTables = []string{
 	"user_foodie_cuisines", "user_foodie_diets", "user_foodie_allergies",
 	"bookings", "home_picks", "restaurant_cuisines", "cuisine_aliases", "cuisines",
-	"restaurants", "users",
+	"foodie_options", "restaurants", "users",
 }
 
 type harness struct {
@@ -54,7 +62,7 @@ func newHarness(t *testing.T) *harness {
 	ctx := context.Background()
 
 	txm := sqltx.NewManager(pool)
-	loader := tastematch.NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool))
+	loader := tastematch.NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool), foodieoptionrepo.New(pool))
 	catalog := restaurants.NewFacade(restaurantrepo.New(pool), restaurantrepo.NewRelated(pool),
 		restaurantrepo.NewCategories(pool), restaurantrepo.NewPartnership(pool), txm)
 	picksRepo := homepicksrepo.New(pool, txm)
@@ -73,13 +81,44 @@ func (h *harness) seedUser(t *testing.T, budget *string) uuid.UUID {
 	return id
 }
 
-func (h *harness) seedCuisine(t *testing.T, code string) uuid.UUID {
+// seedCuisine inserts a cuisine-dictionary entry. tileCodes are OPTIONAL —
+// pass a wizard cuisine-tile code (usually the same string as code, e.g.
+// "italian") to also link this cuisine to that tile's foodie_options row,
+// creating the row if absent (foryouTables truncates foodie_options, see its
+// own comment). Omit tileCodes for a cuisine used only as a candidate venue's
+// cuisine that the guest's profile is NOT expected to match (a decoy).
+func (h *harness) seedCuisine(t *testing.T, code string, tileCodes ...string) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	if _, err := h.pool.Exec(h.ctx, `INSERT INTO cuisines (id, code, name) VALUES ($1,$2,$3)`, id, code, code); err != nil {
 		t.Fatalf("seed cuisine %s: %v", code, err)
 	}
+	for _, tile := range tileCodes {
+		h.linkFoodieCuisineTile(t, tile, id)
+	}
 	return id
+}
+
+// linkFoodieCuisineTile ensures a cuisine-kind foodie_options row for tile
+// exists and links it to cuisineID in foodie_option_cuisines — same helper
+// as usecase/tastematch/loader_test.go's own linkFoodieCuisineTile, not
+// shared across packages (both are test-only, six-line SQL helpers).
+func (h *harness) linkFoodieCuisineTile(t *testing.T, tile string, cuisineID uuid.UUID) {
+	t.Helper()
+	var optionID uuid.UUID
+	err := h.pool.QueryRow(h.ctx,
+		`INSERT INTO foodie_options (id, kind, code, name, is_active)
+		 VALUES ($1, 'cuisine', $2, $2, true)
+		 ON CONFLICT (kind, code) DO UPDATE SET updated_at = now()
+		 RETURNING id`, uuid.New(), tile).Scan(&optionID)
+	if err != nil {
+		t.Fatalf("seed foodie option tile %s: %v", tile, err)
+	}
+	if _, err := h.pool.Exec(h.ctx,
+		`INSERT INTO foodie_option_cuisines (option_id, cuisine_id) VALUES ($1,$2)
+		 ON CONFLICT (option_id, cuisine_id) DO NOTHING`, optionID, cuisineID); err != nil {
+		t.Fatalf("link foodie cuisine tile %s: %v", tile, err)
+	}
 }
 
 func (h *harness) seedRestaurant(t *testing.T, name string, popular, hidden bool, cuisineIDs ...uuid.UUID) uuid.UUID {
@@ -125,7 +164,7 @@ func TestIntegration_ActiveProfileScoresRealCandidates(t *testing.T) {
 	uid := h.seedUser(t, nil)
 	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian)
 
-	italianID := h.seedCuisine(t, "italian")
+	italianID := h.seedCuisine(t, "italian", "italian")
 	georgianID := h.seedCuisine(t, "georgian")
 	match := h.seedRestaurant(t, "Итальянское", false, false, italianID)
 	noMatch := h.seedRestaurant(t, "Грузинское", false, false, georgianID)
@@ -152,7 +191,7 @@ func TestIntegration_CandidatesAreFilteredByCityAndHiddenFromHome(t *testing.T) 
 	h := newHarness(t)
 	uid := h.seedUser(t, nil)
 	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian)
-	italianID := h.seedCuisine(t, "italian")
+	italianID := h.seedCuisine(t, "italian", "italian")
 
 	almaty := h.seedRestaurant(t, "Алматинское", false, false, italianID)
 	hidden := h.seedRestaurant(t, "Скрытое", false, true, italianID)
@@ -182,8 +221,8 @@ func TestIntegration_DiversityWorkedExample(t *testing.T) {
 	h := newHarness(t)
 	uid := h.seedUser(t, nil)
 	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian, domain.FoodieCuisineKazakh)
-	italianID := h.seedCuisine(t, "italian")
-	kazakhID := h.seedCuisine(t, "kazakh")
+	italianID := h.seedCuisine(t, "italian", "italian")
+	kazakhID := h.seedCuisine(t, "kazakh", "kazakh")
 
 	// Explicit, increasing display_order — §5.5.2's own tie-break — so the
 	// pre-diversify order is deterministic (italians first, kazakh last)
@@ -260,7 +299,7 @@ func TestIntegration_EditorialPickBonusFromTheRealManualList(t *testing.T) {
 	h := newHarness(t)
 	uid := h.seedUser(t, nil)
 	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian)
-	italianID := h.seedCuisine(t, "italian")
+	italianID := h.seedCuisine(t, "italian", "italian")
 	venue := h.seedRestaurant(t, "Редакторское", false, false, italianID)
 
 	if err := h.picks.Replace(h.ctx, string(domain.CityAlmaty), []uuid.UUID{venue}); err != nil {
@@ -280,8 +319,8 @@ func TestIntegration_EditorialPickBonusFromTheRealManualList(t *testing.T) {
 // their OWN scored items — nothing here is memoized per-process across calls.
 func TestIntegration_TwoGuestsInARowGetTheirOwnItems(t *testing.T) {
 	h := newHarness(t)
-	italianID := h.seedCuisine(t, "italian")
-	kazakhID := h.seedCuisine(t, "kazakh")
+	italianID := h.seedCuisine(t, "italian", "italian")
+	kazakhID := h.seedCuisine(t, "kazakh", "kazakh")
 	italianVenue := h.seedRestaurant(t, "Итальянское", false, false, italianID)
 	kazakhVenue := h.seedRestaurant(t, "Казахское", false, false, kazakhID)
 
@@ -346,7 +385,7 @@ func TestQueryBudget(t *testing.T) {
 	h := newHarness(t)
 	uid := h.seedUser(t, nil)
 	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian)
-	italianID := h.seedCuisine(t, "italian")
+	italianID := h.seedCuisine(t, "italian", "italian")
 	h.seedRestaurant(t, "Итальянское", false, false, italianID)
 
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -362,7 +401,7 @@ func TestQueryBudget(t *testing.T) {
 	defer tracedPool.Close()
 
 	txm := sqltx.NewManager(tracedPool)
-	loader := tastematch.NewLoader(foodieprofile.New(tracedPool), userrepo.New(tracedPool), cuisinerepo.New(tracedPool), bookingrepo.New(tracedPool))
+	loader := tastematch.NewLoader(foodieprofile.New(tracedPool), userrepo.New(tracedPool), cuisinerepo.New(tracedPool), bookingrepo.New(tracedPool), foodieoptionrepo.New(tracedPool))
 	catalog := restaurants.NewFacade(restaurantrepo.New(tracedPool), restaurantrepo.NewRelated(tracedPool),
 		restaurantrepo.NewCategories(tracedPool), restaurantrepo.NewPartnership(tracedPool), txm)
 	rail := homepicks.NewFacade(homepicksrepo.New(tracedPool, txm), catalog)
