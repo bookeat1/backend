@@ -94,17 +94,26 @@ func TestSearchNormalizedFuzzyMatch(t *testing.T) {
 		if !containsID(items, tomYum) {
 			t.Errorf("query %q did not find TomYumBar; got %d results", q, len(items))
 		}
+		// Not just "found it somewhere" — this exact seeded set must return
+		// ONLY TomYumBar. A regression that widens the match (e.g. the
+		// threshold picked too low) would silently start pulling in Paris
+		// Cafe/Coffeeshka too, and `containsID` alone would still pass.
+		if len(items) != 1 {
+			t.Errorf("query %q matched %d venues, want exactly 1 (TomYumBar): %v", q, len(items), ids(items))
+		}
 	}
 
-	// A short, unrelated query must not fuzzy-match everything in the
-	// seeded set via the lowered normalized threshold — this is the noise
-	// regression the lowered threshold could introduce if picked too high.
-	noise, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: "aaa"})
+	// A near-miss in the 0.3-0.5 band (word_similarity of "tomato" against
+	// "TomYumBar" normalized is ~0.43 — real overlap, below the 0.5 cutoff)
+	// is the actual noise risk the threshold has to hold the line against;
+	// "aaa" shares no trigrams with anything seeded and would pass even at
+	// threshold 0, so it proves nothing about where the cutoff sits.
+	nearMiss, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: "tomato"})
 	if err != nil {
-		t.Fatalf("noise search: %v", err)
+		t.Fatalf("near-miss search: %v", err)
 	}
-	if len(noise) != 0 {
-		t.Errorf("unrelated short query %q matched %d venues, want 0 (noise regression): %v", "aaa", len(noise), ids(noise))
+	if containsID(nearMiss, tomYum) {
+		t.Errorf("near-miss query %q matched TomYumBar via the normalized branch (threshold too low): %v", "tomato", ids(nearMiss))
 	}
 }
 

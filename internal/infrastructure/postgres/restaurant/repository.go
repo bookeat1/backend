@@ -525,6 +525,18 @@ const normalizedSearchTextExpr = `regexp_replace(lower(` + searchTextExpr + `), 
 // unrelated queries ("bar", "paris", "pizza") against the same seeded venues
 // scored 0.17-0.33, comfortably below. Verified empirically against a seeded
 // Postgres 16, see internal/infrastructure/postgres/restaurant/search_test.go.
+//
+// POSITIONAL CAVEAT (review, 2026-09-16): this branch compares the query
+// against the WHOLE concatenated document (name+description+i18n), so a hit
+// depends on where the match falls. "TomYumBar" opening the document scores
+// 0.57 (hit); the identical substring inside "Cafe TomYumBar" or in
+// name_i18n only scores 0.29 (miss) — trigram padding at the START of the
+// document isn't there mid-string. The reported bug (typo'd name AT THE
+// START of a venue's own name) is fixed; a typo'd match buried mid-document
+// is not, and isn't expected to be by this branch. Fixing that would mean
+// comparing the normalized query against r.name and each name_i18n value
+// separately instead of the joined document — not done here, out of scope
+// for the reported bug.
 const normalizedMatchThreshold = 0.5
 
 // menuSearchTextExpr is the exact SQL expression the two GIN indexes in
