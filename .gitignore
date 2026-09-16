@@ -16,6 +16,7 @@ coverage.*
 
 # stray go build artifacts from `go build ./cmd/...`
 /etl
+/import2gis-alpine
 
 # swag's Go wrapper is generated but never imported: the spec we commit is
 # swagger.json/yaml. Keeping docs.go would drag swaggo into go.mod for nothing —

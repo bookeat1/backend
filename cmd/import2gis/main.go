@@ -230,6 +230,12 @@ var chipCodeToFeatureCode = map[string]string{
 	"pet_friendly":   "pets",
 	"panoramic_view": "view",
 	"takeaway":       "takeaway",
+	"business_lunch": "business_lunch",
+	"parking":        "parking",
+	"live_music":     "live_music",
+	// 2gis's own label for "vegetarian" is literally "Вегетарианское меню" —
+	// the same wording as the dictionary entry, not just a related concept.
+	"vegetarian": "vegetarian_menu",
 }
 
 // ---- fuzzy name matching ----------------------------------------------------
