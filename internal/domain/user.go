@@ -46,9 +46,13 @@ type User struct {
 	CountryCode *string
 	// BirthDate is a plain calendar date (time-of-day is always midnight UTC).
 	// Nullable until the guest fills their profile.
-	BirthDate       *time.Time
-	EmailVerifiedAt *time.Time
-	PhoneVerifiedAt *time.Time
+	BirthDate *time.Time
+	// FoodieBudgetTier is the single-value answer of the foodie-profile
+	// wizard's budget step (one of FoodieBudgetTierIDs), or nil when the
+	// guest skipped the (optional) step or never opened the wizard.
+	FoodieBudgetTier *string
+	EmailVerifiedAt  *time.Time
+	PhoneVerifiedAt  *time.Time
 	// DeletedAt marks a soft-deleted account: non-nil means the account was
 	// closed by its owner. The row is kept (bookings/payments reference it) but
 	// personal data has been scrubbed — see UserRepository.Delete.
@@ -65,10 +69,11 @@ type UserRepository interface {
 	GetByPhone(ctx context.Context, phone string) (*User, error)
 	Update(ctx context.Context, u *User) error
 	// Delete soft-deletes and anonymizes the user in one atomic write: sets
-	// DeletedAt, clears email/phone/full_name/avatar/birth_date/country_code,
-	// and flips IsActive false. Bookings/payments keep their user_id reference
-	// unchanged — only the users row itself is scrubbed. Idempotent: calling it
-	// again on an already-deleted user is a no-op success, not an error.
+	// DeletedAt, clears email/phone/full_name/avatar/birth_date/country_code/
+	// foodie_budget_tier, and flips IsActive false. Bookings/payments keep
+	// their user_id reference unchanged — only the users row itself is
+	// scrubbed. Idempotent: calling it again on an already-deleted user is a
+	// no-op success, not an error.
 	// Returns ErrNotFound only when no user with that id exists at all.
 	Delete(ctx context.Context, id uuid.UUID) error
 }

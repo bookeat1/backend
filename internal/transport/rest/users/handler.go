@@ -33,6 +33,8 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	g.DELETE("/me", h.deleteMe)
 	g.POST("/me/phone/otp/request", h.requestPhoneChange)
 	g.POST("/me/phone/otp/verify", h.verifyPhoneChange)
+	g.GET("/me/foodie-profile", h.getFoodieProfile)
+	g.PUT("/me/foodie-profile", h.replaceFoodieProfile)
 }
 
 // me returns the authenticated user's profile.
@@ -206,4 +208,70 @@ func (h *Handler) verifyPhoneChange(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, fromDomain(u, cuisineIDs))
+}
+
+// getFoodieProfile returns the authenticated user's "Фуди-профиль" wizard
+// state (mobile PR #222): cuisines/diets/allergies picks and the optional
+// budget tier. A user who never opened the wizard gets empty lists and a
+// null budget, not a 404.
+// @Summary     Get the current user's foodie profile
+// @Description Returns the guest's cuisine/diet/allergy picks and budget tier
+// @Description from the "Фуди-профиль" wizard. Empty lists and null budget
+// @Description for a guest who never opened the wizard.
+// @Tags        users
+// @Produce     json
+// @Security    BearerAuth
+// @Success     200 {object} response.Envelope{data=foodieProfileResponse}
+// @Failure     401 {object} response.Envelope "unauthorized"
+// @Router      /api/v1/users/me/foodie-profile [get]
+func (h *Handler) getFoodieProfile(c *gin.Context) {
+	au, ok := middleware.GetAuthUser(c.Request.Context())
+	if !ok {
+		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	p, err := h.facade.GetFoodieProfile(c.Request.Context(), au.ID)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, foodieProfileFromDomain(p))
+}
+
+// replaceFoodieProfile overwrites the authenticated user's entire foodie
+// profile in one call (replace semantics — the wizard saves its whole draft
+// on the last screen, never one field at a time).
+// @Summary     Replace the current user's foodie profile
+// @Description Overwrites the guest's ENTIRE foodie profile (cuisines, diets,
+// @Description allergies, budget) in one call. Omitted arrays are treated as
+// @Description empty (cleared), matching the wizard's single final save.
+// @Description Validation: each id must be a known option; cuisines allows at
+// @Description most 5; "no_diet" cannot be combined with any other diet;
+// @Description budget must be one of budget/mid/premium or omitted/null.
+// @Tags        users
+// @Accept      json
+// @Produce     json
+// @Security    BearerAuth
+// @Param       body body replaceFoodieProfileRequest true "The wizard's whole draft"
+// @Success     200 {object} response.Envelope{data=foodieProfileResponse}
+// @Failure     401 {object} response.Envelope "unauthorized"
+// @Failure     422 {object} response.Envelope "validation failed"
+// @Router      /api/v1/users/me/foodie-profile [put]
+func (h *Handler) replaceFoodieProfile(c *gin.Context) {
+	au, ok := middleware.GetAuthUser(c.Request.Context())
+	if !ok {
+		response.Error(c.Writer, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req replaceFoodieProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	p, err := h.facade.ReplaceFoodieProfile(c.Request.Context(), au.ID, req.toInput())
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, foodieProfileFromDomain(p))
 }
