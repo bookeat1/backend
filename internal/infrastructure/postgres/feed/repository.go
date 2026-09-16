@@ -147,7 +147,12 @@ func tableFor(kind domain.FeedItemKind) string {
 // follow-up. It enforces domain.FeedEligible in SQL (published AND approved AND
 // inside the window AND at an active, not-hidden-from-home venue in the
 // requested city) and joins in, per candidate, the venue's published-review
-// aggregate and whether the venue's cuisine is one the guest chose.
+// aggregate plus its own taste signals (cuisines in link position order,
+// price tier, feature codes) — domain.ScoreFeedCard scores those in Go against
+// the guest's domain.TasteProfile (usecase/tastematch.Loader), which is how
+// the dead cuisine_match signal (it used to read user_cuisine_preferences,
+// never written by the foodie-profile wizard, spec
+// foodie-personalization-v1-20260916.md §5.1) was replaced — see §8 BE-3.
 //
 // A recurring series is collapsed to its nearest upcoming occurrence inside
 // the event branch, before the union — see the comment on eventBranch. The
@@ -155,9 +160,9 @@ func tableFor(kind domain.FeedItemKind) string {
 // what keeps the reported count and the pagination honest: the number the
 // client is told matches the set it can actually page through.
 //
-// $1 city, $2 the signed-in guest (NULL when anonymous — the prefs CTE is then
-// empty and every item scores a neutral 0 for the preference signal), $3 now,
-// $4 the candidate cap. Each parameter carries an explicit cast on first use:
+// $1 city, $2 now, $3 the candidate cap. q.UserID is NOT bound here any more —
+// the taste block is scored in Go, not SQL, so the repository no longer needs
+// to know who is asking. Each parameter carries an explicit cast on first use:
 // a bound parameter reused in several positions can otherwise be deduced into
 // two different types under the extended protocol (SQLSTATE 42P08).
 func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]domain.FeedItem, error) {
@@ -174,7 +179,7 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 	promoBranch := itemSelect(domain.FeedItemPromo) + `
 		WHERE ` + feedVisibleSQL + `
 		  AND i.status = 'published' AND i.feed_status = 'approved'
-		  AND i.starts_at <= $3::timestamptz AND i.ends_at > $3`
+		  AND i.starts_at <= $2::timestamptz AND i.ends_at > $2`
 	// A recurring series contributes exactly ONE card — its nearest upcoming
 	// occurrence — and it does so BEFORE the union, so the surviving card
 	// competes with promos on the very same ordering and ranking rules as any
@@ -198,20 +203,11 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		"row_number() OVER (PARTITION BY i.recurrence_id ORDER BY i.starts_at ASC, i.id ASC) AS rn") + `
 			WHERE ` + feedVisibleSQL + `
 			  AND i.status = 'published' AND i.feed_status = 'approved'
-			  AND i.ends_at > $3
+			  AND i.ends_at > $2
 		) ev
 		WHERE ev.recurrence_id IS NULL OR ev.rn = 1`
 
-	// prefs: the guest's picked cuisines. Until migration 0079 this read
-	// user_cuisine_preferences.category_id and compared it to
-	// restaurants.category_id — the VENUE TYPE dictionary, which was empty and
-	// which no restaurant referenced. matches_pref was therefore false for
-	// every card ever served, and the 400-point cuisine signal below has never
-	// once fired in production. It compares dictionary cuisines now.
-	sql := `WITH prefs AS (
-			SELECT cuisine_id FROM user_cuisine_preferences WHERE user_id = $2::uuid
-		),
-		candidates AS (
+	sql := `WITH candidates AS (
 			` + promoBranch + `
 			UNION ALL
 			` + eventBranch + `
@@ -219,10 +215,9 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 		SELECT c.*,
 			COALESCE(rt.avg_rating, 0)::float8 AS venue_rating,
 			COALESCE(rt.review_count, 0)::int  AS venue_review_count,
-			EXISTS (SELECT 1 FROM restaurant_cuisines rc
-			         JOIN prefs p ON p.cuisine_id = rc.cuisine_id
-			        WHERE rc.restaurant_id = c.restaurant_id) AS matches_pref,
-			EXISTS (SELECT 1 FROM prefs) AS has_prefs
+			COALESCE(rp.price_category, '')::varchar AS venue_price_category,
+			COALESCE(rcz.cuisine_codes, '{}'::varchar[]) AS venue_cuisine_codes,
+			COALESCE(rfz.feature_codes, '{}'::varchar[]) AS venue_feature_codes
 		FROM candidates c
 		-- LATERAL, not a platform-wide GROUP BY: the aggregate is computed for
 		-- the candidate venues only, using idx_reviews_published_listing.
@@ -231,12 +226,29 @@ func (r *Repository) ListCandidates(ctx context.Context, q domain.FeedQuery) ([]
 			FROM reviews rv
 			WHERE rv.restaurant_id = c.restaurant_id AND rv.status = 'published'
 		) rt ON true
+		-- The venue's own price tier — c.restaurant_id is NULL for a platform
+		-- item, so this join (and the two below) simply finds no row and the
+		-- COALESCE above projects the neutral empty value.
+		LEFT JOIN restaurants rp ON rp.id = c.restaurant_id
+		-- Cuisine codes in LINK POSITION order (position 0 = the venue's main
+		-- cuisine) — domain.VenueTasteSignals.CuisineCodes' own documented
+		-- order, same ordering cuisine.Repository.ListByRestaurants uses.
+		LEFT JOIN LATERAL (
+			SELECT array_agg(cu.code ORDER BY rc.position, cu.display_order, cu.name) AS cuisine_codes
+			FROM restaurant_cuisines rc JOIN cuisines cu ON cu.id = rc.cuisine_id
+			WHERE rc.restaurant_id = c.restaurant_id
+		) rcz ON true
+		LEFT JOIN LATERAL (
+			SELECT array_agg(vf.code ORDER BY rvf.position, vf.display_order, vf.name) AS feature_codes
+			FROM restaurant_venue_features rvf JOIN venue_features vf ON vf.id = rvf.feature_id
+			WHERE rvf.restaurant_id = c.restaurant_id
+		) rfz ON true
 		-- A deterministic pre-order so the LIMIT truncation itself is
 		-- reproducible; the domain ranking re-orders exactly these rows.
 		ORDER BY c.feed_placement_weight DESC, c.ends_at ASC, c.id ASC
-		LIMIT $4`
+		LIMIT $3`
 
-	rows, err := sqltx.From(ctx, r.pool).Query(ctx, sql, string(q.City), q.UserID, q.Now, limit)
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, sql, string(q.City), q.Now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list feed candidates: %w", err)
 	}
@@ -529,7 +541,7 @@ func scanCandidate(row pgx.Row) (*domain.FeedItem, error) {
 		&it.Placement.ReviewedAt, &it.Placement.RejectionReason, &it.Placement.PlacementWeight,
 		&it.CreatedAt,
 		&it.RestaurantRating, &it.RestaurantReviewCount,
-		&it.MatchesCuisinePreference, &it.HasCuisinePreferences,
+		&it.RestaurantPriceCategory, &it.RestaurantCuisineCodes, &it.RestaurantFeatureCodes,
 	); err != nil {
 		return nil, err
 	}

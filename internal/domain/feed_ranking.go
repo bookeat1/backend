@@ -27,19 +27,18 @@ const (
 	// FeedSignalVenueRating rewards venues guests actually rate well, so paid
 	// placement cannot be the only way up.
 	FeedSignalVenueRating FeedSignalCode = "venue_rating"
-	// FeedSignalCuisineMatch rewards a match with the signed-in guest's own
-	// cuisine preferences (user_cuisine_preferences, migration 0021).
-	FeedSignalCuisineMatch FeedSignalCode = "cuisine_match"
 )
 
 // Scoring constants. They are plain integers on ONE scale (points) rather than
 // normalized weights: an explainable score is one a human can add up in their
 // head. The relative sizes encode the product intent —
 //   - a full paid placement (1000) can outrank any single organic signal but
-//     NOT the sum of them (300+250+200+400 = 1150), so money buys reach and
-//     never buys immunity from being beaten by genuinely relevant content;
-//   - a personal cuisine match (400) is the strongest organic signal, because
-//     relevance is what makes the rail worth opening.
+//     NOT the sum of them (300+250+200 = 750, plus the taste block below), so
+//     money buys reach and never buys immunity from being beaten by genuinely
+//     relevant content;
+//   - the guest's own taste (ScoreTasteMatch, up to 1000 via ScoreFeedCard) is
+//     the strongest organic signal, because relevance is what makes the rail
+//     worth opening — see ScoreFeedCard, not this function, for that block.
 const (
 	// feedPlacementPointsPerWeight maps the 0..100 weight onto 0..1000 points.
 	feedPlacementPointsPerWeight = 10
@@ -60,8 +59,6 @@ const (
 	feedRatingBaseline      = 3.0
 	feedRatingPointsPerStar = 100
 	feedRatingMaxPoints     = 200
-
-	feedCuisineMatchPoints = 400
 )
 
 // Freshness / urgency thresholds, named so the buckets read as product rules.
@@ -83,7 +80,8 @@ type FeedScoreReason struct {
 
 // FeedScore is a card's total plus the full breakdown that produced it. Reasons
 // are always emitted in the same fixed order (placement, freshness, ending
-// soon, rating, cuisine), so two identical inputs render identically.
+// soon, rating — ScoreFeedCard appends the taste block after these four in
+// ScoreTasteMatch's own order), so two identical inputs render identically.
 type FeedScore struct {
 	Total   int
 	Reasons []FeedScoreReason
@@ -102,22 +100,20 @@ type FeedSignals struct {
 	// Rating / ReviewCount is the venue's published-review aggregate.
 	Rating      float64
 	ReviewCount int
-	// MatchesCuisinePreference / HasCuisinePreferences: see FeedItem.
-	MatchesCuisinePreference bool
-	HasCuisinePreferences    bool
 }
 
-// FeedSignalsOf extracts the ranking input from a feed item. Kept next to the
-// scorer so the mapping is visible in one place rather than hidden in a usecase.
+// FeedSignalsOf extracts ScoreFeedItem's OWN four signals from a feed item —
+// placement, freshness, ending soon, venue rating. It deliberately does NOT
+// carry the taste block any more (§5.3's dead cuisine_match signal, replaced
+// by ScoreFeedCard's own domain.ScoreTasteMatch call); kept next to the scorer
+// so the mapping is visible in one place rather than hidden in a usecase.
 func FeedSignalsOf(item FeedItem) FeedSignals {
 	return FeedSignals{
-		PlacementWeight:          item.Placement.PlacementWeight,
-		CreatedAt:                item.CreatedAt,
-		EndsAt:                   item.EndsAt,
-		Rating:                   item.RestaurantRating,
-		ReviewCount:              item.RestaurantReviewCount,
-		MatchesCuisinePreference: item.MatchesCuisinePreference,
-		HasCuisinePreferences:    item.HasCuisinePreferences,
+		PlacementWeight: item.Placement.PlacementWeight,
+		CreatedAt:       item.CreatedAt,
+		EndsAt:          item.EndsAt,
+		Rating:          item.RestaurantRating,
+		ReviewCount:     item.RestaurantReviewCount,
 	}
 }
 
@@ -133,7 +129,7 @@ func FeedSignalsOf(item FeedItem) FeedSignals {
 // apart is what makes it impossible for a high score to smuggle an unapproved
 // item onto the main screen.
 func ScoreFeedItem(s FeedSignals, now time.Time) FeedScore {
-	reasons := make([]FeedScoreReason, 0, 5)
+	reasons := make([]FeedScoreReason, 0, 4)
 
 	// 1. Paid placement. Clamped rather than trusted: a hand-edited row must not
 	// be able to buy an unbounded score.
@@ -201,22 +197,122 @@ func ScoreFeedItem(s FeedSignals, now time.Time) FeedScore {
 	}
 	reasons = append(reasons, FeedScoreReason{Code: FeedSignalVenueRating, Points: ratingPoints, Detail: ratingDetail})
 
-	// 5. Cuisine preference. The "no preferences" path is a distinct, explicit
-	// case: an anonymous guest (or one who never picked a cuisine) gets 0 for
-	// EVERY item, which leaves the relative order of the other signals intact
-	// instead of flattening the personalized items to the bottom.
-	cuisinePoints, cuisineDetail := 0, "guest has no cuisine preferences"
-	switch {
-	case !s.HasCuisinePreferences:
-	case s.MatchesCuisinePreference:
-		cuisinePoints, cuisineDetail = feedCuisineMatchPoints, "matches the guest's cuisine preferences"
-	default:
-		cuisineDetail = "outside the guest's cuisine preferences"
-	}
-	reasons = append(reasons, FeedScoreReason{Code: FeedSignalCuisineMatch, Points: cuisinePoints, Detail: cuisineDetail})
-
 	total := 0
 	for _, r := range reasons {
+		total += r.Points
+	}
+	return FeedScore{Total: total, Reasons: reasons}
+}
+
+// feedTasteReasonCodes are the ONLY ScoreTasteMatch signals a feed card's
+// score includes — spec foodie-personalization-v1-20260916.md §5.3's last
+// paragraph / §4 criterion 15: "Total = ScoreFeedItem-сигналы + ScoreTasteMatch
+// (заведение карточки)". editorial_pick, venue_rating and popular are real
+// ScoreTasteMatch rows too, but are deliberately EXCLUDED here:
+//   - venue_rating would double-count FeedSignalVenueRating above (the same
+//     review aggregate, scored twice under two different codes);
+//   - editorial_pick and popular are /restaurants/picks-only concepts (a
+//     city's manual pick list, is_popular) that §5.3's feed paragraph never
+//     mentions — only "the taste block" (cuisine/diet/budget/booking-history)
+//     replaces the dead cuisine_match signal, not the whole ScoreTasteMatch
+//     formula.
+//
+// ScoreFeedCard passes IsPopular/EditorialPick/Rating/ReviewCount as their
+// zero value into VenueTasteSignals for exactly this reason: with those left
+// zero, ScoreTasteMatch's own editorial_pick/venue_rating/popular rows always
+// score 0 regardless of this filter, so filtering is a belt-and-braces
+// guarantee against ever reading points from a signal this feed does not use,
+// not the only thing preventing double-counting.
+var feedTasteReasonCodes = map[TasteSignalCode]bool{
+	TasteSignalCuisineMatch:         true,
+	TasteSignalCuisineMatchImplicit: true,
+	TasteSignalDietMatch:            true,
+	TasteSignalBudgetMatch:          true,
+	TasteSignalBookedSimilar:        true,
+}
+
+// feedPlatformTasteDetail is criterion 16's detail string for a PLATFORM
+// card's taste reasons: "не исчезает из ленты" with 0 on every taste signal,
+// but WITHOUT the misleading per-signal ScoreTasteMatch details ("guest has no
+// cuisine preferences" etc.) that assume a venue exists to be evaluated
+// against.
+const feedPlatformTasteDetail = "platform item"
+
+// VenueTasteSignalsOf builds the taste-matching input for item's OWN venue —
+// the venue-side half of ScoreFeedCard's ScoreTasteMatch call. Deliberately
+// leaves IsPopular, EditorialPick, Rating and ReviewCount at their zero value:
+// see feedTasteReasonCodes for why a feed card never scores those three
+// ScoreTasteMatch signals. Meaningless (returns the zero VenueTasteSignals) on
+// a PLATFORM item — callers must check item.RestaurantID first, same as every
+// other venue-only field on FeedItem.
+func VenueTasteSignalsOf(item FeedItem) VenueTasteSignals {
+	if item.RestaurantID == nil {
+		return VenueTasteSignals{}
+	}
+	return VenueTasteSignals{
+		RestaurantID:  *item.RestaurantID,
+		CuisineCodes:  item.RestaurantCuisineCodes,
+		PriceCategory: item.RestaurantPriceCategory,
+		FeatureCodes:  item.RestaurantFeatureCodes,
+	}
+}
+
+// platformTasteReasons is criterion 16's answer for a card with no venue:
+// zero on every taste signal a REAL venue could have scored, each carrying
+// feedPlatformTasteDetail instead of ScoreTasteMatch's own per-signal detail.
+// The cuisine row's code still picks cuisine_match vs. cuisine_match_implicit
+// by the SAME rule ScoreTasteMatch itself uses (does the guest have an
+// explicit cuisine pick) — a client that already localizes both codes must not
+// learn a THIRD meaning of either one for the platform-item case.
+func platformTasteReasons(taste TasteProfile) []TasteMatchReason {
+	cuisineCode := TasteSignalCuisineMatchImplicit
+	if len(taste.CuisineCodes) > 0 {
+		cuisineCode = TasteSignalCuisineMatch
+	}
+	return []TasteMatchReason{
+		{Code: cuisineCode, Detail: feedPlatformTasteDetail},
+		{Code: TasteSignalDietMatch, Detail: feedPlatformTasteDetail},
+		{Code: TasteSignalBudgetMatch, Detail: feedPlatformTasteDetail},
+		{Code: TasteSignalBookedSimilar, Detail: feedPlatformTasteDetail},
+	}
+}
+
+// ScoreFeedCard is a feed card's full score: ScoreFeedItem's own four organic
+// signals (placement, freshness, ending soon, venue rating) plus the taste
+// block that replaces the dead cuisine_match signal — spec
+// foodie-personalization-v1-20260916.md §5.3 last paragraph / §8 BE-3.
+//
+// taste is the guest's domain.TasteProfile (usecase/tastematch.Loader's own
+// read — the SAME assembler BE-2/BE-4 use, so two surfaces scoring the same
+// guest against the same venue never disagree, criterion 15). Its zero value
+// (anonymous guest, or one with no foodie profile) scores 0 on every taste
+// signal, which is exactly criterion 18's "today's order" requirement — no
+// branch here treats "no profile" specially, ScoreTasteMatch already does.
+//
+// item.RestaurantID nil (a PLATFORM card) short-circuits to
+// platformTasteReasons instead of calling ScoreTasteMatch with a zero-value
+// venue: criterion 16 wants a "platform item" detail, not ScoreTasteMatch's
+// own per-signal wording for a venue that structurally cannot exist.
+func ScoreFeedCard(item FeedItem, taste TasteProfile, now time.Time) FeedScore {
+	base := ScoreFeedItem(FeedSignalsOf(item), now)
+
+	var tasteReasons []TasteMatchReason
+	if item.RestaurantID == nil {
+		tasteReasons = platformTasteReasons(taste)
+	} else {
+		_, all := ScoreTasteMatch(taste, VenueTasteSignalsOf(item))
+		for _, r := range all {
+			if feedTasteReasonCodes[r.Code] {
+				tasteReasons = append(tasteReasons, r)
+			}
+		}
+	}
+
+	total := base.Total
+	reasons := make([]FeedScoreReason, 0, len(base.Reasons)+len(tasteReasons))
+	reasons = append(reasons, base.Reasons...)
+	for _, r := range tasteReasons {
+		reasons = append(reasons, FeedScoreReason{Code: FeedSignalCode(r.Code), Points: r.Points, Detail: r.Detail})
 		total += r.Points
 	}
 	return FeedScore{Total: total, Reasons: reasons}
@@ -276,18 +372,42 @@ type RankedFeedItem struct {
 // screen shows them. Pure: it neither reads a clock nor mutates its input
 // slice's order in place beyond the copy it builds.
 //
-// The order is a TOTAL one — score desc, then the soonest deadline, then kind,
-// then id — so two calls over the same data can never disagree, and paginating
-// by slicing this list can never show or skip a card twice. Every tie-break
-// after the score is a value that is unique-per-card in the limit (id is), so
-// no pair of distinct cards ever compares equal.
-func RankFeedItems(items []FeedItem, now time.Time) []RankedFeedItem {
+// taste is the guest's domain.TasteProfile, scored into every card via
+// ScoreFeedCard (§8 BE-3) — its zero value is the anonymous/no-profile case
+// (criterion 18).
+//
+// The score order is a TOTAL one — score desc, then the soonest deadline, then
+// kind, then id — so two calls over the same data can never disagree, and
+// paginating by slicing this list can never show or skip a card twice. Every
+// tie-break after the score is a value that is unique-per-card in the limit
+// (id is), so no pair of distinct cards ever compares equal.
+//
+// A DIVERSITY pass then runs over the WHOLE scored order (before any paging —
+// criterion 17: "перестановка ДО нарезки страниц"), via the same
+// domain.DiversifyByKey BE-2 uses for its own cuisine rule: no more than two
+// consecutive cards of the same restaurant. The diversity key is the
+// restaurant id for a venue-bound card; a platform card (no restaurant) gets
+// its OWN unique key per card (kind+id) rather than sharing one group with
+// every other platform card, so two unrelated platform cards next to each
+// other are never treated as "the same venue" and reshuffled.
+func RankFeedItems(items []FeedItem, taste TasteProfile, now time.Time) []RankedFeedItem {
 	ranked := make([]RankedFeedItem, 0, len(items))
 	for _, it := range items {
-		ranked = append(ranked, RankedFeedItem{Item: it, Score: ScoreFeedItem(FeedSignalsOf(it), now)})
+		ranked = append(ranked, RankedFeedItem{Item: it, Score: ScoreFeedCard(it, taste, now)})
 	}
 	sort.Slice(ranked, func(i, j int) bool { return lessRankedFeedItem(ranked[i], ranked[j]) })
-	return ranked
+	return DiversifyByKey(ranked, feedDiversityKey)
+}
+
+// feedDiversityKey is RankFeedItems' own grouping key for DiversifyByKey —
+// see the diversity paragraph on RankFeedItems for why a platform card gets a
+// key unique to itself instead of sharing "no restaurant" with every other
+// platform card.
+func feedDiversityKey(r RankedFeedItem) string {
+	if r.Item.RestaurantID != nil {
+		return r.Item.RestaurantID.String()
+	}
+	return "platform:" + string(r.Item.Kind) + ":" + r.Item.ID.String()
 }
 
 // lessRankedFeedItem is the total order described on RankFeedItems.
