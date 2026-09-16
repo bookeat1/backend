@@ -49,6 +49,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -317,30 +318,54 @@ type matchResult struct {
 	score float64
 }
 
+var digitRun = regexp.MustCompile(`\d{3,}`)
+
+// digitTokens pulls out every run of 3+ digits in s, e.g. a house/branch
+// number. Digits read the same in any script, so they are the one signal
+// that survives a name written in a different alphabet on each side.
+func digitTokens(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range digitRun.FindAllString(s, -1) {
+		out[m] = true
+	}
+	return out
+}
+
 // matchVenue finds the best restaurantRow for a 2gis venue. It returns
 // (nil, false) when nothing scores high enough, and (nil, true) when two or
 // more candidates are too close to call — both are "not found" for the
 // caller, the bool only changes the report wording.
 //
-// Address similarity is folded in ON TOP of the name score (not instead of
-// it): a few venues in this export share a generic chain name across several
-// TEST branches (three "Ocean Basket" entries) or are written in different
-// scripts between 2gis and our own data ("Караоке 1100" vs "1100 Karaoke",
-// which share only their street address and the digits "1100" — no string
-// similarity between "караоке" and "karaoke" exists in any script-agnostic
-// metric). Combining both signals is what makes those resolvable without
-// hand-coding restaurant ids into this file.
+// Two extra signals are folded on top of the plain name score, each added
+// for a real case in this export rather than speculatively:
+//
+//   - Address similarity: several "Ocean Basket <branch>" TEST rows share the
+//     generic 2gis name "Ocean Basket" — the address is what tells the
+//     branches apart. (When it doesn't either — see TEST_DUPLICATE_OCEAN
+//     below — the venue is correctly left unmatched: guessing between two
+//     near-identical rows is worse than asking a human.)
+//   - A shared distinctive number in the NAME itself: "Караоке 1100" vs our
+//     "1100 Karaoke" share zero characters once you compare "караоке" and
+//     "karaoke" letter-for-letter (different alphabets, no script-agnostic
+//     string metric bridges that) — but both names contain literal "1100",
+//     digits read identically in any script. This only fires when the number
+//     is unique to one candidate; sharing a building with other named venues
+//     (Kok-Tobe hosts several) must not turn into a false match through the
+//     address alone, which is exactly why this is name-anchored, not
+//     address-anchored.
 func matchVenue(v venue2, candidates []restaurantRow) (*restaurantRow, bool) {
 	vAddr := addressTokens(v.Address)
+	vNums := digitTokens(v.Name)
 	var scored []matchResult
 	for _, c := range candidates {
 		ns := nameScore(v.Name, c.Name)
 		as := jaccard(vAddr, addressTokens(c.Address))
 		combined := ns
 		if as > combined {
-			// Address-led fallback: lets a cross-script or chain-generic name
-			// still resolve when the address makes the target unambiguous.
 			combined = 0.5*ns + 0.5*as
+		}
+		if len(vNums) > 0 && numberUniquelyShared(vNums, c, candidates) {
+			combined = math.Max(combined, 0.8)
 		}
 		if combined >= 0.45 {
 			scored = append(scored, matchResult{c, combined})
@@ -354,6 +379,32 @@ func matchVenue(v venue2, candidates []restaurantRow) (*restaurantRow, bool) {
 		return nil, true // too close to call, e.g. duplicate-named TEST rows
 	}
 	return &scored[0].row, false
+}
+
+// numberUniquelyShared reports whether c's name shares one of vNums, and no
+// OTHER candidate's name also contains that number — i.e. the number
+// identifies c alone among today's candidate set.
+func numberUniquelyShared(vNums map[string]bool, c restaurantRow, candidates []restaurantRow) bool {
+	cNums := digitTokens(c.Name)
+	for n := range vNums {
+		if !cNums[n] {
+			continue
+		}
+		unique := true
+		for _, other := range candidates {
+			if other.ID == c.ID {
+				continue
+			}
+			if digitTokens(other.Name)[n] {
+				unique = false
+				break
+			}
+		}
+		if unique {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- plan: what would change ------------------------------------------------
