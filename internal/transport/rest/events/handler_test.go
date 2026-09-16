@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/transport/rest/middleware"
 	uc "backend-core/internal/usecase/events"
 )
 
@@ -31,9 +32,16 @@ type fakeFacade struct {
 	// with. It carries the optional venue block, so a platform event is simply
 	// one with a nil Restaurant.
 	detail *domain.EventListItem
+	// ranked/rankedTotal are what ListPublicUpcomingForYou answers with —
+	// separate from items/total so a test can tell "the plain listing was
+	// called" from "the ranked one was" by which field got populated.
+	ranked      []uc.RankedEventListItem
+	rankedTotal int
 
-	gotFilter domain.PublicEventFilter
-	calls     int
+	gotFilter   domain.PublicEventFilter
+	calls       int
+	forYouCalls int
+	gotUserID   uuid.UUID
 }
 
 func (f *fakeFacade) ListPublicUpcoming(_ context.Context, flt domain.PublicEventFilter) ([]domain.EventListItem, int, error) {
@@ -47,6 +55,20 @@ func (f *fakeFacade) ListPublicUpcoming(_ context.Context, flt domain.PublicEven
 		total = len(f.items)
 	}
 	return f.items, total, nil
+}
+
+func (f *fakeFacade) ListPublicUpcomingForYou(_ context.Context, flt domain.PublicEventFilter, userID uuid.UUID) ([]uc.RankedEventListItem, int, error) {
+	f.forYouCalls++
+	f.gotFilter = flt
+	f.gotUserID = userID
+	if f.err != nil {
+		return nil, 0, f.err
+	}
+	total := f.rankedTotal
+	if total == 0 {
+		total = len(f.ranked)
+	}
+	return f.ranked, total, nil
 }
 
 // The rest of uc.Facade is not exercised by these tests.
@@ -98,10 +120,35 @@ func (f *fakeFacade) ListPlatformAdmin(context.Context, uc.Actor, []domain.Event
 
 var _ uc.Facade = (*fakeFacade)(nil)
 
+// newPublicRouter registers every guest route, including GET /events
+// (RegisterExplore) — anonymous, exactly as if it sat on OptionalAuth with no
+// token: OptionalAuth's own contract (middleware/auth.go) is "a missing/
+// invalid token behaves exactly like no token", so a plain group with no
+// middleware at all is a faithful stand-in for these tests.
 func newPublicRouter(f uc.Facade) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	NewHandler(f).RegisterPublic(r.Group("/api/v1"))
+	grp := r.Group("/api/v1")
+	h := NewHandler(f)
+	h.RegisterPublic(grp)
+	h.RegisterExplore(grp)
+	return r
+}
+
+// newExploreRouterWithAuth is newPublicRouter's OptionalAuth-signed-in
+// counterpart: every request carries au as the authenticated user, exactly
+// what middleware.OptionalAuth would attach for a valid bearer token.
+func newExploreRouterWithAuth(f uc.Facade, au middleware.AuthUser) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	grp := r.Group("/api/v1")
+	grp.Use(func(c *gin.Context) {
+		c.Request = c.Request.WithContext(middleware.WithAuthUser(c.Request.Context(), au))
+		c.Next()
+	})
+	h := NewHandler(f)
+	h.RegisterPublic(grp)
+	h.RegisterExplore(grp)
 	return r
 }
 
@@ -397,7 +444,12 @@ func TestPublicRoutesRegisterWithoutConflict(t *testing.T) {
 			t.Fatalf("route registration panicked (a router conflict): %v", rec)
 		}
 	}()
-	NewHandler(nil).RegisterPublic(api)
+	h := NewHandler(nil)
+	h.RegisterPublic(api)
+	// GET /events lives on RegisterExplore now (the OptionalAuth group in
+	// production, bootstrap/app.go) — registered on the SAME engine here to
+	// prove the two route sets still coexist without conflict.
+	h.RegisterExplore(api)
 	// The ticket routes mount on a sibling group of the SAME engine and already
 	// own /events/:eventId/tickets — mirrors bootstrap/app.go.
 	api.Group("").POST("/events/:eventId/tickets", func(*gin.Context) {})
@@ -501,3 +553,122 @@ func TestGetPublic_CarriesTags(t *testing.T) {
 // ptrUUID is the fixture helper for Event.RestaurantID, optional since
 // migration 0085 (nil = a platform event, hosted by no venue).
 func ptrUUID(id uuid.UUID) *uuid.UUID { return &id }
+
+// --- ?sort=for_you (spec §5.6, criterion 19): OptionalAuth + the match field ---
+
+// Without a token, ?sort=for_you must fall through to the exact same plain
+// listing every other guest gets — the ranked usecase method is never even
+// called, and no `match` field is added.
+func TestListUpcoming_SortForYou_NoToken_FallsBackToPlainListing(t *testing.T) {
+	it := sampleItem(24*time.Hour, "Винный ужин", "Bistro", domain.CityAlmaty)
+	f := &fakeFacade{items: []domain.EventListItem{it}}
+
+	rec := do(t, newPublicRouter(f), "/api/v1/events?sort=for_you")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if f.forYouCalls != 0 || f.calls != 1 {
+		t.Fatalf("forYouCalls=%d calls=%d, want 0/1 (anonymous must use the plain listing)", f.forYouCalls, f.calls)
+	}
+	if strings.Contains(rec.Body.String(), `"match"`) {
+		t.Fatalf("match must be absent for an anonymous caller, body: %s", rec.Body.String())
+	}
+}
+
+// A signed-in guest who did NOT ask for sort=for_you gets today's plain
+// listing too — the ranked path is opt-in, not a blanket "logged in" switch.
+func TestListUpcoming_NoSort_WithToken_UsesPlainListing(t *testing.T) {
+	it := sampleItem(24*time.Hour, "Винный ужин", "Bistro", domain.CityAlmaty)
+	f := &fakeFacade{items: []domain.EventListItem{it}}
+	au := middleware.AuthUser{ID: uuid.New(), Role: string(domain.RoleUser)}
+
+	rec := do(t, newExploreRouterWithAuth(f, au), "/api/v1/events")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if f.forYouCalls != 0 || f.calls != 1 {
+		t.Fatalf("forYouCalls=%d calls=%d, want 0/1 (no sort= must use the plain listing)", f.forYouCalls, f.calls)
+	}
+	if strings.Contains(rec.Body.String(), `"match"`) {
+		t.Fatalf("match must be absent without sort=for_you, body: %s", rec.Body.String())
+	}
+}
+
+// An unrecognized sort= value behaves exactly like no sort at all — never an
+// error, per listUpcoming's own doc comment.
+func TestListUpcoming_UnknownSortValue_UsesPlainListing(t *testing.T) {
+	f := &fakeFacade{items: []domain.EventListItem{sampleItem(time.Hour, "X", "V", domain.CityAlmaty)}}
+	au := middleware.AuthUser{ID: uuid.New(), Role: string(domain.RoleUser)}
+
+	rec := do(t, newExploreRouterWithAuth(f, au), "/api/v1/events?sort=popular")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if f.forYouCalls != 0 || f.calls != 1 {
+		t.Fatalf("forYouCalls=%d calls=%d, want 0/1", f.forYouCalls, f.calls)
+	}
+}
+
+// The heart of criterion 19's transport half: sort=for_you WITH a token calls
+// the ranked usecase method with the caller's own id, and every card in the
+// response carries the `match` block it was scored with — the ranking itself
+// (score desc, then starts_at, then id) is the usecase's job, proven by
+// TestListPublicUpcomingForYou in usecase/events; this only proves the wire.
+func TestListUpcoming_SortForYou_WithToken_UsesRankedListingAndAttachesMatch(t *testing.T) {
+	winner := sampleItem(48*time.Hour, "Дальше, но вкуснее", "Osteria", domain.CityAlmaty)
+	loser := sampleItem(2*time.Hour, "Скоро, но мимо", "Diner", domain.CityAlmaty)
+	f := &fakeFacade{ranked: []uc.RankedEventListItem{
+		{EventListItem: winner, Match: uc.EventTasteMatch{
+			Score: 600,
+			Reasons: []domain.TasteMatchReason{
+				{Code: domain.TasteSignalCuisineMatch, Points: 400, Params: map[string]any{"cuisine_codes": []string{"italian"}}, Detail: "matches the guest's cuisine preferences"},
+				{Code: domain.TasteSignalBudgetMatch, Points: 200, Detail: "matches the guest's budget tier"},
+			},
+		}},
+		{EventListItem: loser, Match: uc.EventTasteMatch{
+			Score:   0,
+			Reasons: []domain.TasteMatchReason{{Code: domain.TasteSignalCuisineMatch, Points: 0, Detail: "outside the guest's cuisine preferences"}},
+		}},
+	}}
+	au := middleware.AuthUser{ID: uuid.New(), Role: string(domain.RoleUser)}
+
+	rec := do(t, newExploreRouterWithAuth(f, au), "/api/v1/events?sort=for_you&city="+string(domain.CityAlmaty))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if f.forYouCalls != 1 || f.calls != 0 {
+		t.Fatalf("forYouCalls=%d calls=%d, want 1/0", f.forYouCalls, f.calls)
+	}
+	if f.gotUserID != au.ID {
+		t.Fatalf("userID passed to the usecase = %s, want %s", f.gotUserID, au.ID)
+	}
+
+	env := decode(t, rec)
+	if len(env.Data.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(env.Data.Items))
+	}
+	// The transport must hand the ranked order straight through — it is the
+	// usecase's job to have sorted it, not this handler's.
+	if env.Data.Items[0].ID != winner.ID.String() || env.Data.Items[1].ID != loser.ID.String() {
+		t.Fatalf("order changed by the transport layer: %s, %s", env.Data.Items[0].ID, env.Data.Items[1].ID)
+	}
+	first := env.Data.Items[0]
+	if first.Match == nil {
+		t.Fatalf("match missing on a ranked card, body: %s", rec.Body.String())
+	}
+	if first.Match.Score != 600 || len(first.Match.Reasons) != 2 {
+		t.Fatalf("match = %+v, want score 600 with 2 reasons", first.Match)
+	}
+	if first.Match.Reasons[0].Code != string(domain.TasteSignalCuisineMatch) || first.Match.Reasons[0].Points != 400 {
+		t.Fatalf("reasons[0] = %+v, want cuisine_match/400", first.Match.Reasons[0])
+	}
+	if first.Match.Reasons[0].Params["cuisine_codes"] == nil {
+		t.Fatalf("reasons[0].params dropped: %+v", first.Match.Reasons[0])
+	}
+	// Every scored card carries match, even a zero score — zero is a real
+	// answer ("nothing matched"), not "not computed".
+	second := env.Data.Items[1]
+	if second.Match == nil || second.Match.Score != 0 {
+		t.Fatalf("second card match = %+v, want a present zero-score match", second.Match)
+	}
+}
