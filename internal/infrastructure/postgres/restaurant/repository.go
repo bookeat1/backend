@@ -501,6 +501,44 @@ func appendFeatureConds(where []string, args []any, keys []string) ([]string, []
 
 const searchTextExpr = `restaurant_search_text(r.name, r.description, r.name_i18n, r.description_i18n)`
 
+// normalizedSearchTextExpr strips whitespace/hyphens from searchTextExpr and
+// lower-cases it before it is compared with an equally-normalized query.
+//
+// word_similarity() scores a string as a sequence of trigrams, so a space or
+// hyphen inside a name changes those trigrams: "TomYumBar" (no space) and the
+// guest typing "Tom Yum" (with one) score as two different strings even
+// though they are obviously the same word. Stripping `[\s-]+` on BOTH sides
+// removes exactly that artefact — it does not touch the FTS branch above
+// (which already tokenizes on whitespace correctly via to_tsvector) and it is
+// additive to, not a replacement of, the existing raw <% branch.
+const normalizedSearchTextExpr = `regexp_replace(lower(` + searchTextExpr + `), '[\s-]+', '', 'g')`
+
+// normalizedMatchThreshold is a literal word_similarity cutoff, deliberately
+// NOT the pg_trgm.word_similarity_threshold GUC (default 0.6, governs the raw
+// <% branch above and the menu items' own <% branch in menuMatchExpr).
+// Lowering that GUC session/transaction-wide would also loosen those two
+// unrelated branches for the rest of this same statement — this repository
+// has no per-call transaction to scope a SET LOCAL to without widening it.
+// 0.5 is the smallest step that closes the reported gap: "tomyam" (a
+// one-vowel typo of "tomyum") against a real venue named "TomYumBar" scores
+// 0.571 normalized — a hair under the 0.6 default — while short, genuinely
+// unrelated queries ("bar", "paris", "pizza") against the same seeded venues
+// scored 0.17-0.33, comfortably below. Verified empirically against a seeded
+// Postgres 16, see internal/infrastructure/postgres/restaurant/search_test.go.
+//
+// POSITIONAL CAVEAT (review, 2026-09-16): this branch compares the query
+// against the WHOLE concatenated document (name+description+i18n), so a hit
+// depends on where the match falls. "TomYumBar" opening the document scores
+// 0.57 (hit); the identical substring inside "Cafe TomYumBar" or in
+// name_i18n only scores 0.29 (miss) — trigram padding at the START of the
+// document isn't there mid-string. The reported bug (typo'd name AT THE
+// START of a venue's own name) is fixed; a typo'd match buried mid-document
+// is not, and isn't expected to be by this branch. Fixing that would mean
+// comparing the normalized query against r.name and each name_i18n value
+// separately instead of the joined document — not done here, out of scope
+// for the reported bug.
+const normalizedMatchThreshold = 0.5
+
 // menuSearchTextExpr is the exact SQL expression the two GIN indexes in
 // migration 0095 are built over (menu_item_search_text applied to the dish name
 // and its translations). Same rule as searchTextExpr: reference it VERBATIM or
@@ -594,8 +632,9 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 		// can BitmapOr them instead of scanning.
 		venueMatch = fmt.Sprintf(
 			`(to_tsvector('russian', %s) @@ plainto_tsquery('russian', $%d::text)
-			  OR $%d::text <%% %s)`,
-			searchTextExpr, qN, qN, searchTextExpr)
+			  OR $%d::text <%% %s
+			  OR word_similarity(regexp_replace(lower($%d::text), '[\s-]+', '', 'g'), %s) > %v)`,
+			searchTextExpr, qN, qN, searchTextExpr, qN, normalizedSearchTextExpr, normalizedMatchThreshold)
 		joinSQL = fmt.Sprintf(menuMatchJoin, qN)
 		// The venue answers the query either about itself or through its menu.
 		// mm.restaurant_id IS NOT NULL is "the LEFT JOIN found a matching

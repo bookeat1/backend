@@ -67,6 +67,56 @@ func TestSearchRankingAndTypoTolerance(t *testing.T) {
 	}
 }
 
+// TestSearchNormalizedFuzzyMatch covers the production gap where a venue
+// name with no internal space ("TomYumBar") failed to match a query typed
+// WITH a space ("Tom Yum") — word_similarity treats the space as changing
+// the trigram sequence, so the two scored as unrelated strings even for an
+// exact, correctly-spelled query. It also covers a one-vowel typo of the
+// same query ("tomyam" for "tomyum"), which needs the lowered
+// normalizedMatchThreshold since it scores just under the pg_trgm default
+// (0.6). Both must find the venue; a short, genuinely unrelated query must
+// not turn into noise across the whole seeded set.
+func TestSearchNormalizedFuzzyMatch(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
+	repo := New(pool)
+	ctx := context.Background()
+
+	tomYum := seedSearch(t, repo, "TomYumBar", "Thai street food and noodle bowls", "Тайская", domain.CityAlmaty)
+	seedSearch(t, repo, "Paris Cafe", "French bistro in the city center", "Французская", domain.CityAlmaty)
+	seedSearch(t, repo, "Coffeeshka", "coffee and cakes", "Кофейня", domain.CityAlmaty)
+
+	for _, q := range []string{"tomyam", "Tom Yum", "tomyum"} {
+		items, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: q})
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		if !containsID(items, tomYum) {
+			t.Errorf("query %q did not find TomYumBar; got %d results", q, len(items))
+		}
+		// Not just "found it somewhere" — this exact seeded set must return
+		// ONLY TomYumBar. A regression that widens the match (e.g. the
+		// threshold picked too low) would silently start pulling in Paris
+		// Cafe/Coffeeshka too, and `containsID` alone would still pass.
+		if len(items) != 1 {
+			t.Errorf("query %q matched %d venues, want exactly 1 (TomYumBar): %v", q, len(items), ids(items))
+		}
+	}
+
+	// A near-miss in the 0.3-0.5 band (word_similarity of "tomato" against
+	// "TomYumBar" normalized is ~0.43 — real overlap, below the 0.5 cutoff)
+	// is the actual noise risk the threshold has to hold the line against;
+	// "aaa" shares no trigrams with anything seeded and would pass even at
+	// threshold 0, so it proves nothing about where the cutoff sits.
+	nearMiss, _, err := repo.Search(ctx, domain.RestaurantSearchFilter{Query: "tomato"})
+	if err != nil {
+		t.Fatalf("near-miss search: %v", err)
+	}
+	if containsID(nearMiss, tomYum) {
+		t.Errorf("near-miss query %q matched TomYumBar via the normalized branch (threshold too low): %v", "tomato", ids(nearMiss))
+	}
+}
+
 func TestSearchFiltersNarrow(t *testing.T) {
 	pool := testdb.Connect(t)
 	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
