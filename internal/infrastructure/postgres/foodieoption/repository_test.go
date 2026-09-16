@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -213,6 +214,126 @@ func TestBudgetPriceCategoryRoundTrip(t *testing.T) {
 	}
 	if reread.AffectsMatching() {
 		t.Error("AffectsMatching() = true with no price_category, want false")
+	}
+}
+
+// TestCreateAndUpdateReturnRealTimestamps pins the fix for the review bug
+// where Create/Update only did RETURNING id, so the caller's o.CreatedAt/
+// o.UpdatedAt stayed at their Go zero value ("0001-01-01T00:00:00Z") instead
+// of the row's real now() — the admin POST/PATCH response echoed a bogus
+// timestamp instead of what Postgres actually wrote.
+func TestCreateAndUpdateReturnRealTimestamps(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "foodie_options")
+	ctx := context.Background()
+	repo := New(pool)
+
+	opt := &domain.FoodieOption{ID: uuid.New(), Kind: domain.FoodieOptionKindDiet, Code: "ts_check", Name: "TS Check", IsActive: true}
+	if err := repo.Create(ctx, opt); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if opt.CreatedAt.IsZero() {
+		t.Fatal("Create left CreatedAt at the zero value, want the row's real created_at")
+	}
+	if opt.UpdatedAt.IsZero() {
+		t.Fatal("Create left UpdatedAt at the zero value, want the row's real updated_at")
+	}
+	createdAt, updatedAtBefore := opt.CreatedAt, opt.UpdatedAt
+
+	// A real clock tick between Create and Update so a naive "same instant"
+	// implementation would still be caught.
+	time.Sleep(10 * time.Millisecond)
+
+	opt.Name = "TS Check Renamed"
+	if err := repo.Update(ctx, opt); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !opt.CreatedAt.Equal(createdAt) {
+		t.Fatalf("Update changed CreatedAt = %v, want unchanged %v", opt.CreatedAt, createdAt)
+	}
+	if opt.UpdatedAt.IsZero() {
+		t.Fatal("Update left UpdatedAt at the zero value, want the row's real updated_at")
+	}
+	if !opt.UpdatedAt.After(updatedAtBefore) {
+		t.Fatalf("Update's UpdatedAt = %v, want newer than pre-update %v", opt.UpdatedAt, updatedAtBefore)
+	}
+}
+
+// TestLoadTasteMappingsIncludesHiddenOptions pins spec criterion 12
+// ("a hidden option still scores in personalization until the guest's next
+// save"): a cuisine tile and a budget tier are hidden through the REAL write
+// path (repo.Update setting IsActive=false, the same call
+// usecase/foodieoptions.UseCase.Update makes — not a raw SQL UPDATE), and
+// LoadTasteMappings — the one query tastematch.Loader relies on — must still
+// return both, alongside an untouched active one. LoadTasteMappings had no
+// repository test at all before this.
+func TestLoadTasteMappingsIncludesHiddenOptions(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "foodie_options", "cuisines")
+	ctx := context.Background()
+	repo := New(pool)
+	cuisines := cuisinerepo.New(pool)
+
+	italian := &domain.Cuisine{ID: uuid.New(), Code: "italian", Name: "Итальянская", IsActive: true}
+	kazakh := &domain.Cuisine{ID: uuid.New(), Code: "kazakh", Name: "Казахская", IsActive: true}
+	if err := cuisines.Create(ctx, italian); err != nil {
+		t.Fatalf("seed cuisine italian: %v", err)
+	}
+	if err := cuisines.Create(ctx, kazakh); err != nil {
+		t.Fatalf("seed cuisine kazakh: %v", err)
+	}
+
+	// Active tile, stays active — the control.
+	activeTile := &domain.FoodieOption{ID: uuid.New(), Kind: domain.FoodieOptionKindCuisine, Code: "italian", Name: "Италия", IsActive: true}
+	if err := repo.Create(ctx, activeTile); err != nil {
+		t.Fatalf("create active tile: %v", err)
+	}
+	if err := repo.SetCuisineLinks(ctx, activeTile.ID, []uuid.UUID{italian.ID}); err != nil {
+		t.Fatalf("link active tile: %v", err)
+	}
+
+	// Hidden tile: created active (a guest could have picked it before an
+	// admin hid it), then hidden through repo.Update — the same call the
+	// usecase's Update/SetActive make.
+	hiddenTile := &domain.FoodieOption{ID: uuid.New(), Kind: domain.FoodieOptionKindCuisine, Code: "kazakh", Name: "Казахстан", IsActive: true}
+	if err := repo.Create(ctx, hiddenTile); err != nil {
+		t.Fatalf("create hidden tile: %v", err)
+	}
+	if err := repo.SetCuisineLinks(ctx, hiddenTile.ID, []uuid.UUID{kazakh.ID}); err != nil {
+		t.Fatalf("link hidden tile: %v", err)
+	}
+	hiddenTile.IsActive = false
+	if err := repo.Update(ctx, hiddenTile); err != nil {
+		t.Fatalf("hide tile: %v", err)
+	}
+
+	// Hidden budget tier, same story: a guest may still hold "ultra" in
+	// users.foodie_budget_tier after the admin hides it.
+	hiddenBudget := &domain.FoodieOption{ID: uuid.New(), Kind: domain.FoodieOptionKindBudget, Code: "ultra", Name: "Ultra", PriceCategory: priceCat(domain.PriceHigh), IsActive: true}
+	if err := repo.Create(ctx, hiddenBudget); err != nil {
+		t.Fatalf("create hidden budget: %v", err)
+	}
+	hiddenBudget.IsActive = false
+	if err := repo.Update(ctx, hiddenBudget); err != nil {
+		t.Fatalf("hide budget: %v", err)
+	}
+	if hiddenTile.IsActive || hiddenBudget.IsActive {
+		t.Fatal("test setup bug: hidden fixtures were not actually hidden")
+	}
+
+	cuisineTiles, budgetTiers, err := repo.LoadTasteMappings(ctx)
+	if err != nil {
+		t.Fatalf("LoadTasteMappings: %v", err)
+	}
+
+	if got := cuisineTiles["italian"]; len(got) != 1 || got[0] != "italian" {
+		t.Errorf("cuisineTiles[italian] (active) = %v, want [italian]", got)
+	}
+	if got := cuisineTiles["kazakh"]; len(got) != 1 || got[0] != "kazakh" {
+		t.Errorf("cuisineTiles[kazakh] (HIDDEN) = %v, want [kazakh] — a hidden tile must keep resolving", got)
+	}
+	if got, ok := budgetTiers["ultra"]; !ok || got != domain.PriceHigh {
+		t.Errorf("budgetTiers[ultra] (HIDDEN) = %v, ok=%v, want PriceHigh — a hidden budget tier must keep resolving", got, ok)
 	}
 }
 

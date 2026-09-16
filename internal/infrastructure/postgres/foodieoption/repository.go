@@ -111,12 +111,14 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.FoodieO
 }
 
 func (r *Repository) Create(ctx context.Context, o *domain.FoodieOption) error {
-	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`INSERT INTO foodie_options (`+cols+`)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now())`,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now())
+		 RETURNING id, created_at, updated_at`,
 		o.ID, o.Kind, o.Code, o.Name, i18nToDB(o.NameI18n), o.ImageURL,
 		o.Description, i18nToDB(o.DescriptionI18n), o.PriceLabel, i18nToDB(o.PriceLabelI18n),
-		priceCategoryToDB(o.PriceCategory), o.DisplayOrder, o.IsActive)
+		priceCategoryToDB(o.PriceCategory), o.DisplayOrder, o.IsActive).
+		Scan(&o.ID, &o.CreatedAt, &o.UpdatedAt)
 	if err != nil {
 		return mapWrite(err, "create foodie option")
 	}
@@ -124,17 +126,17 @@ func (r *Repository) Create(ctx context.Context, o *domain.FoodieOption) error {
 }
 
 func (r *Repository) Update(ctx context.Context, o *domain.FoodieOption) error {
-	var id uuid.UUID
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
 		`UPDATE foodie_options SET
 			kind=$2, code=$3, name=$4, name_i18n=$5, image_url=$6,
 			description=$7, description_i18n=$8, price_label=$9, price_label_i18n=$10,
 			price_category=$11, display_order=$12, is_active=$13, updated_at=now()
 		 WHERE id=$1
-		 RETURNING id`,
+		 RETURNING id, created_at, updated_at`,
 		o.ID, o.Kind, o.Code, o.Name, i18nToDB(o.NameI18n), o.ImageURL,
 		o.Description, i18nToDB(o.DescriptionI18n), o.PriceLabel, i18nToDB(o.PriceLabelI18n),
-		priceCategoryToDB(o.PriceCategory), o.DisplayOrder, o.IsActive).Scan(&id)
+		priceCategoryToDB(o.PriceCategory), o.DisplayOrder, o.IsActive).
+		Scan(&o.ID, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrNotFound
 	}

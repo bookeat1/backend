@@ -21,6 +21,7 @@ import (
 	"backend-core/internal/infrastructure/postgres/testdb"
 	userrepo "backend-core/internal/infrastructure/postgres/user"
 	"backend-core/internal/infrastructure/sqltx"
+	"backend-core/internal/usecase/foodieoptions"
 	"backend-core/internal/usecase/homepicks"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/tastematch"
@@ -315,6 +316,53 @@ func TestIntegration_EditorialPickBonusFromTheRealManualList(t *testing.T) {
 	}
 }
 
+// criterion 11 (spec foodie-profile-admin-dictionaries-20260916.md): an admin
+// links a cuisine tile to a real cuisine through the ACTUAL write path —
+// usecase/foodieoptions.UseCase.Create, the same code POST
+// /admin/foodie-profile/options runs — not the raw-SQL linkFoodieCuisineTile
+// helper every other test in this file uses. Picks scoring must pick the new
+// link up on the very next read, proving the admin write path and
+// tastematch.Loader.LoadTasteMappings agree end-to-end, not just that raw SQL
+// fixtures happen to match what the loader expects.
+func TestIntegration_AdminLinksCuisineTileThroughRealUsecase(t *testing.T) {
+	h := newHarness(t)
+	uid := h.seedUser(t, nil)
+	h.setFoodieCuisines(t, uid, domain.FoodieCuisineItalian)
+
+	italian := &domain.Cuisine{ID: uuid.New(), Code: "italian", Name: "Итальянская", IsActive: true}
+	if err := cuisinerepo.New(h.pool).Create(h.ctx, italian); err != nil {
+		t.Fatalf("seed cuisine: %v", err)
+	}
+	venue := h.seedRestaurant(t, "Итальянское", false, false, italian.ID)
+
+	txm := sqltx.NewManager(h.pool)
+	admin := foodieoptions.NewUseCase(foodieoptionrepo.New(h.pool), cuisinerepo.New(h.pool), txm)
+	actor := foodieoptions.Actor{UserID: uuid.New(), Role: domain.RoleAdmin}
+	kind := domain.FoodieOptionKindCuisine
+	code := domain.FoodieCuisineItalian
+	name := "Италия"
+	cuisineIDs := []uuid.UUID{italian.ID}
+	if _, err := admin.Create(h.ctx, actor, foodieoptions.SaveInput{
+		Kind:       &kind,
+		Code:       &code,
+		Name:       &name,
+		CuisineIDs: &cuisineIDs,
+	}); err != nil {
+		t.Fatalf("admin create cuisine tile link: %v", err)
+	}
+
+	res, err := h.f.Guest(h.ctx, &uid, string(domain.CityAlmaty), 8)
+	if err != nil {
+		t.Fatalf("guest: %v", err)
+	}
+	if len(res.Items) != 1 || res.Items[0].Restaurant.ID != venue {
+		t.Fatalf("items = %v, want only Итальянское, scored via the admin-created tile link", names(res.Items))
+	}
+	if res.Items[0].Match == nil || res.Items[0].Match.Score != 400 {
+		t.Fatalf("match = %+v, want cuisine_match alone (400)", res.Items[0].Match)
+	}
+}
+
 // criterion 14 at the usecase layer: two different guests, back to back, get
 // their OWN scored items — nothing here is memoized per-process across calls.
 func TestIntegration_TwoGuestsInARowGetTheirOwnItems(t *testing.T) {
@@ -418,9 +466,12 @@ func TestQueryBudget(t *testing.T) {
 	}
 	t.Logf("REAL query count for one for_you response (matched, no padding, no VenueState): %d queries in %s",
 		counter.count, elapsed)
-	if counter.count <= 4 {
-		t.Logf("within the spec's stated budget of 4")
-	} else {
-		t.Logf("OVER the spec's stated budget of 4 — see the task report for the breakdown")
+	// The spec's stated ceiling after the foodie-options dictionary landed
+	// (foodie-profile-admin-dictionaries-20260916.md criterion 13: "15 -> ≤
+	// 16") — a real assertion, not just a log line, so a future change that
+	// adds an extra round trip here fails CI instead of silently regressing.
+	const queryBudget = 16
+	if counter.count > queryBudget {
+		t.Fatalf("query count = %d, want <= %d (spec's stated ceiling)", counter.count, queryBudget)
 	}
 }
