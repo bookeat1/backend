@@ -35,6 +35,13 @@ const (
 	EventBookingConfirmed EventType = "booking_confirmed"
 	EventBookingCancelled EventType = "booking_cancelled"
 	EventNoShow           EventType = "no_show"
+	// EventBookingArrived and EventBookingCompleted close the marathon funnel
+	// (saw QR -> installed -> booked -> showed up): added for the Almaty
+	// marathon epic (Trello CdwfIzDh / kvMSxhSl) alongside booking_created /
+	// booking_confirmed, which is what a "did a campaign booking convert into
+	// an actual visit" chart needs.
+	EventBookingArrived   EventType = "booking_arrived"
+	EventBookingCompleted EventType = "booking_completed"
 	EventPaymentCaptured  EventType = "payment_captured"
 	EventPaymentRefunded  EventType = "payment_refunded"
 
