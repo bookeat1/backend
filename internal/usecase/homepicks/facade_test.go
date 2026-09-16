@@ -576,6 +576,103 @@ func TestADictionaryFailureFallsBackToTheRawCityKey(t *testing.T) {
 	}
 }
 
+// GuestResolved must label its answer with WHICH step won, and must never
+// read a second time to do it: the whole point of it wrapping Guest's own
+// lookup sequence is that the two can never disagree.
+func TestGuestResolvedLabelsTheWinningStep(t *testing.T) {
+	curated, popular := venue("Кураторское", true), venue("Популярное", true)
+	catalog := catalogOf(curated, popular)
+	catalog.popular = []domain.RestaurantListItem{popular}
+	picks := newFakePicks()
+	picks.lists["Алматы"] = ids(curated)
+	f := NewFacade(picks, catalog)
+
+	items, mode, err := f.GuestResolved(context.Background(), "Алматы", 0)
+	if err != nil {
+		t.Fatalf("guest resolved: %v", err)
+	}
+	if mode != domain.HomePicksModeEditorial {
+		t.Fatalf("mode = %q, want editorial", mode)
+	}
+	if !equal(names(items), []string{"Кураторское"}) {
+		t.Fatalf("items = %v", names(items))
+	}
+
+	items, mode, err = f.GuestResolved(context.Background(), "Астана", 0)
+	if err != nil {
+		t.Fatalf("guest resolved: %v", err)
+	}
+	if mode != domain.HomePicksModePopular {
+		t.Fatalf("mode = %q, want popular", mode)
+	}
+	if !equal(names(items), []string{"Популярное"}) {
+		t.Fatalf("items = %v", names(items))
+	}
+}
+
+// A curation that has gone entirely dark degrades to the automatic rail AND
+// must be labelled "popular", not "editorial" — a guest must never be told
+// "this is somebody's pick" about a rail nobody actually chose.
+func TestGuestResolvedReportsPopularWhenTheCurationIsFullyDeactivated(t *testing.T) {
+	dark, popular := venue("Погашенное", false), venue("Популярное", true)
+	catalog := catalogOf(dark, popular)
+	catalog.popular = []domain.RestaurantListItem{popular}
+	picks := newFakePicks()
+	picks.lists["Алматы"] = ids(dark)
+	f := NewFacade(picks, catalog)
+
+	_, mode, err := f.GuestResolved(context.Background(), "Алматы", 0)
+	if err != nil {
+		t.Fatalf("guest resolved: %v", err)
+	}
+	if mode != domain.HomePicksModePopular {
+		t.Fatalf("mode = %q, want popular", mode)
+	}
+}
+
+// ManualPickIDs reads BOTH lists unconditionally — unlike Guest/GuestResolved,
+// which stop at the city's own list the moment it is non-empty — because the
+// editorial_pick bonus (§5.3 row 5) applies to a venue named in EITHER list,
+// not only to whichever one the fallback would actually show.
+func TestManualPickIDsIsTheUnionOfBothLists(t *testing.T) {
+	own, shared, other := uuid.New(), uuid.New(), uuid.New()
+	picks := newFakePicks()
+	picks.lists["Алматы"] = []uuid.UUID{own}
+	picks.lists[domain.HomePicksAllCities] = []uuid.UUID{shared, other}
+	f := NewFacade(picks, catalogOf())
+
+	set, err := f.ManualPickIDs(context.Background(), "Алматы")
+	if err != nil {
+		t.Fatalf("manual pick ids: %v", err)
+	}
+	if len(set) != 3 || !set[own] || !set[shared] || !set[other] {
+		t.Fatalf("set = %v, want the union of both lists", set)
+	}
+	if want := []string{"Алматы", domain.HomePicksAllCities}; !equal(picks.listed, want) {
+		t.Fatalf("lookups:\n got %v\nwant %v (both lists must be read)", picks.listed, want)
+	}
+}
+
+// The all-cities key is never read twice — ManualPickIDs must not turn one
+// real city query into a second, redundant read of the same list.
+func TestManualPickIDsDoesNotDoubleReadTheAllCitiesKey(t *testing.T) {
+	a := uuid.New()
+	picks := newFakePicks()
+	picks.lists[domain.HomePicksAllCities] = []uuid.UUID{a}
+	f := NewFacade(picks, catalogOf())
+
+	set, err := f.ManualPickIDs(context.Background(), domain.HomePicksAllCities)
+	if err != nil {
+		t.Fatalf("manual pick ids: %v", err)
+	}
+	if len(set) != 1 || !set[a] {
+		t.Fatalf("set = %v, want {%s}", set, a)
+	}
+	if want := []string{domain.HomePicksAllCities}; !equal(picks.listed, want) {
+		t.Fatalf("lookups:\n got %v\nwant %v (must read the all-cities key once)", picks.listed, want)
+	}
+}
+
 // An unknown city is not an error and not a 422: it simply has no rail of its
 // own and falls through the ordinary chain to the all-cities list.
 func TestAnUnknownCityFallsThroughToTheAllCitiesRail(t *testing.T) {
