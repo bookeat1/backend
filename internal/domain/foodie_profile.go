@@ -7,28 +7,37 @@ import (
 )
 
 // FoodieProfile is the guest-facing "Фуди-профиль" 4-step wizard state
-// (mobile PR #222): cuisines/diets/allergies picked from a static,
-// frontend-owned list of string ids, plus an optional single budget tier.
+// (mobile PR #222): cuisines/diets/allergies picked from the platform's
+// foodie_option dictionary (migration 0110, spec
+// foodie-profile-admin-dictionaries-20260916.md), plus an optional single
+// budget tier.
 //
 // These ids are deliberately NOT the cuisine dictionary (Cuisine, migration
 // 0079) that venues pick from — see migration 0109's header for why merging
-// the two would be wrong. Each id is a named Go string constant below,
-// checked with ValidFoodieCuisineID/ValidFoodieDietID/ValidFoodieAllergyID/
-// ValidFoodieBudgetTier — never a Postgres enum or a DB CHECK against this
-// list, per CLAUDE.md's "VARCHAR + app-side validation, no DB enums": the
-// wizard's option set is expected to grow without a migration.
+// the two would be wrong. Each id is a named Go string constant below FOR THE
+// SEEDED SET ONLY — since migration 0110 the closed set of valid ids is
+// whatever domain.FoodieOptionRepository.ExistingCodes(kind) returns, not a
+// Go slice: usecase/users.ReplaceFoodieProfile validates against the
+// repository (criterion 9), never against a hardcoded list, because the
+// option set is now meant to grow through the admin panel, without a
+// deploy. The old ValidFoodieCuisineID/ValidFoodieDietID/ValidFoodieAllergyID/
+// ValidFoodieBudgetTier and their backing FoodieCuisineIDs/FoodieDietIDs/
+// FoodieAllergyIDs/FoodieBudgetTierIDs slices are GONE — do not recreate
+// them, they would be a second, stale source of truth next to the table.
 type FoodieProfile struct {
-	// Cuisines holds at most FoodieCuisineSelectionLimit ids, each one of
-	// FoodieCuisineIDs.
+	// Cuisines holds at most FoodieCuisineSelectionLimit ids, each an
+	// existing foodie_options code of kind "cuisine".
 	Cuisines []string
-	// Diets holds diet ids, each one of FoodieDietIDs. FoodieDietExclusiveID
-	// is exclusive: when present, it is the ONLY entry.
+	// Diets holds diet ids, each an existing foodie_options code of kind
+	// "diet". FoodieDietExclusiveID is exclusive: when present, it is the
+	// ONLY entry.
 	Diets []string
-	// Allergies holds allergy ids, each one of FoodieAllergyIDs. No limit,
-	// no exclusivity.
+	// Allergies holds allergy ids, each an existing foodie_options code of
+	// kind "allergy". No limit, no exclusivity.
 	Allergies []string
 	// Budget is nil when the guest has not answered the (optional) budget
-	// step. When set, it is one of FoodieBudgetTierIDs.
+	// step. When set, it is an existing foodie_options code of kind
+	// "budget".
 	Budget *string
 }
 
@@ -57,14 +66,6 @@ const (
 	FoodieCuisineBBQ      = "bbq"
 )
 
-// FoodieCuisineIDs is the closed set of valid FoodieProfile.Cuisines entries.
-var FoodieCuisineIDs = []string{
-	FoodieCuisineKazakh, FoodieCuisineAsian, FoodieCuisineEuropean, FoodieCuisineJapanese,
-	FoodieCuisineItalian, FoodieCuisineKorean, FoodieCuisineSeafood, FoodieCuisineMeat,
-	FoodieCuisineVegan, FoodieCuisineDesserts, FoodieCuisineCoffee, FoodieCuisineHealthy,
-	FoodieCuisineFastfood, FoodieCuisineSpicy, FoodieCuisineBBQ,
-}
-
 // Diet option ids the wizard's diet step ships (DIET_OPTIONS).
 // FoodieDietExclusiveID ("no_diet") is exclusive: it cannot coexist with any
 // other diet id — picking it clears every other diet, and picking any other
@@ -82,13 +83,6 @@ const (
 	FoodieDietNoGluten    = "no_gluten"
 )
 
-// FoodieDietIDs is the closed set of valid FoodieProfile.Diets entries.
-var FoodieDietIDs = []string{
-	FoodieDietExclusiveID, FoodieDietVegan, FoodieDietPescetarian, FoodieDietHalal,
-	FoodieDietKosher, FoodieDietKeto, FoodieDietLowCarb, FoodieDietPaleo,
-	FoodieDietNoLactose, FoodieDietNoGluten,
-}
-
 // Allergy option ids the wizard's allergy step ships (ALLERGY_OPTIONS).
 const (
 	FoodieAllergyNuts      = "nuts"
@@ -101,44 +95,12 @@ const (
 	FoodieAllergySesame    = "sesame"
 )
 
-// FoodieAllergyIDs is the closed set of valid FoodieProfile.Allergies
-// entries.
-var FoodieAllergyIDs = []string{
-	FoodieAllergyNuts, FoodieAllergyDairy, FoodieAllergyEggs, FoodieAllergySeafood,
-	FoodieAllergySoy, FoodieAllergyWheat, FoodieAllergyShellfish, FoodieAllergySesame,
-}
-
 // Budget tier ids the wizard's (optional) budget step ships (BUDGET_TIERS).
 const (
 	FoodieBudgetTierBudget  = "budget"
 	FoodieBudgetTierMid     = "mid"
 	FoodieBudgetTierPremium = "premium"
 )
-
-// FoodieBudgetTierIDs is the closed set of valid FoodieProfile.Budget
-// values.
-var FoodieBudgetTierIDs = []string{FoodieBudgetTierBudget, FoodieBudgetTierMid, FoodieBudgetTierPremium}
-
-func contains(set []string, id string) bool {
-	for _, s := range set {
-		if s == id {
-			return true
-		}
-	}
-	return false
-}
-
-// ValidFoodieCuisineID reports whether id is one of FoodieCuisineIDs.
-func ValidFoodieCuisineID(id string) bool { return contains(FoodieCuisineIDs, id) }
-
-// ValidFoodieDietID reports whether id is one of FoodieDietIDs.
-func ValidFoodieDietID(id string) bool { return contains(FoodieDietIDs, id) }
-
-// ValidFoodieAllergyID reports whether id is one of FoodieAllergyIDs.
-func ValidFoodieAllergyID(id string) bool { return contains(FoodieAllergyIDs, id) }
-
-// ValidFoodieBudgetTier reports whether tier is one of FoodieBudgetTierIDs.
-func ValidFoodieBudgetTier(tier string) bool { return contains(FoodieBudgetTierIDs, tier) }
 
 // FoodieProfilePreferences is the multi-value half of FoodieProfile (budget
 // is a single column on users, see UserRepository) — what

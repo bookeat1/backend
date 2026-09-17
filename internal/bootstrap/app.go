@@ -27,6 +27,7 @@ import (
 	eventsrest "backend-core/internal/transport/rest/events"
 	favoritesrest "backend-core/internal/transport/rest/favorites"
 	feedrest "backend-core/internal/transport/rest/feed"
+	foodieoptionsrest "backend-core/internal/transport/rest/foodieoptions"
 	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
 	kaspiadminrest "backend-core/internal/transport/rest/kaspiadmin"
 	mediarest "backend-core/internal/transport/rest/media"
@@ -148,7 +149,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// signed-in guest. Mounted here, right after the catalog, so the two static
 	// segments (/restaurants/search, /restaurants/picks) and /restaurants/:id
 	// are declared in one place.
-	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.FavoritesFacade)
+	picksHandler := restrest.NewPicksHandler(deps.HomePicks, deps.ForYou, deps.FavoritesFacade)
 	picksHandler.RegisterPublic(restPublic)
 
 	// The cuisine dictionary. Public read (the app's «Выберите кухню» row and
@@ -157,6 +158,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// plain api group rather than restPublic.
 	cuisinesHandler := cuisinesrest.NewHandler(deps.Cuisines)
 	cuisinesHandler.RegisterPublic(api)
+
+	// The foodie-profile OPTION dictionary (migration 0110, spec
+	// foodie-profile-admin-dictionaries-20260916.md): the mobile wizard's four
+	// steps (cuisine tiles/diets/allergies/budget tiers) read from here instead
+	// of their old store-shipped constant lists. Same anonymous public posture
+	// as the dictionaries around it.
+	foodieOptionsHandler := foodieoptionsrest.NewHandler(deps.FoodieOptions)
+	foodieOptionsHandler.RegisterPublic(api)
 
 	// The venue-feature dictionary («Удобства»). Same anonymous public read as
 	// the cuisines: the app's filter sheet must build its list from the SERVER
@@ -292,6 +301,11 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// identifies the target).
 	eventsHandler := eventsrest.NewHandler(deps.EventsFacade)
 	eventsHandler.RegisterPublic(api)
+	// GET /events (the cross-venue Explore listing) rides the SAME OptionalAuth
+	// group as the catalog and the feed: it is public, but a signed-in guest
+	// asking for ?sort=for_you gets it ranked by taste match instead of date
+	// (spec foodie-personalization-v1-20260916.md §5.6, criterion 19, BE-4).
+	eventsHandler.RegisterExplore(restPublic)
 	eventsHandler.RegisterAdminRoutes(authed)
 
 	// Recurring-event RULES (migration 0074). Admin only, guarded by exactly the
@@ -385,6 +399,9 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// superadmin creates, edits or hides an entry (ADR-022). A venue that
 	// could add its own would recreate «Кафе, европейская» in a new table.
 	cuisinesHandler.RegisterAdminGlobal(adminGlobal)
+	// Same rule for the foodie-profile option dictionary: the platform adds,
+	// translates, links and hides the wizard's variants, a guest only picks.
+	foodieOptionsHandler.RegisterAdminGlobal(adminGlobal)
 	// Same rule for the feature dictionary: the platform owns the list.
 	venueFeaturesHandler.RegisterAdminGlobal(adminGlobal)
 	// Same rule for cities (ADR-023): the dictionary is the platform's, a

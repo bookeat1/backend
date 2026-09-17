@@ -4,6 +4,14 @@
 // group running middleware.Auth; the RBAC gate (PermRestaurantManage at the
 // event's own restaurant) is resolved inside usecase/events, so transport only
 // builds the Actor and parses ids.
+//
+// GET /events (the cross-venue Explore listing) is the one exception: it
+// mounts on RegisterExplore, on a group running middleware.OptionalAuth, not
+// RegisterPublic's plain group — spec foodie-personalization-v1-20260916.md
+// §5.6/criterion 19. A signed-in guest asking for ?sort=for_you gets the
+// listing ranked by taste match instead of date, with a `match` field on
+// each card; a missing/invalid token behaves exactly like no token, same
+// contract as the catalog and the feed.
 package events
 
 import (
@@ -33,15 +41,25 @@ type Handler struct{ facade uc.Facade }
 // NewHandler builds the events HTTP handler.
 func NewHandler(f uc.Facade) *Handler { return &Handler{facade: f} }
 
-// RegisterPublic mounts the unauthenticated read routes.
+// RegisterPublic mounts the unauthenticated read routes. GET /events (the
+// cross-venue Explore listing) is NOT here — see RegisterExplore.
 func (h *Handler) RegisterPublic(rg *gin.RouterGroup) {
-	rg.GET("/events", h.listUpcoming)
 	// The event's OWN page, addressed by the event id alone. It is what an
 	// action button with no external link points at, and the only way to open a
 	// PLATFORM event at all — that one hangs under no restaurant's path.
 	rg.GET("/events/:eventId", h.getPublicDetail)
 	rg.GET("/restaurants/:id/events", h.listPublic)
 	rg.GET("/restaurants/:id/events/:eventId", h.getPublic)
+}
+
+// RegisterExplore mounts the cross-venue guest listing. Mount on a group
+// running middleware.OptionalAuth: the listing itself is public, but a
+// signed-in guest asking for ?sort=for_you gets it ranked by taste match
+// (spec criterion 19). Separate from RegisterPublic on purpose — every other
+// route above needs no user lookup at all, and putting them on OptionalAuth
+// too would only add a token parse none of them uses.
+func (h *Handler) RegisterExplore(rg *gin.RouterGroup) {
+	rg.GET("/events", h.listUpcoming)
 }
 
 // RegisterAdminRoutes mounts the admin CRUD routes. Mount on a group running
@@ -87,23 +105,56 @@ func (h *Handler) listPublic(c *gin.Context) {
 }
 
 // listUpcoming serves the cross-venue guest listing (Explore screen):
-// GET /events?city=&restaurant_id=&from=&to=&page=&per_page=&lang=.
+// GET /events?city=&restaurant_id=&from=&to=&page=&per_page=&sort=&lang=.
 // Unlike /restaurants/:id/events it is not tied to one venue; what a guest may
 // see is decided in usecase/repository, never by a query parameter.
+//
+// ?sort=for_you (spec §5.6, criterion 19) only takes effect for a SIGNED-IN
+// caller: it switches the order to taste-match score, then starts_at, then
+// id, and puts a `match` block on each card. Missing sort, an unknown sort
+// value, or no/invalid token (OptionalAuth already reduced that to "no user")
+// all fall through to today's plain date order with no `match` field at
+// all — never a null one, so a client can branch on the field's presence.
 func (h *Handler) listUpcoming(c *gin.Context) {
 	flt, ok := publicListFilter(c)
 	if !ok {
 		return
 	}
+	lang := reqlocale.Resolve(c)
+
+	if strings.TrimSpace(c.Query("sort")) == "for_you" {
+		if au, ok := middleware.GetAuthUser(c.Request.Context()); ok {
+			h.listUpcomingForYou(c, flt, au.ID, lang)
+			return
+		}
+	}
+
 	items, total, err := h.facade.ListPublicUpcoming(c.Request.Context(), flt)
 	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	lang := reqlocale.Resolve(c)
 	out := make([]eventListItemResponse, 0, len(items))
 	for _, it := range items {
 		out = append(out, publicListItemResponse(it, lang))
+	}
+	response.OK(c.Writer, response.NewPage(out, total, flt.Page, flt.PerPage))
+}
+
+// listUpcomingForYou is listUpcoming's ?sort=for_you branch for a signed-in
+// guest: same filter, ranked (and scored) by usecase/events.
+// ListPublicUpcomingForYou instead of usecase/events.ListPublicUpcoming.
+func (h *Handler) listUpcomingForYou(c *gin.Context, flt domain.PublicEventFilter, userID uuid.UUID, lang string) {
+	ranked, total, err := h.facade.ListPublicUpcomingForYou(c.Request.Context(), flt, userID)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	out := make([]eventListItemResponse, 0, len(ranked))
+	for _, it := range ranked {
+		r := publicListItemResponse(it.EventListItem, lang)
+		r.Match = matchResponse(it.Match)
+		out = append(out, r)
 	}
 	response.OK(c.Writer, response.NewPage(out, total, flt.Page, flt.PerPage))
 }
@@ -797,6 +848,43 @@ func adminResponse(e domain.Event) eventResponse {
 type eventListItemResponse struct {
 	eventResponse
 	Restaurant *eventRestaurantResponse `json:"restaurant,omitempty"`
+	// Match is the taste-match score and its reason breakdown (spec §5.6),
+	// set ONLY by listUpcomingForYou. publicListItemResponse (used by every
+	// other reader of this DTO — plain /events, /events/:id,
+	// /restaurants/:id/events) never sets it, so it serializes as an ABSENT
+	// field there, never `"match": null` — see listUpcoming's doc comment.
+	Match *eventMatchResponse `json:"match,omitempty"`
+}
+
+// eventMatchResponse mirrors uc.EventTasteMatch for the wire: the total score
+// plus every domain.ScoreTasteMatch signal that produced it, in the SAME
+// shape spec §5.6 already documents for GET /restaurants/picks' own `match`.
+type eventMatchResponse struct {
+	Score   int                   `json:"score"`
+	Reasons []matchReasonResponse `json:"reasons"`
+}
+
+// matchReasonResponse is one domain.TasteMatchReason on the wire. Params is
+// omitted when nil (most reasons carry none — only cuisine_match/
+// cuisine_match_implicit ever set it, per domain.ScoreTasteMatch).
+type matchReasonResponse struct {
+	Code   string         `json:"code"`
+	Points int            `json:"points"`
+	Params map[string]any `json:"params,omitempty"`
+	Detail string         `json:"detail"`
+}
+
+// matchResponse renders one card's uc.EventTasteMatch. Always non-nil — the
+// caller (listUpcomingForYou) only calls it when the card WAS scored; whether
+// to attach the result to the DTO at all is decided one level up.
+func matchResponse(m uc.EventTasteMatch) *eventMatchResponse {
+	reasons := make([]matchReasonResponse, 0, len(m.Reasons))
+	for _, r := range m.Reasons {
+		reasons = append(reasons, matchReasonResponse{
+			Code: string(r.Code), Points: r.Points, Params: r.Params, Detail: r.Detail,
+		})
+	}
+	return &eventMatchResponse{Score: m.Score, Reasons: reasons}
 }
 
 // eventRestaurantResponse is the minimal venue identity on an Explore card.

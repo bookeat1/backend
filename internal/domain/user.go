@@ -48,8 +48,9 @@ type User struct {
 	// Nullable until the guest fills their profile.
 	BirthDate *time.Time
 	// FoodieBudgetTier is the single-value answer of the foodie-profile
-	// wizard's budget step (one of FoodieBudgetTierIDs), or nil when the
-	// guest skipped the (optional) step or never opened the wizard.
+	// wizard's budget step (an existing foodie_options code of kind
+	// "budget", migration 0110), or nil when the guest skipped the
+	// (optional) step or never opened the wizard.
 	FoodieBudgetTier *string
 	EmailVerifiedAt  *time.Time
 	PhoneVerifiedAt  *time.Time

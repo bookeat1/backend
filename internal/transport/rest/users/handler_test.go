@@ -259,6 +259,52 @@ func TestGetFoodieProfileReturnsOwnProfile(t *testing.T) {
 	}
 }
 
+// TestGetFoodieProfileResponseShapeIsByteIdentical pins spec criterion 3
+// (foodie-profile-admin-dictionaries-20260916.md: "GET /users/me/foodie-profile
+// остаётся байт-в-байт таким же после миграции"). The migration (0110) moved
+// the cuisine/diet/allergy/budget dictionary itself into an admin-editable
+// table, but GET/PUT /users/me/foodie-profile still serve
+// usecase/users.Facade.GetFoodieProfile through the SAME foodieProfileResponse
+// this handler used before the migration — this test freezes the exact wire
+// bytes so a future change to that struct's field names/order/omitempty
+// behaviour fails loudly here instead of only being noticed by a mobile
+// client.
+func TestGetFoodieProfileResponseShapeIsByteIdentical(t *testing.T) {
+	id := uuid.New()
+	budget := "mid"
+	f := &fakeFacade{foodieProfile: domain.FoodieProfile{
+		Cuisines: []string{"kazakh", "asian"}, Diets: []string{"halal"},
+		Allergies: []string{"nuts"}, Budget: &budget,
+	}}
+	w := do(newRouter(f), http.MethodGet, "/api/v1/users/me/foodie-profile", nil, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	want := `{"data":{"cuisines":["kazakh","asian"],"diets":["halal"],"allergies":["nuts"],"budget":"mid"}}` + "\n"
+	if got := w.Body.String(); got != want {
+		t.Fatalf("response body =\n%s\nwant byte-identical to\n%s", got, want)
+	}
+}
+
+// TestGetFoodieProfileResponseShapeIsByteIdentical_EmptyProfile covers the
+// other half of the same shape freeze: a guest with no picks yet gets `[]`,
+// never `null`, for every array, and `budget: null` — same convention
+// pre/post migration.
+func TestGetFoodieProfileResponseShapeIsByteIdentical_EmptyProfile(t *testing.T) {
+	id := uuid.New()
+	f := &fakeFacade{foodieProfile: domain.FoodieProfile{}}
+	w := do(newRouter(f), http.MethodGet, "/api/v1/users/me/foodie-profile", nil, id.String())
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	want := `{"data":{"cuisines":[],"diets":[],"allergies":[],"budget":null}}` + "\n"
+	if got := w.Body.String(); got != want {
+		t.Fatalf("response body =\n%s\nwant byte-identical to\n%s", got, want)
+	}
+}
+
 func TestGetFoodieProfileRequiresAuth(t *testing.T) {
 	f := &fakeFacade{}
 	w := do(newRouter(f), http.MethodGet, "/api/v1/users/me/foodie-profile", nil, "")

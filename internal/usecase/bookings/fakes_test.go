@@ -118,6 +118,28 @@ func (f *fakeBookings) CountPromoCodeUsage(_ context.Context, promoCodeID uuid.U
 	return u, nil
 }
 
+// ListBookedRestaurantIDs mirrors the real query's predicate (status not
+// cancelled) and de-duplication; no usecase in this package calls it today
+// (usecase/tastematch does), this fake exists only so fakeBookings keeps
+// satisfying domain.BookingRepository.
+func (f *fakeBookings) ListBookedRestaurantIDs(_ context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	seen := map[uuid.UUID]bool{}
+	var out []uuid.UUID
+	for _, b := range f.list {
+		if b.UserID == nil || *b.UserID != userID {
+			continue
+		}
+		if b.Status == domain.BookingCancelled {
+			continue
+		}
+		if !seen[b.RestaurantID] {
+			seen[b.RestaurantID] = true
+			out = append(out, b.RestaurantID)
+		}
+	}
+	return out, nil
+}
+
 // ListLiveForReconcile mirrors the real query rather than returning f.list
 // wholesale: same predicates (venue, status, starts_at >= from), same total
 // ascending order, same cap. A fake that ignored the filter would let a usecase
