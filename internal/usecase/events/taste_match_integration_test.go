@@ -11,6 +11,7 @@ import (
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
 	cuisinerepo "backend-core/internal/infrastructure/postgres/cuisine"
 	eventrepo "backend-core/internal/infrastructure/postgres/event"
+	foodieoptionrepo "backend-core/internal/infrastructure/postgres/foodieoption"
 	"backend-core/internal/infrastructure/postgres/foodieprofile"
 	restaurantrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	"backend-core/internal/infrastructure/postgres/testdb"
@@ -21,19 +22,56 @@ import (
 
 // integrationTables lists every table this file's tests own, children first.
 // Truncated before each test so one test's leftovers cannot pass another.
+//
+// foodie_options is included for the same reason
+// usecase/tastematch/loader_test.go's own loaderTables truncates it: `go
+// test ./...` runs packages concurrently against one shared Postgres, and
+// infrastructure/postgres/foodieoption's tests also truncate this table —
+// relying on the migration-0110 seed surviving until THIS package's tests
+// run would make the outcome depend on inter-package test order/timing.
+// integrationSeedCuisine below (re)creates exactly the tile row this file's
+// one test needs.
 var integrationTables = []string{
 	"user_foodie_cuisines", "user_foodie_diets", "user_foodie_allergies",
 	"events", "restaurant_cuisines", "cuisine_aliases", "cuisines",
-	"restaurants", "users",
+	"foodie_options", "restaurants", "users",
 }
 
-func integrationSeedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code string) uuid.UUID {
+// integrationSeedCuisine inserts a cuisine-dictionary entry. tileCodes are
+// OPTIONAL — pass a wizard cuisine-tile code (usually the same string as
+// code) to also link this cuisine to that tile's foodie_options row,
+// creating the row if absent. Omit for a cuisine the guest's profile is not
+// expected to match.
+func integrationSeedCuisine(ctx context.Context, t *testing.T, pool sqltx.Querier, code string, tileCodes ...string) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	if _, err := pool.Exec(ctx, `INSERT INTO cuisines (id, code, name) VALUES ($1,$2,$3)`, id, code, code); err != nil {
 		t.Fatalf("seed cuisine %s: %v", code, err)
 	}
+	for _, tile := range tileCodes {
+		integrationLinkFoodieCuisineTile(ctx, t, pool, tile, id)
+	}
 	return id
+}
+
+// integrationLinkFoodieCuisineTile ensures a cuisine-kind foodie_options row
+// for tile exists and links it to cuisineID in foodie_option_cuisines.
+func integrationLinkFoodieCuisineTile(ctx context.Context, t *testing.T, pool sqltx.Querier, tile string, cuisineID uuid.UUID) {
+	t.Helper()
+	var optionID uuid.UUID
+	err := pool.QueryRow(ctx,
+		`INSERT INTO foodie_options (id, kind, code, name, is_active)
+		 VALUES ($1, 'cuisine', $2, $2, true)
+		 ON CONFLICT (kind, code) DO UPDATE SET updated_at = now()
+		 RETURNING id`, uuid.New(), tile).Scan(&optionID)
+	if err != nil {
+		t.Fatalf("seed foodie option tile %s: %v", tile, err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO foodie_option_cuisines (option_id, cuisine_id) VALUES ($1,$2)
+		 ON CONFLICT (option_id, cuisine_id) DO NOTHING`, optionID, cuisineID); err != nil {
+		t.Fatalf("link foodie cuisine tile %s: %v", tile, err)
+	}
 }
 
 func integrationSeedRestaurant(ctx context.Context, t *testing.T, pool sqltx.Querier, name string, cuisineIDs ...uuid.UUID) uuid.UUID {
@@ -79,7 +117,7 @@ func TestListPublicUpcomingForYou_Integration(t *testing.T) {
 	testdb.Truncate(t, pool, integrationTables...)
 	ctx := context.Background()
 
-	italianCuisineID := integrationSeedCuisine(ctx, t, pool, "italian")
+	italianCuisineID := integrationSeedCuisine(ctx, t, pool, "italian", "italian")
 	kazakhCuisineID := integrationSeedCuisine(ctx, t, pool, "kazakh")
 	venueItalian := integrationSeedRestaurant(ctx, t, pool, "Osteria", italianCuisineID)
 	venueKazakh := integrationSeedRestaurant(ctx, t, pool, "Дастархан", kazakhCuisineID)
@@ -103,7 +141,7 @@ func TestListPublicUpcomingForYou_Integration(t *testing.T) {
 	}
 
 	restRepo := restaurantrepo.New(pool)
-	loader := tastematch.NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool))
+	loader := tastematch.NewLoader(foodieprofile.New(pool), userrepo.New(pool), cuisinerepo.New(pool), bookingrepo.New(pool), foodieoptionrepo.New(pool))
 	f := NewFacade(er, nil, nil, WithTasteMatch(loader, restRepo, nil))
 
 	// sort=for_you: score desc (matching venue wins) beats date order.

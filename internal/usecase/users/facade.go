@@ -51,9 +51,16 @@ type facade struct {
 	users    domain.UserRepository
 	cuisines domain.UserCuisinePreferenceRepository
 	foodie   domain.FoodieProfileRepository
-	refresh  domain.RefreshTokenRepository
-	otp      domain.OTPRepository
-	tx       domain.TxManager
+	// options is domain.FoodieOptionRepository directly (not a local port):
+	// domain's own contract for exactly this data, same convention as foodie
+	// above. Used only by ReplaceFoodieProfile's code validation (criterion 9
+	// of spec foodie-profile-admin-dictionaries-20260916.md) — it replaces
+	// the deleted domain.ValidFoodieCuisineID/ValidFoodieDietID/
+	// ValidFoodieAllergyID/ValidFoodieBudgetTier constant-backed checks.
+	options domain.FoodieOptionRepository
+	refresh domain.RefreshTokenRepository
+	otp     domain.OTPRepository
+	tx      domain.TxManager
 }
 
 // NewFacade constructs the users Facade.
@@ -61,11 +68,12 @@ func NewFacade(
 	repo domain.UserRepository,
 	cuisines domain.UserCuisinePreferenceRepository,
 	foodie domain.FoodieProfileRepository,
+	options domain.FoodieOptionRepository,
 	refresh domain.RefreshTokenRepository,
 	otp domain.OTPRepository,
 	tx domain.TxManager,
 ) Facade {
-	return &facade{users: repo, cuisines: cuisines, foodie: foodie, refresh: refresh, otp: otp, tx: tx}
+	return &facade{users: repo, cuisines: cuisines, foodie: foodie, options: options, refresh: refresh, otp: otp, tx: tx}
 }
 
 // UpdateInput carries the mutable profile fields. A nil pointer leaves the
@@ -245,25 +253,42 @@ func (f *facade) GetFoodieProfile(ctx context.Context, id uuid.UUID) (domain.Foo
 // ReplaceFoodieProfile validates in against the wizard's own rules (option
 // ids exist, the 5-cuisine cap, no_diet's exclusivity, a known budget tier)
 // and then overwrites the caller's whole foodie profile atomically: the
-// users.foodie_budget_tier column and all three preference tables are
-// written inside ONE transaction, so a rejected write never leaves budget
-// updated but preferences stale (or vice versa).
+// users.foodie_budget_tier column, all three preference tables, AND the
+// foodie_options code read they are validated against are all inside ONE
+// transaction (criterion 9 of spec
+// foodie-profile-admin-dictionaries-20260916.md — "внутри той же
+// транзакции"), so a rejected write never leaves budget updated but
+// preferences stale (or vice versa), and the validation never races a
+// concurrent admin write in a way that would matter (Postgres's own
+// snapshot isolation is enough here; this is a read of a 36-row dictionary,
+// not a money path).
 func (f *facade) ReplaceFoodieProfile(ctx context.Context, id uuid.UUID, in ReplaceFoodieProfileInput) (domain.FoodieProfile, error) {
-	if err := validateFoodieCuisines(in.Cuisines); err != nil {
-		return domain.FoodieProfile{}, err
-	}
-	if err := validateFoodieDiets(in.Diets); err != nil {
-		return domain.FoodieProfile{}, err
-	}
-	if err := validateFoodieAllergies(in.Allergies); err != nil {
-		return domain.FoodieProfile{}, err
-	}
-	if err := validateFoodieBudget(in.Budget); err != nil {
-		return domain.FoodieProfile{}, err
-	}
-
 	var out domain.FoodieProfile
 	err := f.tx.WithinTx(ctx, func(ctx context.Context) error {
+		// ONE read of every foodie_options code, across all four kinds
+		// (criterion 9's "одно чтение всех кодов за запрос") — replaces the
+		// deleted domain.ValidFoodieCuisineID/ValidFoodieDietID/
+		// ValidFoodieAllergyID/ValidFoodieBudgetTier constant-backed checks.
+		// Active AND hidden codes both count as "exists": an old store build
+		// with the hardcoded list can still submit a code an admin has since
+		// hidden, and it must keep saving (spec 3.9).
+		codes, err := f.options.AllExistingCodes(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validateFoodieCuisines(in.Cuisines, codes[domain.FoodieOptionKindCuisine]); err != nil {
+			return err
+		}
+		if err := validateFoodieDiets(in.Diets, codes[domain.FoodieOptionKindDiet]); err != nil {
+			return err
+		}
+		if err := validateFoodieAllergies(in.Allergies, codes[domain.FoodieOptionKindAllergy]); err != nil {
+			return err
+		}
+		if err := validateFoodieBudget(in.Budget, codes[domain.FoodieOptionKindBudget]); err != nil {
+			return err
+		}
+
 		u, err := f.users.GetByID(ctx, id)
 		if err != nil {
 			return err
@@ -285,17 +310,19 @@ func (f *facade) ReplaceFoodieProfile(ctx context.Context, id uuid.UUID, in Repl
 	return out, nil
 }
 
-// validateFoodieCuisines rejects an unknown cuisine id or more than
+// validateFoodieCuisines rejects an unknown cuisine id (unknown = absent from
+// existing, the caller's kind=cuisine slice of foodie_options.
+// AllExistingCodes — active or hidden both count) or more than
 // domain.FoodieCuisineSelectionLimit entries. The 5-tile cap is a hard block
 // on the client too (foodie-profile-selection.ts) — this is the
 // server-side backstop against a client bug or a hand-rolled request.
-func validateFoodieCuisines(ids []string) error {
+func validateFoodieCuisines(ids []string, existing map[string]struct{}) error {
 	if len(ids) > domain.FoodieCuisineSelectionLimit {
 		return fmt.Errorf("%w: cuisines: at most %d allowed, got %d",
 			domain.ErrValidation, domain.FoodieCuisineSelectionLimit, len(ids))
 	}
 	for _, id := range ids {
-		if !domain.ValidFoodieCuisineID(id) {
+		if _, ok := existing[id]; !ok {
 			return fmt.Errorf("%w: cuisines: unknown id %q", domain.ErrValidation, id)
 		}
 	}
@@ -304,11 +331,13 @@ func validateFoodieCuisines(ids []string) error {
 
 // validateFoodieDiets rejects an unknown diet id, and rejects
 // domain.FoodieDietExclusiveID ("no_diet") appearing alongside any other
-// diet — the two are mutually exclusive by definition.
-func validateFoodieDiets(ids []string) error {
+// diet — the two are mutually exclusive by definition. The exclusivity rule
+// itself stays a Go constant check (🔴2 = A of the admin-dictionaries spec:
+// diet RULES, as opposed to the diet LIST, are not admin-editable data).
+func validateFoodieDiets(ids []string, existing map[string]struct{}) error {
 	hasExclusive := false
 	for _, id := range ids {
-		if !domain.ValidFoodieDietID(id) {
+		if _, ok := existing[id]; !ok {
 			return fmt.Errorf("%w: diets: unknown id %q", domain.ErrValidation, id)
 		}
 		if id == domain.FoodieDietExclusiveID {
@@ -324,22 +353,23 @@ func validateFoodieDiets(ids []string) error {
 
 // validateFoodieAllergies rejects an unknown allergy id. No limit, no
 // exclusivity.
-func validateFoodieAllergies(ids []string) error {
+func validateFoodieAllergies(ids []string, existing map[string]struct{}) error {
 	for _, id := range ids {
-		if !domain.ValidFoodieAllergyID(id) {
+		if _, ok := existing[id]; !ok {
 			return fmt.Errorf("%w: allergies: unknown id %q", domain.ErrValidation, id)
 		}
 	}
 	return nil
 }
 
-// validateFoodieBudget rejects a non-nil tier that is not one of
-// domain.FoodieBudgetTierIDs. nil (the step was skipped) is always valid.
-func validateFoodieBudget(tier *string) error {
+// validateFoodieBudget rejects a non-nil tier absent from existing (the
+// kind=budget slice of AllExistingCodes). nil (the step was skipped) is
+// always valid.
+func validateFoodieBudget(tier *string, existing map[string]struct{}) error {
 	if tier == nil {
 		return nil
 	}
-	if !domain.ValidFoodieBudgetTier(*tier) {
+	if _, ok := existing[*tier]; !ok {
 		return fmt.Errorf("%w: budget: unknown tier %q", domain.ErrValidation, *tier)
 	}
 	return nil

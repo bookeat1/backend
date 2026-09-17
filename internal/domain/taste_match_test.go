@@ -453,6 +453,23 @@ func TestScoreTasteMatchDeterministic(t *testing.T) {
 	}
 }
 
+// testFoodieCuisineMapping mirrors the old package-level constant
+// FoodieCuisineDictionaryCodes (deleted by spec
+// foodie-profile-admin-dictionaries-20260916.md, 🔴1 = A: the tile ->
+// cuisine-codes link is now admin-editable data, read by
+// usecase/tastematch.Loader instead of a Go map) — kept here as a fixture so
+// this test still pins MapFoodieCuisinesToDictionaryCodes' own contract:
+// expand, de-duplicate, never error on a missing or unknown key.
+var testFoodieCuisineMapping = map[string][]string{
+	FoodieCuisineKazakh:   {"kazakh"},
+	FoodieCuisineAsian:    {"pan_asian", "japanese", "indian"},
+	FoodieCuisineEuropean: {"european", "french", "mediterranean", "greek"},
+	FoodieCuisineJapanese: {"japanese"},
+	FoodieCuisineItalian:  {"italian"},
+	FoodieCuisineSeafood:  {"seafood"},
+	FoodieCuisineVegan:    {"vegan"},
+}
+
 func TestMapFoodieCuisinesToDictionaryCodes(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -485,7 +502,7 @@ func TestMapFoodieCuisinesToDictionaryCodes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := MapFoodieCuisinesToDictionaryCodes(tt.tiles)
+			got := MapFoodieCuisinesToDictionaryCodes(tt.tiles, testFoodieCuisineMapping)
 			if len(got) != len(tt.want) {
 				t.Fatalf("got %v, want %v", got, tt.want)
 			}
