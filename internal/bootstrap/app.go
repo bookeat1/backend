@@ -41,6 +41,7 @@ import (
 	preorderrest "backend-core/internal/transport/rest/preorder"
 	promocodesrest "backend-core/internal/transport/rest/promocodes"
 	promosrest "backend-core/internal/transport/rest/promos"
+	pushcampaignsrest "backend-core/internal/transport/rest/pushcampaigns"
 	pushsubscriptionsrest "backend-core/internal/transport/rest/pushsubscriptions"
 	restrest "backend-core/internal/transport/rest/restaurants"
 	reviewsrest "backend-core/internal/transport/rest/reviews"
@@ -318,6 +319,14 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	promosHandler := promosrest.NewHandler(deps.PromosFacade)
 	promosHandler.RegisterPublic(api)
 	promosHandler.RegisterAdminRoutes(authed)
+
+	// Manual push campaigns (migration 0111): mounted on the plain authed
+	// group, not adminGlobal — GET (list/get) allows a restaurant's own staff
+	// to read their venue's campaign status (PermRestaurantManage, resolved
+	// inside the usecase), while POST/estimate stay RoleAdmin-only the same
+	// way, one level down (see usecase/pushcampaigns.Facade's own doc
+	// comments, same split as events/promos above).
+	pushcampaignsrest.NewHandler(deps.PushCampaigns).RegisterRoutes(authed)
 
 	// Guest promo codes. The precheck route is on the AUTHENTICATED group, not
 	// the public one: the verdict includes "have you already used this code",

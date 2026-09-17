@@ -87,6 +87,49 @@ type Config struct {
 	// keeps today's stub behaviour (dev logs the code, everything else warns),
 	// so the tokens can arrive one at a time without a deploy in between.
 	OTPDelivery OTPDeliveryConfig
+
+	// PushCampaigns configures the manual push-campaign sender worker (spec
+	// push-campaigns-manual-spec-2026-09-17.md): scheduling, frequency caps and
+	// the quiet-hours window. It only ever runs when GUEST_PUSH_PROVIDER is
+	// configured — with no provider nothing could be sent anyway, so the worker
+	// is simply not started (same posture as NewPushReceiptWorker, not the
+	// safe-idle-when-unconfigured posture of the reconcilers).
+	PushCampaigns PushCampaignsConfig
+}
+
+// PushCampaignsConfig is the manual push-campaign sender's schedule and safety
+// knobs. Frequency caps and quiet hours exist to protect the SAME guest across
+// EVERY venue's campaigns — the audience is "the whole city", not one venue's
+// subscriber list, so these are platform-wide constants, not a per-venue
+// setting.
+type PushCampaignsConfig struct {
+	// Tick is the pause between two sender passes. env: PUSH_CAMPAIGNS_TICK
+	Tick time.Duration
+	// BatchSize caps how many campaigns one tick claims. env:
+	// PUSH_CAMPAIGNS_BATCH_SIZE
+	BatchSize int
+	// LeaseFor is how long a claimed campaign is considered "someone is already
+	// sending this" before a second worker process may reclaim it (criterion
+	// 10). env: PUSH_CAMPAIGNS_LEASE
+	LeaseFor time.Duration
+	// MaxQueueAge is how old a still-`queued` campaign may get before the
+	// worker expires it instead of sending it late (criterion 17, spec 3.12 —
+	// "the worker was down, sending it hours later without the admin's
+	// knowledge is not wanted"). env: PUSH_CAMPAIGNS_MAX_QUEUE_AGE
+	MaxQueueAge time.Duration
+	// MaxAttempts is the campaign-level retry budget on a transient (429/5xx)
+	// Expo failure before the campaign is marked `failed` (criterion 16). env:
+	// PUSH_CAMPAIGNS_MAX_ATTEMPTS
+	MaxAttempts int
+	// SendBatchSize is how many messages go into ONE Expo push/send request
+	// (criterion 15 — Expo's own documented ceiling is 100). env:
+	// PUSH_CAMPAIGNS_SEND_BATCH_SIZE
+	SendBatchSize int
+	// DailyCap / WeeklyCap bound how many marketing pushes ONE guest may
+	// receive, across every campaign and every venue (criterion 13's
+	// skipped_cap). env: PUSH_CAMPAIGNS_DAILY_CAP / PUSH_CAMPAIGNS_WEEKLY_CAP
+	DailyCap  int
+	WeeklyCap int
 }
 
 // OTPDeliveryConfig holds the credentials and knobs of every OTP channel. All
@@ -825,6 +868,16 @@ func NewConfig() (Config, error) {
 			WhatsAppNotifyAPIVersion:   getEnv("WHATSAPP_NOTIFY_API_VERSION", getEnv("OTP_WHATSAPP_API_VERSION", whatsapp.DefaultAPIVersion)),
 			WhatsAppNotifyAPIURL:       getEnv("WHATSAPP_NOTIFY_API_URL", ""),
 			WhatsAppNotifyTimeout:      getEnvDuration("WHATSAPP_NOTIFY_TIMEOUT", 10*time.Second),
+		},
+		PushCampaigns: PushCampaignsConfig{
+			Tick:          getEnvDuration("PUSH_CAMPAIGNS_TICK", 10*time.Second),
+			BatchSize:     getEnvInt("PUSH_CAMPAIGNS_BATCH_SIZE", 5),
+			LeaseFor:      getEnvDuration("PUSH_CAMPAIGNS_LEASE", 10*time.Minute),
+			MaxQueueAge:   getEnvDuration("PUSH_CAMPAIGNS_MAX_QUEUE_AGE", 6*time.Hour),
+			MaxAttempts:   getEnvInt("PUSH_CAMPAIGNS_MAX_ATTEMPTS", 12),
+			SendBatchSize: getEnvInt("PUSH_CAMPAIGNS_SEND_BATCH_SIZE", 100),
+			DailyCap:      getEnvInt("PUSH_CAMPAIGNS_DAILY_CAP", 1),
+			WeeklyCap:     getEnvInt("PUSH_CAMPAIGNS_WEEKLY_CAP", 3),
 		},
 		StaticMap: StaticMapConfig{
 			Provider:      getEnv("STATIC_MAP_PROVIDER", ""),
