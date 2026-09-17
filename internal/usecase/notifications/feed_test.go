@@ -13,6 +13,8 @@ import (
 	"backend-core/internal/domain"
 )
 
+func uuidPtr(id uuid.UUID) *uuid.UUID { return &id }
+
 // fakeFeed is an in-memory domain.NotificationFeedRepository. Insert enforces the
 // same (outbox_event_id, user_id) idempotency the Postgres unique key does, so a
 // redelivery test proves the no-op without a database.
@@ -27,7 +29,14 @@ func (f *fakeFeed) Insert(_ context.Context, n *domain.Notification) (bool, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, r := range f.rows {
-		if r.OutboxEventID == n.OutboxEventID && r.UserID == n.UserID {
+		if r.UserID != n.UserID {
+			continue
+		}
+		if n.CampaignID != nil && r.CampaignID != nil && *r.CampaignID == *n.CampaignID {
+			return false, nil
+		}
+		if n.CampaignID == nil && r.CampaignID == nil &&
+			n.OutboxEventID != nil && r.OutboxEventID != nil && *r.OutboxEventID == *n.OutboxEventID {
 			return false, nil
 		}
 	}
@@ -232,14 +241,14 @@ func TestNotificationFeedListUnreadAndPagination(t *testing.T) {
 			Type:          domain.FeedTypeBooking,
 			Title:         "t",
 			Body:          "b",
-			OutboxEventID: uuid.New(),
+			OutboxEventID: uuidPtr(uuid.New()),
 			CreatedAt:     base.Add(time.Duration(i) * time.Minute),
 		})
 	}
 	// noise for another user must never leak or count.
 	_, _ = feed.Insert(context.Background(), &domain.Notification{
 		UserID: uuid.New(), Type: domain.FeedTypeBooking, Title: "x", Body: "x",
-		OutboxEventID: uuid.New(), CreatedAt: base,
+		OutboxEventID: uuidPtr(uuid.New()), CreatedAt: base,
 	})
 
 	page1, err := uc.List(context.Background(), uid, nil, 2)
@@ -293,7 +302,7 @@ func TestNotificationFeedMarkReadScopesToOwner(t *testing.T) {
 	owner, other := uuid.New(), uuid.New()
 	n := &domain.Notification{
 		UserID: owner, Type: domain.FeedTypeBooking, Title: "t", Body: "b",
-		OutboxEventID: uuid.New(), CreatedAt: time.Now(),
+		OutboxEventID: uuidPtr(uuid.New()), CreatedAt: time.Now(),
 	}
 	_, _ = feed.Insert(context.Background(), n)
 
@@ -324,7 +333,7 @@ func TestNotificationFeedMarkAllRead(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		_, _ = feed.Insert(context.Background(), &domain.Notification{
 			UserID: uid, Type: domain.FeedTypeBooking, Title: "t", Body: "b",
-			OutboxEventID: uuid.New(), CreatedAt: time.Now(),
+			OutboxEventID: uuidPtr(uuid.New()), CreatedAt: time.Now(),
 		})
 	}
 	if err := uc.MarkAllRead(context.Background(), uid); err != nil {

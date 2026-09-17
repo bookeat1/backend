@@ -583,6 +583,22 @@ func (f *fakeDeviceTokens) ListActiveByUser(_ context.Context, userID uuid.UUID)
 	return out, nil
 }
 
+func (f *fakeDeviceTokens) ListActiveByUsers(_ context.Context, userIDs []uuid.UUID) ([]domain.DevicePushToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[uuid.UUID]bool, len(userIDs))
+	for _, id := range userIDs {
+		want[id] = true
+	}
+	var out []domain.DevicePushToken
+	for _, r := range f.byID {
+		if want[r.UserID] && r.IsActive {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeDeviceTokens) DeactivateByID(_ context.Context, id uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

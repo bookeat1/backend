@@ -345,6 +345,34 @@ func (r *DeviceTokens) ListActiveByUser(ctx context.Context, userID uuid.UUID) (
 	return out, rows.Err()
 }
 
+// ListActiveByUsers returns the live devices of MANY guests in one round trip
+// — the push campaign worker's fan-out target set for a whole city.
+// `= ANY($1)` on an empty slice correctly returns zero rows rather than
+// erroring, so callers never need to special-case an empty audience.
+func (r *DeviceTokens) ListActiveByUsers(ctx context.Context, userIDs []uuid.UUID) ([]domain.DevicePushToken, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+deviceTokenCols+` FROM device_push_tokens
+		  WHERE user_id = ANY($1) AND is_active ORDER BY user_id, created_at, id`, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list device push tokens for users: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.DevicePushToken
+	for rows.Next() {
+		var t domain.DevicePushToken
+		var platform string
+		if err := rows.Scan(&t.ID, &t.UserID, &t.Token, &platform, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("list device push tokens for users: %w", err)
+		}
+		t.Platform = domain.DevicePlatform(platform)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // DeactivateByID silences a token the provider reported as gone. The row stays
 // (the delivery ledger points at its id); only the flag flips.
 func (r *DeviceTokens) DeactivateByID(ctx context.Context, id uuid.UUID) error {
