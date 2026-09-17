@@ -48,6 +48,14 @@ type Config struct {
 	ReceiptsEndpoint string
 	// Timeout caps one send call.
 	Timeout time.Duration
+	// MaxBatchSize caps how many messages SendBatch puts in ONE Expo request.
+	// Zero/negative uses defaultMaxBatchSize (Expo's own documented ceiling);
+	// a value ABOVE it is clamped down to it — this can only ever make a
+	// deployment send SMALLER batches than Expo allows, never larger ones a
+	// real Expo project would reject. env: PUSH_CAMPAIGNS_SEND_BATCH_SIZE
+	// (the only caller that ever sets this today — booking pushes always
+	// batch of one, well under any cap).
+	MaxBatchSize int
 }
 
 // Sender posts one message per call to the Expo push service.
@@ -56,6 +64,7 @@ type Sender struct {
 	receiptsEndpoint string
 	accessToken      string
 	client           *http.Client
+	maxBatchSize     int
 }
 
 // NewSender builds an Expo push sender.
@@ -72,11 +81,16 @@ func NewSender(cfg Config) *Sender {
 	if receipts == "" {
 		receipts = defaultReceiptsEndpoint
 	}
+	batchSize := cfg.MaxBatchSize
+	if batchSize <= 0 || batchSize > defaultMaxBatchSize {
+		batchSize = defaultMaxBatchSize
+	}
 	return &Sender{
 		endpoint:         endpoint,
 		receiptsEndpoint: receipts,
 		accessToken:      strings.TrimSpace(cfg.AccessToken),
 		client:           &http.Client{Timeout: timeout},
+		maxBatchSize:     batchSize,
 	}
 }
 
@@ -88,6 +102,10 @@ type pushMessage struct {
 	Body  string            `json:"body"`
 	Data  map[string]string `json:"data,omitempty"`
 	Sound string            `json:"sound,omitempty"`
+	// ChannelID selects the Android notification channel ("bookings",
+	// "offers"). Omitted (empty) leaves Android to its default channel — the
+	// behaviour every message had before this field existed.
+	ChannelID string `json:"channelId,omitempty"`
 }
 
 // pushResponse is Expo's ticket envelope. `data` is an ARRAY because the request
@@ -112,38 +130,95 @@ type pushResponse struct {
 	} `json:"errors"`
 }
 
-// Send delivers one message to one Expo push token.
+// defaultMaxBatchSize is Expo's documented ceiling on messages per send
+// request (docs.expo.dev, "Batching push notifications") — the default and
+// hard upper bound for Sender.maxBatchSize (see Config.MaxBatchSize).
+const defaultMaxBatchSize = 100
+
+// Send delivers one message to one Expo push token. It is a thin wrapper over
+// SendBatch with a single-element slice (criterion 15 of the push-campaigns
+// spec): booking pushes go through the exact same wire format and verdict
+// mapping they always have, byte for byte, because they are now simply
+// SendBatch's n=1 case rather than a separate code path.
+func (s *Sender) Send(ctx context.Context, token string, msg notifications.MobilePushMessage) (notifications.MobilePushResult, error) {
+	results, err := s.SendBatch(ctx, []BatchMessage{{
+		Token: token, Title: msg.Title, Body: msg.Body, Data: msg.Data, ChannelID: msg.ChannelID,
+	}})
+	if len(results) != 1 {
+		// Unreachable given SendBatch's own contract (always len(msgs) results),
+		// kept so a future refactor cannot silently panic on results[0] below.
+		return rejected(), err
+	}
+	return results[0], err
+}
+
+// BatchMessage is one recipient's push within a SendBatch call.
+type BatchMessage struct {
+	Token     string
+	Title     string
+	Body      string
+	Data      map[string]string
+	ChannelID string
+}
+
+// SendBatch delivers up to len(msgs) messages, chunked internally to Expo's
+// own per-request ceiling (s.maxBatchSize) so a push-campaign fan-out of
+// thousands of tokens is simply several sequential requests, never one
+// oversized one. The returned slice is ALWAYS len(msgs) long and positionally
+// aligned with msgs: result[i] answers msgs[i].
 //
-// Verdict mapping (per Expo's documented ticket format):
+// A non-nil error means one chunk's HTTP round trip itself failed (transport
+// error, 429, 5xx) — the transient case the campaign sender retries on a
+// later tick (spec 3.11). Every message in a chunk that succeeded before the
+// failure carries its real verdict; every message from the failing chunk
+// onward is reported Rejected (never silently zero-valued) so a caller that
+// only checks the per-message verdict, not the returned error, cannot mistake
+// "we never actually tried" for "Expo rejected it".
+func (s *Sender) SendBatch(ctx context.Context, msgs []BatchMessage) ([]notifications.MobilePushResult, error) {
+	out := make([]notifications.MobilePushResult, len(msgs))
+	for i := range out {
+		out[i] = rejected()
+	}
+	for start := 0; start < len(msgs); start += s.maxBatchSize {
+		end := start + s.maxBatchSize
+		if end > len(msgs) {
+			end = len(msgs)
+		}
+		results, err := s.sendChunk(ctx, msgs[start:end])
+		copy(out[start:start+len(results)], results)
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// sendChunk sends AT MOST s.maxBatchSize messages in one Expo request and
+// returns one result per input message, positionally aligned — exactly the
+// verdict mapping the pre-batch Send used for its single element:
 //
 //	HTTP 2xx + status "ok"                     → Delivered + the ticket id
 //	status "error", details.error DeviceNotRegistered → DeviceGone (deactivate)
 //	any other ticket error (e.g. MessageTooBig) → Rejected (not retryable)
-//	HTTP 429 / 5xx / transport failure          → error (transient, retried)
-//
-// "Delivered" here means ACCEPTED BY EXPO, nothing more. The real per-device
-// outcome only exists in the receipt, which is why the ticket id is returned
-// instead of thrown away: on 2026-09-01 three live android tokens all came back
-// `ok` from this call and two of them came back DeviceNotRegistered from
-// Receipts. Whoever calls Send owns enqueueing that id for polling.
+//	HTTP 429 / 5xx / transport failure          → error (transient, retried);
+//	  no per-message results are returned, since a whole-chunk HTTP failure
+//	  answers nothing about any individual message in it.
 //
 // TODO(verify): проверить на реальном Expo-проекте, что при
 // push-security-токене неверный токен приходит как HTTP 400 с errors[].code
 // UNAUTHORIZED, а не как ticket-ошибка.
-func (s *Sender) Send(ctx context.Context, token string, msg notifications.MobilePushMessage) (notifications.MobilePushResult, error) {
-	body, err := json.Marshal([]pushMessage{{
-		To:    token,
-		Title: msg.Title,
-		Body:  msg.Body,
-		Data:  msg.Data,
-		Sound: "default",
-	}})
+func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) ([]notifications.MobilePushResult, error) {
+	payload := make([]pushMessage, len(chunk))
+	for i, m := range chunk {
+		payload[i] = pushMessage{To: m.Token, Title: m.Title, Body: m.Body, Data: m.Data, Sound: "default", ChannelID: m.ChannelID}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return rejected(), fmt.Errorf("expo push: marshal request: %w", err)
+		return nil, fmt.Errorf("expo push: marshal request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return rejected(), s.scrub(fmt.Errorf("expo push: build request: %w", err))
+		return nil, s.scrub(fmt.Errorf("expo push: build request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -153,51 +228,64 @@ func (s *Sender) Send(ctx context.Context, token string, msg notifications.Mobil
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return rejected(), s.scrub(fmt.Errorf("expo push: send: %w", err))
+		return nil, s.scrub(fmt.Errorf("expo push: send: %w", err))
 	}
 	defer resp.Body.Close()
-	// Bounded read: the ticket envelope for one message is tiny, and an
-	// unbounded ReadAll on a misbehaving endpoint is a memory hazard.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	// Bounded read: scales with the chunk (≤100 tiny ticket entries), and an
+	// unbounded ReadAll on a misbehaving endpoint is still a memory hazard.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return rejected(), s.scrub(fmt.Errorf("expo push: read response: %w", err))
+		return nil, s.scrub(fmt.Errorf("expo push: read response: %w", err))
 	}
 	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-		// Transient — the notifier leaves the outbox event for the next tick.
-		return rejected(), fmt.Errorf("expo push: status %d", resp.StatusCode)
+		// Transient — the caller retries the whole chunk later.
+		return nil, fmt.Errorf("expo push: status %d", resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 4xx other than 429: a bad request or a bad access token. Retrying
-		// cannot fix it; the notifier logs and drains. The response body is NOT
-		// echoed into the error — it may quote the push token back.
-		return rejected(), nil
+		// cannot fix it. The response body is NOT echoed into the error — it
+		// may quote a push token back. Every message in the chunk is reported
+		// Rejected rather than erroring the caller into a pointless retry.
+		out := make([]notifications.MobilePushResult, len(chunk))
+		for i := range out {
+			out[i] = rejected()
+		}
+		return out, nil
 	}
 
-	var out pushResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return rejected(), fmt.Errorf("expo push: decode response: %w", err)
+	var decoded pushResponse
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("expo push: decode response: %w", err)
 	}
-	if len(out.Data) == 0 {
-		// A 2xx with no ticket is Expo refusing the whole request (errors[] is
-		// populated). Treat as non-retryable; the code is safe to log, the
-		// message may quote the token.
+	if len(decoded.Data) == 0 {
+		// A 2xx with no tickets is Expo refusing the whole request (errors[]
+		// is populated). Treat as non-retryable; the code is safe to log, the
+		// message may quote a token.
 		code := ""
-		if len(out.Errors) > 0 {
-			code = out.Errors[0].Code
+		if len(decoded.Errors) > 0 {
+			code = decoded.Errors[0].Code
 		}
-		return rejected(), fmt.Errorf("expo push: no ticket returned (code %q)", code)
+		return nil, fmt.Errorf("expo push: no tickets returned (code %q)", code)
 	}
-	ticket := out.Data[0]
-	if ticket.Status == "ok" {
-		return notifications.MobilePushResult{
-			Verdict:  notifications.MobilePushDelivered,
-			TicketID: strings.TrimSpace(ticket.ID),
-		}, nil
+	if len(decoded.Data) != len(chunk) {
+		return nil, fmt.Errorf("expo push: got %d tickets for %d messages, cannot map positionally",
+			len(decoded.Data), len(chunk))
 	}
-	if ticket.Details.Error == "DeviceNotRegistered" {
-		return notifications.MobilePushResult{Verdict: notifications.MobilePushDeviceGone}, nil
+	out := make([]notifications.MobilePushResult, len(chunk))
+	for i, ticket := range decoded.Data {
+		switch {
+		case ticket.Status == "ok":
+			out[i] = notifications.MobilePushResult{
+				Verdict:  notifications.MobilePushDelivered,
+				TicketID: strings.TrimSpace(ticket.ID),
+			}
+		case ticket.Details.Error == "DeviceNotRegistered":
+			out[i] = notifications.MobilePushResult{Verdict: notifications.MobilePushDeviceGone}
+		default:
+			out[i] = rejected()
+		}
 	}
-	return rejected(), nil
+	return out, nil
 }
 
 // rejected is the "no ticket to poll" result. Spelled out once so no branch
