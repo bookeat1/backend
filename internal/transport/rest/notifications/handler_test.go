@@ -136,9 +136,10 @@ func seed(feed *fakeFeed, userID uuid.UUID, created time.Time, read bool) uuid.U
 		t := created.Add(time.Minute)
 		readAt = &t
 	}
+	outboxEventID := uuid.New()
 	feed.rows = append(feed.rows, domain.Notification{
 		ID: id, UserID: userID, Type: domain.FeedTypeBooking,
-		Title: "Бронь подтверждена", Body: "b", OutboxEventID: uuid.New(),
+		Title: "Бронь подтверждена", Body: "b", OutboxEventID: &outboxEventID,
 		ReadAt: readAt, CreatedAt: created,
 	})
 	return id
@@ -176,6 +177,59 @@ func TestListReturnsItemsAndUnreadCount(t *testing.T) {
 	}
 	if fr.UnreadCount != 1 {
 		t.Errorf("unread_count = %d, want 1", fr.UnreadCount)
+	}
+}
+
+// TestListIncludesCampaignFields pins criterion 25: event_id/promo_id are
+// null on an old booking row and populated on a push-campaign row, and
+// `type` can be "event" — old fields stay untouched either way.
+func TestListIncludesCampaignFields(t *testing.T) {
+	feed := &fakeFeed{}
+	uid := uuid.New()
+	base := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	outboxEventID := uuid.New()
+	feed.rows = append(feed.rows, domain.Notification{
+		ID: uuid.New(), UserID: uid, Type: domain.FeedTypeBooking,
+		Title: "Бронь подтверждена", Body: "b", OutboxEventID: &outboxEventID, CreatedAt: base,
+	})
+	eventID := uuid.New()
+	campaignID := uuid.New()
+	feed.rows = append(feed.rows, domain.Notification{
+		ID: uuid.New(), UserID: uid, Type: domain.FeedTypeEvent,
+		Title: "Новое событие", Body: "b", CampaignID: &campaignID, EventID: &eventID,
+		CreatedAt: base.Add(time.Minute),
+	})
+
+	w := do(newRouter(feed), http.MethodGet, "/api/v1/notifications", uid.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	fr := decodeFeed(t, w)
+	if len(fr.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(fr.Items))
+	}
+	var campaignItem, bookingItem notificationResponse
+	for _, item := range fr.Items {
+		if item.Type == "event" {
+			campaignItem = item
+		} else {
+			bookingItem = item
+		}
+	}
+	if campaignItem.Type != "event" {
+		t.Fatalf("campaign item type = %q, want event", campaignItem.Type)
+	}
+	if campaignItem.EventID == nil || *campaignItem.EventID != eventID {
+		t.Fatalf("campaign item event_id = %v, want %v", campaignItem.EventID, eventID)
+	}
+	if campaignItem.PromoID != nil {
+		t.Fatalf("campaign item promo_id = %v, want nil", campaignItem.PromoID)
+	}
+	if bookingItem.EventID != nil || bookingItem.PromoID != nil {
+		t.Fatalf("old booking item event_id/promo_id = %v/%v, want both nil", bookingItem.EventID, bookingItem.PromoID)
+	}
+	if bookingItem.Type != "booking" {
+		t.Fatalf("booking item type = %q, want booking (unchanged)", bookingItem.Type)
 	}
 }
 

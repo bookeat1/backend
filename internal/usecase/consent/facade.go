@@ -36,10 +36,23 @@ type RecordInput struct {
 }
 
 // PreferenceInput is the guest's desired notification opt-out state.
+//
+// The three original fields keep their existing semantics byte for byte: the
+// transport layer already defaults an omitted field to true
+// (preferenceRequest.boolOrTrue) before it ever reaches here, so this struct
+// cannot tell "the client sent false" from "the client sent nothing" for
+// them, and SetPreferences always writes exactly what it is given.
+//
+// PromoPushEnabled is different ON PURPOSE (criterion 23 — new behaviour for
+// the NEW field only): nil means "the client did not mention this field, keep
+// whatever it already was" — an old mobile build that has never heard of
+// «Акции и события» must not silently reset a guest's earlier opt-out every
+// time it PUTs the three fields it does know about.
 type PreferenceInput struct {
 	NotificationsEnabled bool
 	PushEnabled          bool
 	EmailEnabled         bool
+	PromoPushEnabled     *bool
 }
 
 // Facade exposes the current user's consent and notification-preference operations.
@@ -112,11 +125,22 @@ func (f *facade) Preferences(ctx context.Context, userID uuid.UUID) (domain.Noti
 }
 
 func (f *facade) SetPreferences(ctx context.Context, userID uuid.UUID, in PreferenceInput) (domain.NotificationPreference, error) {
+	// PromoPushEnabled needs the CURRENT value when the client omitted it —
+	// the only field with "absent = keep" semantics (see PreferenceInput).
+	promoPushEnabled := true
+	if in.PromoPushEnabled != nil {
+		promoPushEnabled = *in.PromoPushEnabled
+	} else if current, err := f.prefs.Get(ctx, userID); err != nil {
+		return domain.NotificationPreference{}, err
+	} else {
+		promoPushEnabled = current.PromoPushEnabled
+	}
 	pref := domain.NotificationPreference{
 		UserID:               userID,
 		NotificationsEnabled: in.NotificationsEnabled,
 		PushEnabled:          in.PushEnabled,
 		EmailEnabled:         in.EmailEnabled,
+		PromoPushEnabled:     promoPushEnabled,
 	}
 	if err := f.prefs.Upsert(ctx, pref); err != nil {
 		return domain.NotificationPreference{}, err

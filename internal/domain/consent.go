@@ -59,7 +59,12 @@ type NotificationPreference struct {
 	NotificationsEnabled bool
 	PushEnabled          bool
 	EmailEnabled         bool
-	UpdatedAt            time.Time
+	// PromoPushEnabled is the «Акции и события» toggle (migration 0111,
+	// push-campaigns spec §0.2): opt-out, DEFAULT true. It is independent of
+	// PushEnabled (a guest can keep booking pushes and drop marketing ones) but
+	// still subordinate to it and to NotificationsEnabled — see AllowsPromoPush.
+	PromoPushEnabled bool
+	UpdatedAt        time.Time
 }
 
 // DefaultNotificationPreference is the effective preference for a user who has
@@ -70,6 +75,7 @@ func DefaultNotificationPreference(userID uuid.UUID) NotificationPreference {
 		NotificationsEnabled: true,
 		PushEnabled:          true,
 		EmailEnabled:         true,
+		PromoPushEnabled:     true,
 	}
 }
 
@@ -77,6 +83,14 @@ func DefaultNotificationPreference(userID uuid.UUID) NotificationPreference {
 // switch must be on AND the channel's own flag must be on. A channel this
 // preference model does not track (e.g. a future one) defaults to allowed as
 // long as the master switch is on, so adding a channel never silently mutes it.
+//
+// This is deliberately NOT consulted for a push campaign — see
+// AllowsPromoPush, which ALSO requires PromoPushEnabled. Reusing Allows for a
+// campaign would let a guest who only turned off "Акции и события" (and kept
+// booking pushes) get skipped correctly, but it would also let a guest who
+// merely has an old-client default (PromoPushEnabled defaults true) receive
+// promos through the BOOKING push toggle alone, which is the OPPOSITE of the
+// point of a separate marketing toggle.
 func (p NotificationPreference) Allows(channel NotificationChannel) bool {
 	if !p.NotificationsEnabled {
 		return false
@@ -90,6 +104,16 @@ func (p NotificationPreference) Allows(channel NotificationChannel) bool {
 	default:
 		return true
 	}
+}
+
+// AllowsPromoPush reports whether the guest may receive a MARKETING push
+// (event/promo campaign): the master switch, the push channel switch AND the
+// dedicated opt-out must all be true (spec criterion 13's
+// `NOT (notifications_enabled AND push_enabled AND promo_push_enabled)`).
+// This is the ONE function usecase/pushcampaigns' Estimate and Sender both
+// call, so the two never classify the same guest differently.
+func (p NotificationPreference) AllowsPromoPush() bool {
+	return p.NotificationsEnabled && p.PushEnabled && p.PromoPushEnabled
 }
 
 // UserNotificationPreferenceRepository persists a guest's notification opt-out.

@@ -108,3 +108,55 @@ func TestSetPreferencesRoundTrips(t *testing.T) {
 		t.Fatalf("preference did not round-trip: %+v", read)
 	}
 }
+
+// TestSetPreferencesOmittedPromoPushKeepsCurrentValue pins criterion 23: an
+// old client that PUTs only the three original fields must not reset a
+// PREVIOUSLY set promo_push_enabled=false back to true.
+func TestSetPreferencesOmittedPromoPushKeepsCurrentValue(t *testing.T) {
+	_, _, f := newFacade()
+	uid := uuid.New()
+	ctx := context.Background()
+
+	off := false
+	if _, err := f.SetPreferences(ctx, uid, PreferenceInput{
+		NotificationsEnabled: true, PushEnabled: true, EmailEnabled: true, PromoPushEnabled: &off,
+	}); err != nil {
+		t.Fatalf("turn promo push off: %v", err)
+	}
+
+	// An "old client" PUT: the three original fields, PromoPushEnabled left nil
+	// (exactly what preferenceRequest.toInput produces when the field is absent
+	// from the JSON body).
+	got, err := f.SetPreferences(ctx, uid, PreferenceInput{
+		NotificationsEnabled: true, PushEnabled: true, EmailEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("old-client PUT: %v", err)
+	}
+	if got.PromoPushEnabled {
+		t.Fatalf("old-client PUT (no promo_push_enabled field) reset promo_push_enabled to true, want it to stay false")
+	}
+
+	read, err := f.Preferences(ctx, uid)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if read.PromoPushEnabled {
+		t.Fatalf("promo_push_enabled did not stay false after a read-back: %+v", read)
+	}
+}
+
+// TestSetPreferencesNewGuestDefaultsPromoPushOn pins criterion 24: a guest
+// with no preference row at all is promo_push_enabled=true, same as every
+// other channel (opt-out, not opt-in).
+func TestSetPreferencesNewGuestDefaultsPromoPushOn(t *testing.T) {
+	_, _, f := newFacade()
+	uid := uuid.New()
+	pref, err := f.Preferences(context.Background(), uid)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !pref.PromoPushEnabled {
+		t.Fatalf("a guest with no preference row must default promo_push_enabled=true, got %+v", pref)
+	}
+}

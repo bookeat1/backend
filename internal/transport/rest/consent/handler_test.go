@@ -99,9 +99,21 @@ func (f *fakeFacade) Preferences(_ context.Context, userID uuid.UUID) (domain.No
 
 func (f *fakeFacade) SetPreferences(_ context.Context, userID uuid.UUID, in uc.PreferenceInput) (domain.NotificationPreference, error) {
 	f.lastSetID = userID
+	// Mirror the real facade's "absent PromoPushEnabled = keep current" rule
+	// (usecase/consent.facade.SetPreferences), so a handler-level test can
+	// prove the JSON binding actually produces nil for an omitted field,
+	// not just that some facade received SOME value.
+	promo := true
+	if current, ok := f.prefs[userID]; ok {
+		promo = current.PromoPushEnabled
+	}
+	if in.PromoPushEnabled != nil {
+		promo = *in.PromoPushEnabled
+	}
 	p := domain.NotificationPreference{
 		UserID: userID, NotificationsEnabled: in.NotificationsEnabled,
-		PushEnabled: in.PushEnabled, EmailEnabled: in.EmailEnabled, UpdatedAt: time.Now(),
+		PushEnabled: in.PushEnabled, EmailEnabled: in.EmailEnabled,
+		PromoPushEnabled: promo, UpdatedAt: time.Now(),
 	}
 	f.prefs[userID] = p
 	return p, nil
@@ -268,5 +280,41 @@ func TestNotificationOptOutPersistsAndReadsBack(t *testing.T) {
 	_ = json.Unmarshal(raw, &got)
 	if got.NotificationsEnabled {
 		t.Fatalf("opt-out did not persist through the handler")
+	}
+}
+
+// TestOldClientPutDoesNotResetPromoPushOptOut pins criterion 23 at the wire
+// level: a PUT body with exactly the three original fields (no
+// promo_push_enabled key at all — what a build predating this feature sends)
+// must not reset a previously-opted-out promo_push_enabled back to true.
+func TestOldClientPutDoesNotResetPromoPushOptOut(t *testing.T) {
+	id := uuid.New()
+	f := newFakeFacade()
+	r := newRouter(f)
+
+	off := false
+	w := do(r, http.MethodPut, "/api/v1/notification-preferences",
+		map[string]any{"notifications_enabled": true, "push_enabled": true, "email_enabled": true, "promo_push_enabled": &off},
+		id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("turn promo push off: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// The "old client" body: exactly the three fields it has always sent, the
+	// json.Marshal of a map WITHOUT a promo_push_enabled key at all — not the
+	// key present with a null/zero value.
+	w = do(r, http.MethodPut, "/api/v1/notification-preferences",
+		map[string]any{"notifications_enabled": true, "push_enabled": true, "email_enabled": true},
+		id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("old-client PUT: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var env response.Envelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	raw, _ := json.Marshal(env.Data)
+	var got preferenceResponse
+	_ = json.Unmarshal(raw, &got)
+	if got.PromoPushEnabled {
+		t.Fatalf("an old-client PUT (no promo_push_enabled key) reset it to true, want it to stay false")
 	}
 }

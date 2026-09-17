@@ -46,8 +46,13 @@ type notificationResponse struct {
 	Body         string     `json:"body"`
 	BookingID    *uuid.UUID `json:"booking_id"`
 	RestaurantID *uuid.UUID `json:"restaurant_id"`
-	Read         bool       `json:"read"`
-	CreatedAt    time.Time  `json:"created_at"`
+	// EventID / PromoID are the push-campaign deep-link targets (migration
+	// 0111): null for every entry that predates campaigns, and for a booking
+	// entry. Type "event"/"promo" tells the client which of the two to expect.
+	EventID   *uuid.UUID `json:"event_id"`
+	PromoID   *uuid.UUID `json:"promo_id"`
+	Read      bool       `json:"read"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // feedResponse is the list payload: a page of entries, the unread badge count
@@ -66,6 +71,8 @@ func toResponse(n domain.Notification) notificationResponse {
 		Body:         n.Body,
 		BookingID:    n.BookingID,
 		RestaurantID: n.RestaurantID,
+		EventID:      n.EventID,
+		PromoID:      n.PromoID,
 		Read:         n.Read(),
 		CreatedAt:    n.CreatedAt,
 	}

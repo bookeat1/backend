@@ -95,9 +95,9 @@ var _ domain.UserNotificationPreferenceRepository = (*PreferenceRepository)(nil)
 func (r *PreferenceRepository) Get(ctx context.Context, userID uuid.UUID) (domain.NotificationPreference, error) {
 	var p domain.NotificationPreference
 	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT user_id, notifications_enabled, push_enabled, email_enabled, updated_at
+		`SELECT user_id, notifications_enabled, push_enabled, email_enabled, promo_push_enabled, updated_at
 		 FROM user_notification_preferences WHERE user_id = $1`, userID).
-		Scan(&p.UserID, &p.NotificationsEnabled, &p.PushEnabled, &p.EmailEnabled, &p.UpdatedAt)
+		Scan(&p.UserID, &p.NotificationsEnabled, &p.PushEnabled, &p.EmailEnabled, &p.PromoPushEnabled, &p.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.DefaultNotificationPreference(userID), nil
 	}
@@ -111,14 +111,15 @@ func (r *PreferenceRepository) Get(ctx context.Context, userID uuid.UUID) (domai
 func (r *PreferenceRepository) Upsert(ctx context.Context, pref domain.NotificationPreference) error {
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`INSERT INTO user_notification_preferences
-		     (user_id, notifications_enabled, push_enabled, email_enabled, updated_at)
-		 VALUES ($1,$2,$3,$4, now())
+		     (user_id, notifications_enabled, push_enabled, email_enabled, promo_push_enabled, updated_at)
+		 VALUES ($1,$2,$3,$4,$5, now())
 		 ON CONFLICT (user_id) DO UPDATE SET
 		     notifications_enabled = EXCLUDED.notifications_enabled,
 		     push_enabled          = EXCLUDED.push_enabled,
 		     email_enabled         = EXCLUDED.email_enabled,
+		     promo_push_enabled    = EXCLUDED.promo_push_enabled,
 		     updated_at            = now()`,
-		pref.UserID, pref.NotificationsEnabled, pref.PushEnabled, pref.EmailEnabled)
+		pref.UserID, pref.NotificationsEnabled, pref.PushEnabled, pref.EmailEnabled, pref.PromoPushEnabled)
 	if err != nil {
 		return fmt.Errorf("upsert notification preference: %w", err)
 	}
