@@ -309,6 +309,18 @@ type BookingRepository interface {
 	// PromoCodeRepository.LockByID — outside that lock the answer is a
 	// snapshot two concurrent bookings can both pass.
 	CountPromoCodeUsage(ctx context.Context, promoCodeID uuid.UUID, userID uuid.UUID) (PromoCodeUsage, error)
+	// ListBookedRestaurantIDs returns the DISTINCT restaurant ids of userID's
+	// bookings whose status is NOT cancelled (spec
+	// foodie-personalization-v1-20260916.md §5.1: "бронировал" = status ∉
+	// {cancelled} — an auto no_show still counts, it is the background worker
+	// closing an unanswered booking, not the guest declining it).
+	//
+	// Ordered most-recently-started restaurant first, then by id, so two
+	// calls over the same data always return the same slice — the ONE caller
+	// today (usecase/tastematch.Loader) de-duplicates cuisines derived from
+	// this list and needs that to be reproducible, not "some order Postgres
+	// happened to pick".
+	ListBookedRestaurantIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
 }
 
 // MaxReconcileBookings is the hard cap on how many bookings one whole-set

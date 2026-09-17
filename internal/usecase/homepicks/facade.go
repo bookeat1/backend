@@ -86,6 +86,23 @@ type Facade interface {
 	// Replace sets one city's whole list, in order. An empty list clears the
 	// curation and hands the city back to the automatic rail.
 	Replace(ctx context.Context, city string, restaurantIDs []uuid.UUID) error
+	// GuestResolved is Guest, plus WHICH of the three steps actually answered
+	// — spec foodie-personalization-v1-20260916.md, BE-2: a guest without an
+	// active taste profile (or whose profile matched nothing) is shown this
+	// SAME rail, labelled data.mode = "editorial" | "popular". It runs the
+	// identical lookup sequence Guest does (no extra query over calling
+	// Guest alone), so the two can never disagree about what they show for
+	// the same city.
+	GuestResolved(ctx context.Context, city string, limit int) ([]domain.RestaurantListItem, domain.HomePicksMode, error)
+	// ManualPickIDs returns the UNION of the city's own manual list and the
+	// all-cities one — every id named in EITHER, regardless of which (if
+	// any) Guest/GuestResolved would actually show. BE-2's for_you scoring
+	// needs this union to give editorial_pick's +150 bonus (spec §5.3 row 5:
+	// "в ручном списке города ИЛИ всех городов") to any active candidate,
+	// not only to the venues that ended up in the resolved rail — that is
+	// why this reads BOTH lists unconditionally, unlike GuestResolved/Guest,
+	// which stop at the first non-empty one.
+	ManualPickIDs(ctx context.Context, city string) (map[uuid.UUID]bool, error)
 }
 
 type facade struct {
@@ -142,37 +159,70 @@ func (f *facade) cityKey(ctx context.Context, city string) string {
 }
 
 func (f *facade) Guest(ctx context.Context, city string, limit int) ([]domain.RestaurantListItem, error) {
+	items, _, err := f.GuestResolved(ctx, city, limit)
+	return items, err
+}
+
+func (f *facade) GuestResolved(ctx context.Context, city string, limit int) ([]domain.RestaurantListItem, domain.HomePicksMode, error) {
 	limit = normalizeLimit(limit)
 	city = f.cityKey(ctx, city)
 
 	ids, err := f.picks.ListIDs(ctx, city)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(ids) == 0 && city != domain.HomePicksAllCities {
 		if ids, err = f.picks.ListIDs(ctx, domain.HomePicksAllCities); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	if len(ids) == 0 {
-		return f.automatic(ctx, limit)
+		items, err := f.automatic(ctx, limit)
+		return items, domain.HomePicksModePopular, err
 	}
 
 	items, err := f.byIDs(ctx, ids, false)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// A curated list that has gone entirely dark — every venue deactivated —
 	// is not a reason to show the guest an empty main screen. It falls back
 	// exactly like an empty list does; the curation itself is untouched and
 	// comes back the moment a venue is switched on again.
 	if len(items) == 0 {
-		return f.automatic(ctx, limit)
+		items, err := f.automatic(ctx, limit)
+		return items, domain.HomePicksModePopular, err
 	}
 	if len(items) > limit {
 		items = items[:limit]
 	}
-	return items, nil
+	return items, domain.HomePicksModeEditorial, nil
+}
+
+// ManualPickIDs reads city's own list and the all-cities one UNCONDITIONALLY
+// (unlike GuestResolved, which skips the second read the moment the first
+// list is non-empty) and returns their union. See the Facade interface doc
+// for why the bonus needs the union rather than "whichever list won".
+func (f *facade) ManualPickIDs(ctx context.Context, city string) (map[uuid.UUID]bool, error) {
+	key := f.cityKey(ctx, city)
+	idsCity, err := f.picks.ListIDs(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	idsAll := idsCity
+	if key != domain.HomePicksAllCities {
+		if idsAll, err = f.picks.ListIDs(ctx, domain.HomePicksAllCities); err != nil {
+			return nil, err
+		}
+	}
+	set := make(map[uuid.UUID]bool, len(idsCity)+len(idsAll))
+	for _, id := range idsCity {
+		set[id] = true
+	}
+	for _, id := range idsAll {
+		set[id] = true
+	}
+	return set, nil
 }
 
 func (f *facade) Editor(ctx context.Context, city string) ([]domain.RestaurantListItem, error) {

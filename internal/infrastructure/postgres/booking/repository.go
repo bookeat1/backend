@@ -399,3 +399,34 @@ func (r *Repository) CountPromoCodeUsage(ctx context.Context, promoCodeID uuid.U
 	}
 	return u, nil
 }
+
+// ListBookedRestaurantIDs is the taste-match domain's ONE read of "which
+// venues has this guest booked" (see the interface doc). GROUP BY collapses
+// repeat bookings at the same venue to one row; ordering by the group's own
+// latest starts_at keeps the result reproducible without a second query.
+func (r *Repository) ListBookedRestaurantIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT restaurant_id
+		   FROM bookings
+		  WHERE user_id = $1 AND status <> 'cancelled'
+		  GROUP BY restaurant_id
+		  ORDER BY max(starts_at) DESC, restaurant_id ASC`,
+		userID)
+	if err != nil {
+		return nil, fmt.Errorf("list booked restaurant ids: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list booked restaurant ids: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list booked restaurant ids: %w", err)
+	}
+	return ids, nil
+}

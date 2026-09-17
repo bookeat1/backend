@@ -35,6 +35,7 @@ import (
 	eventticketrepo "backend-core/internal/infrastructure/postgres/eventticket"
 	favoriterepo "backend-core/internal/infrastructure/postgres/favorite"
 	feedrepo "backend-core/internal/infrastructure/postgres/feed"
+	foodieoptionrepo "backend-core/internal/infrastructure/postgres/foodieoption"
 	foodieprofilerepo "backend-core/internal/infrastructure/postgres/foodieprofile"
 	gastroguiderepo "backend-core/internal/infrastructure/postgres/gastroguide"
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
@@ -82,6 +83,8 @@ import (
 	"backend-core/internal/usecase/events"
 	"backend-core/internal/usecase/favorites"
 	"backend-core/internal/usecase/feed"
+	foodieoptionsuc "backend-core/internal/usecase/foodieoptions"
+	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
 	"backend-core/internal/usecase/legacysync"
@@ -98,6 +101,7 @@ import (
 	rolesuc "backend-core/internal/usecase/roles"
 	"backend-core/internal/usecase/staticmap"
 	"backend-core/internal/usecase/stories"
+	"backend-core/internal/usecase/tastematch"
 	"backend-core/internal/usecase/tickets"
 	"backend-core/internal/usecase/users"
 	venuedashboarduc "backend-core/internal/usecase/venuedashboard"
@@ -118,6 +122,10 @@ type Deps struct {
 	AuthMiniApp *auth.MiniAppUseCase
 	Cities      citiesuc.UseCase
 	Cuisines    cuisinesuc.UseCase
+	// FoodieOptions is the "Фуди-профиль" option dictionary (migration 0110):
+	// the public GET /foodie-profile/options the wizard reads plus the
+	// superadmin CRUD behind it.
+	FoodieOptions foodieoptionsuc.UseCase
 	// AppVersion is the mobile update gate: the public launch check and the
 	// superadmin screen behind it (migration 0103).
 	AppVersion appversionuc.UseCase
@@ -141,8 +149,12 @@ type Deps struct {
 	PromoCodesFacade promocodesuc.Facade
 	// PromoCodesEditor is the cabinet side of the same table; it is a separate
 	// interface because only the superadmin route group reaches it.
-	PromoCodesEditor  promocodesuc.Editor
-	HomePicks         homepicks.Facade
+	PromoCodesEditor promocodesuc.Editor
+	HomePicks        homepicks.Facade
+	// ForYou is GET /restaurants/picks' personalization (BE-2): the SAME
+	// route, wired under OptionalAuth, resolves through this when the caller
+	// has an active taste profile.
+	ForYou            *foryou.Facade
 	GastroguideFacade gastroguide.Facade
 	GastroguideEditor gastroguide.Editor
 	// GastroRoutes / GastroRouteEditor — «Гастропрогулки» (migration 0078): the
@@ -264,6 +276,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	otpRepo := otprepo.New(db)
 	userCuisineRepo := usercuisinerepo.New(db)
 	foodieProfileRepo := foodieprofilerepo.New(db)
+	// The foodie-profile OPTION dictionary (migration 0110, spec
+	// foodie-profile-admin-dictionaries-20260916.md) — distinct from
+	// foodieProfileRepo above, which holds a GUEST's picks; this one is the
+	// platform's list of what can be picked. Built here (not next to
+	// cuisinesUC below) because usersuc.NewFacade needs it for
+	// ReplaceFoodieProfile's code validation, ahead of the admin usecase.
+	foodieOptionRepo := foodieoptionrepo.New(db)
 	// Built here, ahead of the other booking wiring below, because the OTP
 	// usecase needs it: a successful phone verification hands the guest the
 	// bookings that were made for their number before they had an account.
@@ -366,6 +385,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// manager and no other usecase: one row per slug, the row set itself is
 	// fixed by the migration's seed.
 	platformPagesUC := platformpagesuc.NewUseCase(platformpagesrepo.New(db))
+	// The shared taste-match assembly (BE-1's usecase/tastematch): the ONE
+	// read of "this guest's taste" GET /restaurants/picks (BE-2), GET /feed
+	// (BE-3) and GET /events?sort=for_you (BE-4) all use, so the three
+	// surfaces can never quietly disagree about what it means. Constructed
+	// once here and reused below for feed/picks — three independent copies
+	// (one per BE task, before they were integrated) collided on the name
+	// `tasteLoader` and failed to build; there is nothing per-surface in the
+	// Loader itself, so one instance is correct, not just convenient.
+	tasteLoader := tastematch.NewLoader(foodieProfileRepo, usersRepo, cuisinerepo.New(db), bookingRepo, foodieOptionRepo)
 	eventsFacade := events.NewFacade(eventRepo, restaurantManagers, feedRepo,
 		events.WithOccurrenceSkips(recurrenceRepo),
 		// The same repository again, in its second one-effect role: editing ONE
@@ -375,14 +403,26 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		events.WithSeriesContent(recurrenceRepo),
 		// Same seam as the catalog: ?city=almaty, a historical spelling or a
 		// renamed city resolve to the one spelling the listing compares.
-		events.WithCityResolver(citiesUC))
+		events.WithCityResolver(citiesUC),
+		// GET /events?sort=for_you (spec foodie-personalization-v1-20260916.md
+		// §5.6, criterion 19): restRepo doubles as the bulk venue-signals read
+		// (domain.RestaurantFilter.IDs + Unpaginated, same shape homepicks
+		// uses for its rail), and a second homepicksrepo instance resolves
+		// editorial_pick — independent from homePicksFacade's own instance
+		// below for the same "stateless, cheap to construct twice" reason as
+		// the shared tasteLoader's own cuisine reader above.
+		events.WithTasteMatch(tasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
 		// The same dictionary the events listing uses: a promo's own city
 		// override (migration 0085) and ?city= must mean the same thing in both
 		// listings, or the two halves of one screen would disagree.
 		promos.WithCityResolver(citiesUC))
-	feedFacade := feed.NewFacade(feedRepo, restaurantManagers)
+	// /feed reuses the exact same `tasteLoader` constructed above that
+	// /restaurants/picks and /events?sort=for_you build their input with, so
+	// no surface can quietly disagree about what "this guest's taste" means
+	// (criterion 15).
+	feedFacade := feed.NewFacade(feedRepo, restaurantManagers, tasteLoader)
 
 	// Gastroguide (migration 0061): editorial collections of venues. Two halves
 	// with two postures — the guest facade is read-only and takes no RBAC port
@@ -516,6 +556,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// cuisine_type string (UpdateCuisineTypeString) and restaurantManagers as
 	// the venue permission check, so the usecase depends on neither package.
 	cuisinesUC := cuisinesuc.NewUseCase(cuisinerepo.New(db), restRepo, restaurantManagers, txm)
+	// The foodie-profile OPTION dictionary's admin CRUD + public read (spec
+	// foodie-profile-admin-dictionaries-20260916.md, BE-2). cuisinerepo.New(db)
+	// again here is the cuisine-tile link's resolver (🔴1 = A) — a stateless,
+	// cheap-to-construct-twice repo, same reasoning as tasteLoader's own
+	// cuisine reader above.
+	foodieOptionsUC := foodieoptionsuc.NewUseCase(foodieOptionRepo, cuisinerepo.New(db), txm)
 	// The venue-feature dictionary (migration 0082). Unlike cuisines it has NO
 	// derived scalar column to keep in step — the free-text restaurant_features
 	// table it replaces was dropped, not kept as a rendering — so it needs no
@@ -538,6 +584,14 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// quietly fail to appear for exactly the guests it was curated for.
 	homePicksFacade := homepicks.NewFacade(homepicksrepo.New(db, txm), restaurantsFacade,
 		homepicks.WithCityResolver(citiesUC))
+	// Personalization on top of the rail above (spec
+	// foodie-personalization-v1-20260916.md, BE-2): reuses the same
+	// `tasteLoader` /feed and /events?sort=for_you build their input with —
+	// never a second assembly of "this guest's taste". homePicksFacade
+	// doubles as BOTH the fallback rail AND the editorial-pick membership
+	// source, so a guest whose profile scores nothing sees the identical
+	// rail an anonymous guest does.
+	forYouFacade := foryou.NewFacade(tasteLoader, restaurantsFacade, homePicksFacade)
 	menuFacade := menu.NewFacade(menuItems, menuCategories, txm)
 	storiesFacade := stories.NewFacade(storyItems, restaurantManagers)
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
@@ -588,10 +642,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	return &Deps{
 		AuthFacade:            authFacade,
 		AuthOTP:               authOTP,
-		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, refreshRepo, otpRepo, txm),
+		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, foodieOptionRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
 		HomePicks:             homePicksFacade,
+		ForYou:                forYouFacade,
 		RestaurantManagers:    restaurantManagers,
 		MyRestaurants:         myRestaurants,
 		AuthMiniApp:           authMiniApp,
@@ -599,6 +654,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		AppVersion:            appVersionUC,
 		PlatformPages:         platformPagesUC,
 		Cuisines:              cuisinesUC,
+		FoodieOptions:         foodieOptionsUC,
 		VenueFeatures:         venueFeaturesUC,
 		PushSubscriptions:     pushSubscriptions,
 		DeviceTokens:          deviceTokens,

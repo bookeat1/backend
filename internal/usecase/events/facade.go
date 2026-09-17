@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,37 @@ type Actor struct {
 // and bypasses it, the same contract every other HasPermission call site keeps.
 type permissionChecker interface {
 	HasPermission(ctx context.Context, userID, restaurantID uuid.UUID, perm domain.Permission) (bool, error)
+}
+
+// tasteProfileLoader is the events usecase's minimal dependency for
+// GET /events?sort=for_you (spec foodie-personalization-v1-20260916.md, BE-4):
+// the ONE shared read of a guest's taste, exactly usecase/tastematch.Loader's
+// own interface, declared locally so this package never imports usecase/
+// tastematch's package directly — same seam every other local port here
+// keeps. Bound to a *tastematch.Loader in bootstrap/deps.go.
+type tasteProfileLoader interface {
+	LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain.TasteProfile, error)
+}
+
+// venueSignalsReader is the minimal slice of the restaurant repository BE-4
+// needs to score events by taste match: price tier, popularity, cuisines and
+// features for a KNOWN set of restaurant ids, in ONE query
+// (domain.RestaurantFilter.IDs + Unpaginated) rather than one GetByID per
+// event's venue. The exact call shape usecase/homepicks already uses for its
+// hand-picked rail. Bound to domain.RestaurantRepository.ListActive in
+// bootstrap/deps.go.
+type venueSignalsReader interface {
+	ListActive(ctx context.Context, f domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error)
+}
+
+// homePicksReader is the minimal slice of the home-picks repository needed to
+// resolve ScoreTasteMatch's editorial_pick signal (§5.3 row 5) for events:
+// "is this venue on the manual list of its own effective city, or of every
+// city (domain.HomePicksAllCities)". OPTIONAL (see WithTasteMatch) — without
+// it editorial_pick always scores 0, never an error, same posture as
+// WithSeriesContent's documented missing-dependency fallback.
+type homePicksReader interface {
+	ListIDs(ctx context.Context, city string) ([]uuid.UUID, error)
 }
 
 // feedModerator is the events usecase's minimal slice of the feed's moderation
@@ -88,12 +120,48 @@ type Facade interface {
 	// narrowed by f and paginated. No authorization. An inverted date range is
 	// ErrValidation, never a silently empty page.
 	ListPublicUpcoming(ctx context.Context, f domain.PublicEventFilter) ([]domain.EventListItem, int, error)
+	// ListPublicUpcomingForYou is ListPublicUpcoming ranked by userID's
+	// taste-match score against each event's host venue instead of date
+	// (spec foodie-personalization-v1-20260916.md §5.6, criterion 19):
+	// venue taste score ↓, then starts_at ↑, then id ↑ — the same total
+	// order the plain listing keeps as its own tie-break, just with the
+	// score column added in front. Every visible candidate inside f (up to
+	// maxEventTasteCandidates) is scored and sorted BEFORE pagination —
+	// paginating first would let a card appear on two pages, or none, as
+	// scores are not stable across an unranked page boundary (same
+	// reasoning as usecase/feed.Main). A PLATFORM event (no host venue)
+	// scores from a zero domain.VenueTasteSignals — never excluded, just
+	// never favoured either. No authorization; callers only reach this when
+	// the caller IS signed in (an anonymous guest has no userID to score
+	// against — see the transport layer).
+	ListPublicUpcomingForYou(ctx context.Context, f domain.PublicEventFilter, userID uuid.UUID) ([]RankedEventListItem, int, error)
 	// GetPublicDetail returns ONE published, not-yet-ended event by its own id,
 	// with its venue when it has one. This is the event's own page — the target
 	// an action button points at when it has no external link — and the only
 	// public read that can address a PLATFORM event at all, since the older
 	// GetPublic is reached through a restaurant's path. No authorization.
 	GetPublicDetail(ctx context.Context, eventID uuid.UUID) (*domain.EventListItem, error)
+}
+
+// EventTasteMatch is one event card's taste-match score and reason breakdown
+// (spec §5.6 match), computed from domain.ScoreTasteMatch against the event's
+// host venue.
+type EventTasteMatch struct {
+	Score   int
+	Reasons []domain.TasteMatchReason
+}
+
+// RankedEventListItem is one row of ListPublicUpcomingForYou's result: the
+// same domain.EventListItem the plain listing returns, plus the score it was
+// ranked by. The zero Match (Score 0, nil Reasons) is a REAL, valid score
+// (every ScoreTasteMatch signal legitimately scored 0 for this venue) — it is
+// never "not computed": ListPublicUpcomingForYou always scores every item it
+// returns. Whether the transport layer renders match at all is decided by
+// ITS OWN sort=for_you + auth condition (spec criterion 19), never by
+// inspecting this struct.
+type RankedEventListItem struct {
+	domain.EventListItem
+	Match EventTasteMatch
 }
 
 // CreateInput carries a new event's fields. Status defaults to draft when empty.
@@ -248,7 +316,12 @@ type facade struct {
 	// series reads the rule a generated occurrence belongs to (see
 	// WithSeriesContent). Nil unless wired.
 	series seriesContentReader
-	clock  func() time.Time
+	// taste/venues/homePicks back ListPublicUpcomingForYou (see WithTasteMatch).
+	// Nil unless wired — see that method's own fallback when they are not.
+	taste     tasteProfileLoader
+	venues    venueSignalsReader
+	homePicks homePicksReader
+	clock     func() time.Time
 }
 
 // Option tunes the facade. Variadic options keep every existing positional
@@ -287,6 +360,18 @@ func WithSeriesContent(r seriesContentReader) Option {
 // dictionary instead of two constants compiled into the binary.
 func WithCityResolver(r cityResolver) Option {
 	return func(f *facade) { f.cities = r }
+}
+
+// WithTasteMatch wires GET /events?sort=for_you's ranking (spec BE-4,
+// criterion 19): taste loads a signed-in guest's TasteProfile, venues bulk-
+// resolves each candidate event's host venue signals. homePicks is OPTIONAL
+// (may be nil) — without it editorial_pick always scores 0, see
+// homePicksReader. bootstrap always supplies taste/venues; a facade built
+// without this option (every existing test) still serves ListPublicUpcoming
+// unchanged and ListPublicUpcomingForYou falls back to plain date order — see
+// that method.
+func WithTasteMatch(taste tasteProfileLoader, venues venueSignalsReader, homePicks homePicksReader) Option {
+	return func(f *facade) { f.taste = taste; f.venues = venues; f.homePicks = homePicks }
 }
 
 // NewFacade constructs the events Facade.
@@ -661,6 +746,220 @@ func (f *facade) ListPublicUpcoming(ctx context.Context, flt domain.PublicEventF
 	}
 	flt.City = f.canonicalCity(ctx, flt.City)
 	return f.repo.ListPublicUpcoming(ctx, flt, f.clock())
+}
+
+// maxEventTasteCandidates caps the candidate window ListPublicUpcomingForYou
+// ranks, exactly usecase/feed.maxFeedCandidates' own reasoning: the guest
+// catalog is small in practice (spec §5.1: 5 events in Algaty today) and a
+// cap that is never hit costs nothing, while the alternative — ranking the
+// database's entire unbounded future — would let one busy city's queries
+// grow without bound. Total (below) is capped along with it.
+const maxEventTasteCandidates = 500
+
+// ListPublicUpcomingForYou ranks the cross-venue listing by taste match
+// instead of date. See the Facade interface doc for the ordering contract
+// (criterion 19).
+func (f *facade) ListPublicUpcomingForYou(ctx context.Context, flt domain.PublicEventFilter, userID uuid.UUID) ([]RankedEventListItem, int, error) {
+	if flt.From != nil && flt.To != nil && flt.To.Before(*flt.From) {
+		return nil, 0, fmt.Errorf("%w: to must not be before from", domain.ErrValidation)
+	}
+	flt.City = f.canonicalCity(ctx, flt.City)
+
+	page, perPage := flt.Page, flt.PerPage
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 20
+	}
+
+	// Missing wiring (every existing test's NewFacade call, which predates
+	// this option) degrades to the plain listing's own date order rather than
+	// panicking — same posture WithSeriesContent documents for its own
+	// optional dependency.
+	if f.taste == nil || f.venues == nil {
+		items, total, err := f.repo.ListPublicUpcoming(ctx, flt, f.clock())
+		if err != nil {
+			return nil, 0, err
+		}
+		return unranked(items), total, nil
+	}
+
+	candidateFilter := flt
+	candidateFilter.Page = 1
+	candidateFilter.PerPage = maxEventTasteCandidates
+	items, total, err := f.repo.ListPublicUpcoming(ctx, candidateFilter, f.clock())
+	if err != nil {
+		return nil, 0, err
+	}
+	if total > len(items) {
+		// Same documented compromise as usecase/feed.Main: the ranked window
+		// is capped, so Total describes the ranked set actually paginated,
+		// never a count the client could page past into nothing.
+		total = len(items)
+	}
+
+	profile, err := f.taste.LoadTasteProfile(ctx, userID)
+	if err != nil {
+		// A guest whose profile fails to load still gets their events — date
+		// order, no personalization — never a 5xx over a ranking nicety
+		// (same posture as spec criterion 10 for /restaurants/picks).
+		slog.Warn("taste-match: failed to load guest profile for events ranking",
+			slog.String("error", err.Error()))
+		return unranked(items), total, nil
+	}
+
+	signals, err := f.loadVenueTasteSignals(ctx, items)
+	if err != nil {
+		// Same posture as the profile-load failure above: the event list
+		// itself already loaded successfully, so a venue-signals read
+		// failure degrades to date order, not a 5xx over a ranking nicety
+		// (review of PR #138 caught this returning err before the fix —
+		// every other personalization path on this surface already
+		// degrades this way, this one should too).
+		slog.Warn("taste-match: failed to load venue taste signals for events ranking",
+			slog.String("error", err.Error()))
+		return unranked(items), total, nil
+	}
+
+	ranked := make([]RankedEventListItem, 0, len(items))
+	for _, it := range items {
+		var v domain.VenueTasteSignals
+		if it.Restaurant != nil {
+			v = signals[it.Restaurant.ID]
+		}
+		score, reasons := domain.ScoreTasteMatch(profile, v)
+		ranked = append(ranked, RankedEventListItem{EventListItem: it, Match: EventTasteMatch{Score: score, Reasons: reasons}})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		a, b := ranked[i], ranked[j]
+		if a.Match.Score != b.Match.Score {
+			return a.Match.Score > b.Match.Score
+		}
+		if !a.StartsAt.Equal(b.StartsAt) {
+			return a.StartsAt.Before(b.StartsAt)
+		}
+		// String comparison of the canonical hyphenated form orders exactly
+		// like Postgres' own `ORDER BY id ASC` (both compare the same 16
+		// bytes in the same order; the hyphens sit at the same position in
+		// every uuid, so they never change which string sorts first).
+		return a.ID.String() < b.ID.String()
+	})
+	return pageOfRankedEvents(ranked, page, perPage), total, nil
+}
+
+// unranked wraps a plain, date-ordered listing into RankedEventListItem with
+// a zero Match, for the two paths that could not actually score anything
+// (missing wiring, or a profile load failure) — see ListPublicUpcomingForYou.
+func unranked(items []domain.EventListItem) []RankedEventListItem {
+	out := make([]RankedEventListItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, RankedEventListItem{EventListItem: it})
+	}
+	return out
+}
+
+// loadVenueTasteSignals bulk-resolves the domain.VenueTasteSignals of every
+// DISTINCT host venue among items, in one restaurant read plus (only when
+// f.homePicks is wired) one home-picks read per distinct effective city — see
+// venueSignalsReader and homePicksReader. A platform event (no restaurant) is
+// simply absent from the returned map; ListPublicUpcomingForYou scores it
+// from the zero value instead.
+func (f *facade) loadVenueTasteSignals(ctx context.Context, items []domain.EventListItem) (map[uuid.UUID]domain.VenueTasteSignals, error) {
+	ids := make([]uuid.UUID, 0, len(items))
+	seen := make(map[uuid.UUID]struct{}, len(items))
+	for _, it := range items {
+		if it.Restaurant == nil {
+			continue
+		}
+		if _, dup := seen[it.Restaurant.ID]; dup {
+			continue
+		}
+		seen[it.Restaurant.ID] = struct{}{}
+		ids = append(ids, it.Restaurant.ID)
+	}
+	out := make(map[uuid.UUID]domain.VenueTasteSignals, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	venues, _, err := f.venues.ListActive(ctx, domain.RestaurantFilter{IDs: ids, Unpaginated: true})
+	if err != nil {
+		return nil, fmt.Errorf("load venue taste signals: %w", err)
+	}
+	editorial := f.editorialPickSet(ctx, items)
+	for _, v := range venues {
+		cuisineCodes := make([]string, 0, len(v.Cuisines))
+		for _, c := range v.Cuisines {
+			cuisineCodes = append(cuisineCodes, c.Code)
+		}
+		featureCodes := make([]string, 0, len(v.Features))
+		for _, ft := range v.Features {
+			featureCodes = append(featureCodes, ft.Code)
+		}
+		out[v.Restaurant.ID] = domain.VenueTasteSignals{
+			RestaurantID:  v.Restaurant.ID,
+			CuisineCodes:  cuisineCodes,
+			PriceCategory: v.PriceCategory,
+			FeatureCodes:  featureCodes,
+			IsPopular:     v.IsPopular != nil && *v.IsPopular,
+			EditorialPick: editorial[v.Restaurant.ID],
+		}
+	}
+	return out, nil
+}
+
+// editorialPickSet resolves which of items' host venues sit on the manual
+// pick list of THEIR OWN effective city, or of domain.HomePicksAllCities
+// (§5.3 row 5 / criterion 12) — one ListIDs call per DISTINCT city rather
+// than per event. Returns an empty set, never an error, when f.homePicks is
+// not wired: editorial_pick then simply always scores 0 (see homePicksReader).
+func (f *facade) editorialPickSet(ctx context.Context, items []domain.EventListItem) map[uuid.UUID]bool {
+	out := map[uuid.UUID]bool{}
+	if f.homePicks == nil {
+		return out
+	}
+	cities := map[string]struct{}{domain.HomePicksAllCities: {}}
+	for _, it := range items {
+		if it.Restaurant == nil {
+			continue
+		}
+		cities[effectiveEventCity(it)] = struct{}{}
+	}
+	for city := range cities {
+		ids, err := f.homePicks.ListIDs(ctx, city)
+		if err != nil {
+			slog.Warn("taste-match: home-picks lookup failed for events ranking",
+				slog.String("city", city), slog.String("error", err.Error()))
+			continue
+		}
+		for _, id := range ids {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// effectiveEventCity mirrors the repository's own COALESCE(e.city, r.city):
+// the event's own city override when set, otherwise its host venue's city.
+func effectiveEventCity(it domain.EventListItem) string {
+	if it.City != nil {
+		return string(*it.City)
+	}
+	return string(it.Restaurant.City)
+}
+
+// pageOfRankedEvents slices a fully ranked, fully ordered list into one page,
+// identical in shape to usecase/feed.pageOf.
+func pageOfRankedEvents(ranked []RankedEventListItem, page, perPage int) []RankedEventListItem {
+	start := (page - 1) * perPage
+	if start >= len(ranked) {
+		return nil
+	}
+	end := start + perPage
+	if end > len(ranked) {
+		end = len(ranked)
+	}
+	return ranked[start:end]
 }
 
 func (f *facade) GetPublic(ctx context.Context, restaurantID, eventID uuid.UUID) (*domain.Event, error) {
