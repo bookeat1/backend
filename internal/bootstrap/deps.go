@@ -1595,7 +1595,16 @@ func NewPushCampaignsSender(cfg Config, db *pgxpool.Pool, log *slog.Logger) *pus
 // expoBatchSender adapts expopush.Sender.SendBatch to the
 // usecase/pushcampaigns.BatchSender port. It is the ONE place the two
 // packages' independent result/verdict types (deliberately not shared — see
-// pushcampaigns.SendVerdict's doc comment) are translated into each other.
+// pushcampaigns.SendVerdict's doc comment) are translated into each other,
+// AND the one place that knows expopush.SendBatchError's Definite flag: when
+// SendBatch could not confirm a chunk's outcome (a transport error/timeout,
+// or an unreadable/malformed response — Definite false), that range is
+// re-flagged via pushcampaigns.MarkUnknownRange so Sender.fanOut never
+// unclaims those recipients for a retry (spec push-campaigns-manual-spec §7
+// п.7 / §3.11 — retrying an unconfirmed send risks a duplicate push). A
+// DEFINITE failure (Expo itself answered 429/5xx, or rejected the whole
+// batch outright) is passed through unmarked: fanOut's legacy behaviour
+// (unclaim and retry every unresolved recipient) is exactly right for it.
 func expoBatchSender(provider *expopush.Sender) pushcampaigns.BatchSender {
 	return func(ctx context.Context, msgs []pushcampaigns.SendMessage) ([]pushcampaigns.SendResult, error) {
 		in := make([]expopush.BatchMessage, len(msgs))
@@ -1614,6 +1623,10 @@ func expoBatchSender(provider *expopush.Sender) pushcampaigns.BatchSender {
 			default:
 				out[i].Verdict = pushcampaigns.SendRejected
 			}
+		}
+		var batchErr *expopush.SendBatchError
+		if errors.As(err, &batchErr) && !batchErr.Definite {
+			err = pushcampaigns.MarkUnknownRange(err, batchErr.FailedAt, batchErr.FailedThrough)
 		}
 		return out, err
 	}

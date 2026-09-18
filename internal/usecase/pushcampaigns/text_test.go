@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -31,6 +32,9 @@ func TestRenderTextTranslatedVsFallback(t *testing.T) {
 	if !strings.Contains(kk.Body, "Джаз кеші") {
 		t.Fatalf("kk body = %q, want the kk translation", kk.Body)
 	}
+	if want := "«Абай» мекемесінде жаңа іс-шара"; kk.Title != want {
+		t.Fatalf("kk title = %q, want exactly %q (guard against double guillemets)", kk.Title, want)
+	}
 
 	en := renderText(s, "en", loc)
 	if !strings.Contains(en.Body, "Джазовый вечер") {
@@ -38,8 +42,8 @@ func TestRenderTextTranslatedVsFallback(t *testing.T) {
 	}
 
 	ru := renderText(s, "ru", loc)
-	if !strings.Contains(ru.Title, "«Абай»") {
-		t.Fatalf("ru title = %q, want it to name the venue", ru.Title)
+	if want := "Новое событие в «Абай»"; ru.Title != want {
+		t.Fatalf("ru title = %q, want exactly %q (guard against double guillemets, e.g. ««Абай»»)", ru.Title, want)
 	}
 }
 
@@ -61,13 +65,45 @@ func TestRenderTextPlatformSubjectHasNoVenueName(t *testing.T) {
 	}
 }
 
-// TestRenderTextBodyNeverExceedsLimit pins criterion 20's "тело ≤ 120 символов".
+// TestRenderTextBodyNeverExceedsLimit pins criterion 20's "тело ≤ 120
+// символов" — a character count, not a byte count, so it must be checked in
+// runes: Cyrillic is 2 bytes/rune and a byte-length assertion here would pass
+// even if renderText silently halved the guest-visible budget.
 func TestRenderTextBodyNeverExceedsLimit(t *testing.T) {
 	s := eventSubject()
 	s.Title = strings.Repeat("Очень длинное название события ", 10)
 	got := renderText(s, "ru", time.UTC)
-	if len(got.Body) > maxBodyLen {
-		t.Fatalf("body length = %d, want <= %d", len(got.Body), maxBodyLen)
+	if n := len([]rune(got.Body)); n > maxBodyLen {
+		t.Fatalf("body length = %d runes, want <= %d", n, maxBodyLen)
+	}
+}
+
+// TestRenderTextBodyTruncatesRunesNotBytes pins the exact regression from
+// code review: a Cyrillic subject long enough to need truncation must not
+// have a multi-byte UTF-8 rune sliced in half (which would break Expo's JSON
+// encoding downstream), and the date/time suffix must survive intact — it is
+// the part truncation must never touch.
+func TestRenderTextBodyTruncatesRunesNotBytes(t *testing.T) {
+	s := eventSubject()
+	// 113 runes + the 16-rune date suffix below = 129, over maxBodyLen (120):
+	// long enough to actually force truncation, unlike a shorter title that
+	// would silently pass this test without ever exercising truncateBody.
+	s.Title = "Джазовый вечер с оркестром имени Курмангазы и специальными гостями, приглашённые артисты, живая музыка и угощение"
+	s.TitleI18n = domain.I18n{}
+	got := renderText(s, "ru", time.UTC)
+
+	if n := len([]rune(got.Body)); n > maxBodyLen {
+		t.Fatalf("body length = %d runes, want <= %d", n, maxBodyLen)
+	}
+	if !utf8.ValidString(got.Body) {
+		t.Fatalf("body is not valid UTF-8: %q", got.Body)
+	}
+	const suffix = " · 26.09 в 19:00"
+	if !strings.HasSuffix(got.Body, suffix) {
+		t.Fatalf("body = %q, want it to end with the intact date suffix %q", got.Body, suffix)
+	}
+	if !strings.HasSuffix(got.Body[:len(got.Body)-len(suffix)], "…") {
+		t.Fatalf("body = %q, want the truncated subject to end with an ellipsis", got.Body)
 	}
 }
 

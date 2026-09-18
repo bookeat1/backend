@@ -234,6 +234,59 @@ func TestSenderReschedulesOnTransientFailure(t *testing.T) {
 	}
 }
 
+// TestSenderDoesNotRetryUnknownOutcome pins the bug-review fix for #141: a
+// send failure whose outcome the provider genuinely could not confirm (a
+// client timeout, a connection reset after the request left this process, or
+// an unreadable/malformed response) must NEVER be retried — retrying could
+// duplicate a push the provider already accepted (spec
+// push-campaigns-manual-spec §7 п.7 / §3.11: "лучше недослать, чем прислать
+// дважды"). Contrast with TestSenderReschedulesOnTransientFailure, whose
+// plain "expo: 502" error is a DEFINITE non-delivery (the provider itself
+// answered) and must keep retrying.
+func TestSenderDoesNotRetryUnknownOutcome(t *testing.T) {
+	subjects := newFakeSubjects()
+	subjectID := uuid.New()
+	subjects.put(publishedSubjectForSender(subjectID))
+	guest := uuid.New()
+	rows := []domain.PushAudienceRow{{UserID: guest, Allowed: true, HasDevice: true}}
+	var calls int
+	unknownOutcome := func(context.Context, []SendMessage) ([]SendResult, error) {
+		calls++
+		// Simulates a client timeout/connection reset AFTER the request may
+		// have already reached the provider — see expopush.SendBatchError's
+		// Definite flag, translated here via MarkUnknownRange the same way
+		// bootstrap.expoBatchSender does.
+		return nil, MarkUnknownRange(context.DeadlineExceeded, 0, 1)
+	}
+	s, campaigns, recipients, tokens, _, _ := newTestSender(subjects, rows, unknownOutcome, at(12))
+	s.cfg.MaxAttempts = 5
+	tokens.add(guest, "tok")
+	c := &domain.PushCampaign{Kind: domain.PushCampaignKindEvent, SubjectID: subjectID, EstimatedRecipients: 1}
+	mustSeedCampaign(t, campaigns, c, domain.PushCampaignQueued)
+
+	if _, err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	counts, _ := recipients.CountByStatus(context.Background(), c.ID)
+	if counts[domain.RecipientSending] != 1 {
+		t.Fatalf("after tick 1: counts = %+v, want the guest left `sending` (unknown outcome, not unclaimed)", counts)
+	}
+
+	// Advance past the lease AND the backoff so the campaign is claimable
+	// again, and tick a second time.
+	s.now = func() time.Time { return at(12)().Add(2 * time.Hour) }
+	if _, err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("BatchSender called %d times, want exactly 1 — an ambiguous-outcome recipient must never be resent to", calls)
+	}
+	counts, _ = recipients.CountByStatus(context.Background(), c.ID)
+	if counts[domain.RecipientSending] != 1 {
+		t.Fatalf("after tick 2: counts = %+v, want the guest still `sending` (never retried, never resolved)", counts)
+	}
+}
+
 // TestSenderExpiresStaleQueuedCampaign pins criterion 17 at the Sender level
 // (the repository-level test already covers the SQL; this proves Tick reports
 // it and never calls the guest audience for an expired campaign).

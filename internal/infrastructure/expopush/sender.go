@@ -140,6 +140,13 @@ const defaultMaxBatchSize = 100
 // spec): booking pushes go through the exact same wire format and verdict
 // mapping they always have, byte for byte, because they are now simply
 // SendBatch's n=1 case rather than a separate code path.
+//
+// Any error — definite or unknown-outcome alike — is forwarded as-is: this
+// preserves booking push's pre-existing "any error is retryable" behaviour
+// (usecase/notifications.guestpush) untouched. The definite/unknown
+// distinction only matters to a caller fanning out MANY messages in one call
+// (push campaigns), because only there does "retry" mean "resend to
+// thousands of the same recipients" — see SendBatch and SendBatchError.
 func (s *Sender) Send(ctx context.Context, token string, msg notifications.MobilePushMessage) (notifications.MobilePushResult, error) {
 	results, err := s.SendBatch(ctx, []BatchMessage{{
 		Token: token, Title: msg.Title, Body: msg.Body, Data: msg.Data, ChannelID: msg.ChannelID,
@@ -161,19 +168,46 @@ type BatchMessage struct {
 	ChannelID string
 }
 
+// SendBatchError is returned by SendBatch when it could not get an answer for
+// every message. Everything in the returned results slice before FailedAt is
+// a REAL per-message verdict, from a chunk Expo answered in full; SendBatch
+// never attempts a chunk after one that failed, so nothing from FailedAt
+// onward was resolved.
+//
+// Definite says whether msgs[FailedAt:FailedThrough] — the chunk that was
+// actually attempted and failed — got a DEFINITE non-delivery answer: Expo
+// itself responded (429/5xx, or a 2xx envelope with no tickets at all), so
+// nothing in that chunk reached a device and it is safe to retry. When false,
+// that same range's outcome is UNKNOWN: a transport error, client timeout or
+// connection reset, an unreadable 2xx body, a malformed JSON response, or a
+// ticket count that does not match the sent message count — all cases where
+// the request may have already reached Expo before this process lost track
+// of it. Retrying an unknown-outcome range risks a duplicate push, so a
+// caller MUST NOT auto-retry it (spec push-campaigns-manual-spec §7 п.7 /
+// §3.11: "лучше недослать, чем прислать дважды").
+//
+// msgs[FailedThrough:] (any chunk after the failing one) was never even sent
+// — SendBatch stops at the first failure — so it is ALWAYS safe to retry,
+// independent of Definite.
+type SendBatchError struct {
+	FailedAt      int
+	FailedThrough int
+	Definite      bool
+	Err           error
+}
+
+func (e *SendBatchError) Error() string { return e.Err.Error() }
+func (e *SendBatchError) Unwrap() error { return e.Err }
+
 // SendBatch delivers up to len(msgs) messages, chunked internally to Expo's
 // own per-request ceiling (s.maxBatchSize) so a push-campaign fan-out of
 // thousands of tokens is simply several sequential requests, never one
 // oversized one. The returned slice is ALWAYS len(msgs) long and positionally
-// aligned with msgs: result[i] answers msgs[i].
-//
-// A non-nil error means one chunk's HTTP round trip itself failed (transport
-// error, 429, 5xx) — the transient case the campaign sender retries on a
-// later tick (spec 3.11). Every message in a chunk that succeeded before the
-// failure carries its real verdict; every message from the failing chunk
-// onward is reported Rejected (never silently zero-valued) so a caller that
-// only checks the per-message verdict, not the returned error, cannot mistake
-// "we never actually tried" for "Expo rejected it".
+// aligned with msgs: result[i] answers msgs[i], for every i before the
+// failure (see SendBatchError) — every message from the failure onward keeps
+// its Rejected placeholder in the slice and MUST be ignored in favour of the
+// returned *SendBatchError, which is the only thing that can tell "Expo
+// definitely said no" apart from "we don't actually know".
 func (s *Sender) SendBatch(ctx context.Context, msgs []BatchMessage) ([]notifications.MobilePushResult, error) {
 	out := make([]notifications.MobilePushResult, len(msgs))
 	for i := range out {
@@ -184,11 +218,11 @@ func (s *Sender) SendBatch(ctx context.Context, msgs []BatchMessage) ([]notifica
 		if end > len(msgs) {
 			end = len(msgs)
 		}
-		results, err := s.sendChunk(ctx, msgs[start:end])
-		copy(out[start:start+len(results)], results)
+		results, definite, err := s.sendChunk(ctx, msgs[start:end])
 		if err != nil {
-			return out, err
+			return out, &SendBatchError{FailedAt: start, FailedThrough: end, Definite: definite, Err: err}
 		}
+		copy(out[start:start+len(results)], results)
 	}
 	return out, nil
 }
@@ -200,25 +234,34 @@ func (s *Sender) SendBatch(ctx context.Context, msgs []BatchMessage) ([]notifica
 //	HTTP 2xx + status "ok"                     → Delivered + the ticket id
 //	status "error", details.error DeviceNotRegistered → DeviceGone (deactivate)
 //	any other ticket error (e.g. MessageTooBig) → Rejected (not retryable)
-//	HTTP 429 / 5xx / transport failure          → error (transient, retried);
-//	  no per-message results are returned, since a whole-chunk HTTP failure
-//	  answers nothing about any individual message in it.
+//	HTTP 429 / 5xx                              → err, definite=true  (Expo
+//	  itself said no — safe to retry the whole chunk)
+//	HTTP 2xx with no tickets at all (errors[] populated) → err, definite=true
+//	  (Expo answered synchronously that it accepted nothing)
+//	transport failure, timeout, unreadable body, malformed JSON, or a ticket
+//	  count that does not match the chunk → err, definite=false (the request
+//	  may have already reached Expo — outcome UNKNOWN, must not be retried
+//	  blindly)
+//
+// No per-message results are returned on any error path, since a whole-chunk
+// failure — definite or not — answers nothing about any individual message
+// in it.
 //
 // TODO(verify): проверить на реальном Expo-проекте, что при
 // push-security-токене неверный токен приходит как HTTP 400 с errors[].code
 // UNAUTHORIZED, а не как ticket-ошибка.
-func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) ([]notifications.MobilePushResult, error) {
+func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) (results []notifications.MobilePushResult, definite bool, err error) {
 	payload := make([]pushMessage, len(chunk))
 	for i, m := range chunk {
 		payload[i] = pushMessage{To: m.Token, Title: m.Title, Body: m.Body, Data: m.Data, Sound: "default", ChannelID: m.ChannelID}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("expo push: marshal request: %w", err)
+		return nil, false, fmt.Errorf("expo push: marshal request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, s.scrub(fmt.Errorf("expo push: build request: %w", err))
+		return nil, false, s.scrub(fmt.Errorf("expo push: build request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -228,18 +271,18 @@ func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) ([]notific
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, s.scrub(fmt.Errorf("expo push: send: %w", err))
+		// The request may have left this process and reached Expo before the
+		// timeout/connection error fired — outcome unknown, never definite.
+		return nil, false, s.scrub(fmt.Errorf("expo push: send: %w", err))
 	}
 	defer resp.Body.Close()
-	// Bounded read: scales with the chunk (≤100 tiny ticket entries), and an
-	// unbounded ReadAll on a misbehaving endpoint is still a memory hazard.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, s.scrub(fmt.Errorf("expo push: read response: %w", err))
-	}
+
 	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-		// Transient — the caller retries the whole chunk later.
-		return nil, fmt.Errorf("expo push: status %d", resp.StatusCode)
+		// Expo itself answered "try later" — definitely not accepted. The
+		// body is drained (not parsed: this class of response is not the
+		// JSON ticket envelope) so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return nil, true, fmt.Errorf("expo push: status %d", resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 4xx other than 429: a bad request or a bad access token. Retrying
@@ -250,25 +293,41 @@ func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) ([]notific
 		for i := range out {
 			out[i] = rejected()
 		}
-		return out, nil
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return out, false, nil
+	}
+
+	// Bounded read: scales with the chunk (≤100 tiny ticket entries), and an
+	// unbounded ReadAll on a misbehaving endpoint is still a memory hazard.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// Expo's headers arrived (2xx), but the body never fully did — we
+		// cannot know what it would have said, so this is NOT a definite
+		// non-delivery.
+		return nil, false, s.scrub(fmt.Errorf("expo push: read response: %w", err))
 	}
 
 	var decoded pushResponse
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("expo push: decode response: %w", err)
+		// A 2xx body that fails to parse tells us nothing about delivery —
+		// unknown, not definite.
+		return nil, false, fmt.Errorf("expo push: decode response: %w", err)
 	}
 	if len(decoded.Data) == 0 {
 		// A 2xx with no tickets is Expo refusing the whole request (errors[]
-		// is populated). Treat as non-retryable; the code is safe to log, the
-		// message may quote a token.
+		// is populated) — Expo DID answer, definitively, so this chunk is
+		// safe to retry. The code is safe to log, the message may quote a
+		// token.
 		code := ""
 		if len(decoded.Errors) > 0 {
 			code = decoded.Errors[0].Code
 		}
-		return nil, fmt.Errorf("expo push: no tickets returned (code %q)", code)
+		return nil, true, fmt.Errorf("expo push: no tickets returned (code %q)", code)
 	}
 	if len(decoded.Data) != len(chunk) {
-		return nil, fmt.Errorf("expo push: got %d tickets for %d messages, cannot map positionally",
+		// Cannot map tickets to messages positionally — we do not know which
+		// message got which verdict, so nothing here can be called definite.
+		return nil, false, fmt.Errorf("expo push: got %d tickets for %d messages, cannot map positionally",
 			len(decoded.Data), len(chunk))
 	}
 	out := make([]notifications.MobilePushResult, len(chunk))
@@ -285,7 +344,7 @@ func (s *Sender) sendChunk(ctx context.Context, chunk []BatchMessage) ([]notific
 			out[i] = rejected()
 		}
 	}
-	return out, nil
+	return out, false, nil
 }
 
 // rejected is the "no ticket to poll" result. Spelled out once so no branch

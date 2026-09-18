@@ -223,7 +223,18 @@ func (s *Sender) processCampaign(ctx context.Context, c *domain.PushCampaign, no
 		return s.campaigns.Cancel(ctx, c.ID, domain.CancelReasonVenueInactive, now)
 	}
 
-	rows, err := s.audience.Classify(ctx, subject.CityID, c.Kind, c.SubjectID, now, s.cfg.DailyCap, s.cfg.WeeklyCap)
+	// c.CityID (not subject.CityID) on purpose: c.CityID is the city frozen
+	// at Create — after facade.Create's own CodeCityUnresolved guard already
+	// confirmed it resolves for a venue-scoped campaign (facade.go's
+	// RestaurantID != nil && CityID == nil check) — while subject.CityID is
+	// re-read live on every tick. If a venue's city_id flips to NULL between
+	// Create and this tick (e.g. the restaurants_sync_city trigger bug,
+	// migration 0081) while RestaurantID stays non-nil, a live subject.CityID
+	// would pass nil into Classify and blast the push to every city on the
+	// platform instead of cancelling or narrowing to the original one. The
+	// snapshot has no such live dependency, so it is what audience targeting
+	// must use.
+	rows, err := s.audience.Classify(ctx, c.CityID, c.Kind, c.SubjectID, now, s.cfg.DailyCap, s.cfg.WeeklyCap)
 	if err != nil {
 		return err
 	}
@@ -366,7 +377,26 @@ func (s *Sender) fanOut(ctx context.Context, c *domain.PushCampaign, subject *do
 		}
 	}
 
+	// unknownFrom/unknownTo mark the message-index range (see BatchSender's
+	// doc comment / unknownRange) whose outcome sendErr genuinely could not
+	// confirm — a client timeout, a connection reset after the request left
+	// this process, or an unreadable/malformed response. Any other error,
+	// including the zero value here (no range at all), means every message
+	// it leaves unresolved is a DEFINITE non-delivery.
+	unknownFrom, unknownTo := len(msgs), len(msgs)
+	var withRange unknownRange
+	if errors.As(sendErr, &withRange) {
+		unknownFrom, unknownTo = withRange.UnknownRange()
+	}
+	unknownUsers := map[uuid.UUID]bool{}
+	for i, tg := range targets {
+		if i >= unknownFrom && i < unknownTo {
+			unknownUsers[tg.userID] = true
+		}
+	}
+
 	var retry []uuid.UUID
+	var ambiguous int
 	for _, uid := range userIDs {
 		if sentUsers[uid] {
 			if err := s.recipients.Resolve(ctx, c.ID, uid, domain.RecipientSent, now); err != nil {
@@ -379,13 +409,25 @@ func (s *Sender) fanOut(ctx context.Context, c *domain.PushCampaign, subject *do
 			}
 			continue
 		}
+		if unknownUsers[uid] {
+			// Outcome unknown for at least one of this guest's devices: the
+			// provider may already have accepted a push we cannot confirm
+			// from here. Leave the row `sending` untouched — never
+			// unclaimed, never resolved — so it is NEVER retried (spec
+			// push-campaigns-manual-spec §7 п.7 / §3.11: "лучше недослать,
+			// чем прислать дважды"); it settles to failed the same way a
+			// crashed process's leftover `sending` row does.
+			ambiguous++
+			continue
+		}
 		if sendErr != nil {
-			// The call itself failed transiently: we KNOW (we are still in
-			// this same process, past the call, not recovering from a crash)
-			// that nothing was delivered to this guest, so it is safe to
-			// unclaim them for a retry on the next attempt — the exact
-			// "continues with guests who have no row yet" behaviour spec 3.11
-			// describes, without weakening the crash-safety ClaimSending's
+			// A DEFINITE non-delivery for this guest: the provider itself
+			// refused the chunk (429/5xx or an outright batch rejection), or
+			// this guest's chunk was never even attempted because an
+			// earlier one failed first — either way nothing was delivered,
+			// so it is safe to unclaim them for a retry on the next attempt
+			// (spec 3.11's "continues with guests who have no row yet"),
+			// without weakening the crash-safety ClaimSending's
 			// write-before-send gives a guest whose fate we genuinely do not
 			// know (a process crash, not an error THIS call observed).
 			retry = append(retry, uid)
@@ -397,6 +439,10 @@ func (s *Sender) fanOut(ctx context.Context, c *domain.PushCampaign, subject *do
 		if err := s.recipients.Resolve(ctx, c.ID, uid, domain.RecipientFailed, now); err != nil {
 			return err
 		}
+	}
+	if ambiguous > 0 {
+		s.log.Warn("push campaign: send outcome unknown for some recipients, leaving them pending (never retried)",
+			slog.String("campaign_id", c.ID.String()), slog.Int("count", ambiguous))
 	}
 	if len(retry) > 0 {
 		if err := s.recipients.UnclaimSending(ctx, c.ID, retry); err != nil {

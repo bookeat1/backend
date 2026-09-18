@@ -74,9 +74,54 @@ type SendMessage struct {
 // to the provider's own request-size ceiling — see expopush.Sender.SendBatch),
 // returning one result per input message, positionally aligned. A non-nil
 // error means the call could not get an answer for every message (a
-// transient HTTP failure partway through): the campaign is left `sending`
-// and retried later (spec 3.11) rather than assumed sent.
+// transient HTTP failure partway through).
+//
+// By default every message left unresolved by such an error is treated as a
+// DEFINITE non-delivery — the provider itself refused it (e.g. Expo 429/5xx),
+// so unclaiming and retrying it on the next tick cannot duplicate anything
+// real. When the error also implements unknownRange, msgs[from:to) is the
+// exception: the call ended in a way that does NOT tell us whether the
+// provider actually accepted it (a client timeout, a connection reset AFTER
+// the request left this process, or an unreadable/malformed response) — see
+// expopush.SendBatchError.Definite, which bootstrap.expoBatchSender (the one
+// place that knows that concrete type) translates into MarkUnknownRange.
+// fanOut must NEVER unclaim a recipient whose only unresolved message falls
+// in that range (spec push-campaigns-manual-spec §7 п.7 / §3.11: "лучше
+// недослать, чем прислать дважды") — it is left `sending` and settles to
+// failed the same way a crashed process's leftover `sending` row would.
 type BatchSender func(ctx context.Context, msgs []SendMessage) ([]SendResult, error)
+
+// unknownRange is the optional marker a BatchSender's error can implement
+// (see BatchSender's doc comment) to mark part of the call's outcome as
+// genuinely unknown rather than a definite non-delivery.
+type unknownRange interface {
+	UnknownRange() (from, to int)
+}
+
+// unknownRangeError wraps an error to mark msgs[from:to) as unknown-outcome —
+// see BatchSender and unknownRange.
+type unknownRangeError struct {
+	err      error
+	from, to int
+}
+
+func (e *unknownRangeError) Error() string            { return e.err.Error() }
+func (e *unknownRangeError) Unwrap() error            { return e.err }
+func (e *unknownRangeError) UnknownRange() (int, int) { return e.from, e.to }
+
+// MarkUnknownRange wraps err so fanOut treats msgs[from:to) — a BatchSender
+// call's message indices — as an UNKNOWN send outcome rather than a definite
+// non-delivery (see BatchSender's doc comment). The one production caller is
+// bootstrap.expoBatchSender, translating expopush.SendBatchError's Definite
+// flag into this package's own port rather than importing that concrete
+// type here (the same "declare a local seam" discipline ports.go already
+// uses elsewhere in this file).
+func MarkUnknownRange(err error, from, to int) error {
+	if err == nil {
+		return nil
+	}
+	return &unknownRangeError{err: err, from: from, to: to}
+}
 
 // languageReader batches guests' preferred_language for text rendering — a
 // dedicated minimal reader (one column, many ids in one round trip), not the
