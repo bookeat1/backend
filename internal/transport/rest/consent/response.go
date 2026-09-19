@@ -27,10 +27,13 @@ func fromConsent(r domain.ConsentRecord) consentResponse {
 }
 
 type preferenceResponse struct {
-	NotificationsEnabled bool      `json:"notifications_enabled" example:"true"`
-	PushEnabled          bool      `json:"push_enabled" example:"true"`
-	EmailEnabled         bool      `json:"email_enabled" example:"true"`
-	UpdatedAt            time.Time `json:"updated_at" example:"2026-07-24T09:00:00Z"`
+	NotificationsEnabled bool `json:"notifications_enabled" example:"true"`
+	PushEnabled          bool `json:"push_enabled" example:"true"`
+	EmailEnabled         bool `json:"email_enabled" example:"true"`
+	// PromoPushEnabled is «Акции и события» (migration 0111) — independent of
+	// PushEnabled, see domain.NotificationPreference.AllowsPromoPush.
+	PromoPushEnabled bool      `json:"promo_push_enabled" example:"true"`
+	UpdatedAt        time.Time `json:"updated_at" example:"2026-07-24T09:00:00Z"`
 }
 
 func fromPreference(p domain.NotificationPreference) preferenceResponse {
@@ -38,6 +41,7 @@ func fromPreference(p domain.NotificationPreference) preferenceResponse {
 		NotificationsEnabled: p.NotificationsEnabled,
 		PushEnabled:          p.PushEnabled,
 		EmailEnabled:         p.EmailEnabled,
+		PromoPushEnabled:     p.PromoPushEnabled,
 		UpdatedAt:            p.UpdatedAt,
 	}
 }

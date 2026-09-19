@@ -25,14 +25,22 @@ func (r recordRequest) toInput() uc.RecordInput {
 	}
 }
 
-// preferenceRequest is a full replacement of the caller's notification opt-out.
-// Each flag is a *bool so an omitted field defaults to true (enabled) rather
-// than to Go's false zero-value — a client sending only notifications_enabled
-// does not accidentally silence every channel.
+// preferenceRequest is a full replacement of the caller's notification opt-out
+// — with ONE exception. NotificationsEnabled/PushEnabled/EmailEnabled are each
+// a *bool where an omitted field defaults to true (enabled) rather than to
+// Go's false zero-value — a client sending only notifications_enabled does
+// not accidentally silence every channel. This is UNCHANGED, byte for byte,
+// by promo_push_enabled's arrival.
+//
+// PromoPushEnabled is DIFFERENT (criterion 23, new behaviour for the NEW
+// field only): an omitted field here means "do not change it", not "true" —
+// see PreferenceInput's doc comment for why a shared "absent = true" rule
+// would be wrong for this one field specifically.
 type preferenceRequest struct {
 	NotificationsEnabled *bool `json:"notifications_enabled" example:"true"`
 	PushEnabled          *bool `json:"push_enabled" example:"true"`
 	EmailEnabled         *bool `json:"email_enabled" example:"true"`
+	PromoPushEnabled     *bool `json:"promo_push_enabled" example:"true"`
 }
 
 func (r preferenceRequest) toInput() uc.PreferenceInput {
@@ -40,6 +48,7 @@ func (r preferenceRequest) toInput() uc.PreferenceInput {
 		NotificationsEnabled: boolOrTrue(r.NotificationsEnabled),
 		PushEnabled:          boolOrTrue(r.PushEnabled),
 		EmailEnabled:         boolOrTrue(r.EmailEnabled),
+		PromoPushEnabled:     r.PromoPushEnabled,
 	}
 }
 

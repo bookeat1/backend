@@ -264,6 +264,11 @@ func TestGuestMessageContentIsMinimal(t *testing.T) {
 	if msg.Data["booking_id"] != e.BookingID.String() {
 		t.Fatalf("data must deep-link to the booking, got %v", msg.Data)
 	}
+	// Criterion 21: a booking push explicitly names the "bookings" Android
+	// channel — it must never land in "offers", the channel push campaigns use.
+	if msg.ChannelID != "bookings" {
+		t.Fatalf("channel id = %q, want %q", msg.ChannelID, "bookings")
+	}
 }
 
 // The outbox payload contract: the producer's user_id / cancelled_by reach the

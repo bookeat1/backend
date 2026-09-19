@@ -350,3 +350,45 @@ end-to-end before leaving it to cron.
 разослать одно и то же уведомление дважды, а сверка — дважды дёрнуть банк.
 НЕ масштабировать `worker` выше одной реплики, пока в claim не добавлена
 колонка-владелец (lease). Приложение (`app`) масштабируется свободно.
+
+## Пуш-кампании (миграция 0111, ручная рассылка по акциям/событиям)
+
+**Предусловие, без которого кнопка «Отправить пуш» в кабинете будет честно
+отвечать 503 `push_channel_disabled`:** на этом окружении должен быть задан
+`GUEST_PUSH_PROVIDER=expo` (см. `internal/bootstrap/config.go`,
+`PushConfig.GuestPushProvider`) — без него гостевой пуш-канал вообще собран
+как no-op (см. разбор от 01.09 в team-memory), и это касается не только
+кампаний, но и обычных пушей о бронях. Проверить на боевом окружении перед
+первой кампанией:
+
+```bash
+# Names only — never dump `env` wholesale on a real server (a stray
+# multi-line secret can print its own body that way).
+docker compose exec app sh -c "env -0 | cut -z -d= -f1 | tr '\0' '\n'" | grep GUEST_PUSH_PROVIDER
+```
+
+Сама рассылка — фоновый воркер внутри `cmd/worker` (`NewPushCampaignsSender`),
+который стартует ТОЛЬКО когда `GUEST_PUSH_PROVIDER` задан (иначе тикать
+незачем — слать всё равно нечем); в отличие от остальных циклов `worker`
+(см. предупреждение выше) у него настоящая аренда (`lease_until`,
+`PUSH_CAMPAIGNS_LEASE`), поэтому именно этот цикл переживает второй экземпляр
+`worker`, но само правило «не масштабировать `worker` выше одной реплики»
+остаётся в силе — сверка платежей и рассыльщик обычных уведомлений в том же
+бинаре его по-прежнему не переживают.
+
+Переменные (все необязательные, со здравыми умолчаниями — `internal/bootstrap/config.go`, `PushCampaignsConfig`):
+
+| Переменная | По умолчанию | Что это |
+|---|---|---|
+| `PUSH_CAMPAIGNS_TICK` | `10s` | Пауза между проходами воркера-отправителя |
+| `PUSH_CAMPAIGNS_BATCH_SIZE` | `5` | Сколько кампаний берёт один проход (`FOR UPDATE SKIP LOCKED`) |
+| `PUSH_CAMPAIGNS_LEASE` | `10m` | Аренда claim+lease — до истечения второй процесс кампанию не возьмёт |
+| `PUSH_CAMPAIGNS_MAX_QUEUE_AGE` | `6h` | `queued`-кампания старше этого возраста → `expired`, а не отправляется поздно без ведома админа |
+| `PUSH_CAMPAIGNS_MAX_ATTEMPTS` | `12` | Попыток отправить пачку в Expo при 429/5xx, прежде чем кампания уйдёт в `failed` |
+| `PUSH_CAMPAIGNS_SEND_BATCH_SIZE` | `100` | Сообщений в одном запросе к Expo (`expopush.Sender.SendBatch`, потолок самого Expo) |
+| `PUSH_CAMPAIGNS_DAILY_CAP` | `1` | Маркетинговых пушей на гостя в сутки |
+| `PUSH_CAMPAIGNS_WEEKLY_CAP` | `3` | Маркетинговых пушей на гостя в неделю |
+
+Тихие часы (21:00–10:00) считаются по уже существующему
+`BOOKING_TIMEZONE_FALLBACK` (по умолчанию `Asia/Almaty`) — отдельной
+переменной под пуш-кампании не заводили, город один и тот же.

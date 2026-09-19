@@ -20,22 +20,44 @@ func NewFeed(pool sqltx.Querier) *Feed { return &Feed{pool: pool} }
 
 var _ domain.NotificationFeedRepository = (*Feed)(nil)
 
-const feedCols = `id, user_id, type, title, body, booking_id, restaurant_id, outbox_event_id, read_at, created_at`
+const feedCols = `id, user_id, type, title, body, booking_id, restaurant_id, outbox_event_id, campaign_id, event_id, promo_id, read_at, created_at`
 
-// Insert appends a feed entry idempotently on (outbox_event_id, user_id). Under
-// the at-least-once dispatcher a redelivered event hits ON CONFLICT DO NOTHING
-// and inserts nothing; the boolean lets a caller (and tests) tell a fresh write
-// from a deduped one.
+// Insert appends a feed entry idempotently. Which unique index backs the
+// ON CONFLICT depends on which producer wrote the row (migration 0111 gave
+// them two separate keys, since a push-campaign row's outbox_event_id is
+// always NULL and Postgres never treats two NULLs as conflicting):
+//   - a booking-outbox row (CampaignID nil) dedupes on (outbox_event_id, user_id)
+//     — the at-least-once dispatcher's own idempotency;
+//   - a push-campaign row (CampaignID set) dedupes on (campaign_id, user_id)
+//     — criterion 19, one feed entry per (campaign, guest).
+//
+// The boolean lets a caller (and tests) tell a fresh write from a deduped one.
 func (r *Feed) Insert(ctx context.Context, n *domain.Notification) (bool, error) {
 	if n.ID == uuid.Nil {
 		n.ID = uuid.New()
 	}
-	q := `INSERT INTO notifications
-	        (id, user_id, type, title, body, booking_id, restaurant_id, outbox_event_id, created_at)
-	      VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
-	      ON CONFLICT (outbox_event_id, user_id) DO NOTHING`
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q,
-		n.ID, n.UserID, string(n.Type), n.Title, n.Body, n.BookingID, n.RestaurantID, n.OutboxEventID)
+	var (
+		tag interface{ RowsAffected() int64 }
+		err error
+	)
+	if n.CampaignID != nil {
+		res, e := sqltx.From(ctx, r.pool).Exec(ctx,
+			`INSERT INTO notifications
+			    (id, user_id, type, title, body, booking_id, restaurant_id, campaign_id, event_id, promo_id, created_at)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+			 ON CONFLICT (campaign_id, user_id) WHERE campaign_id IS NOT NULL DO NOTHING`,
+			n.ID, n.UserID, string(n.Type), n.Title, n.Body, n.BookingID, n.RestaurantID,
+			n.CampaignID, n.EventID, n.PromoID)
+		tag, err = res, e
+	} else {
+		res, e := sqltx.From(ctx, r.pool).Exec(ctx,
+			`INSERT INTO notifications
+			    (id, user_id, type, title, body, booking_id, restaurant_id, outbox_event_id, created_at)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
+			 ON CONFLICT (outbox_event_id, user_id) DO NOTHING`,
+			n.ID, n.UserID, string(n.Type), n.Title, n.Body, n.BookingID, n.RestaurantID, n.OutboxEventID)
+		tag, err = res, e
+	}
 	if err != nil {
 		return false, fmt.Errorf("insert notification: %w", err)
 	}
@@ -73,7 +95,8 @@ func (r *Feed) ListByUser(ctx context.Context, userID uuid.UUID, cursor *domain.
 			ty string
 		)
 		if err := rows.Scan(&n.ID, &n.UserID, &ty, &n.Title, &n.Body,
-			&n.BookingID, &n.RestaurantID, &n.OutboxEventID, &n.ReadAt, &n.CreatedAt); err != nil {
+			&n.BookingID, &n.RestaurantID, &n.OutboxEventID, &n.CampaignID, &n.EventID, &n.PromoID,
+			&n.ReadAt, &n.CreatedAt); err != nil {
 			return nil, fmt.Errorf("list notifications: %w", err)
 		}
 		n.Type = domain.NotificationFeedType(ty)

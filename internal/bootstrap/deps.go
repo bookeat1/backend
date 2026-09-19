@@ -50,6 +50,7 @@ import (
 	platformpagesrepo "backend-core/internal/infrastructure/postgres/platformpages"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	promocoderepo "backend-core/internal/infrastructure/postgres/promocode"
+	pushcampaignrepo "backend-core/internal/infrastructure/postgres/pushcampaign"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
@@ -96,6 +97,7 @@ import (
 	"backend-core/internal/usecase/preorder"
 	promocodesuc "backend-core/internal/usecase/promocodes"
 	"backend-core/internal/usecase/promos"
+	"backend-core/internal/usecase/pushcampaigns"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
 	rolesuc "backend-core/internal/usecase/roles"
@@ -140,6 +142,11 @@ type Deps struct {
 	ConsentFacade     consent.Facade
 	ReviewsFacade     reviews.Facade
 	EventsFacade      events.Facade
+	// PushCampaigns is the superadmin manual push-campaign facade (migration
+	// 0111): estimate/create/list/get. The background sender itself lives in
+	// cmd/worker (NewPushCampaignsSender), not here — same split as
+	// EventRecurrences (admin CRUD) vs the worker that acts on it.
+	PushCampaigns pushcampaigns.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
 	EventRecurrences eventrecurrence.Facade
@@ -413,6 +420,24 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// the shared tasteLoader's own cuisine reader above.
 		events.WithTasteMatch(tasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
+	// Manual push campaigns (migration 0111): the same 21:00-10:00 quiet-hours
+	// window bookings render times in (BOOKING_TIMEZONE_FALLBACK), so a
+	// superadmin's "quiet hours" always matches the city clock guests keep,
+	// not the server's. Falls back to UTC on a broken env value rather than
+	// crashing the API — the same degrade-not-die posture NewNotificationDispatcher
+	// uses for the WhatsApp render zone.
+	pushCampaignsLoc, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("push campaigns timezone fallback is unusable, quiet hours will use UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		pushCampaignsLoc = time.UTC
+	}
+	pushCampaignsFacade := pushcampaigns.NewFacade(
+		pushcampaignrepo.NewSubjects(db), pushcampaignrepo.NewAudience(db),
+		pushcampaignrepo.New(db), pushcampaignrepo.NewRecipients(db),
+		restaurantManagers, pushCampaignsLoc,
+		cfg.PushCampaigns.DailyCap, cfg.PushCampaigns.WeeklyCap,
+		cfg.Push.GuestPushConfigured())
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
 		// The same dictionary the events listing uses: a promo's own city
 		// override (migration 0085) and ?city= must mean the same thing in both
@@ -663,6 +688,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		ConsentFacade:         consentFacade,
 		ReviewsFacade:         reviewsFacade,
 		EventsFacade:          eventsFacade,
+		PushCampaigns:         pushCampaignsFacade,
 		EventRecurrences:      eventRecurrences,
 		PromosFacade:          promosFacade,
 		PromoCodesFacade:      promoCodesFacade,
@@ -1486,6 +1512,10 @@ func newGuestPushProvider(cfg Config, log *slog.Logger) *expopush.Sender {
 			AccessToken:      cfg.Push.ExpoAccessToken,
 			Endpoint:         cfg.Push.ExpoEndpoint,
 			ReceiptsEndpoint: cfg.Push.ExpoReceiptsEndpoint,
+			// Only push campaigns ever send more than one message at a time
+			// (a booking push is always a batch of one); this is PUSH_CAMPAIGNS_
+			// SEND_BATCH_SIZE, clamped to Expo's own ceiling inside NewSender.
+			MaxBatchSize: cfg.PushCampaigns.SendBatchSize,
 		})
 	default:
 		// An unknown provider name is a config typo, not a reason to crash the
@@ -1524,6 +1554,82 @@ func NewPushReceiptWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notif
 		},
 		log,
 	)
+}
+
+// NewPushCampaignsSender wires the manual push-campaign background sender, or
+// returns nil when no guest push provider is configured — same posture as
+// NewPushReceiptWorker (not the reconcilers' safe-idle-when-unconfigured
+// one): with no provider nothing could ever be sent, so a running loop would
+// only ever find campaigns to leave queued forever, which is worse than
+// simply not starting it and letting the create-time 503 (push_channel_disabled)
+// tell the operator why.
+func NewPushCampaignsSender(cfg Config, db *pgxpool.Pool, log *slog.Logger) *pushcampaigns.Sender {
+	provider := newGuestPushProvider(cfg, log)
+	if provider == nil {
+		log.Info("push campaign sender not started (no guest push provider configured)")
+		return nil
+	}
+	loc, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("push campaign sender timezone fallback is unusable, using UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		loc = time.UTC
+	}
+	return pushcampaigns.NewSender(
+		pushcampaignrepo.NewSubjects(db), pushcampaignrepo.NewAudience(db),
+		pushcampaignrepo.New(db), pushcampaignrepo.NewRecipients(db),
+		notificationrepo.NewDeviceTokens(db), pushcampaignrepo.NewLanguages(db),
+		notificationrepo.NewFeed(db), notificationrepo.NewPushTickets(db),
+		expoBatchSender(provider),
+		sqltx.NewManager(db), loc,
+		pushcampaigns.SenderConfig{
+			Tick: cfg.PushCampaigns.Tick, BatchSize: cfg.PushCampaigns.BatchSize,
+			LeaseFor: cfg.PushCampaigns.LeaseFor, MaxQueueAge: cfg.PushCampaigns.MaxQueueAge,
+			MaxAttempts: cfg.PushCampaigns.MaxAttempts, SendBatchSize: cfg.PushCampaigns.SendBatchSize,
+			DailyCap: cfg.PushCampaigns.DailyCap, WeeklyCap: cfg.PushCampaigns.WeeklyCap,
+		},
+		log,
+	)
+}
+
+// expoBatchSender adapts expopush.Sender.SendBatch to the
+// usecase/pushcampaigns.BatchSender port. It is the ONE place the two
+// packages' independent result/verdict types (deliberately not shared — see
+// pushcampaigns.SendVerdict's doc comment) are translated into each other,
+// AND the one place that knows expopush.SendBatchError's Definite flag: when
+// SendBatch could not confirm a chunk's outcome (a transport error/timeout,
+// or an unreadable/malformed response — Definite false), that range is
+// re-flagged via pushcampaigns.MarkUnknownRange so Sender.fanOut never
+// unclaims those recipients for a retry (spec push-campaigns-manual-spec §7
+// п.7 / §3.11 — retrying an unconfirmed send risks a duplicate push). A
+// DEFINITE failure (Expo itself answered 429/5xx, or rejected the whole
+// batch outright) is passed through unmarked: fanOut's legacy behaviour
+// (unclaim and retry every unresolved recipient) is exactly right for it.
+func expoBatchSender(provider *expopush.Sender) pushcampaigns.BatchSender {
+	return func(ctx context.Context, msgs []pushcampaigns.SendMessage) ([]pushcampaigns.SendResult, error) {
+		in := make([]expopush.BatchMessage, len(msgs))
+		for i, m := range msgs {
+			in[i] = expopush.BatchMessage{Token: m.Token, Title: m.Title, Body: m.Body, Data: m.Data, ChannelID: m.ChannelID}
+		}
+		results, err := provider.SendBatch(ctx, in)
+		out := make([]pushcampaigns.SendResult, len(results))
+		for i, r := range results {
+			out[i] = pushcampaigns.SendResult{TicketID: r.TicketID}
+			switch r.Verdict {
+			case notifications.MobilePushDelivered:
+				out[i].Verdict = pushcampaigns.SendDelivered
+			case notifications.MobilePushDeviceGone:
+				out[i].Verdict = pushcampaigns.SendDeviceGone
+			default:
+				out[i].Verdict = pushcampaigns.SendRejected
+			}
+		}
+		var batchErr *expopush.SendBatchError
+		if errors.As(err, &batchErr) && !batchErr.Definite {
+			err = pushcampaigns.MarkUnknownRange(err, batchErr.FailedAt, batchErr.FailedThrough)
+		}
+		return out, err
+	}
 }
 
 // newOTPSender builds the login-code delivery sender.

@@ -61,6 +61,12 @@ type MobilePushMessage struct {
 	Title string
 	Body  string
 	Data  map[string]string
+	// ChannelID is the Android notification channel the app should file this
+	// under ("bookings" for a booking alert, "offers" for a push-campaign
+	// marketing push — usecase/pushcampaigns). Empty leaves Android to its
+	// default channel, which is how every push behaved before this field
+	// existed — see expopush.Sender.Send/SendBatch's doc comment.
+	ChannelID string
 }
 
 // venueNameReader resolves a venue's display name for the guest-facing text. A
@@ -316,5 +322,11 @@ func buildGuestMessage(e Event, venue string) (MobilePushMessage, bool) {
 			"restaurant_id": e.RestaurantID.String(),
 			"starts_at":     e.StartsAt.Format(time.RFC3339),
 		},
+		// ChannelID: Android previously fell through to its default channel
+		// (no channel was ever sent) — pinning "bookings" explicitly is safe
+		// because the app has created that channel since 1.5.x (spec criterion
+		// 21), and it is what keeps a booking alert out of the new "offers"
+		// channel push campaigns use.
+		ChannelID: "bookings",
 	}, true
 }
