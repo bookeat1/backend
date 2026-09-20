@@ -230,6 +230,13 @@ type AppConfig struct {
 	LogFormat           string // env: APP_LOG_FORMAT — "json" (default) or "text"
 	CORSAllowedOrigins  []string
 
+	// WebBaseURL is apps/web's own public origin, used ONLY to build the
+	// campaign mini-landing's "Открыть на сайте" button
+	// (`<WebBaseURL>/?promo=<promotion_id>`, see transport/rest/campaign).
+	// Trailing slash trimmed so the handler can always concatenate
+	// "/?promo=..." without a double slash.
+	WebBaseURL string // env: WEB_BASE_URL
+
 	// TrustedProxies lists the IPs/CIDRs allowed to set X-Forwarded-For /
 	// X-Real-IP and have gin's Context.ClientIP() believe them (env:
 	// APP_TRUSTED_PROXIES, comma-separated). Empty (the default) means trust
@@ -721,6 +728,7 @@ func NewConfig() (Config, error) {
 			LogFormat:           getEnv("APP_LOG_FORMAT", "json"),
 			CORSAllowedOrigins:  getEnvList("APP_CORS_ORIGINS", "*"),
 			TrustedProxies:      getEnvList("APP_TRUSTED_PROXIES", ""),
+			WebBaseURL:          strings.TrimRight(getEnv("WEB_BASE_URL", "https://book-eat.com"), "/"),
 		},
 		DB: DBConfig{
 			Postgres: PostgresConfig{

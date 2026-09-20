@@ -18,6 +18,7 @@ import (
 	appversionrest "backend-core/internal/transport/rest/appversion"
 	authrest "backend-core/internal/transport/rest/auth"
 	bookingsrest "backend-core/internal/transport/rest/bookings"
+	campaignrest "backend-core/internal/transport/rest/campaign"
 	citiesrest "backend-core/internal/transport/rest/cities"
 	consentrest "backend-core/internal/transport/rest/consent"
 	contentrest "backend-core/internal/transport/rest/content"
@@ -114,6 +115,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"status": "ready"}})
 	})
 	r.GET("/.well-known/jwks.json", func(c *gin.Context) { c.JSON(http.StatusOK, deps.Issuer.JWKS()) })
+
+	// QR-flyer resolver (marathon-remainder-plan-20260914.md M1): a printed
+	// slug a phone's browser navigates to after a camera scan, so it lives
+	// at the bare path, not under /api/v1 — see transport/rest/campaign's
+	// package doc.
+	campaignrest.NewHandler(deps.CampaignLinks, cfg.App.WebBaseURL).RegisterRoutes(r)
 
 	// Interactive API docs at /docs — mounted only outside production.
 	swaggerui.Register(r, cfg.App.Environment)

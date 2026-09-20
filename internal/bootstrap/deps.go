@@ -25,6 +25,7 @@ import (
 	analyticsrepo "backend-core/internal/infrastructure/postgres/analytics"
 	appversionrepo "backend-core/internal/infrastructure/postgres/appversion"
 	bookingrepo "backend-core/internal/infrastructure/postgres/booking"
+	campaignrepo "backend-core/internal/infrastructure/postgres/campaign"
 	cityrepo "backend-core/internal/infrastructure/postgres/city"
 	consentrepo "backend-core/internal/infrastructure/postgres/consent"
 	contentdraftrepo "backend-core/internal/infrastructure/postgres/contentdraft"
@@ -75,6 +76,7 @@ import (
 	appversionuc "backend-core/internal/usecase/appversion"
 	"backend-core/internal/usecase/auth"
 	"backend-core/internal/usecase/bookings"
+	campaignuc "backend-core/internal/usecase/campaign"
 	citiesuc "backend-core/internal/usecase/cities"
 	"backend-core/internal/usecase/consent"
 	"backend-core/internal/usecase/content"
@@ -219,6 +221,9 @@ type Deps struct {
 	Preorder         *preorder.UseCase
 	StaticMap        *staticmap.UseCase
 	Issuer           *token.RSAIssuer
+	// CampaignLinks is the QR-flyer resolver (GET /m/:slug, migration 0112,
+	// marathon-remainder-plan-20260914.md M1).
+	CampaignLinks campaignuc.Facade
 
 	// Payments repositories, exposed for anything that still wants direct
 	// access (the reconciler in cmd/worker, ad-hoc tooling).
@@ -664,6 +669,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// posture as the payout gateway above.
 	mediaStore := newMediaStore(log)
 
+	// QR-flyer resolver (GET /m/:slug, migration 0112,
+	// marathon-remainder-plan-20260914.md M1): looks up a printed slug and
+	// records a scan. No txm needed — the whole usecase is a single-repo
+	// lookup-then-insert, nothing else participates in its transaction.
+	campaignFacade := campaignuc.NewFacade(campaignrepo.New(db))
+
 	return &Deps{
 		AuthFacade:            authFacade,
 		AuthOTP:               authOTP,
@@ -740,6 +751,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// contract and the day the key arrives it is one env var and a restart.
 		StaticMap: newStaticMap(cfg, restRepo, log),
 		Issuer:    issuer,
+
+		CampaignLinks: campaignFacade,
 
 		PaymentsRepo:         paymentsRepo,
 		PaymentRefundsRepo:   paymentRefundsRepo,

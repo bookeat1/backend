@@ -190,10 +190,18 @@ func (l *InMemoryLimiter) sweepLocked(now time.Time) {
 // endpoint are polled on a fixed schedule by the orchestrator/other services,
 // not user traffic — throttling them would turn a health check into a false
 // outage signal.
+//
+// GET /m/:slug (the printed QR-flyer resolver, marathon-remainder-plan
+// spec M1) joins this list for a different reason: it is the ONE url printed
+// on paper flyers a promoter hands out in person, so many phones on the same
+// venue Wi-Fi/NAT can scan it within the same minute — a per-IP budget meant
+// for API abuse would turn a good marathon morning into 429s on someone's own
+// campaign.
 var exemptRoutes = map[string]bool{
 	"GET /health":                true,
 	"GET /health/ready":          true,
 	"GET /.well-known/jwks.json": true,
+	"GET /m/:slug":               true,
 }
 
 // routeTiers classifies every route this API registers (see bootstrap.NewApp)
