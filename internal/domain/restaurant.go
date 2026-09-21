@@ -189,8 +189,19 @@ type Restaurant struct {
 	// neighbour preorderCols) — a catalog listing row leaves it nil, which is
 	// what keeps it absent from the listing JSON without a second mechanism.
 	PreorderMinAmountMinor *int64
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// ServiceFeeBps is the venue's own service-fee rate in basis points
+	// (restaurants.service_fee_bps, migration 0007; 350 = 3.5%), read here
+	// directly for the public payload — the same column
+	// PaymentSettingsOverride.ServiceFeeBps carries for the payment/gross-up
+	// flow (usecase/payments). nil = no venue-level rate stored (the payment
+	// flow then falls back to the global default; this field mirrors the
+	// STORED value only, never the resolved fallback, so a guest never sees a
+	// generic 3.5% attributed to a venue that never actually set one).
+	// Scanned only by the detail read (GetByID, see policyCols' neighbour
+	// serviceFeeCols) — a catalog listing row leaves it nil.
+	ServiceFeeBps *int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // RestaurantAggregate is a restaurant with its inline collections, matching the
