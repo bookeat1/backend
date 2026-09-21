@@ -987,6 +987,30 @@ func i18nFromDB(b []byte) domain.I18n {
 	return m
 }
 
+// ListKwaakaLinked returns every restaurant with kwaaka_restaurant_id set,
+// regardless of is_active — see domain.RestaurantRepository's doc comment.
+func (r *Repository) ListKwaakaLinked(ctx context.Context) ([]domain.KwaakaLinkedRestaurant, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, kwaaka_restaurant_id FROM restaurants
+		 WHERE kwaaka_restaurant_id IS NOT NULL AND kwaaka_restaurant_id <> ''`)
+	if err != nil {
+		return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.KwaakaLinkedRestaurant{}
+	for rows.Next() {
+		var l domain.KwaakaLinkedRestaurant
+		if err := rows.Scan(&l.RestaurantID, &l.KwaakaRestaurantID); err != nil {
+			return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+	}
+	return out, nil
+}
+
 // mapWrite maps a unique_violation to domain.ErrAlreadyExists, otherwise wraps
 // err with resource for context. resource should name the entity/operation
 // being written (e.g. "create restaurant", "create manager").

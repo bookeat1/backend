@@ -103,6 +103,20 @@ func (f *fakeItems) ReplaceTags(_ context.Context, itemID uuid.UUID, tags []doma
 	return nil
 }
 
+// UpsertFromKwaaka / MarkUnavailableExceptKwaakaIDs are not exercised by this
+// package's tests (usecase/kwaakasync owns that behaviour) — stubs only to
+// satisfy domain.MenuItemRepository.
+func (f *fakeItems) UpsertFromKwaaka(_ context.Context, m *domain.MenuItem) error {
+	if m.ID == uuid.Nil {
+		m.ID = uuid.New()
+	}
+	f.store[m.ID] = m
+	return nil
+}
+func (f *fakeItems) MarkUnavailableExceptKwaakaIDs(_ context.Context, _ uuid.UUID, _ []string) (int, error) {
+	return 0, nil
+}
+
 type fakeCategories struct {
 	created, updated *domain.MenuCategory
 	deleted          uuid.UUID

@@ -102,6 +102,12 @@ type MenuItem struct {
 	Tags         []MenuItemTag
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// KwaakaProductID correlates this row to a product in Kwaaka's menu feed
+	// for a restaurant synced from Kwaaka POS (Restaurant.KwaakaRestaurantID
+	// set). Nil for every hand-entered dish — see migration 0114 and
+	// usecase/kwaakasync. Together with RestaurantID it is the natural key
+	// MenuItemRepository.UpsertFromKwaaka matches on.
+	KwaakaProductID *string
 }
 
 // HasImage reports whether the dish has a usable photo. A NULL column and a
@@ -229,4 +235,28 @@ type MenuItemRepository interface {
 	ClearTopPicks(ctx context.Context, restaurantID uuid.UUID) (int, error)
 	// ReplaceTags deletes the item's tags and inserts items (call within a tx).
 	ReplaceTags(ctx context.Context, menuItemID uuid.UUID, tags []MenuItemTag) error
+
+	// UpsertFromKwaaka inserts or updates one dish synced from Kwaaka, matching
+	// on (m.RestaurantID, m.KwaakaProductID) — see migration 0114's partial
+	// unique index. m.KwaakaProductID must be non-nil; m.ID is generated on
+	// insert and left untouched on update (the row keeps its BookEat id across
+	// syncs, which is what every existing FK — tags, top-pick slot, the
+	// featured rail — depends on). IsFeatured and TopPickPosition are NEVER
+	// touched by this method: those are the venue's own editorial choices, made
+	// through the panel, and a POS sync must not silently drop them because a
+	// dish's price changed in the kitchen. Only the fields Kwaaka actually owns
+	// (name, description, price, availability, category, image) are written.
+	UpsertFromKwaaka(ctx context.Context, m *MenuItem) error
+	// MarkUnavailableExceptKwaakaIDs sets is_available=false for every
+	// Kwaaka-sourced dish (kwaaka_product_id IS NOT NULL) of restaurantID whose
+	// kwaaka_product_id is NOT in keep, and returns how many rows it changed.
+	// This is how a dish that Kwaaka's menu feed stopped returning entirely
+	// (removed from the POS, not just flagged unavailable) goes dark on our
+	// side too: a full sync pass calls this once per restaurant with the
+	// product ids it just upserted, so anything left over — no longer served —
+	// is stop-listed exactly like an explicit is_available=false would be. A
+	// nil/empty keep is valid (every Kwaaka-sourced dish at that restaurant
+	// goes unavailable) — Kwaaka answering "empty menu" is data, not a reason
+	// to skip stop-listing everything that used to be there.
+	MarkUnavailableExceptKwaakaIDs(ctx context.Context, restaurantID uuid.UUID, keep []string) (int, error)
 }

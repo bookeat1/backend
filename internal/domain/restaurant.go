@@ -354,6 +354,21 @@ type RestaurantRepository interface {
 	// value (a NULL stays NULL, i.e. "use the global default"). Returns
 	// ErrNotFound when the restaurant does not exist.
 	UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o BookingPolicyOverride) error
+	// ListKwaakaLinked returns every restaurant with KwaakaRestaurantID set,
+	// regardless of IsActive — a venue paused on the platform can still be
+	// re-activated later, and its menu should already be current when that
+	// happens rather than stale from the day it was hidden. Restaurants
+	// without a Kwaaka binding (the vast majority, entered by hand) are never
+	// returned and therefore never touched by usecase/kwaakasync.
+	ListKwaakaLinked(ctx context.Context) ([]KwaakaLinkedRestaurant, error)
+}
+
+// KwaakaLinkedRestaurant is the minimal projection usecase/kwaakasync needs to
+// drive one restaurant's sync pass: our id to write menu_items against, and
+// Kwaaka's id to ask its API for.
+type KwaakaLinkedRestaurant struct {
+	RestaurantID       uuid.UUID
+	KwaakaRestaurantID string
 }
 
 // RestaurantListItem is a lightweight row for the catalog listing.
