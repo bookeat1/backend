@@ -155,6 +155,12 @@ type bookingPayload struct {
 	// (today: the analytics mapper) read it through an allow-list, same as
 	// every other field here — nothing about how it got here changes that.
 	PromotionID *uuid.UUID `json:"promotion_id,omitempty"`
+	// AttributionSource is the marathon QR channel tag (spec
+	// marathon-qr-attribution-20260921 §4 criterion 8) this booking was
+	// created under, already validated by domain.SanitizeAttributionSource —
+	// see createUseCase.sanitizedAttributionSource. Omitted for the vast
+	// majority of bookings that carry no channel tag.
+	AttributionSource *string `json:"attribution_source,omitempty"`
 }
 
 func newBookingPayload(b *domain.Booking) bookingPayload {
@@ -162,7 +168,7 @@ func newBookingPayload(b *domain.Booking) bookingPayload {
 		ID: b.ID, RestaurantID: b.RestaurantID, UserID: b.UserID, Name: b.Name,
 		Phone: b.PhoneNormalized, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: b.Status, Source: b.Source,
-		PromotionID: b.PromotionID,
+		PromotionID: b.PromotionID, AttributionSource: b.AttributionSource,
 	}
 	if b.CancelledBy != nil {
 		p.CancelledBy = *b.CancelledBy

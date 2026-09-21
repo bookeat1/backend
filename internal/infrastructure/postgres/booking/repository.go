@@ -28,7 +28,7 @@ const cols = `id, restaurant_id, user_id, name, phone, email, phone_normalized,
 	cancelled_by, cancellation_reason_code, cancellation_reason,
 	late_notification_sent, user_notified_late_at, user_late_message,
 	reminder_60_sent_at, reminder_30_sent_at, original_booking_time_text,
-	promo_code_id, promo_code, created_at, updated_at`
+	promo_code_id, promo_code, attribution_source, created_at, updated_at`
 
 func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	now := time.Now()
@@ -38,7 +38,7 @@ func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	b.UpdatedAt = now
 	q := `INSERT INTO bookings (` + cols + `) VALUES
 		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)`
+		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)`
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(b)...); err != nil {
 		return mapWrite(err, "create booking")
 	}
@@ -312,8 +312,10 @@ func (r *Repository) args(b *domain.Booking) []any {
 		b.Reminder30SentAt, b.OriginalBookingTime,
 		// Promo code fields are INSERT-only (ADR-047): Update below does not
 		// list them, so "the code as of this booking" cannot be rewritten by a
-		// later edit of the booking.
-		b.PromoCodeID, b.PromoCode,
+		// later edit of the booking. attribution_source follows the same rule
+		// (migration 0115, spec §5) for the same reason: "which channel this
+		// booking was created under" is a fact about the moment of creation.
+		b.PromoCodeID, b.PromoCode, b.AttributionSource,
 		b.CreatedAt, b.UpdatedAt,
 	}
 }
@@ -342,7 +344,7 @@ func scanBooking(row scanner) (*domain.Booking, error) {
 		&b.CancellationReasonCode, &b.CancellationReason, &b.LateNotificationSent,
 		&b.UserNotifiedLateAt, &b.UserLateMessage, &b.Reminder60SentAt,
 		&b.Reminder30SentAt, &b.OriginalBookingTime, &b.PromoCodeID, &b.PromoCode,
-		&b.CreatedAt, &b.UpdatedAt,
+		&b.AttributionSource, &b.CreatedAt, &b.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}

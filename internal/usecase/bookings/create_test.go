@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,9 +186,9 @@ func TestCreateWithItems(t *testing.T) {
 // A promotion_id that names a real, live promo (fakePromos knows it) is
 // accepted, stored on the booking, and reaches the outbox payload — the tag
 // consumers (today: the analytics mapper) read to attribute the booking to a
-// campaign. Twin of "a random uuid is not a real promotion" in
-// TestCreateRejections, which covers the ugly path this one is the happy path
-// for.
+// campaign. Twin of TestCreateDeadPromotionIDIsSilentlyDropped, which covers
+// the ugly path (spec marathon-qr-attribution-20260921 §4 criterion 10) this
+// one is the happy path for.
 func TestCreatePromotionID(t *testing.T) {
 	h := newCreateHarness(t, domain.BookingPolicyOverride{})
 	in := h.input()
@@ -237,6 +238,126 @@ func TestCreatePromotionIDWithoutPromosConfigured(t *testing.T) {
 	if len(h.bookings.created) != 0 {
 		t.Fatalf("a rejected request must not create a booking")
 	}
+}
+
+// TestCreateDeadPromotionIDIsSilentlyDropped is spec
+// marathon-qr-attribution-20260921 §4 criterion 10: a promotion_id naming a
+// campaign that never existed (the antispoofing case TestCreateRejections
+// used to cover as a 422) now creates the booking anyway, with
+// promotion_id=NULL rather than the caller-supplied id. The antispoofing
+// guarantee itself is untouched — the booking can still never end up tagged
+// with an id nothing here verified as live, see TestCreatePromotionID for
+// the mirror case where the id IS live.
+func TestCreateDeadPromotionIDIsSilentlyDropped(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+	in := h.input()
+	dead := uuid.New() // never registered with h.promos
+	in.PromotionID = &dead
+
+	got, err := h.uc.Create(context.Background(), h.guest, in)
+	if err != nil {
+		t.Fatalf("Create: %v, want 201 with the tag dropped", err)
+	}
+	if got.Booking.PromotionID != nil {
+		t.Fatalf("promotion_id = %v, want nil (dead id must be dropped, not stored)", got.Booking.PromotionID)
+	}
+	if len(h.outbox.created) != 1 {
+		t.Fatalf("outbox events = %d, want 1", len(h.outbox.created))
+	}
+	var payload struct {
+		PromotionID *uuid.UUID `json:"promotion_id"`
+	}
+	if err := json.Unmarshal(h.outbox.created[0].Payload, &payload); err != nil {
+		t.Fatalf("decode outbox payload: %v", err)
+	}
+	if payload.PromotionID != nil {
+		t.Fatalf("outbox payload promotion_id = %v, want omitted/nil", payload.PromotionID)
+	}
+}
+
+// TestCreatePromoCodeStillRejectsAnUnknownCode is the regression spec
+// criterion 11 requires: the "silently drop" rule of criterion 10 applies
+// ONLY to promotion_id, never to a promo_code the guest actually typed. A
+// code that does not exist must keep refusing the booking exactly as before
+// this feature.
+func TestCreatePromoCodeStillRejectsAnUnknownCode(t *testing.T) {
+	h := newCreateHarness(t, domain.BookingPolicyOverride{})
+
+	_, err := h.uc.Create(context.Background(), h.guest, CreateInput{
+		RestaurantID: h.restaurantID, UserID: &h.guest.UserID, Name: "Гость",
+		Phone: "+77071234567", Guests: 2, StartsAt: h.startsAt,
+		Source: domain.SourceApp, PromoCode: "NOSUCHCODE",
+	})
+	if got, ok := domain.CodeOf(err); !ok || got != domain.CodePromoCodeNotFound {
+		t.Fatalf("code = %q (ok=%v), want %q (err %v)", got, ok, domain.CodePromoCodeNotFound, err)
+	}
+	if len(h.bookings.created) != 0 {
+		t.Fatalf("a rejected code must not create a booking")
+	}
+}
+
+// TestCreateAttributionSource is spec marathon-qr-attribution-20260921 §4
+// criteria 8, 9, 12: a valid tag is stored and reaches the outbox payload; an
+// invalid one (wrong shape or too long) never fails the booking, it is
+// silently dropped to NULL; the field absent entirely (an old client,
+// criterion 12) behaves exactly like an empty one.
+func TestCreateAttributionSource(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want *string
+	}{
+		{name: "valid tshirt", raw: "tshirt", want: strPtr("tshirt")},
+		{name: "valid box", raw: "box", want: strPtr("box")},
+		{name: "valid with digits/dash/underscore", raw: "box-promo_2", want: strPtr("box-promo_2")},
+		{name: "absent (old client, criterion 12)", raw: "", want: nil},
+		{name: "spaces", raw: "t shirt", want: nil},
+		{name: "cyrillic", raw: "футболка", want: nil},
+		{name: "uppercase", raw: "TSHIRT", want: nil},
+		{name: "too long (40 chars)", raw: strings.Repeat("a", 40), want: nil},
+		{name: "exactly 32 chars is still valid", raw: strings.Repeat("a", 32), want: strPtr(strings.Repeat("a", 32))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCreateHarness(t, domain.BookingPolicyOverride{})
+			in := h.input()
+			in.AttributionSource = tc.raw
+
+			got, err := h.uc.Create(context.Background(), h.guest, in)
+			if err != nil {
+				t.Fatalf("Create: %v, want 201 regardless of the tag (criterion 9: never an error)", err)
+			}
+			if !equalStrPtr(got.Booking.AttributionSource, tc.want) {
+				t.Fatalf("booking.AttributionSource = %v, want %v", derefOrNil(got.Booking.AttributionSource), derefOrNil(tc.want))
+			}
+			if len(h.outbox.created) != 1 {
+				t.Fatalf("outbox events = %d, want 1", len(h.outbox.created))
+			}
+			var payload struct {
+				AttributionSource *string `json:"attribution_source"`
+			}
+			if err := json.Unmarshal(h.outbox.created[0].Payload, &payload); err != nil {
+				t.Fatalf("decode outbox payload: %v", err)
+			}
+			if !equalStrPtr(payload.AttributionSource, tc.want) {
+				t.Fatalf("outbox payload attribution_source = %v, want %v", derefOrNil(payload.AttributionSource), derefOrNil(tc.want))
+			}
+		})
+	}
+}
+
+func equalStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func derefOrNil(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
 }
 
 // Every rejection branch of Create, in the order the usecase applies them.
@@ -355,17 +476,6 @@ func TestCreateRejections(t *testing.T) {
 				return Actor{UserID: uuid.New(), Role: domain.RoleRestaurant}
 			},
 			wantErr: domain.ErrForbidden,
-		},
-		{
-			// The spoofing hole this check exists to close: a guest cannot make a
-			// booking read as if it came from a real campaign by pasting an
-			// arbitrary uuid into promotion_id.
-			name: "a random uuid is not a real promotion",
-			mutate: func(_ *createHarness, in *CreateInput) {
-				id := uuid.New()
-				in.PromotionID = &id
-			},
-			wantErr: domain.ErrValidation,
 		},
 	}
 
