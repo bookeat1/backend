@@ -108,6 +108,15 @@ type restaurantResponse struct {
 	// they have opened the venue's menu. nil/omitted means "no minimum set" —
 	// the client must not read absence as a floor of zero.
 	PreorderMinAmountMinor *int64 `json:"preorder_min_amount_minor,omitempty"`
+	// ServiceFeeBps is the venue's own service-fee rate in basis points
+	// (restaurants.service_fee_bps; 350 = 3.5%). Served by the DETAIL read
+	// only, same rule as PreorderMinAmountMinor above. nil/omitted means "no
+	// venue rate stored" — the client must treat that (and an explicit 0)
+	// identically to "no fee", never fall back to the platform default
+	// (unlike the payment flow's own gross-up, which does fall back — see
+	// usecase/payments.Config.ServiceFeeBps — this is a display-only field,
+	// not a promise about what a payment will actually charge).
+	ServiceFeeBps *int `json:"service_fee_bps,omitempty"`
 	// Match is this card's taste-match explanation (spec
 	// foodie-personalization-v1-20260916.md §5.6) — set ONLY by
 	// GET /restaurants/picks' guest read (picks_handler.go), and only when
@@ -455,6 +464,7 @@ func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantR
 		attachRawTranslations(&resp, a.Restaurant)
 	}
 	resp.PreorderMinAmountMinor = a.Restaurant.PreorderMinAmountMinor
+	resp.ServiceFeeBps = a.Restaurant.ServiceFeeBps
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
