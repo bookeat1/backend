@@ -65,6 +65,14 @@ const preorderCols = `preorder_min_amount_minor`
 // dynamic-SET UpdateBookingRules below, exactly like UpdateBookingPolicy.
 const bookingRulesCols = `hold_minutes, late_arrival_text, late_arrival_text_i18n, free_cancel_window_minutes`
 
+// serviceFeeCols is the venue's optional own service-fee rate
+// (restaurants.service_fee_bps, migration 0007), read only by GetByID for the
+// same reason preorderCols is: the public DETAIL payload publishes it (see
+// transport/rest/restaurants.aggregateToResponse), the catalog listing does
+// not need it, and it is deliberately its own constant so Create/Update's
+// placeholder numbering stays untouched.
+const serviceFeeCols = `service_fee_bps`
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -374,7 +382,7 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
+		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -935,6 +943,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
 		&capacityMode, &p.BookingCapacitySeats,
 		&m.PreorderMinAmountMinor,
+		&m.ServiceFeeBps,
 		&br.HoldMinutes, &br.LateArrivalText, &lateArrivalI18n, &m.FreeCancelWindowMinutes,
 	); err != nil {
 		return nil, err
@@ -1089,6 +1098,30 @@ func i18nFromDB(b []byte) domain.I18n {
 		return nil
 	}
 	return m
+}
+
+// ListKwaakaLinked returns every restaurant with kwaaka_restaurant_id set,
+// regardless of is_active — see domain.RestaurantRepository's doc comment.
+func (r *Repository) ListKwaakaLinked(ctx context.Context) ([]domain.KwaakaLinkedRestaurant, error) {
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT id, kwaaka_restaurant_id FROM restaurants
+		 WHERE kwaaka_restaurant_id IS NOT NULL AND kwaaka_restaurant_id <> ''`)
+	if err != nil {
+		return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.KwaakaLinkedRestaurant{}
+	for rows.Next() {
+		var l domain.KwaakaLinkedRestaurant
+		if err := rows.Scan(&l.RestaurantID, &l.KwaakaRestaurantID); err != nil {
+			return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list kwaaka linked restaurants: %w", err)
+	}
+	return out, nil
 }
 
 // mapWrite maps a unique_violation to domain.ErrAlreadyExists, otherwise wraps

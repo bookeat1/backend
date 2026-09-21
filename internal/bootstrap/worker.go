@@ -104,12 +104,17 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer closeLegacy()
 	}
 
+	// The Kwaaka menu/stop-list sync (phase 1 of the Kwaaka POS integration)
+	// is started only when KWAAKA_BASE_URL/KWAAKA_TOKEN are configured — see
+	// NewKwaakaSyncWorker.
+	kwaakaSync := NewKwaakaSyncWorker(cfg, db, log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
 	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	var recurrenceErr, pushReceiptErr, pushCampaignsErr error
+	var recurrenceErr, pushReceiptErr, pushCampaignsErr, kwaakaSyncErr error
 	wg.Add(8)
 	go func() {
 		defer wg.Done()
@@ -164,6 +169,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 			legacyErr = legacySync.Run(ctx)
 		}()
 	}
+	if kwaakaSync != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kwaakaSyncErr = kwaakaSync.Run(ctx)
+		}()
+	}
 	wg.Wait()
 
 	if bookingErr != nil {
@@ -198,6 +210,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)
+	}
+	if kwaakaSyncErr != nil {
+		return fmt.Errorf("kwaaka menu sync: %w", kwaakaSyncErr)
 	}
 	return nil
 }

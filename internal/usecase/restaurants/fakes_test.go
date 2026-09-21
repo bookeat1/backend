@@ -80,6 +80,13 @@ func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) 
 	return nil
 }
 
+// ListKwaakaLinked is not exercised by this package's tests
+// (usecase/kwaakasync owns that behaviour) — stub only to satisfy
+// domain.RestaurantRepository.
+func (f *fakeRestaurantRepo) ListKwaakaLinked(_ context.Context) ([]domain.KwaakaLinkedRestaurant, error) {
+	return nil, nil
+}
+
 // fakeRelated records both the total number of Replace* calls (replaced, kept
 // for backward-compat with existing assertions) and which specific
 // collections were touched, so tests can assert that Update only replaces

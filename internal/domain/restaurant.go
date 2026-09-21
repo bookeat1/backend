@@ -189,6 +189,17 @@ type Restaurant struct {
 	// neighbour preorderCols) — a catalog listing row leaves it nil, which is
 	// what keeps it absent from the listing JSON without a second mechanism.
 	PreorderMinAmountMinor *int64
+	// ServiceFeeBps is the venue's own service-fee rate in basis points
+	// (restaurants.service_fee_bps, migration 0007; 350 = 3.5%), read here
+	// directly for the public payload — the same column
+	// PaymentSettingsOverride.ServiceFeeBps carries for the payment/gross-up
+	// flow (usecase/payments). nil = no venue-level rate stored (the payment
+	// flow then falls back to the global default; this field mirrors the
+	// STORED value only, never the resolved fallback, so a guest never sees a
+	// generic 3.5% attributed to a venue that never actually set one).
+	// Scanned only by the detail read (GetByID, see policyCols' neighbour
+	// serviceFeeCols) — a catalog listing row leaves it nil.
+	ServiceFeeBps *int
 	// BookingRules holds the venue's optional overrides of the guest-facing
 	// booking-rules copy shown at booking confirmation and in the pre-visit
 	// reminder (Trello BNjLdfSP): how long the table is held, and what to do
@@ -396,6 +407,13 @@ type RestaurantRepository interface {
 	// value (a NULL stays NULL, i.e. "use the global default"). Returns
 	// ErrNotFound when the restaurant does not exist.
 	UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o BookingPolicyOverride) error
+	// ListKwaakaLinked returns every restaurant with KwaakaRestaurantID set,
+	// regardless of IsActive — a venue paused on the platform can still be
+	// re-activated later, and its menu should already be current when that
+	// happens rather than stale from the day it was hidden. Restaurants
+	// without a Kwaaka binding (the vast majority, entered by hand) are never
+	// returned and therefore never touched by usecase/kwaakasync.
+	ListKwaakaLinked(ctx context.Context) ([]KwaakaLinkedRestaurant, error)
 	// UpdateBookingRules patches the venue's optional booking-rules-copy
 	// override (Trello BNjLdfSP). Same PATCH semantics as UpdateBookingPolicy
 	// for HoldMinutes/LateArrivalText: nil = untouched, otherwise written
@@ -407,6 +425,14 @@ type RestaurantRepository interface {
 	// the fully-merged map, not a raw patch). Returns ErrNotFound when the
 	// restaurant does not exist.
 	UpdateBookingRules(ctx context.Context, id uuid.UUID, o BookingRulesOverride, i18nTouched bool) error
+}
+
+// KwaakaLinkedRestaurant is the minimal projection usecase/kwaakasync needs to
+// drive one restaurant's sync pass: our id to write menu_items against, and
+// Kwaaka's id to ask its API for.
+type KwaakaLinkedRestaurant struct {
+	RestaurantID       uuid.UUID
+	KwaakaRestaurantID string
 }
 
 // RestaurantListItem is a lightweight row for the catalog listing.
