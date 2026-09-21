@@ -54,6 +54,17 @@ const policyCols = `timezone, booking_duration_minutes, booking_buffer_minutes,
 // from cols so Create/Update's placeholder numbering stays untouched.
 const preorderCols = `preorder_min_amount_minor`
 
+// bookingRulesCols are the venue's optional guest-facing booking-rules-copy
+// overrides (Trello BNjLdfSP) plus the money-path free-cancellation window
+// that copy quotes (free_cancel_window_minutes — see
+// domain.Restaurant.FreeCancelWindowMinutes for why it is read-only here).
+// Read only by GetByID, for the same reason policyCols/preorderCols are: the
+// catalog listing has no use for them, and keeping them out of `cols` means
+// this feature never touches Create/Update's fixed placeholder numbering —
+// hold_minutes and late_arrival_text(+i18n) are written through the separate
+// dynamic-SET UpdateBookingRules below, exactly like UpdateBookingPolicy.
+const bookingRulesCols = `hold_minutes, late_arrival_text, late_arrival_text_i18n, free_cancel_window_minutes`
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -251,6 +262,103 @@ func (r *Repository) UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o do
 	return nil
 }
 
+// UpdateBookingRules patches the venue's optional booking-rules-copy override
+// (Trello BNjLdfSP): hold_minutes and late_arrival_text(+i18n). Same PATCH
+// semantics as UpdateBookingPolicy — a nil field of o leaves its column(s)
+// untouched. Built as its own dynamic-SET statement, deliberately NOT folded
+// into the big fixed Update above, for the same reason UpdateBookingPolicy
+// is: adding these columns to Create/Update's placeholder list would have
+// meant renumbering every one of them for an unrelated feature.
+//
+// A ZERO/negative HoldMinutes or an EMPTY LateArrivalText is not rejected
+// here (validateProvided does that for a genuinely bad value) — it is treated
+// as the explicit "clear the override, go back to the platform default"
+// sentinel, the same idiom setManagerRequest.WhatsappPhone uses for its own
+// clearable field. Clearing LateArrivalText also clears LateArrivalTextI18n
+// in the SAME statement: the CHECK requires a base text for any translation,
+// and a two-step clear would let a concurrent read see the impossible
+// in-between state (translations with no base text) for the gap between them.
+//
+// i18nTouched writes LateArrivalTextI18n on its OWN, independently of
+// LateArrivalText: a caller that only patched a translation (no change to
+// LateArrivalText) still has to persist the merged map without disturbing the
+// base text — the read-modify-write of that map is the CALLER's job
+// (usecase/restaurants.applyRestaurant), o.LateArrivalTextI18n here is
+// already the full, merged value.
+func (r *Repository) UpdateBookingRules(ctx context.Context, id uuid.UUID, o domain.BookingRulesOverride, i18nTouched bool) error {
+	args := []any{id}
+	sets := make([]string, 0, 3)
+	set := func(col string, val any) {
+		args = append(args, val)
+		sets = append(sets, fmt.Sprintf("%s=$%d", col, len(args)))
+	}
+	if v := o.HoldMinutes; v != nil {
+		if *v > 0 {
+			set("hold_minutes", *v)
+		} else {
+			set("hold_minutes", nil)
+		}
+	}
+	switch v := o.LateArrivalText; {
+	case v != nil && strings.TrimSpace(*v) != "":
+		set("late_arrival_text", *v)
+		set("late_arrival_text_i18n", i18nToDB(o.LateArrivalTextI18n))
+	case v != nil:
+		// Empty string: clear both — see the CHECK note above.
+		set("late_arrival_text", nil)
+		set("late_arrival_text_i18n", nil)
+	case i18nTouched:
+		// The base text was not part of this request; only the translations
+		// map moves. i18nToDB(nil) is a safe no-op when the venue has no base
+		// text at all (CHECK: NULL i18n is always allowed).
+		set("late_arrival_text_i18n", i18nToDB(o.LateArrivalTextI18n))
+	}
+
+	if len(sets) == 0 {
+		return r.exists(ctx, id)
+	}
+	sets = append(sets, "updated_at=now()")
+
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants SET `+strings.Join(sets, ", ")+` WHERE id=$1`, args...)
+	if err != nil {
+		return fmt.Errorf("update booking rules: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// GetBookingRulesOverride reads one restaurant's optional booking-rules-copy
+// override plus the money-path free-cancellation window it quotes (Trello
+// BNjLdfSP) — a minimal read for callers that need only this, not the whole
+// aggregate GetByID returns (usecase/bookings' confirmation-screen resolver,
+// bound through a local adapter in bootstrap). Mirrors GetPaymentOverride's
+// shape and the same reason it exists: one SELECT, no joins, no collections.
+func (r *Repository) GetBookingRulesOverride(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error) {
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT `+bookingRulesCols+` FROM restaurants WHERE id=$1`, restaurantID)
+
+	var (
+		holdMinutes   *int
+		lateText      *string
+		lateTextI18n  []byte
+		freeCancelMin *int
+	)
+	if err := row.Scan(&holdMinutes, &lateText, &lateTextI18n, &freeCancelMin); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.BookingRulesOverride{}, nil, domain.ErrNotFound
+		}
+		return domain.BookingRulesOverride{}, nil, fmt.Errorf("read booking rules override: %w", err)
+	}
+	return domain.BookingRulesOverride{
+		HoldMinutes:         holdMinutes,
+		LateArrivalText:     lateText,
+		LateArrivalTextI18n: i18nFromDB(lateTextI18n),
+	}, freeCancelMin, nil
+}
+
 // exists returns nil when the restaurant is present, domain.ErrNotFound otherwise.
 func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 	var one int
@@ -265,7 +373,8 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
-	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+cols+`, `+policyCols+`, `+preorderCols+` FROM restaurants WHERE id=$1`, id)
+	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -811,7 +920,9 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 	// know about a domain type, and a legacy/unknown label must reach
 	// resolvePolicy (which ignores it) rather than fail the scan.
 	var capacityMode *string
+	var lateArrivalI18n []byte
 	p := &m.BookingPolicy
+	br := &m.BookingRules
 	if err := row.Scan(
 		&m.ID, &m.CategoryID, &m.Name, &name, &m.Description, &desc,
 		&m.CuisineType, &cuisine, &m.Address, &addr, &m.OpeningHours, &opening,
@@ -824,6 +935,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
 		&capacityMode, &p.BookingCapacitySeats,
 		&m.PreorderMinAmountMinor,
+		&br.HoldMinutes, &br.LateArrivalText, &lateArrivalI18n, &m.FreeCancelWindowMinutes,
 	); err != nil {
 		return nil, err
 	}
@@ -838,6 +950,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 	m.CuisineTypeI18n = i18nFromDB(cuisine)
 	m.AddressI18n = i18nFromDB(addr)
 	m.OpeningHoursI18n = i18nFromDB(opening)
+	br.LateArrivalTextI18n = i18nFromDB(lateArrivalI18n)
 	return &m, nil
 }
 

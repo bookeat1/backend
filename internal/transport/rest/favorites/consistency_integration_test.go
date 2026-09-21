@@ -142,7 +142,7 @@ func TestFavoritesMatchCatalogAndSearch(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	restaurantsrest.NewHandler(catalog, nil, nil).RegisterPublic(r.Group("/api/v1"))
+	restaurantsrest.NewHandler(catalog, nil, nil, restaurantsuc.BookingRulesDefaults{}).RegisterPublic(r.Group("/api/v1"))
 	authed := r.Group("/api/v1")
 	authed.Use(middleware.Auth(fakeIssuer{}, userrepo.New(pool)))
 	NewHandler(favs).RegisterRoutes(authed)

@@ -96,7 +96,7 @@ type publicPayload struct {
 func newTestRouter(f uc.Facade) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	NewHandler(f, nil, nil).RegisterPublic(r.Group("/api/v1"))
+	NewHandler(f, nil, nil, uc.BookingRulesDefaults{}).RegisterPublic(r.Group("/api/v1"))
 	return r
 }
 

@@ -31,10 +31,14 @@ type Handler struct {
 	facade    uc.Facade
 	managers  uc.ManagerUseCase
 	favorites favoriteChecker
+	// bookingRules is the platform-wide fallback for a venue's optional
+	// booking-rules-copy override (Trello BNjLdfSP), used to resolve the
+	// `booking_rules` block on every detail response.
+	bookingRules uc.BookingRulesDefaults
 }
 
-func NewHandler(f uc.Facade, m uc.ManagerUseCase, favorites favoriteChecker) *Handler {
-	return &Handler{facade: f, managers: m, favorites: favorites}
+func NewHandler(f uc.Facade, m uc.ManagerUseCase, favorites favoriteChecker, bookingRules uc.BookingRulesDefaults) *Handler {
+	return &Handler{facade: f, managers: m, favorites: favorites, bookingRules: bookingRules}
 }
 
 // RegisterPublic mounts the unauthenticated catalog routes.
@@ -358,7 +362,7 @@ func (h *Handler) get(c *gin.Context) {
 		return
 	}
 	lang := resolveLocale(c)
-	list := []restaurantResponse{aggregateToResponse(agg, lang)}
+	list := []restaurantResponse{aggregateToResponse(agg, lang, h.bookingRules)}
 	h.attachFavorites(c.Request.Context(), list, []uuid.UUID{agg.Restaurant.ID})
 	response.OK(c.Writer, list[0])
 }
@@ -398,7 +402,7 @@ func (h *Handler) adminGet(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg, ""))
+	response.OK(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
 }
 
 // attachFavorites sets IsFavorite on each element of out (in place, matched
@@ -483,7 +487,7 @@ func (h *Handler) create(c *gin.Context) {
 	// write, its answer is what the editor's form re-reads, and a browser
 	// sending Accept-Language: ru would get the ru TRANSLATION back in the
 	// scalar fields and post it as the next value of the column.
-	response.Created(c.Writer, aggregateToResponse(agg, ""))
+	response.Created(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -520,7 +524,7 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	// NOT localized — see create above and adminGet below.
-	response.OK(c.Writer, aggregateToResponse(agg, ""))
+	response.OK(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
 }
 
 func (h *Handler) deactivate(c *gin.Context) {

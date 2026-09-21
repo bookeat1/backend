@@ -118,7 +118,11 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
-	MyRestaurants      *restaurants.MyRestaurantsUseCase
+	// BookingRulesDefaults are the platform-wide fallbacks for a venue's
+	// optional guest-facing booking-rules copy (Trello BNjLdfSP), used to
+	// resolve the `booking_rules` block on every venue detail response.
+	BookingRulesDefaults restaurants.BookingRulesDefaults
+	MyRestaurants        *restaurants.MyRestaurantsUseCase
 	// AuthMiniApp is sign-in for the Telegram venue mini app. Always built; it
 	// disables its own routes when RESTAURANTS_BOT_TOKEN is unset.
 	AuthMiniApp *auth.MiniAppUseCase
@@ -622,7 +626,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
-		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}))
+		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}),
+		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
@@ -670,6 +675,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, foodieOptionRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
+		BookingRulesDefaults:  newBookingRulesDefaults(cfg),
 		HomePicks:             homePicksFacade,
 		ForYou:                forYouFacade,
 		RestaurantManagers:    restaurantManagers,
@@ -1018,6 +1024,34 @@ func (a cancelDeadlineAdapter) CancelDeadlineFor(ctx context.Context, booking do
 	return payments.FreeCancelDeadlineFor(o, a.cfg, booking.StartsAt), nil
 }
 
+// bookingRulesReader is the slice of the restaurant repo the booking-rules
+// adapter below needs. Implemented by *restaurant.Repository
+// (GetBookingRulesOverride).
+type bookingRulesReader interface {
+	GetBookingRulesOverride(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error)
+}
+
+// bookingRulesAdapter implements usecase/bookings' bookingRulesResolver port
+// over the venue's optional booking-rules-copy columns (Trello BNjLdfSP,
+// migration 0113) plus the money-path free-cancellation window they quote,
+// resolved through restaurants.ResolveBookingRules — the SAME function the
+// venue detail response (aggregateToResponse) and the guest push footer
+// (guestpush.go) use, so the confirmation screen, the venue page and the push
+// notification can never disagree about what a venue's rules are.
+type bookingRulesAdapter struct {
+	reader   bookingRulesReader
+	defaults restaurants.BookingRulesDefaults
+}
+
+func (a bookingRulesAdapter) EffectiveBookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.EffectiveBookingRules, error) {
+	override, freeCancelMin, err := a.reader.GetBookingRulesOverride(ctx, restaurantID)
+	if err != nil {
+		return domain.EffectiveBookingRules{}, err
+	}
+	r := domain.Restaurant{BookingRules: override, FreeCancelWindowMinutes: freeCancelMin}
+	return restaurants.ResolveBookingRules(r, a.defaults, domain.LocaleRU), nil
+}
+
 // depositSettlerAdapter binds usecase/payments.DepositCancellationUseCase to
 // usecase/bookings.DepositSettler so a booking cancel / no-show transition
 // settles the held deposit. It runs as a SYSTEM (admin) actor: the booking
@@ -1097,6 +1131,20 @@ func (a specialDayAdapter) PaidSpecialDayFor(ctx context.Context, restaurantID u
 // newBookingConfig mirrors BookingConfig field-for-field into the usecase
 // layer's own Config so that layer never imports bootstrap (same arrangement as
 // auth.Config).
+// newBookingRulesDefaults builds the platform-wide fallback for a venue's
+// optional booking-rules-copy override (Trello BNjLdfSP). The free-cancel
+// default mirrors cfg.Payments.FreeCancelWindow (PAYMENTS_FREE_CANCEL_WINDOW_MINUTES)
+// rather than owning a second env var: restaurants.free_cancel_window_minutes
+// is NOT NULL, so this default is only ever read as a last-resort guard (see
+// BookingRulesDefaults.DefaultFreeCancelWindowMinutes).
+func newBookingRulesDefaults(cfg Config) restaurants.BookingRulesDefaults {
+	return restaurants.BookingRulesDefaults{
+		HoldMinutes:                    cfg.Booking.DefaultHoldMinutes,
+		LateArrivalText:                cfg.Booking.DefaultLateArrivalText,
+		DefaultFreeCancelWindowMinutes: int(cfg.Payments.FreeCancelWindow / time.Minute),
+	}
+}
+
 func newBookingConfig(cfg Config) bookings.Config {
 	return bookings.Config{
 		DefaultDuration:       cfg.Booking.DefaultDuration,
@@ -1412,12 +1460,15 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
+	notifVenues := notificationrepo.NewVenues(db)
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),
 		notificationrepo.NewPushTickets(db),
 		notifications.NewGuestNotificationGate(consentrepo.NewPreferenceRepository(db)),
-		notificationrepo.NewVenues(db),
+		notifVenues,
+		notifVenues, // same reader, also implements the booking-rules footer's port
+		newBookingRulesDefaults(cfg),
 		guestSender,
 		guestSender != nil,
 		log,

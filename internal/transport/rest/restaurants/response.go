@@ -6,6 +6,7 @@ import (
 	"backend-core/internal/domain"
 	"backend-core/internal/media"
 	"backend-core/internal/usecase/foryou"
+	uc "backend-core/internal/usecase/restaurants"
 )
 
 type restaurantResponse struct {
@@ -115,6 +116,22 @@ type restaurantResponse struct {
 	// card and every other endpoint, including a picks card served in
 	// editorial/popular mode.
 	Match *matchResponse `json:"match,omitempty"`
+	// BookingRules is the venue's guest-facing booking-rules copy (Trello
+	// BNjLdfSP) resolved against the platform defaults: how long the table is
+	// held, the free-cancellation window, and what to do when running late.
+	// Served by the DETAIL read only (same rule as PreorderMinAmountMinor
+	// above) — the underlying columns are not loaded by the catalog listing.
+	BookingRules *bookingRulesResponse `json:"booking_rules,omitempty"`
+}
+
+// bookingRulesResponse is domain.EffectiveBookingRules on the wire — already
+// resolved against the platform default and (for FreeCancelHours) the
+// venue's own money-path window, so the client never has to know which
+// fields were overridden versus inherited.
+type bookingRulesResponse struct {
+	HoldMinutes     int    `json:"hold_minutes"`
+	FreeCancelHours int    `json:"free_cancel_hours"`
+	LateArrivalText string `json:"late_arrival_text"`
 }
 
 // matchResponse is one card's taste-match block: the total score plus every
@@ -449,12 +466,18 @@ func attachRawTranslations(resp *restaurantResponse, r domain.Restaurant) {
 	resp.OpeningHoursI18n = r.OpeningHoursI18n
 }
 
-func aggregateToResponse(a *domain.RestaurantAggregate, lang string) restaurantResponse {
+func aggregateToResponse(a *domain.RestaurantAggregate, lang string, rulesDefaults uc.BookingRulesDefaults) restaurantResponse {
 	resp := baseFromDomain(a.Restaurant, lang)
 	if lang == "" {
 		attachRawTranslations(&resp, a.Restaurant)
 	}
 	resp.PreorderMinAmountMinor = a.Restaurant.PreorderMinAmountMinor
+	rules := uc.ResolveBookingRules(a.Restaurant, rulesDefaults, lang)
+	resp.BookingRules = &bookingRulesResponse{
+		HoldMinutes:     rules.HoldMinutes,
+		FreeCancelHours: rules.FreeCancelHours,
+		LateArrivalText: rules.LateArrivalText,
+	}
 	resp.Cuisines = cuisinesToResponse(a.Cuisines, lang)
 	applyDerivedCuisineType(&resp, a.Cuisines, lang)
 	for _, i := range a.Images {
