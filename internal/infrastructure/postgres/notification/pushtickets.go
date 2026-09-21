@@ -27,10 +27,10 @@ func (r *PushTickets) Record(ctx context.Context, t domain.PushTicket) error {
 		return fmt.Errorf("record push ticket: empty ticket id")
 	}
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`INSERT INTO push_tickets (ticket_id, device_token_id, outbox_event_id, created_at)
-		 VALUES ($1,$2,$3, now())
+		`INSERT INTO push_tickets (ticket_id, device_token_id, outbox_event_id, campaign_id, created_at)
+		 VALUES ($1,$2,$3,$4, now())
 		 ON CONFLICT (ticket_id) DO NOTHING`,
-		t.ID, t.DeviceTokenID, t.OutboxEventID); err != nil {
+		t.ID, t.DeviceTokenID, t.OutboxEventID, t.CampaignID); err != nil {
 		return fmt.Errorf("record push ticket: %w", err)
 	}
 	return nil

@@ -5,6 +5,7 @@ package notification
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -345,6 +346,34 @@ func (r *DeviceTokens) ListActiveByUser(ctx context.Context, userID uuid.UUID) (
 	return out, rows.Err()
 }
 
+// ListActiveByUsers returns the live devices of MANY guests in one round trip
+// — the push campaign worker's fan-out target set for a whole city.
+// `= ANY($1)` on an empty slice correctly returns zero rows rather than
+// erroring, so callers never need to special-case an empty audience.
+func (r *DeviceTokens) ListActiveByUsers(ctx context.Context, userIDs []uuid.UUID) ([]domain.DevicePushToken, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
+		`SELECT `+deviceTokenCols+` FROM device_push_tokens
+		  WHERE user_id = ANY($1) AND is_active ORDER BY user_id, created_at, id`, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list device push tokens for users: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.DevicePushToken
+	for rows.Next() {
+		var t domain.DevicePushToken
+		var platform string
+		if err := rows.Scan(&t.ID, &t.UserID, &t.Token, &platform, &t.IsActive, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("list device push tokens for users: %w", err)
+		}
+		t.Platform = domain.DevicePlatform(platform)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // DeactivateByID silences a token the provider reported as gone. The row stays
 // (the delivery ledger points at its id); only the flag flips.
 func (r *DeviceTokens) DeactivateByID(ctx context.Context, id uuid.UUID) error {
@@ -390,6 +419,42 @@ func (r *Venues) Name(ctx context.Context, restaurantID uuid.UUID) (string, erro
 		return "", fmt.Errorf("read venue name: %w", err)
 	}
 	return name, nil
+}
+
+// BookingRules reads the venue's optional booking-rules-copy override plus
+// the money-path free-cancellation window it quotes (Trello BNjLdfSP), for
+// the guest-facing text guestpush.go renders at booking confirmation and in
+// the pre-visit reminder. A minimal, standalone SELECT — see Name's doc
+// comment for why this package does not reuse RestaurantRepository.GetByID.
+// A missing venue yields domain.ErrNotFound.
+func (r *Venues) BookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error) {
+	var (
+		holdMinutes   *int
+		lateText      *string
+		lateTextI18n  []byte
+		freeCancelMin *int
+	)
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT hold_minutes, late_arrival_text, late_arrival_text_i18n, free_cancel_window_minutes
+		   FROM restaurants WHERE id=$1`, restaurantID,
+	).Scan(&holdMinutes, &lateText, &lateTextI18n, &freeCancelMin)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.BookingRulesOverride{}, nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.BookingRulesOverride{}, nil, fmt.Errorf("read venue booking rules: %w", err)
+	}
+	var i18n domain.I18n
+	if len(lateTextI18n) > 0 {
+		if err := json.Unmarshal(lateTextI18n, &i18n); err != nil {
+			i18n = nil
+		}
+	}
+	return domain.BookingRulesOverride{
+		HoldMinutes:         holdMinutes,
+		LateArrivalText:     lateText,
+		LateArrivalTextI18n: i18n,
+	}, freeCancelMin, nil
 }
 
 // Timezone returns the IANA zone stored on the venue, or "" when it has none of

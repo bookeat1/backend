@@ -57,6 +57,20 @@ type saveRestaurantRequest struct {
 	Features    []featureInput `json:"features"`
 	Tags        []tagInput     `json:"tags"`
 	SocialLinks []socialInput  `json:"social_links"`
+	// HoldMinutes / LateArrivalText(+I18n) are the venue's optional
+	// booking-rules-copy override (Trello BNjLdfSP): how long the table is
+	// held after the booked time, and what to do when running late. Absent =
+	// unchanged; an explicit 0 / empty string clears the override back to the
+	// platform default (BOOKING_DEFAULT_HOLD_MINUTES /
+	// BOOKING_DEFAULT_LATE_ARRIVAL_TEXT) — see uc.SaveInput's doc comment.
+	// There is deliberately no `free_cancel_hours` field here: free
+	// cancellation is not an independent setting, it reuses the money-path
+	// `free_cancel_window_minutes` a venue's owner/manager already edits via
+	// the admin-panel free-cancel endpoint — see
+	// domain.Restaurant.FreeCancelWindowMinutes.
+	HoldMinutes         *int               `json:"hold_minutes"`
+	LateArrivalText     *string            `json:"late_arrival_text"`
+	LateArrivalTextI18n map[string]*string `json:"late_arrival_text_i18n"`
 }
 
 type imageInput struct {
@@ -92,6 +106,8 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
+		HoldMinutes: r.HoldMinutes, LateArrivalText: r.LateArrivalText,
+		LateArrivalTextI18n: domain.I18nPatch(r.LateArrivalTextI18n),
 	}
 	if r.CategoryID != nil {
 		id, err := uuid.Parse(*r.CategoryID)

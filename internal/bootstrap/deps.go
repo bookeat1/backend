@@ -15,6 +15,7 @@ import (
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/amplitude"
 	"backend-core/internal/infrastructure/expopush"
+	"backend-core/internal/infrastructure/kwaaka"
 	"backend-core/internal/infrastructure/legacysource"
 	"backend-core/internal/infrastructure/mediastore"
 	"backend-core/internal/infrastructure/otpsender"
@@ -50,6 +51,7 @@ import (
 	platformpagesrepo "backend-core/internal/infrastructure/postgres/platformpages"
 	promorepo "backend-core/internal/infrastructure/postgres/promo"
 	promocoderepo "backend-core/internal/infrastructure/postgres/promocode"
+	pushcampaignrepo "backend-core/internal/infrastructure/postgres/pushcampaign"
 	rtrepo "backend-core/internal/infrastructure/postgres/refreshtoken"
 	restrepo "backend-core/internal/infrastructure/postgres/restaurant"
 	reviewrepo "backend-core/internal/infrastructure/postgres/review"
@@ -87,6 +89,7 @@ import (
 	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
+	"backend-core/internal/usecase/kwaakasync"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
@@ -96,6 +99,7 @@ import (
 	"backend-core/internal/usecase/preorder"
 	promocodesuc "backend-core/internal/usecase/promocodes"
 	"backend-core/internal/usecase/promos"
+	"backend-core/internal/usecase/pushcampaigns"
 	"backend-core/internal/usecase/restaurants"
 	"backend-core/internal/usecase/reviews"
 	rolesuc "backend-core/internal/usecase/roles"
@@ -116,7 +120,11 @@ type Deps struct {
 	UsersRepo          domain.UserRepository
 	RestaurantsFacade  restaurants.Facade
 	RestaurantManagers restaurants.ManagerUseCase
-	MyRestaurants      *restaurants.MyRestaurantsUseCase
+	// BookingRulesDefaults are the platform-wide fallbacks for a venue's
+	// optional guest-facing booking-rules copy (Trello BNjLdfSP), used to
+	// resolve the `booking_rules` block on every venue detail response.
+	BookingRulesDefaults restaurants.BookingRulesDefaults
+	MyRestaurants        *restaurants.MyRestaurantsUseCase
 	// AuthMiniApp is sign-in for the Telegram venue mini app. Always built; it
 	// disables its own routes when RESTAURANTS_BOT_TOKEN is unset.
 	AuthMiniApp *auth.MiniAppUseCase
@@ -140,6 +148,11 @@ type Deps struct {
 	ConsentFacade     consent.Facade
 	ReviewsFacade     reviews.Facade
 	EventsFacade      events.Facade
+	// PushCampaigns is the superadmin manual push-campaign facade (migration
+	// 0111): estimate/create/list/get. The background sender itself lives in
+	// cmd/worker (NewPushCampaignsSender), not here — same split as
+	// EventRecurrences (admin CRUD) vs the worker that acts on it.
+	PushCampaigns pushcampaigns.Facade
 	// EventRecurrences is the admin CRUD over recurring-event RULES; the worker
 	// that materialises them lives in cmd/worker (NewEventRecurrenceGenerator).
 	EventRecurrences eventrecurrence.Facade
@@ -413,6 +426,24 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// the shared tasteLoader's own cuisine reader above.
 		events.WithTasteMatch(tasteLoader, restRepo, homepicksrepo.New(db, txm)))
 	eventRecurrences := eventrecurrence.NewFacade(recurrenceRepo, restaurantManagers)
+	// Manual push campaigns (migration 0111): the same 21:00-10:00 quiet-hours
+	// window bookings render times in (BOOKING_TIMEZONE_FALLBACK), so a
+	// superadmin's "quiet hours" always matches the city clock guests keep,
+	// not the server's. Falls back to UTC on a broken env value rather than
+	// crashing the API — the same degrade-not-die posture NewNotificationDispatcher
+	// uses for the WhatsApp render zone.
+	pushCampaignsLoc, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("push campaigns timezone fallback is unusable, quiet hours will use UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		pushCampaignsLoc = time.UTC
+	}
+	pushCampaignsFacade := pushcampaigns.NewFacade(
+		pushcampaignrepo.NewSubjects(db), pushcampaignrepo.NewAudience(db),
+		pushcampaignrepo.New(db), pushcampaignrepo.NewRecipients(db),
+		restaurantManagers, pushCampaignsLoc,
+		cfg.PushCampaigns.DailyCap, cfg.PushCampaigns.WeeklyCap,
+		cfg.Push.GuestPushConfigured())
 	promosFacade := promos.NewFacade(promorepo.New(db), restaurantManagers, feedRepo,
 		// The same dictionary the events listing uses: a promo's own city
 		// override (migration 0085) and ?city= must mean the same thing in both
@@ -597,7 +628,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	bookingsFacade := bookings.NewFacade(bookingRepo, bookingLinks, bookingItems,
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
-		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}))
+		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}),
+		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
@@ -645,6 +677,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		UsersFacade:           users.NewFacade(usersRepo, userCuisineRepo, foodieProfileRepo, foodieOptionRepo, refreshRepo, otpRepo, txm),
 		UsersRepo:             usersRepo,
 		RestaurantsFacade:     restaurantsFacade,
+		BookingRulesDefaults:  newBookingRulesDefaults(cfg),
 		HomePicks:             homePicksFacade,
 		ForYou:                forYouFacade,
 		RestaurantManagers:    restaurantManagers,
@@ -663,6 +696,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		ConsentFacade:         consentFacade,
 		ReviewsFacade:         reviewsFacade,
 		EventsFacade:          eventsFacade,
+		PushCampaigns:         pushCampaignsFacade,
 		EventRecurrences:      eventRecurrences,
 		PromosFacade:          promosFacade,
 		PromoCodesFacade:      promoCodesFacade,
@@ -992,6 +1026,34 @@ func (a cancelDeadlineAdapter) CancelDeadlineFor(ctx context.Context, booking do
 	return payments.FreeCancelDeadlineFor(o, a.cfg, booking.StartsAt), nil
 }
 
+// bookingRulesReader is the slice of the restaurant repo the booking-rules
+// adapter below needs. Implemented by *restaurant.Repository
+// (GetBookingRulesOverride).
+type bookingRulesReader interface {
+	GetBookingRulesOverride(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error)
+}
+
+// bookingRulesAdapter implements usecase/bookings' bookingRulesResolver port
+// over the venue's optional booking-rules-copy columns (Trello BNjLdfSP,
+// migration 0113) plus the money-path free-cancellation window they quote,
+// resolved through restaurants.ResolveBookingRules — the SAME function the
+// venue detail response (aggregateToResponse) and the guest push footer
+// (guestpush.go) use, so the confirmation screen, the venue page and the push
+// notification can never disagree about what a venue's rules are.
+type bookingRulesAdapter struct {
+	reader   bookingRulesReader
+	defaults restaurants.BookingRulesDefaults
+}
+
+func (a bookingRulesAdapter) EffectiveBookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.EffectiveBookingRules, error) {
+	override, freeCancelMin, err := a.reader.GetBookingRulesOverride(ctx, restaurantID)
+	if err != nil {
+		return domain.EffectiveBookingRules{}, err
+	}
+	r := domain.Restaurant{BookingRules: override, FreeCancelWindowMinutes: freeCancelMin}
+	return restaurants.ResolveBookingRules(r, a.defaults, domain.LocaleRU), nil
+}
+
 // depositSettlerAdapter binds usecase/payments.DepositCancellationUseCase to
 // usecase/bookings.DepositSettler so a booking cancel / no-show transition
 // settles the held deposit. It runs as a SYSTEM (admin) actor: the booking
@@ -1071,6 +1133,20 @@ func (a specialDayAdapter) PaidSpecialDayFor(ctx context.Context, restaurantID u
 // newBookingConfig mirrors BookingConfig field-for-field into the usecase
 // layer's own Config so that layer never imports bootstrap (same arrangement as
 // auth.Config).
+// newBookingRulesDefaults builds the platform-wide fallback for a venue's
+// optional booking-rules-copy override (Trello BNjLdfSP). The free-cancel
+// default mirrors cfg.Payments.FreeCancelWindow (PAYMENTS_FREE_CANCEL_WINDOW_MINUTES)
+// rather than owning a second env var: restaurants.free_cancel_window_minutes
+// is NOT NULL, so this default is only ever read as a last-resort guard (see
+// BookingRulesDefaults.DefaultFreeCancelWindowMinutes).
+func newBookingRulesDefaults(cfg Config) restaurants.BookingRulesDefaults {
+	return restaurants.BookingRulesDefaults{
+		HoldMinutes:                    cfg.Booking.DefaultHoldMinutes,
+		LateArrivalText:                cfg.Booking.DefaultLateArrivalText,
+		DefaultFreeCancelWindowMinutes: int(cfg.Payments.FreeCancelWindow / time.Minute),
+	}
+}
+
 func newBookingConfig(cfg Config) bookings.Config {
 	return bookings.Config{
 		DefaultDuration:       cfg.Booking.DefaultDuration,
@@ -1386,12 +1462,15 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
+	notifVenues := notificationrepo.NewVenues(db)
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),
 		notificationrepo.NewPushTickets(db),
 		notifications.NewGuestNotificationGate(consentrepo.NewPreferenceRepository(db)),
-		notificationrepo.NewVenues(db),
+		notifVenues,
+		notifVenues, // same reader, also implements the booking-rules footer's port
+		newBookingRulesDefaults(cfg),
 		guestSender,
 		guestSender != nil,
 		log,
@@ -1486,6 +1565,10 @@ func newGuestPushProvider(cfg Config, log *slog.Logger) *expopush.Sender {
 			AccessToken:      cfg.Push.ExpoAccessToken,
 			Endpoint:         cfg.Push.ExpoEndpoint,
 			ReceiptsEndpoint: cfg.Push.ExpoReceiptsEndpoint,
+			// Only push campaigns ever send more than one message at a time
+			// (a booking push is always a batch of one); this is PUSH_CAMPAIGNS_
+			// SEND_BATCH_SIZE, clamped to Expo's own ceiling inside NewSender.
+			MaxBatchSize: cfg.PushCampaigns.SendBatchSize,
 		})
 	default:
 		// An unknown provider name is a config typo, not a reason to crash the
@@ -1524,6 +1607,82 @@ func NewPushReceiptWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notif
 		},
 		log,
 	)
+}
+
+// NewPushCampaignsSender wires the manual push-campaign background sender, or
+// returns nil when no guest push provider is configured — same posture as
+// NewPushReceiptWorker (not the reconcilers' safe-idle-when-unconfigured
+// one): with no provider nothing could ever be sent, so a running loop would
+// only ever find campaigns to leave queued forever, which is worse than
+// simply not starting it and letting the create-time 503 (push_channel_disabled)
+// tell the operator why.
+func NewPushCampaignsSender(cfg Config, db *pgxpool.Pool, log *slog.Logger) *pushcampaigns.Sender {
+	provider := newGuestPushProvider(cfg, log)
+	if provider == nil {
+		log.Info("push campaign sender not started (no guest push provider configured)")
+		return nil
+	}
+	loc, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("push campaign sender timezone fallback is unusable, using UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		loc = time.UTC
+	}
+	return pushcampaigns.NewSender(
+		pushcampaignrepo.NewSubjects(db), pushcampaignrepo.NewAudience(db),
+		pushcampaignrepo.New(db), pushcampaignrepo.NewRecipients(db),
+		notificationrepo.NewDeviceTokens(db), pushcampaignrepo.NewLanguages(db),
+		notificationrepo.NewFeed(db), notificationrepo.NewPushTickets(db),
+		expoBatchSender(provider),
+		sqltx.NewManager(db), loc,
+		pushcampaigns.SenderConfig{
+			Tick: cfg.PushCampaigns.Tick, BatchSize: cfg.PushCampaigns.BatchSize,
+			LeaseFor: cfg.PushCampaigns.LeaseFor, MaxQueueAge: cfg.PushCampaigns.MaxQueueAge,
+			MaxAttempts: cfg.PushCampaigns.MaxAttempts, SendBatchSize: cfg.PushCampaigns.SendBatchSize,
+			DailyCap: cfg.PushCampaigns.DailyCap, WeeklyCap: cfg.PushCampaigns.WeeklyCap,
+		},
+		log,
+	)
+}
+
+// expoBatchSender adapts expopush.Sender.SendBatch to the
+// usecase/pushcampaigns.BatchSender port. It is the ONE place the two
+// packages' independent result/verdict types (deliberately not shared — see
+// pushcampaigns.SendVerdict's doc comment) are translated into each other,
+// AND the one place that knows expopush.SendBatchError's Definite flag: when
+// SendBatch could not confirm a chunk's outcome (a transport error/timeout,
+// or an unreadable/malformed response — Definite false), that range is
+// re-flagged via pushcampaigns.MarkUnknownRange so Sender.fanOut never
+// unclaims those recipients for a retry (spec push-campaigns-manual-spec §7
+// п.7 / §3.11 — retrying an unconfirmed send risks a duplicate push). A
+// DEFINITE failure (Expo itself answered 429/5xx, or rejected the whole
+// batch outright) is passed through unmarked: fanOut's legacy behaviour
+// (unclaim and retry every unresolved recipient) is exactly right for it.
+func expoBatchSender(provider *expopush.Sender) pushcampaigns.BatchSender {
+	return func(ctx context.Context, msgs []pushcampaigns.SendMessage) ([]pushcampaigns.SendResult, error) {
+		in := make([]expopush.BatchMessage, len(msgs))
+		for i, m := range msgs {
+			in[i] = expopush.BatchMessage{Token: m.Token, Title: m.Title, Body: m.Body, Data: m.Data, ChannelID: m.ChannelID}
+		}
+		results, err := provider.SendBatch(ctx, in)
+		out := make([]pushcampaigns.SendResult, len(results))
+		for i, r := range results {
+			out[i] = pushcampaigns.SendResult{TicketID: r.TicketID}
+			switch r.Verdict {
+			case notifications.MobilePushDelivered:
+				out[i].Verdict = pushcampaigns.SendDelivered
+			case notifications.MobilePushDeviceGone:
+				out[i].Verdict = pushcampaigns.SendDeviceGone
+			default:
+				out[i].Verdict = pushcampaigns.SendRejected
+			}
+		}
+		var batchErr *expopush.SendBatchError
+		if errors.As(err, &batchErr) && !batchErr.Definite {
+			err = pushcampaigns.MarkUnknownRange(err, batchErr.FailedAt, batchErr.FailedThrough)
+		}
+		return out, err
+	}
 }
 
 // newOTPSender builds the login-code delivery sender.
@@ -1779,6 +1938,29 @@ func NewAnalyticsDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *ana
 //
 // The returned closer owns the legacy pool; RunWorker calls it on shutdown. The
 // connection string is a credential and is never logged.
+// NewKwaakaSyncWorker wires the Kwaaka menu/stop-list background sync (phase
+// 1 of the Kwaaka POS integration), or returns nil when the Kwaaka adapter is
+// not configured — same posture as NewPushReceiptWorker: with no
+// KWAAKA_BASE_URL/KWAAKA_TOKEN there is nothing to sync from, so a running
+// loop would only ever find zero linked restaurants to iterate (harmless, but
+// pointless to schedule).
+func NewKwaakaSyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaakasync.Worker {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka menu sync not started", slog.String("reason", err.Error()))
+		return nil
+	}
+	client := kwaaka.NewClient(nil, kwCfg)
+	return kwaakasync.NewWorker(
+		restrepo.New(db),
+		kwaaka.NewMenuSource(client),
+		menurepo.New(db),
+		sqltx.NewManager(db),
+		kwaakasync.Config{TickInterval: cfg.KwaakaSync.TickInterval},
+		log,
+	)
+}
+
 func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legacysync.Worker, func(), error) {
 	if cfg.LegacySync.DatabaseURL == "" {
 		log.Info("legacy sync disabled (LEGACY_DB_URL unset)")

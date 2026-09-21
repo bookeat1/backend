@@ -122,7 +122,7 @@ func TestPreferenceDefaultsThenPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get default: %v", err)
 	}
-	if !def.NotificationsEnabled || !def.PushEnabled || !def.EmailEnabled {
+	if !def.NotificationsEnabled || !def.PushEnabled || !def.EmailEnabled || !def.PromoPushEnabled {
 		t.Fatalf("unset preference should default to all-enabled, got %+v", def)
 	}
 
@@ -158,5 +158,27 @@ func TestPreferenceDefaultsThenPersists(t *testing.T) {
 	}
 	if got.Allows(domain.ChannelWebPush) {
 		t.Errorf("push off should mute web push even with master on")
+	}
+
+	// promo_push_enabled is independent of push_enabled (spec 0111): turning
+	// off marketing pushes alone must not touch AllowsPromoPush's OTHER two
+	// inputs, and must round-trip through the same column-aware Upsert.
+	if err := repo.Upsert(ctx, domain.NotificationPreference{
+		UserID: uid, NotificationsEnabled: true, PushEnabled: true, EmailEnabled: true, PromoPushEnabled: false,
+	}); err != nil {
+		t.Fatalf("upsert promo opt-out: %v", err)
+	}
+	got, err = repo.Get(ctx, uid)
+	if err != nil {
+		t.Fatalf("get after promo opt-out: %v", err)
+	}
+	if got.PromoPushEnabled {
+		t.Fatalf("promo_push_enabled did not persist as false")
+	}
+	if got.AllowsPromoPush() {
+		t.Errorf("AllowsPromoPush must be false once promo_push_enabled is false")
+	}
+	if !got.Allows(domain.ChannelMobilePush) {
+		t.Errorf("booking mobile push must stay allowed when only promo_push_enabled is off")
 	}
 }

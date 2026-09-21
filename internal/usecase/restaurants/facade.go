@@ -162,6 +162,19 @@ type SaveInput struct {
 	IsPremium    *bool
 	DisplayOrder *int
 
+	// HoldMinutes / LateArrivalText(+I18n) are the venue's optional
+	// booking-rules-copy override (Trello BNjLdfSP). Same PATCH semantics as
+	// every other field here (nil = untouched); HoldMinutes<=0 or an empty
+	// LateArrivalText CLEARS the override back to the platform default — see
+	// postgres/restaurant.Repository.UpdateBookingRules. There is
+	// deliberately no FreeCancelHours field: free cancellation is not an
+	// independent override, it reuses restaurants.free_cancel_window_minutes
+	// (the money path, edited only via usecase/admin.SetFreeCancelWindow) —
+	// see domain.Restaurant.FreeCancelWindowMinutes.
+	HoldMinutes         *int
+	LateArrivalText     *string
+	LateArrivalTextI18n domain.I18nPatch
+
 	Images *[]domain.Image // nil = collection not provided (preserve on Update)
 	// NOTE: there is no Features field. A venue's features stopped being a
 	// free-text inline collection in migration 0082 and became links into the
@@ -383,6 +396,12 @@ func (f *facade) Create(ctx context.Context, in SaveInput) (*domain.RestaurantAg
 		if err := f.repo.Create(ctx, &rest); err != nil {
 			return err
 		}
+		if touchesBookingRules(in) {
+			o, i18nTouched := bookingRulesPatch(in, rest.BookingRules)
+			if err := f.repo.UpdateBookingRules(ctx, rest.ID, o, i18nTouched); err != nil {
+				return err
+			}
+		}
 		return f.saveAllCollections(ctx, in, rest.ID)
 	})
 	if err != nil {
@@ -415,6 +434,12 @@ func (f *facade) Update(ctx context.Context, id uuid.UUID, in SaveInput) (*domai
 		}
 		if err := f.repo.Update(ctx, &rest); err != nil {
 			return err
+		}
+		if touchesBookingRules(in) {
+			o, i18nTouched := bookingRulesPatch(in, rest.BookingRules)
+			if err := f.repo.UpdateBookingRules(ctx, id, o, i18nTouched); err != nil {
+				return err
+			}
 		}
 		return f.saveProvidedCollections(ctx, in, id)
 	})
@@ -457,6 +482,32 @@ func (f *facade) saveProvidedCollections(ctx context.Context, in SaveInput, rid 
 		}
 	}
 	return nil
+}
+
+// touchesBookingRules reports whether the request asked to change any of the
+// venue's optional booking-rules-copy fields, so Create/Update can skip the
+// extra UpdateBookingRules round trip entirely for the overwhelming majority
+// of requests that never mention them.
+func touchesBookingRules(in SaveInput) bool {
+	return in.HoldMinutes != nil || in.LateArrivalText != nil || in.LateArrivalTextI18n != nil
+}
+
+// bookingRulesPatch builds the Repository.UpdateBookingRules arguments from
+// the RAW request plus the already-merged model applyRestaurant produced.
+//
+// HoldMinutes/LateArrivalText are taken from `in` (the raw request), not from
+// `merged`: the repository tells "clear" (0 / "") from "untouched" (nil) by
+// the POINTER itself, and applyRestaurant already collapsed a clear into a
+// nil on the merged model — passing the merged value here would make a clear
+// indistinguishable from a field the request never mentioned.
+// LateArrivalTextI18n is the opposite: it MUST be the merged map (the request
+// carries only a patch), so it comes from `merged`.
+func bookingRulesPatch(in SaveInput, merged domain.BookingRulesOverride) (domain.BookingRulesOverride, bool) {
+	return domain.BookingRulesOverride{
+		HoldMinutes:         in.HoldMinutes,
+		LateArrivalText:     in.LateArrivalText,
+		LateArrivalTextI18n: merged.LateArrivalTextI18n,
+	}, in.LateArrivalTextI18n != nil
 }
 
 // deref returns the empty/nil-slice value of *p, or nil if p is nil.
@@ -562,6 +613,24 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	if in.PriceMax != nil {
 		m.PriceMax = in.PriceMax
 	}
+	if in.HoldMinutes != nil {
+		m.BookingRules.HoldMinutes = in.HoldMinutes
+	}
+	if in.LateArrivalText != nil {
+		if strings.TrimSpace(*in.LateArrivalText) == "" {
+			// Clearing the base text also clears its translations: the CHECK
+			// requires a base text for any translation, and an empty string
+			// is this endpoint's "reset to the platform default" sentinel
+			// (see SaveInput's doc comment).
+			m.BookingRules.LateArrivalText = nil
+			m.BookingRules.LateArrivalTextI18n = nil
+		} else {
+			m.BookingRules.LateArrivalText = in.LateArrivalText
+		}
+	}
+	if in.LateArrivalTextI18n != nil && m.BookingRules.LateArrivalText != nil {
+		m.BookingRules.LateArrivalTextI18n = in.LateArrivalTextI18n.ApplyTo(m.BookingRules.LateArrivalTextI18n)
+	}
 	syncRussianTranslations(m, in)
 }
 
@@ -616,6 +685,14 @@ func syncRussianTranslations(m *domain.Restaurant, in SaveInput) {
 	if in.OpeningHours != nil {
 		m.OpeningHoursI18n = m.OpeningHoursI18n.WithLocale(domain.LocaleRU, *in.OpeningHours)
 	}
+	// LateArrivalText is nullable (unlike the fields above): only sync the ru
+	// entry when the request set a real value. A clear (applyRestaurant
+	// already nilled both LateArrivalText and LateArrivalTextI18n above) has
+	// nothing to sync — there is no column left for a translation to agree
+	// with.
+	if in.LateArrivalText != nil && m.BookingRules.LateArrivalText != nil {
+		m.BookingRules.LateArrivalTextI18n = m.BookingRules.LateArrivalTextI18n.WithLocale(domain.LocaleRU, *m.BookingRules.LateArrivalText)
+	}
 }
 
 // promoteRussianTranslations moves a `ru` entry found inside one of the
@@ -635,6 +712,7 @@ func promoteRussianTranslations(in SaveInput) SaveInput {
 	promoteRussian(&in.CuisineType, in.CuisineTypeI18n)
 	promoteRussian(&in.Address, in.AddressI18n)
 	promoteRussian(&in.OpeningHours, in.OpeningHoursI18n)
+	promoteRussian(&in.LateArrivalText, in.LateArrivalTextI18n)
 	return in
 }
 
@@ -656,11 +734,12 @@ func validateProvided(in SaveInput) error {
 		return domain.ErrValidation
 	}
 	for field, patch := range map[string]domain.I18nPatch{
-		"name_i18n":          in.NameI18n,
-		"description_i18n":   in.DescriptionI18n,
-		"cuisine_type_i18n":  in.CuisineTypeI18n,
-		"address_i18n":       in.AddressI18n,
-		"opening_hours_i18n": in.OpeningHoursI18n,
+		"name_i18n":              in.NameI18n,
+		"description_i18n":       in.DescriptionI18n,
+		"cuisine_type_i18n":      in.CuisineTypeI18n,
+		"address_i18n":           in.AddressI18n,
+		"opening_hours_i18n":     in.OpeningHoursI18n,
+		"late_arrival_text_i18n": in.LateArrivalTextI18n,
 	} {
 		if err := patch.Validate(field); err != nil {
 			return err
@@ -671,8 +750,22 @@ func validateProvided(in SaveInput) error {
 	if in.PriceCategory != nil && !domain.PriceCategory(*in.PriceCategory).Valid() {
 		return domain.ErrValidation
 	}
+	// hold_minutes bounds: a venue holding a table for more than half a day is
+	// almost certainly a typo, not a policy — no product maximum was
+	// specified beyond the platform default of 15, so this is a generous
+	// sanity ceiling, not a tuned business rule. 0 is deliberately ALLOWED
+	// here (it is the "clear the override" sentinel — see
+	// Repository.UpdateBookingRules); only a genuinely negative value is
+	// refused.
+	if v := in.HoldMinutes; v != nil && (*v < 0 || *v > maxHoldMinutes) {
+		return fmt.Errorf("%w: hold_minutes must be between 0 and %d", domain.ErrValidation, maxHoldMinutes)
+	}
 	return nil
 }
+
+// maxHoldMinutes caps the venue's optional table-hold override. See
+// validateProvided's comment on where the number comes from.
+const maxHoldMinutes = 720
 
 // canonicalCity turns whatever a client put in ?city= into the spelling that
 // is actually stored in restaurants.city — the only thing the catalog query

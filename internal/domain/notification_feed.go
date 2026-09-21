@@ -18,9 +18,13 @@ const (
 	FeedTypeBooking NotificationFeedType = "booking"
 	// FeedTypeReminder is the pre-visit nudge.
 	FeedTypeReminder NotificationFeedType = "reminder"
-	// FeedTypePromo is a marketing entry. No producer emits it yet; it exists so
-	// the app's three known types all have a name on the backend.
+	// FeedTypePromo is a marketing entry — a promo push campaign (migration
+	// 0111). Written by usecase/pushcampaigns.Sender, not by
+	// notifications.Dispatcher's booking outbox path.
 	FeedTypePromo NotificationFeedType = "promo"
+	// FeedTypeEvent is a marketing entry for an event push campaign — the
+	// sibling of FeedTypePromo. Also written by usecase/pushcampaigns.Sender.
+	FeedTypeEvent NotificationFeedType = "event"
 )
 
 // Notification is one DURABLE entry in a guest's in-app «Уведомления» feed. It
@@ -32,17 +36,34 @@ const (
 // BookingID / RestaurantID are the app's deep-link targets and are NULLABLE:
 // the row outlives the booking or venue it came from (ON DELETE SET NULL), so a
 // guest never loses a history entry because a venue left the platform.
+//
+// Since migration 0111 there are TWO producers, never both on the same row
+// (CHECK num_nonnulls(outbox_event_id, campaign_id) = 1):
+//   - the booking outbox (notifications.FeedNotifier) sets OutboxEventID,
+//     BookingID, RestaurantID; CampaignID/EventID/PromoID are nil.
+//   - a push campaign (pushcampaigns.Sender) sets CampaignID and, depending on
+//     Type, EventID or PromoID (RestaurantID too, when the subject has one);
+//     OutboxEventID is nil.
 type Notification struct {
-	ID            uuid.UUID
-	UserID        uuid.UUID
-	Type          NotificationFeedType
-	Title         string
-	Body          string
-	BookingID     *uuid.UUID
-	RestaurantID  *uuid.UUID
-	OutboxEventID uuid.UUID
-	ReadAt        *time.Time
-	CreatedAt     time.Time
+	ID           uuid.UUID
+	UserID       uuid.UUID
+	Type         NotificationFeedType
+	Title        string
+	Body         string
+	BookingID    *uuid.UUID
+	RestaurantID *uuid.UUID
+	// OutboxEventID is the booking_outbox event this row came from — nil for a
+	// push-campaign row (see CampaignID).
+	OutboxEventID *uuid.UUID
+	// CampaignID is the push_campaigns row this row came from — nil for a
+	// booking row (see OutboxEventID).
+	CampaignID *uuid.UUID
+	// EventID / PromoID are the tap-through target for a campaign row of the
+	// matching Type; both nil for a booking row.
+	EventID   *uuid.UUID
+	PromoID   *uuid.UUID
+	ReadAt    *time.Time
+	CreatedAt time.Time
 }
 
 // Read reports whether the guest has already seen this entry.

@@ -84,6 +84,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// independently of a provider, because without one nothing is ever sent.
 	pushReceipts := NewPushReceiptWorker(cfg, db, log)
 
+	// The manual push-campaign sender (migration 0111) claims queued
+	// campaigns and fans them out. Same nil-when-unconfigured posture as
+	// pushReceipts, one level up: without a provider nothing could ever be
+	// sent, and POST /admin/push-campaigns already answers 503 so the gap is
+	// never silent.
+	pushCampaigns := NewPushCampaignsSender(cfg, db, log)
+
 	// The legacy one-way sync (old Supabase -> new DB) is started only when
 	// LEGACY_DB_URL is set. When it is unset legacySync is nil and the loop is
 	// simply never started — a clean no-op, same discipline as the other
@@ -97,12 +104,17 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 		defer closeLegacy()
 	}
 
+	// The Kwaaka menu/stop-list sync (phase 1 of the Kwaaka POS integration)
+	// is started only when KWAAKA_BASE_URL/KWAAKA_TOKEN are configured — see
+	// NewKwaakaSyncWorker.
+	kwaakaSync := NewKwaakaSyncWorker(cfg, db, log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
 	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	var recurrenceErr, pushReceiptErr error
+	var recurrenceErr, pushReceiptErr, pushCampaignsErr, kwaakaSyncErr error
 	wg.Add(8)
 	go func() {
 		defer wg.Done()
@@ -143,11 +155,25 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 			pushReceiptErr = pushReceipts.Run(ctx)
 		}()
 	}
+	if pushCampaigns != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pushCampaignsErr = pushCampaigns.Run(ctx)
+		}()
+	}
 	if legacySync != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			legacyErr = legacySync.Run(ctx)
+		}()
+	}
+	if kwaakaSync != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kwaakaSyncErr = kwaakaSync.Run(ctx)
 		}()
 	}
 	wg.Wait()
@@ -179,8 +205,14 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	if pushReceiptErr != nil {
 		return fmt.Errorf("push receipt worker: %w", pushReceiptErr)
 	}
+	if pushCampaignsErr != nil {
+		return fmt.Errorf("push campaign sender: %w", pushCampaignsErr)
+	}
 	if legacyErr != nil {
 		return fmt.Errorf("legacy sync: %w", legacyErr)
+	}
+	if kwaakaSyncErr != nil {
+		return fmt.Errorf("kwaaka menu sync: %w", kwaakaSyncErr)
 	}
 	return nil
 }

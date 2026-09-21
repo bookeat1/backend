@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/usecase/restaurants"
 )
 
 // MobilePushVerdict is the provider's answer for ONE device token. It is a small
@@ -61,6 +62,12 @@ type MobilePushMessage struct {
 	Title string
 	Body  string
 	Data  map[string]string
+	// ChannelID is the Android notification channel the app should file this
+	// under ("bookings" for a booking alert, "offers" for a push-campaign
+	// marketing push — usecase/pushcampaigns). Empty leaves Android to its
+	// default channel, which is how every push behaved before this field
+	// existed — see expopush.Sender.Send/SendBatch's doc comment.
+	ChannelID string
 }
 
 // venueNameReader resolves a venue's display name for the guest-facing text. A
@@ -69,6 +76,16 @@ type MobilePushMessage struct {
 // whole restaurant aggregate.
 type venueNameReader interface {
 	Name(ctx context.Context, restaurantID uuid.UUID) (string, error)
+}
+
+// venueBookingRulesReader is the minimal slice of the venue's guest-facing
+// booking-rules copy (Trello BNjLdfSP) the notifier needs: the venue's
+// optional override plus the money-path free-cancellation window it quotes
+// (see domain.Restaurant.FreeCancelWindowMinutes). Bound to
+// postgres/notification.Venues in bootstrap, same minimal-reader posture as
+// venueNameReader right above.
+type venueBookingRulesReader interface {
+	BookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error)
 }
 
 // GuestPushNotifier is the GUEST channel: it pushes to the signed-in guest's own
@@ -97,9 +114,13 @@ type GuestPushNotifier struct {
 	tickets    domain.PushTicketRepository
 	gate       *GuestNotificationGate
 	venues     venueNameReader
-	send       MobilePushSender
-	enabled    bool // a push provider is configured
-	log        *slog.Logger
+	// rules / rulesDefaults render the booking-rules footer (Trello BNjLdfSP)
+	// on booking.confirmed / booking.reminder — see bookingRulesFooter.
+	rules         venueBookingRulesReader
+	rulesDefaults restaurants.BookingRulesDefaults
+	send          MobilePushSender
+	enabled       bool // a push provider is configured
+	log           *slog.Logger
 }
 
 // NewGuestPushNotifier builds the guest mobile-push channel. Pass enabled=false
@@ -108,18 +129,27 @@ type GuestPushNotifier struct {
 // tickets may be nil: without it the channel still delivers, it just cannot
 // enqueue receipts, which is exactly how it behaved before the receipt worker
 // existed.
+//
+// rules may be nil: the booking-rules footer (Trello BNjLdfSP) is then simply
+// omitted from the confirmation/reminder text, the same "enhancement, never a
+// hard dependency" posture the rest of this notifier follows (a venue-name
+// lookup failure degrades to a nameless message rather than blocking the
+// event).
 func NewGuestPushNotifier(
 	tokens domain.DevicePushTokenRepository,
 	deliveries domain.NotificationDeliveryRepository,
 	tickets domain.PushTicketRepository,
 	gate *GuestNotificationGate,
 	venues venueNameReader,
+	rules venueBookingRulesReader,
+	rulesDefaults restaurants.BookingRulesDefaults,
 	send MobilePushSender,
 	enabled bool,
 	log *slog.Logger,
 ) *GuestPushNotifier {
 	return &GuestPushNotifier{
 		tokens: tokens, deliveries: deliveries, tickets: tickets, gate: gate, venues: venues,
+		rules: rules, rulesDefaults: rulesDefaults,
 		send: send, enabled: enabled && send != nil, log: log,
 	}
 }
@@ -199,7 +229,7 @@ func (g *GuestPushNotifier) Notify(ctx context.Context, e Event) error {
 			return fmt.Errorf("guest push: read venue name: %w", err)
 		}
 	}
-	msg, ok := buildGuestMessage(e, venue)
+	msg, ok := buildGuestMessage(e, venue, g.bookingRulesFooter(ctx, e))
 	if !ok {
 		// An event type Interested claims but buildGuestMessage has no text for
 		// — a programming error, not a delivery failure. Drain it rather than
@@ -278,6 +308,43 @@ func (g *GuestPushNotifier) recordTicket(ctx context.Context, ticketID string, d
 	}
 }
 
+// bookingRulesFooter renders the venue's guest-facing booking-rules copy
+// (Trello BNjLdfSP) for the two events that need it — booking.confirmed
+// ("what happens if you're late") and booking.reminder (the pre-visit nudge).
+// Returns "" for every other event type, and "" (never an error) when the
+// reader is not wired or the lookup fails: this text is an enhancement, the
+// same posture buildGuestMessage's venue name already has — a booking must
+// never fail to notify a guest because a policy lookup hiccuped.
+func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event) string {
+	if g.rules == nil {
+		return ""
+	}
+	if e.Type != domain.EventBookingConfirmed && e.Type != domain.EventBookingReminder {
+		return ""
+	}
+	override, freeCancelMin, err := g.rules.BookingRules(ctx, e.RestaurantID)
+	if err != nil {
+		g.log.Warn("guest push: read venue booking rules failed, omitting the footer",
+			slog.String("booking_id", e.BookingID.String()), slog.String("error", err.Error()))
+		return ""
+	}
+	eff := restaurants.ResolveBookingRules(
+		domain.Restaurant{BookingRules: override, FreeCancelWindowMinutes: freeCancelMin},
+		g.rulesDefaults, domain.LocaleRU)
+
+	switch e.Type {
+	case domain.EventBookingConfirmed:
+		holdUntil := e.StartsAt.Add(time.Duration(eff.HoldMinutes) * time.Minute).Local().Format("15:04")
+		freeCancelUntil := e.StartsAt.Add(-time.Duration(eff.FreeCancelHours) * time.Hour).Local().Format("02.01 в 15:04")
+		return fmt.Sprintf(" Стол держим %d мин. (до %s). %s Бесплатная отмена — до %s.",
+			eff.HoldMinutes, holdUntil, eff.LateArrivalText, freeCancelUntil)
+	case domain.EventBookingReminder:
+		return fmt.Sprintf(" Стол держат %d мин. %s", eff.HoldMinutes, eff.LateArrivalText)
+	default:
+		return ""
+	}
+}
+
 // buildGuestMessage renders the Russian guest-facing text. It carries ONLY what
 // the guest already knows about their own booking — venue, date/time, party
 // size. No phone, no payment data, no token. Returns ok=false for an event type
@@ -287,7 +354,11 @@ func (g *GuestPushNotifier) recordTicket(ctx context.Context, ticketID string, d
 // channels use (see buildTelegramText). The venue's own timezone would be more
 // correct for a guest travelling abroad — deliberately deferred rather than
 // half-solved here, since it would need the venue policy in the notifier.
-func buildGuestMessage(e Event, venue string) (MobilePushMessage, bool) {
+//
+// rulesFooter is the optional booking-rules copy (Trello BNjLdfSP) computed by
+// bookingRulesFooter — already "" for every event type that does not carry
+// one, so this function appends it blindly rather than re-checking e.Type.
+func buildGuestMessage(e Event, venue string, rulesFooter string) (MobilePushMessage, bool) {
 	when := e.StartsAt.Local().Format("02.01 в 15:04")
 	at := ""
 	if venue != "" {
@@ -297,13 +368,13 @@ func buildGuestMessage(e Event, venue string) (MobilePushMessage, bool) {
 	switch e.Type {
 	case domain.EventBookingConfirmed:
 		title = "Бронь подтверждена"
-		body = fmt.Sprintf("%s%s · %d чел.", at, when, e.Guests)
+		body = fmt.Sprintf("%s%s · %d чел.%s", at, when, e.Guests, rulesFooter)
 	case domain.EventBookingCancelled:
 		title = "Бронь отменена"
 		body = fmt.Sprintf("%s%s · %d чел.", at, when, e.Guests)
 	case domain.EventBookingReminder:
 		title = "Напоминание о брони"
-		body = fmt.Sprintf("%s%s · %d чел.", at, when, e.Guests)
+		body = fmt.Sprintf("Напоминаем о брони %s%s · %d чел.%s", at, when, e.Guests, rulesFooter)
 	default:
 		return MobilePushMessage{}, false
 	}
@@ -316,5 +387,11 @@ func buildGuestMessage(e Event, venue string) (MobilePushMessage, bool) {
 			"restaurant_id": e.RestaurantID.String(),
 			"starts_at":     e.StartsAt.Format(time.RFC3339),
 		},
+		// ChannelID: Android previously fell through to its default channel
+		// (no channel was ever sent) — pinning "bookings" explicitly is safe
+		// because the app has created that channel since 1.5.x (spec criterion
+		// 21), and it is what keeps a booking alert out of the new "offers"
+		// channel push campaigns use.
+		ChannelID: "bookings",
 	}, true
 }

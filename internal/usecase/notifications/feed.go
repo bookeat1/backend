@@ -96,6 +96,7 @@ func (f *FeedNotifier) Notify(ctx context.Context, e Event) error {
 
 	bookingID := e.BookingID
 	restaurantID := e.RestaurantID
+	outboxEventID := e.OutboxEventID
 	n := &domain.Notification{
 		UserID:        *e.GuestUserID,
 		Type:          feedType,
@@ -103,7 +104,7 @@ func (f *FeedNotifier) Notify(ctx context.Context, e Event) error {
 		Body:          body,
 		BookingID:     &bookingID,
 		RestaurantID:  &restaurantID,
-		OutboxEventID: e.OutboxEventID,
+		OutboxEventID: &outboxEventID,
 	}
 	if _, err := f.feed.Insert(ctx, n); err != nil {
 		return fmt.Errorf("feed: insert notification: %w", err)

@@ -15,6 +15,7 @@ import (
 	"backend-core/internal/domain"
 	"backend-core/internal/transport/rest/middleware"
 	"backend-core/internal/usecase/foryou"
+	uc "backend-core/internal/usecase/restaurants"
 )
 
 // fakePicks is the admin-facing homepicks.Facade double: the editor's
@@ -146,7 +147,7 @@ func TestPicksRouteIsNotSwallowedByTheVenueDetailRoute(t *testing.T) {
 	r := gin.New()
 	recommend := &fakeRecommend{result: plainResult(foryou.ModePopular, pickVenue("Выбранное"))}
 	api := r.Group("/api/v1")
-	NewHandler(&fakeFacade{}, nil, nil).RegisterPublic(api)
+	NewHandler(&fakeFacade{}, nil, nil, uc.BookingRulesDefaults{}).RegisterPublic(api)
 	NewPicksHandler(&fakePicks{}, recommend, nil).RegisterPublic(api)
 
 	w := httptest.NewRecorder()

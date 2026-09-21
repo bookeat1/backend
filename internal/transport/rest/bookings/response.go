@@ -45,9 +45,27 @@ type bookingDetailsResponse struct {
 	// a live countdown from it. Null for a booking that can no longer be
 	// cancelled; still present (in the past) once the window has elapsed so the
 	// app can show the "paid cancellation" state. Additive, backward-compatible.
-	FreeCancelDeadline *time.Time             `json:"free_cancel_deadline"`
-	Items              []bookingItemResponse  `json:"items"`
-	Tables             []bookingTableResponse `json:"tables"`
+	FreeCancelDeadline *time.Time `json:"free_cancel_deadline"`
+	// BookingRules is the venue's guest-facing booking-rules copy (Trello
+	// BNjLdfSP) resolved against the platform defaults, so the confirmation
+	// screen never needs a second request to the venue detail endpoint for
+	// it. Nil when the resolver is not wired or the venue lookup failed —
+	// additive, the same posture as FreeCancelDeadline.
+	BookingRules *bookingRulesResponse  `json:"booking_rules,omitempty"`
+	Items        []bookingItemResponse  `json:"items"`
+	Tables       []bookingTableResponse `json:"tables"`
+}
+
+// bookingRulesResponse is domain.EffectiveBookingRules on the wire — already
+// resolved against the platform default and the venue's own money-path
+// free-cancellation window. Mirrors restaurants package's own
+// bookingRulesResponse (the venue detail payload uses the same shape); kept
+// as a separate type because Go response DTOs are declared where they are
+// served, not shared across transport packages.
+type bookingRulesResponse struct {
+	HoldMinutes     int    `json:"hold_minutes"`
+	FreeCancelHours int    `json:"free_cancel_hours"`
+	LateArrivalText string `json:"late_arrival_text"`
 }
 
 type bookingItemResponse struct {
@@ -175,6 +193,11 @@ func detailsToResponse(d *uc.BookingDetails) bookingDetailsResponse {
 		FreeCancelDeadline: d.FreeCancelDeadline,
 		Items:              make([]bookingItemResponse, 0, len(d.Items)),
 		Tables:             make([]bookingTableResponse, 0, len(d.Tables)),
+	}
+	if r := d.BookingRules; r != nil {
+		out.BookingRules = &bookingRulesResponse{
+			HoldMinutes: r.HoldMinutes, FreeCancelHours: r.FreeCancelHours, LateArrivalText: r.LateArrivalText,
+		}
 	}
 	for _, it := range d.Items {
 		out.Items = append(out.Items, bookingItemResponse{

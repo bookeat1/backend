@@ -13,9 +13,19 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	"backend-core/internal/usecase/restaurants"
 )
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// testBookingRulesDefaults are the platform defaults guestpush tests resolve
+// the booking-rules footer against — arbitrary but distinct values, so a test
+// asserting on the rendered text cannot pass by coincidence with a zero value.
+var testBookingRulesDefaults = restaurants.BookingRulesDefaults{
+	HoldMinutes:                    15,
+	LateArrivalText:                "Опаздываете — позвоните в заведение.",
+	DefaultFreeCancelWindowMinutes: 120,
+}
 
 // guestHarness wires a GuestPushNotifier over in-memory fakes.
 type guestHarness struct {
@@ -38,6 +48,7 @@ func newGuestHarness(t *testing.T, tokens ...domain.DevicePushToken) *guestHarne
 	}
 	h.n = NewGuestPushNotifier(h.tokens, h.deliv, h.tickets,
 		NewGuestNotificationGate(h.prefs), fakeVenues{name: "Ocean Basket"},
+		fakeVenues{name: "Ocean Basket"}, testBookingRulesDefaults,
 		h.sender.send, true, discardLog())
 	return h
 }
@@ -214,7 +225,8 @@ func TestGuestPushDisabledIsNoop(t *testing.T) {
 	sender := newRecordingMobileSender()
 	n := NewGuestPushNotifier(newFakeDeviceTokens(guestToken(uid)), newFakeDeliveries(),
 		newFakePushTickets(), NewGuestNotificationGate(newFakeGuestPrefs()),
-		fakeVenues{name: "Ocean Basket"}, sender.send, false, discardLog())
+		fakeVenues{name: "Ocean Basket"}, fakeVenues{name: "Ocean Basket"}, testBookingRulesDefaults,
+		sender.send, false, discardLog())
 
 	if err := n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
 		t.Fatalf("notify: %v", err)
@@ -249,7 +261,7 @@ func TestGuestPushInterestedEvents(t *testing.T) {
 // phone number or the device token.
 func TestGuestMessageContentIsMinimal(t *testing.T) {
 	e := guestEvent(uuid.New(), domain.EventBookingReminder)
-	msg, ok := buildGuestMessage(e, "Ocean Basket")
+	msg, ok := buildGuestMessage(e, "Ocean Basket", "")
 	if !ok {
 		t.Fatal("no template for booking.reminder")
 	}
@@ -263,6 +275,11 @@ func TestGuestMessageContentIsMinimal(t *testing.T) {
 	}
 	if msg.Data["booking_id"] != e.BookingID.String() {
 		t.Fatalf("data must deep-link to the booking, got %v", msg.Data)
+	}
+	// Criterion 21: a booking push explicitly names the "bookings" Android
+	// channel — it must never land in "offers", the channel push campaigns use.
+	if msg.ChannelID != "bookings" {
+		t.Fatalf("channel id = %q, want %q", msg.ChannelID, "bookings")
 	}
 }
 
@@ -365,5 +382,88 @@ func TestGuestPushSurvivesTicketStoreFailure(t *testing.T) {
 	}
 	if got := h.sender.count(); got != 1 {
 		t.Fatalf("pushes sent = %d, want 1", got)
+	}
+}
+
+// --- booking-rules footer (Trello BNjLdfSP) ---
+
+func hourly(i int) *int { return &i }
+
+// The confirmation footer names the hold time, the venue's own late-arrival
+// note (not the platform default, since this venue set one) and the
+// free-cancellation deadline derived from the MONEY-path window — not an
+// independent number.
+func TestBookingRulesFooterOnConfirmed(t *testing.T) {
+	hold, text := 25, "Опоздали? Звоните хостес."
+	n := &GuestPushNotifier{
+		rules: fakeVenues{rules: domain.BookingRulesOverride{
+			HoldMinutes: &hold, LateArrivalText: &text,
+		}, freeCancelMinutes: hourly(180)},
+		rulesDefaults: testBookingRulesDefaults,
+		log:           discardLog(),
+	}
+	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
+	footer := n.bookingRulesFooter(context.Background(), e)
+	if !strings.Contains(footer, "25 мин") {
+		t.Errorf("footer %q must name the venue's own hold time (25), not the platform default", footer)
+	}
+	if !strings.Contains(footer, text) {
+		t.Errorf("footer %q must carry the venue's own late-arrival note", footer)
+	}
+	// starts_at (19:30 UTC) − 180 min (the money-path window) = 16:30.
+	if !strings.Contains(footer, "16:30") {
+		t.Errorf("footer %q must derive the free-cancel deadline (180 min = until 16:30) from the money-path window", footer)
+	}
+}
+
+// The reminder footer is shorter (no free-cancel line) but still carries the
+// venue's own hold time and late-arrival note.
+func TestBookingRulesFooterOnReminder(t *testing.T) {
+	hold := 10
+	n := &GuestPushNotifier{
+		rules:         fakeVenues{rules: domain.BookingRulesOverride{HoldMinutes: &hold}},
+		rulesDefaults: testBookingRulesDefaults,
+		log:           discardLog(),
+	}
+	e := guestEvent(uuid.New(), domain.EventBookingReminder)
+	footer := n.bookingRulesFooter(context.Background(), e)
+	if !strings.Contains(footer, "10 мин") {
+		t.Errorf("footer %q must name the venue's own hold time", footer)
+	}
+	if !strings.Contains(footer, testBookingRulesDefaults.LateArrivalText) {
+		t.Errorf("footer %q must fall back to the platform default late-arrival text (venue set none)", footer)
+	}
+}
+
+// A cancellation is not a "come visit us" message — no footer.
+func TestBookingRulesFooterOmittedOnCancelled(t *testing.T) {
+	n := &GuestPushNotifier{rules: fakeVenues{}, rulesDefaults: testBookingRulesDefaults, log: discardLog()}
+	e := guestEvent(uuid.New(), domain.EventBookingCancelled)
+	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+		t.Errorf("footer = %q, want empty for booking.cancelled", footer)
+	}
+}
+
+// A lookup failure degrades to no footer, never an error — the same posture
+// as the venue-name lookup right above it in Notify.
+func TestBookingRulesFooterSwallowsReaderError(t *testing.T) {
+	n := &GuestPushNotifier{
+		rules:         fakeVenues{rulesErr: errors.New("db down")},
+		rulesDefaults: testBookingRulesDefaults,
+		log:           discardLog(),
+	}
+	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
+	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+		t.Errorf("footer = %q, want empty when the reader errors", footer)
+	}
+}
+
+// No reader wired at all (rules == nil, the zero value in most existing
+// tests/wiring) must not panic and must simply omit the footer.
+func TestBookingRulesFooterNilReaderIsNoop(t *testing.T) {
+	n := &GuestPushNotifier{log: discardLog()}
+	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
+	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+		t.Errorf("footer = %q, want empty with no rules reader wired", footer)
 	}
 }

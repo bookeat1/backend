@@ -607,6 +607,49 @@ const (
 	// the cabinet must delete or re-point the code first. Without this the
 	// Postgres FK error would surface as a 500.
 	CodePromoInUseByPromoCode ErrorCode = "promo_in_use_by_promo_code"
+
+	// --- push campaigns (migration 0111) ---
+	//
+	// POST /admin/push-campaigns's five 422 reasons plus its 409/503: the admin
+	// modal shows a human sentence per code (spec criterion 30), never the raw
+	// status, so each of these has to be distinguishable on the wire.
+
+	// CodeSubjectNotPublished — the event/promo is still draft or hidden. A
+	// campaign can only ever target what a guest could already see.
+	CodeSubjectNotPublished ErrorCode = "subject_not_published"
+
+	// CodeSubjectExpired — an event whose StartsAt has passed, or a promo whose
+	// EndsAt has passed. Pushing "come tonight" about something already over
+	// would be worse than not pushing at all.
+	CodeSubjectExpired ErrorCode = "subject_expired"
+
+	// CodeVenueInactive — the subject's own restaurant has is_active = false.
+	// A platform subject (no restaurant) can never hit this.
+	CodeVenueInactive ErrorCode = "venue_inactive"
+
+	// CodeCityUnresolved — the subject has a restaurant, but neither the
+	// subject's own city override nor the restaurant's city string resolves to
+	// a dictionary entry (city_aliases) — there is no city to scope the
+	// audience to. Distinct from a platform subject's legitimate nil city
+	// ("everywhere"), which is never an error.
+	CodeCityUnresolved ErrorCode = "city_unresolved"
+
+	// CodeQuietHours — 21:00-10:00 in BOOKING_TIMEZONE_FALLBACK, and the caller
+	// did not set force_quiet_hours. Not a refusal to ever send at night — a
+	// second POST with the flag set succeeds — only a guard against a click
+	// nobody meant to fire the whole city's phones with at 3 AM.
+	CodeQuietHours ErrorCode = "quiet_hours"
+
+	// CodePushChannelDisabled — GUEST_PUSH_PROVIDER is unset, so nothing can be
+	// sent at all right now (503, not 422: the request itself is fine, the
+	// deployment is not ready). Estimate still works — the modal can show reach
+	// while the button stays honestly disabled.
+	CodePushChannelDisabled ErrorCode = "push_channel_disabled"
+
+	// CodeCampaignInProgress — an active (queued/sending) campaign already
+	// exists for this exact subject (the partial unique index, never a
+	// read-then-write check — see the double-click scenario in the spec).
+	CodeCampaignInProgress ErrorCode = "campaign_in_progress"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

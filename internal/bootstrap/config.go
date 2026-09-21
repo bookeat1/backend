@@ -61,6 +61,10 @@ type Config struct {
 	// absent.
 	LegacySync LegacySyncConfig
 
+	// KwaakaSync configures the Kwaaka menu/stop-list background sync (phase 1
+	// of the Kwaaka POS integration). See KwaakaSyncConfig.
+	KwaakaSync KwaakaSyncConfig
+
 	// RateLimit configures middleware.RateLimit and the in-memory limiter
 	// backing it (per-client-IP request budgets, one per route tier — see
 	// that middleware's doc comment for which routes fall into which tier
@@ -87,6 +91,49 @@ type Config struct {
 	// keeps today's stub behaviour (dev logs the code, everything else warns),
 	// so the tokens can arrive one at a time without a deploy in between.
 	OTPDelivery OTPDeliveryConfig
+
+	// PushCampaigns configures the manual push-campaign sender worker (spec
+	// push-campaigns-manual-spec-2026-09-17.md): scheduling, frequency caps and
+	// the quiet-hours window. It only ever runs when GUEST_PUSH_PROVIDER is
+	// configured — with no provider nothing could be sent anyway, so the worker
+	// is simply not started (same posture as NewPushReceiptWorker, not the
+	// safe-idle-when-unconfigured posture of the reconcilers).
+	PushCampaigns PushCampaignsConfig
+}
+
+// PushCampaignsConfig is the manual push-campaign sender's schedule and safety
+// knobs. Frequency caps and quiet hours exist to protect the SAME guest across
+// EVERY venue's campaigns — the audience is "the whole city", not one venue's
+// subscriber list, so these are platform-wide constants, not a per-venue
+// setting.
+type PushCampaignsConfig struct {
+	// Tick is the pause between two sender passes. env: PUSH_CAMPAIGNS_TICK
+	Tick time.Duration
+	// BatchSize caps how many campaigns one tick claims. env:
+	// PUSH_CAMPAIGNS_BATCH_SIZE
+	BatchSize int
+	// LeaseFor is how long a claimed campaign is considered "someone is already
+	// sending this" before a second worker process may reclaim it (criterion
+	// 10). env: PUSH_CAMPAIGNS_LEASE
+	LeaseFor time.Duration
+	// MaxQueueAge is how old a still-`queued` campaign may get before the
+	// worker expires it instead of sending it late (criterion 17, spec 3.12 —
+	// "the worker was down, sending it hours later without the admin's
+	// knowledge is not wanted"). env: PUSH_CAMPAIGNS_MAX_QUEUE_AGE
+	MaxQueueAge time.Duration
+	// MaxAttempts is the campaign-level retry budget on a transient (429/5xx)
+	// Expo failure before the campaign is marked `failed` (criterion 16). env:
+	// PUSH_CAMPAIGNS_MAX_ATTEMPTS
+	MaxAttempts int
+	// SendBatchSize is how many messages go into ONE Expo push/send request
+	// (criterion 15 — Expo's own documented ceiling is 100). env:
+	// PUSH_CAMPAIGNS_SEND_BATCH_SIZE
+	SendBatchSize int
+	// DailyCap / WeeklyCap bound how many marketing pushes ONE guest may
+	// receive, across every campaign and every venue (criterion 13's
+	// skipped_cap). env: PUSH_CAMPAIGNS_DAILY_CAP / PUSH_CAMPAIGNS_WEEKLY_CAP
+	DailyCap  int
+	WeeklyCap int
 }
 
 // OTPDeliveryConfig holds the credentials and knobs of every OTP channel. All
@@ -256,6 +303,14 @@ type BookingConfig struct {
 	DefaultConfirmOnCreate bool          // env: BOOKING_DEFAULT_CONFIRM_ON_CREATE — confirm a NEW booking without asking the venue
 	TimezoneFallback       string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
 
+	// DefaultHoldMinutes / DefaultLateArrivalText are the platform defaults for
+	// the guest-facing booking-rules copy (Trello BNjLdfSP), shown at booking
+	// confirmation and in the pre-visit reminder when a venue has not set its
+	// own restaurants.hold_minutes / late_arrival_text (migration 0113).
+	// Resolution: usecase/restaurants.ResolveBookingRules.
+	DefaultHoldMinutes     int    // env: BOOKING_DEFAULT_HOLD_MINUTES
+	DefaultLateArrivalText string // env: BOOKING_DEFAULT_LATE_ARRIVAL_TEXT
+
 	// Anti-fraud: at most RateLimit booking attempts per normalized phone
 	// within RateWindow (booking_rate_log).
 	RateLimit  int           // env: BOOKING_RATE_LIMIT
@@ -417,6 +472,15 @@ type LegacySyncConfig struct {
 	DatabaseURL  string        // env: LEGACY_DB_URL
 	TickInterval time.Duration // env: LEGACY_SYNC_TICK_INTERVAL
 	BatchSize    int           // env: LEGACY_SYNC_BATCH_SIZE
+}
+
+// KwaakaSyncConfig configures cmd/worker's Kwaaka menu/stop-list sync loop
+// (phase 1 of the Kwaaka POS integration — see usecase/kwaakasync). The
+// worker is started only when the Kwaaka adapter's own config validates
+// (KWAAKA_BASE_URL + KWAAKA_TOKEN both set) — see
+// infrastructure/kwaaka.Config.Validate.
+type KwaakaSyncConfig struct {
+	TickInterval time.Duration // env: KWAAKA_SYNC_TICK_INTERVAL
 }
 
 // TicketsSweepConfig configures the pending-event-ticket sweep worker. The
@@ -722,6 +786,8 @@ func NewConfig() (Config, error) {
 			RateLimit:              getEnvInt("BOOKING_RATE_LIMIT", 10),
 			RateWindow:             getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
 			SlotStep:               getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+			DefaultHoldMinutes:     getEnvInt("BOOKING_DEFAULT_HOLD_MINUTES", 15),
+			DefaultLateArrivalText: getEnv("BOOKING_DEFAULT_LATE_ARRIVAL_TEXT", "Опаздываете — позвоните в заведение."),
 		},
 		Worker: WorkerConfig{
 			TickInterval:          getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),
@@ -754,6 +820,10 @@ func NewConfig() (Config, error) {
 			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
 		},
+		KwaakaSync: KwaakaSyncConfig{
+			TickInterval: getEnvDuration("KWAAKA_SYNC_TICK_INTERVAL", 5*time.Minute),
+		},
+
 		LegacySync: LegacySyncConfig{
 			DatabaseURL:  getEnv("LEGACY_DB_URL", ""),
 			TickInterval: getEnvDuration("LEGACY_SYNC_TICK_INTERVAL", time.Minute),
@@ -825,6 +895,16 @@ func NewConfig() (Config, error) {
 			WhatsAppNotifyAPIVersion:   getEnv("WHATSAPP_NOTIFY_API_VERSION", getEnv("OTP_WHATSAPP_API_VERSION", whatsapp.DefaultAPIVersion)),
 			WhatsAppNotifyAPIURL:       getEnv("WHATSAPP_NOTIFY_API_URL", ""),
 			WhatsAppNotifyTimeout:      getEnvDuration("WHATSAPP_NOTIFY_TIMEOUT", 10*time.Second),
+		},
+		PushCampaigns: PushCampaignsConfig{
+			Tick:          getEnvDuration("PUSH_CAMPAIGNS_TICK", 10*time.Second),
+			BatchSize:     getEnvInt("PUSH_CAMPAIGNS_BATCH_SIZE", 5),
+			LeaseFor:      getEnvDuration("PUSH_CAMPAIGNS_LEASE", 10*time.Minute),
+			MaxQueueAge:   getEnvDuration("PUSH_CAMPAIGNS_MAX_QUEUE_AGE", 6*time.Hour),
+			MaxAttempts:   getEnvInt("PUSH_CAMPAIGNS_MAX_ATTEMPTS", 12),
+			SendBatchSize: getEnvInt("PUSH_CAMPAIGNS_SEND_BATCH_SIZE", 100),
+			DailyCap:      getEnvInt("PUSH_CAMPAIGNS_DAILY_CAP", 1),
+			WeeklyCap:     getEnvInt("PUSH_CAMPAIGNS_WEEKLY_CAP", 3),
 		},
 		StaticMap: StaticMapConfig{
 			Provider:      getEnv("STATIC_MAP_PROVIDER", ""),

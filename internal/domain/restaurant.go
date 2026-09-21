@@ -189,8 +189,72 @@ type Restaurant struct {
 	// neighbour preorderCols) — a catalog listing row leaves it nil, which is
 	// what keeps it absent from the listing JSON without a second mechanism.
 	PreorderMinAmountMinor *int64
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// ServiceFeeBps is the venue's own service-fee rate in basis points
+	// (restaurants.service_fee_bps, migration 0007; 350 = 3.5%), read here
+	// directly for the public payload — the same column
+	// PaymentSettingsOverride.ServiceFeeBps carries for the payment/gross-up
+	// flow (usecase/payments). nil = no venue-level rate stored (the payment
+	// flow then falls back to the global default; this field mirrors the
+	// STORED value only, never the resolved fallback, so a guest never sees a
+	// generic 3.5% attributed to a venue that never actually set one).
+	// Scanned only by the detail read (GetByID, see policyCols' neighbour
+	// serviceFeeCols) — a catalog listing row leaves it nil.
+	ServiceFeeBps *int
+	// BookingRules holds the venue's optional overrides of the guest-facing
+	// booking-rules copy shown at booking confirmation and in the pre-visit
+	// reminder (Trello BNjLdfSP): how long the table is held, and what to do
+	// when running late. Nil fields fall back to the platform default
+	// (BOOKING_DEFAULT_*); resolution is usecase/restaurants.ResolveBookingRules.
+	// Free cancellation is deliberately NOT here — see FreeCancelWindowMinutes.
+	BookingRules BookingRulesOverride
+	// FreeCancelWindowMinutes mirrors the MONEY-path free-cancellation window
+	// (restaurants.free_cancel_window_minutes, migration 0034/0035) for the
+	// guest-facing "free cancellation until N hours before" copy. Always
+	// written through usecase/payments (UpdateFreeCancelWindow) with its own
+	// validated range — read-only here, never touched by this package's
+	// Update, so the copy and the enforced deposit deadline can never
+	// disagree. Populated only where the booking-rules copy is rendered
+	// (GetByID / the notification reader), nil on a catalog listing row.
+	FreeCancelWindowMinutes *int
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+}
+
+// BookingRulesOverride is a restaurant's optional override of the
+// guest-facing booking-rules copy (Trello BNjLdfSP). Nil fields mean "use the
+// platform default" — see usecase/restaurants.ResolveBookingRules.
+type BookingRulesOverride struct {
+	// HoldMinutes is how long the venue holds the table after the booked time
+	// before releasing it. Platform default: BOOKING_DEFAULT_HOLD_MINUTES
+	// (15).
+	HoldMinutes *int
+	// LateArrivalText is a short venue-authored note on what to do when
+	// running late. Platform default: BOOKING_DEFAULT_LATE_ARRIVAL_TEXT. An
+	// empty string clears the override (the same "empty string clears, nil
+	// leaves alone" convention setManagerRequest.WhatsappPhone uses), not a
+	// third state on top of *string.
+	LateArrivalText *string
+	// LateArrivalTextI18n follows the same *_i18n convention as the rest of
+	// the venue's localized text (migration 0101): the 'ru' entry always
+	// equals LateArrivalText, translations are additive PATCHes
+	// (domain.I18nPatch), never a full replace.
+	LateArrivalTextI18n I18n
+}
+
+// EffectiveBookingRules is BookingRulesOverride resolved against the platform
+// defaults (and, for free cancellation, the venue's own money-path window) —
+// what the guest actually reads on the confirmation screen and in the
+// pre-visit reminder. See usecase/restaurants.ResolveBookingRules.
+type EffectiveBookingRules struct {
+	HoldMinutes int
+	// FreeCancelHours is restaurants.free_cancel_window_minutes rounded to the
+	// nearest hour, NOT an independently stored value — see
+	// Restaurant.FreeCancelWindowMinutes.
+	FreeCancelHours int
+	// LateArrivalText is already resolved to the caller's locale (the venue's
+	// own LateArrivalTextI18n, or the platform default, which is Russian
+	// only).
+	LateArrivalText string
 }
 
 // RestaurantAggregate is a restaurant with its inline collections, matching the
@@ -343,6 +407,32 @@ type RestaurantRepository interface {
 	// value (a NULL stays NULL, i.e. "use the global default"). Returns
 	// ErrNotFound when the restaurant does not exist.
 	UpdateBookingPolicy(ctx context.Context, id uuid.UUID, o BookingPolicyOverride) error
+	// ListKwaakaLinked returns every restaurant with KwaakaRestaurantID set,
+	// regardless of IsActive — a venue paused on the platform can still be
+	// re-activated later, and its menu should already be current when that
+	// happens rather than stale from the day it was hidden. Restaurants
+	// without a Kwaaka binding (the vast majority, entered by hand) are never
+	// returned and therefore never touched by usecase/kwaakasync.
+	ListKwaakaLinked(ctx context.Context) ([]KwaakaLinkedRestaurant, error)
+	// UpdateBookingRules patches the venue's optional booking-rules-copy
+	// override (Trello BNjLdfSP). Same PATCH semantics as UpdateBookingPolicy
+	// for HoldMinutes/LateArrivalText: nil = untouched, otherwise written
+	// (HoldMinutes<=0 or an empty LateArrivalText clears the override back to
+	// the platform default). LateArrivalTextI18n is written whenever
+	// i18nTouched is true, INDEPENDENTLY of LateArrivalText — this is what
+	// lets a caller merge a translation onto the stored map without
+	// resending the base text (o.LateArrivalTextI18n must then already be
+	// the fully-merged map, not a raw patch). Returns ErrNotFound when the
+	// restaurant does not exist.
+	UpdateBookingRules(ctx context.Context, id uuid.UUID, o BookingRulesOverride, i18nTouched bool) error
+}
+
+// KwaakaLinkedRestaurant is the minimal projection usecase/kwaakasync needs to
+// drive one restaurant's sync pass: our id to write menu_items against, and
+// Kwaaka's id to ask its API for.
+type KwaakaLinkedRestaurant struct {
+	RestaurantID       uuid.UUID
+	KwaakaRestaurantID string
 }
 
 // RestaurantListItem is a lightweight row for the catalog listing.

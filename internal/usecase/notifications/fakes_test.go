@@ -583,6 +583,22 @@ func (f *fakeDeviceTokens) ListActiveByUser(_ context.Context, userID uuid.UUID)
 	return out, nil
 }
 
+func (f *fakeDeviceTokens) ListActiveByUsers(_ context.Context, userIDs []uuid.UUID) ([]domain.DevicePushToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[uuid.UUID]bool, len(userIDs))
+	for _, id := range userIDs {
+		want[id] = true
+	}
+	var out []domain.DevicePushToken
+	for _, r := range f.byID {
+		if want[r.UserID] && r.IsActive {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeDeviceTokens) DeactivateByID(_ context.Context, id uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -660,10 +676,22 @@ func (f *fakeGuestPrefs) Upsert(_ context.Context, p domain.NotificationPreferen
 	return nil
 }
 
-// fakeVenues resolves every restaurant to the same display name.
-type fakeVenues struct{ name string }
+// fakeVenues resolves every restaurant to the same display name and the same
+// booking-rules override (zero value by default — every field falls back to
+// the platform default, exactly like a venue that never set an override).
+type fakeVenues struct {
+	name string
+	// rules / freeCancelMinutes / rulesErr — see BookingRules below.
+	rules             domain.BookingRulesOverride
+	freeCancelMinutes *int
+	rulesErr          error
+}
 
 func (f fakeVenues) Name(context.Context, uuid.UUID) (string, error) { return f.name, nil }
+
+func (f fakeVenues) BookingRules(context.Context, uuid.UUID) (domain.BookingRulesOverride, *int, error) {
+	return f.rules, f.freeCancelMinutes, f.rulesErr
+}
 
 // recordingMobileSender captures every device token it was asked to push to and
 // returns a scripted verdict/error per token. Every accepted send hands back a

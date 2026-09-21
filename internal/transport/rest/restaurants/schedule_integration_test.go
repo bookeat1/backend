@@ -142,7 +142,7 @@ func TestPublicScheduleEndToEnd(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	NewHandler(facade, nil, nil).RegisterPublic(r.Group("/api/v1"))
+	NewHandler(facade, nil, nil, uc.BookingRulesDefaults{}).RegisterPublic(r.Group("/api/v1"))
 
 	// ---- the LIST-shaped routes -------------------------------------------
 	// Every route that serves catalog rows is exercised. A third list added
@@ -341,7 +341,7 @@ func TestCatalogFiltersEndToEnd(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	NewHandler(facade, nil, nil).RegisterPublic(r.Group("/api/v1"))
+	NewHandler(facade, nil, nil, uc.BookingRulesDefaults{}).RegisterPublic(r.Group("/api/v1"))
 
 	type pageEnvelope struct {
 		Items   []publicPayload `json:"items"`

@@ -9,16 +9,19 @@ import (
 )
 
 type fakeRestaurantRepo struct {
-	created  *domain.Restaurant
-	updated  *domain.Restaurant
-	getErr   error
-	agg      *domain.RestaurantAggregate
-	list     []domain.RestaurantListItem
-	total    int
-	activeID uuid.UUID
-	active   bool
-	policyID uuid.UUID
-	policy   domain.BookingPolicyOverride
+	created          *domain.Restaurant
+	updated          *domain.Restaurant
+	getErr           error
+	agg              *domain.RestaurantAggregate
+	list             []domain.RestaurantListItem
+	total            int
+	activeID         uuid.UUID
+	active           bool
+	policyID         uuid.UUID
+	policy           domain.BookingPolicyOverride
+	rulesID          uuid.UUID
+	rules            domain.BookingRulesOverride
+	rulesI18nTouched bool
 
 	// lastList / lastSearch record the filter the facade actually handed the
 	// repository. The venue-state filter is evaluated above the repository, so
@@ -53,6 +56,10 @@ func (f *fakeRestaurantRepo) UpdateBookingPolicy(_ context.Context, id uuid.UUID
 	f.policyID, f.policy = id, o
 	return nil
 }
+func (f *fakeRestaurantRepo) UpdateBookingRules(_ context.Context, id uuid.UUID, o domain.BookingRulesOverride, i18nTouched bool) error {
+	f.rulesID, f.rules, f.rulesI18nTouched = id, o, i18nTouched
+	return nil
+}
 func (f *fakeRestaurantRepo) ListActive(_ context.Context, flt domain.RestaurantFilter) ([]domain.RestaurantListItem, int, error) {
 	f.lastList = flt
 	return f.list, f.matched(), nil
@@ -71,6 +78,13 @@ func (f *fakeRestaurantRepo) matched() int {
 func (f *fakeRestaurantRepo) SetActive(_ context.Context, id uuid.UUID, a bool) error {
 	f.activeID, f.active = id, a
 	return nil
+}
+
+// ListKwaakaLinked is not exercised by this package's tests
+// (usecase/kwaakasync owns that behaviour) — stub only to satisfy
+// domain.RestaurantRepository.
+func (f *fakeRestaurantRepo) ListKwaakaLinked(_ context.Context) ([]domain.KwaakaLinkedRestaurant, error) {
+	return nil, nil
 }
 
 // fakeRelated records both the total number of Replace* calls (replaced, kept

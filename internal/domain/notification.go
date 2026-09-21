@@ -118,6 +118,11 @@ type DevicePushTokenRepository interface {
 	// ListActiveByUser returns the guest's live devices — the fan-out target set
 	// for their own booking events. Deactivated rows are never returned.
 	ListActiveByUser(ctx context.Context, userID uuid.UUID) ([]DevicePushToken, error)
+	// ListActiveByUsers is the MANY-guest fan-out: a push campaign's audience
+	// can be thousands of users, and one ListActiveByUser call per guest would
+	// be one round trip per guest. Deactivated rows are never returned; a
+	// userID with no active device is simply absent from the result.
+	ListActiveByUsers(ctx context.Context, userIDs []uuid.UUID) ([]DevicePushToken, error)
 	// DeactivateByID marks a token the push provider reported as gone
 	// (Expo "DeviceNotRegistered") inactive. The row is kept, not deleted: the
 	// delivery ledger references it as a target. Idempotent.
@@ -150,8 +155,13 @@ type PushTicket struct {
 	DeviceTokenID uuid.UUID
 	// OutboxEventID is the booking event the push came from. Forensics only
 	// (nullable, no FK): the ticket's fate must not depend on the outbox row.
+	// nil for a push-campaign ticket (see CampaignID).
 	OutboxEventID *uuid.UUID
-	CreatedAt     time.Time
+	// CampaignID is the push_campaigns row the push came from (migration
+	// 0111) — the campaign counterpart of OutboxEventID, same "forensics
+	// only, no FK" discipline. nil for a booking ticket.
+	CampaignID *uuid.UUID
+	CreatedAt  time.Time
 	// ResolvedAt is nil while the receipt is still pending.
 	ResolvedAt *time.Time
 }
