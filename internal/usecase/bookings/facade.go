@@ -25,6 +25,13 @@ type BookingDetails struct {
 	// cancellation" state — the client compares it to now, this layer does not
 	// null it out. See the facade Get doc for the free-booking judgement.
 	FreeCancelDeadline *time.Time
+	// BookingRules is the venue's guest-facing booking-rules copy (Trello
+	// BNjLdfSP) — hold time, free-cancellation window, late-arrival note —
+	// resolved for this booking's venue, so the confirmation screen never
+	// needs a second request to the venue detail endpoint for it. Nil when
+	// the resolver is not wired or the lookup failed (an enhancement, not a
+	// hard dependency — same posture as FreeCancelDeadline).
+	BookingRules *domain.EffectiveBookingRules
 }
 
 // freeCancelDeadlineResolver derives starts_at − free_cancel_window_minutes for
@@ -33,6 +40,13 @@ type BookingDetails struct {
 // so the countdown the guest sees and the money decision can never disagree.
 type freeCancelDeadlineResolver interface {
 	CancelDeadlineFor(ctx context.Context, booking domain.Booking) (time.Time, error)
+}
+
+// bookingRulesResolver resolves one restaurant's guest-facing booking-rules
+// copy (Trello BNjLdfSP) against the platform defaults. Bound in bootstrap to
+// an adapter over the restaurant repository, mirroring cancelDeadlineAdapter.
+type bookingRulesResolver interface {
+	EffectiveBookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.EffectiveBookingRules, error)
 }
 
 // Facade exposes booking reads plus the chat and survey side-channels.
@@ -91,6 +105,7 @@ type facade struct {
 	tx         domain.TxManager
 	freeCancel freeCancelDeadlineResolver
 	venueZone  venueLocationResolver
+	rules      bookingRulesResolver
 }
 
 // FacadeOption configures optional facade dependencies without breaking the
@@ -109,6 +124,13 @@ func WithFreeCancelDeadlineResolver(r freeCancelDeadlineResolver) FacadeOption {
 // silently answered for a UTC day — see resolveCalendarDate.
 func WithVenueLocationResolver(r venueLocationResolver) FacadeOption {
 	return func(f *facade) { f.venueZone = r }
+}
+
+// WithBookingRulesResolver wires the venue's guest-facing booking-rules copy
+// used to populate BookingDetails.BookingRules. Left nil in tests / when not
+// wired, in which case the field is simply omitted (nil).
+func WithBookingRulesResolver(r bookingRulesResolver) FacadeOption {
+	return func(f *facade) { f.rules = r }
 }
 
 // NewFacade constructs the bookings Facade.
@@ -147,7 +169,23 @@ func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDe
 		return nil, err
 	}
 	out.FreeCancelDeadline = f.freeCancelDeadline(ctx, b)
+	out.BookingRules = f.bookingRules(ctx, b)
 	return out, nil
+}
+
+// bookingRules resolves the booking's venue's guest-facing booking-rules copy
+// for the confirmation screen, or nil. A resolver error is swallowed (nil) on
+// purpose, for the same reason freeCancelDeadline's is: a booking read must
+// not fail because an auxiliary copy lookup hiccuped.
+func (f *facade) bookingRules(ctx context.Context, b *domain.Booking) *domain.EffectiveBookingRules {
+	if f.rules == nil {
+		return nil
+	}
+	eff, err := f.rules.EffectiveBookingRules(ctx, b.RestaurantID)
+	if err != nil {
+		return nil
+	}
+	return &eff
 }
 
 // freeCancelDeadline computes the booking's free-cancellation deadline for the

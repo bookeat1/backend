@@ -303,6 +303,14 @@ type BookingConfig struct {
 	DefaultConfirmOnCreate bool          // env: BOOKING_DEFAULT_CONFIRM_ON_CREATE — confirm a NEW booking without asking the venue
 	TimezoneFallback       string        // env: BOOKING_TIMEZONE_FALLBACK — IANA name used when restaurants.timezone is NULL
 
+	// DefaultHoldMinutes / DefaultLateArrivalText are the platform defaults for
+	// the guest-facing booking-rules copy (Trello BNjLdfSP), shown at booking
+	// confirmation and in the pre-visit reminder when a venue has not set its
+	// own restaurants.hold_minutes / late_arrival_text (migration 0113).
+	// Resolution: usecase/restaurants.ResolveBookingRules.
+	DefaultHoldMinutes     int    // env: BOOKING_DEFAULT_HOLD_MINUTES
+	DefaultLateArrivalText string // env: BOOKING_DEFAULT_LATE_ARRIVAL_TEXT
+
 	// Anti-fraud: at most RateLimit booking attempts per normalized phone
 	// within RateWindow (booking_rate_log).
 	RateLimit  int           // env: BOOKING_RATE_LIMIT
@@ -778,6 +786,8 @@ func NewConfig() (Config, error) {
 			RateLimit:              getEnvInt("BOOKING_RATE_LIMIT", 10),
 			RateWindow:             getEnvDuration("BOOKING_RATE_WINDOW", time.Hour),
 			SlotStep:               getEnvMinutes("BOOKING_SLOT_STEP_MINUTES", 30),
+			DefaultHoldMinutes:     getEnvInt("BOOKING_DEFAULT_HOLD_MINUTES", 15),
+			DefaultLateArrivalText: getEnv("BOOKING_DEFAULT_LATE_ARRIVAL_TEXT", "Опаздываете — позвоните в заведение."),
 		},
 		Worker: WorkerConfig{
 			TickInterval:          getEnvDuration("WORKER_TICK_INTERVAL", time.Minute),

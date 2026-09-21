@@ -5,6 +5,7 @@ package notification
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -418,6 +419,42 @@ func (r *Venues) Name(ctx context.Context, restaurantID uuid.UUID) (string, erro
 		return "", fmt.Errorf("read venue name: %w", err)
 	}
 	return name, nil
+}
+
+// BookingRules reads the venue's optional booking-rules-copy override plus
+// the money-path free-cancellation window it quotes (Trello BNjLdfSP), for
+// the guest-facing text guestpush.go renders at booking confirmation and in
+// the pre-visit reminder. A minimal, standalone SELECT — see Name's doc
+// comment for why this package does not reuse RestaurantRepository.GetByID.
+// A missing venue yields domain.ErrNotFound.
+func (r *Venues) BookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.BookingRulesOverride, *int, error) {
+	var (
+		holdMinutes   *int
+		lateText      *string
+		lateTextI18n  []byte
+		freeCancelMin *int
+	)
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT hold_minutes, late_arrival_text, late_arrival_text_i18n, free_cancel_window_minutes
+		   FROM restaurants WHERE id=$1`, restaurantID,
+	).Scan(&holdMinutes, &lateText, &lateTextI18n, &freeCancelMin)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.BookingRulesOverride{}, nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.BookingRulesOverride{}, nil, fmt.Errorf("read venue booking rules: %w", err)
+	}
+	var i18n domain.I18n
+	if len(lateTextI18n) > 0 {
+		if err := json.Unmarshal(lateTextI18n, &i18n); err != nil {
+			i18n = nil
+		}
+	}
+	return domain.BookingRulesOverride{
+		HoldMinutes:         holdMinutes,
+		LateArrivalText:     lateText,
+		LateArrivalTextI18n: i18n,
+	}, freeCancelMin, nil
 }
 
 // Timezone returns the IANA zone stored on the venue, or "" when it has none of

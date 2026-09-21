@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"backend-core/internal/domain"
+	uc "backend-core/internal/usecase/restaurants"
 )
 
 // adminReadPayload is the slice of GET /admin/restaurants/:id the cabinet's
@@ -50,7 +51,7 @@ func hiddenVenue(id uuid.UUID) *domain.RestaurantAggregate {
 func newScopedRouter(f *fakeFacade) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := NewHandler(f, nil, nil)
+	h := NewHandler(f, nil, nil, uc.BookingRulesDefaults{})
 	api := r.Group("/api/v1")
 	h.RegisterPublic(api)
 	// Registered on the SAME engine as the superadmin catalog listing on

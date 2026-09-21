@@ -137,7 +137,7 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 	// /auth/login and must not be a more generous door to it.
 	authrest.NewTelegramHandler(deps.AuthMiniApp).RegisterRoutes(api)
 
-	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers, deps.FavoritesFacade)
+	restHandler := restrest.NewHandler(deps.RestaurantsFacade, deps.RestaurantManagers, deps.FavoritesFacade, deps.BookingRulesDefaults)
 	// OptionalAuth (not Auth): the catalog itself is public, but a logged-in
 	// caller gets an "is_favorite" flag on each item — see
 	// restrest.Handler.attachFavorites. A missing/invalid token behaves
