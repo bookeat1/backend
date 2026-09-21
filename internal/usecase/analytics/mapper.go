@@ -43,6 +43,12 @@ type bookingProps struct {
 	// real, live promo before the booking existed. Nil for the vast majority
 	// of bookings that carry no campaign.
 	PromotionID *uuid.UUID `json:"promotion_id"`
+	// AttributionSource is the marathon QR channel tag (spec
+	// marathon-qr-attribution-20260921 §4 criterion 8) a booking was created
+	// under — see usecase/bookings.bookingPayload.AttributionSource, already
+	// validated by domain.SanitizeAttributionSource. Nil for the vast
+	// majority of bookings that carry no channel tag.
+	AttributionSource *string `json:"attribution_source"`
 }
 
 func bookingEventType(t string) (EventType, bool) {
@@ -93,6 +99,13 @@ func mapBooking(row SourceRow) (Event, bool, error) {
 	// nil/"" would read as "campaign unknown".
 	if p.PromotionID != nil && (et == EventBookingCreated || et == EventBookingConfirmed || et == EventBookingArrived || et == EventBookingCompleted) {
 		props["promotion_id"] = p.PromotionID.String()
+	}
+	// attribution_source: unlike promotion_id this is not restricted to the
+	// campaign funnel steps — every channel report (docs/runbook-admin.md
+	// §10) needs it on every step a booking passes through, cancellation
+	// included, to answer "how far did guests from this channel get".
+	if p.AttributionSource != nil {
+		props["attribution_source"] = *p.AttributionSource
 	}
 	return Event{
 		Type:       et,

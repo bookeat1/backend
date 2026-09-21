@@ -722,3 +722,209 @@ Grafana (не хватало прав токена). У самой панели 
 пайплайна из 4.2 (или те же команды руками из 4.3). Это сегодня не прогонялось
 именно как восстановление с нуля, но выкладка нового релиза и откат прогонялись —
 а это те же самые шаги.
+
+---
+
+## 10. Выгрузки марафона: розыгрыш и отчёт по каналам (`attribution_source`)
+
+Дата составления: 2026-09-21. Спека `marathon-qr-attribution-20260921.md` (ревизия 2,
+`/home/tai/work/specs/`), задача З5. Три SQL-выгрузки ниже проверены сегодня на
+одноразовой локальной Postgres (миграция `0115` накатана, синтетические данные —
+никаких гостевых данных, тестовых или боевых, в проверке не участвовало) и возвращают
+ожидаемые строки. **Не проверено**: реальный прогон на тестовом сервере с настоящим
+сканом QR (критерий 24 «возвращает гостя из К17») — этого сканирования ещё не было,
+приложение с кодом атрибуции ещё не выкачено (задачи З6-З13). Раздел допишет
+`qa-engineer`/`pm` фактическим прогоном перед 27.09 (задача З17 спеки).
+
+Все три запроса читают только `users` и `bookings` (+ join на `restaurants` для
+названия заведения), новых прав не требуют — тот же доступ к базе, что и остальные
+запросы этого файла (раздел 3.1).
+
+**Обе колонки `attribution_source`, что они значат** (см. миграцию `0115` и спеку §5):
+
+- `users.attribution_source` / `users.attribution_at` — ПЕРВОЕ касание аккаунта,
+  пишется один раз, никогда не перезаписывается.
+- `bookings.attribution_source` — канал КОНКРЕТНОЙ брони на момент её создания,
+  пишется только при `INSERT`, `PATCH` его не трогает.
+- Гость может отсканировать «футболку», затем «бокс»: `users.attribution_source`
+  останется `tshirt` (первое касание), а `bookings.attribution_source` следующей
+  брони будет `box`. Это расхождение легально (спец, ugly case 5) — обе колонки
+  показаны в списке А отдельно, ничего не «исправляет» одну через другую.
+
+Окно розыгрыша (спека §5, §6 🟡 2): `[2026-09-26 19:00:00+00, 2026-09-27 19:00:00+00)`
+— сутки 27.09 по Алматы (UTC+5). Если Дамир попросит сдвинуть окно — правятся ровно
+две строки `\set` в начале списков А и Б, отчёт В окна не имеет вообще.
+
+### 10.1. Список А — участники розыгрыша
+
+Определение «участника» (спека §5): (1) `users.created_at` внутри окна, (2) есть
+бронь, созданная внутри того же окна и не отменённая САМИМ гостем (отменённая
+заведением/системой не исключает), (3) хотя бы одна из двух `attribution_source`
+непустая. Один ряд на гостя — самая ранняя подходящая бронь (`DISTINCT ON`), если
+гостей с несколькими бронями в окне нужно видеть все — уберите `DISTINCT ON (u.id)` и
+верхний `ORDER BY`.
+
+Выдача содержит телефоны и имена — файл с результатом отдаётся только Дамиру,
+правило §4 критерий 27 (раздел 6, риск 7 спеки), в общий чат/тикет не идёт.
+
+```sql
+\set window_from '''2026-09-26 19:00:00+00'''
+\set window_to   '''2026-09-27 19:00:00+00'''
+
+SELECT DISTINCT ON (u.id)
+    u.id                    AS user_id,
+    u.full_name,
+    u.phone,
+    u.attribution_source    AS account_attribution_source,
+    b.attribution_source    AS booking_attribution_source,
+    u.created_at            AS registered_at,
+    b.created_at            AS booked_at,
+    r.id                    AS restaurant_id,
+    r.name                  AS restaurant_name,
+    b.status                AS booking_status,
+    b.source                AS booking_source
+FROM users u
+JOIN bookings b     ON b.user_id = u.id
+JOIN restaurants r  ON r.id = b.restaurant_id
+WHERE u.created_at >= :window_from::timestamptz AND u.created_at < :window_to::timestamptz
+  AND b.created_at >= :window_from::timestamptz AND b.created_at < :window_to::timestamptz
+  AND NOT (b.cancelled_at IS NOT NULL AND b.cancelled_by = 'guest')
+  AND (u.attribution_source IS NOT NULL OR b.attribution_source IS NOT NULL)
+ORDER BY u.id, b.created_at ASC;
+```
+
+Без `psql`-переменных (например, для другого клиента) замените `:window_from`/
+`:window_to` двумя литералами `'2026-09-26 19:00:00+00'::timestamptz` и
+`'2026-09-27 19:00:00+00'::timestamptz` напрямую.
+
+Проверено 21.09 на одноразовой БД: гость с `users.created_at` и
+`bookings.created_at` внутри окна, `bookings.attribution_source='tshirt'`,
+`bookings.cancelled_at IS NULL` — попал в выборку одной строкой с ожидаемыми
+значениями всех столбцов. Гость с той же формой, но `cancelled_by='guest'`, из
+выборки исключён; с `cancelled_by='restaurant'` — остался (правило «отменённая
+гостем», не любая отмена).
+
+### 10.2. Список Б — запасной (на случай потерянной атрибуции)
+
+Тот же список участников окна, БЕЗ условия на непустой `attribution_source` —
+нужен целиком, если OTA не доехал или отложенный матчинг подвёл (риски 1-2 спеки) и
+список А пуст или подозрительно мал. Колонка канала присутствует, просто может быть
+`NULL` у части строк — это ожидаемо, не повод считать выгрузку сломанной.
+
+```sql
+\set window_from '''2026-09-26 19:00:00+00'''
+\set window_to   '''2026-09-27 19:00:00+00'''
+
+SELECT DISTINCT ON (u.id)
+    u.id                    AS user_id,
+    u.full_name,
+    u.phone,
+    u.attribution_source    AS account_attribution_source,
+    b.attribution_source    AS booking_attribution_source,
+    u.created_at            AS registered_at,
+    b.created_at            AS booked_at,
+    r.id                    AS restaurant_id,
+    r.name                  AS restaurant_name,
+    b.status                AS booking_status,
+    b.source                AS booking_source
+FROM users u
+JOIN bookings b     ON b.user_id = u.id
+JOIN restaurants r  ON r.id = b.restaurant_id
+WHERE u.created_at >= :window_from::timestamptz AND u.created_at < :window_to::timestamptz
+  AND b.created_at >= :window_from::timestamptz AND b.created_at < :window_to::timestamptz
+  AND NOT (b.cancelled_at IS NOT NULL AND b.cancelled_by = 'guest')
+ORDER BY u.id, b.created_at ASC;
+```
+
+Проверено 21.09: тот же гость, что в 10.1, плюс синтетический гость БЕЗ метки
+(оба `attribution_source` NULL) в том же окне — во список Б попал, в список А (10.1)
+не попал. Ровно та разница, ради которой список Б существует.
+
+### 10.3. Отчёт В — постоянный отчёт по каналам
+
+Главный ответ на вопрос Дамира («сколько человек пришло по футболкам, сколько по
+боксам»), не привязан ни к окну розыгрыша, ни к марафону — параметр «период» задаётся
+двумя переменными, по умолчанию ниже — весь период с начала данных по сейчас.
+Список каналов НЕ захардкожен (спека §5): строится из фактических значений
+`attribution_source`, встреченных в `users` ИЛИ `bookings` за период — опечатка в
+ссылке Detour (`tshrit` вместо `tshirt`) видна в отчёте отдельной строкой, а не
+теряется.
+
+Разница между «зарегистрировалось» и «забронировало» умышленно взята по РАЗНЫМ
+колонкам: «зарегистрировалось» — это `users.attribution_source` (первое касание
+аккаунта), «забронировало»/«броней всего»/«дошло» — это `bookings.attribution_source`
+(канал самой брони). У гостя, сканировавшего сначала футболку, потом бокс, аккаунт
+считается в `tshirt`, а его брони — в `box`; сумма по каналам поэтому не обязана
+совпадать со сквозным числом уникальных гостей, это ожидаемо (см. 10 выше и спеку
+§3 ugly case 5).
+
+```sql
+\set period_from '''-infinity'''
+\set period_to   '''infinity'''
+-- Для конкретного периода (например, для сверки с окном розыгрыша) замените
+-- значения выше на literal-даты, например:
+-- \set period_from '''2026-09-26 19:00:00+00'''
+-- \set period_to   '''2026-09-27 19:00:00+00'''
+
+WITH channels AS (
+    SELECT DISTINCT attribution_source AS channel FROM users    WHERE attribution_source IS NOT NULL
+    UNION
+    SELECT DISTINCT attribution_source AS channel FROM bookings WHERE attribution_source IS NOT NULL
+),
+regs AS (
+    SELECT attribution_source AS channel, count(*) AS accounts_registered
+    FROM users
+    WHERE attribution_source IS NOT NULL
+      AND created_at >= :period_from::timestamptz AND created_at < :period_to::timestamptz
+    GROUP BY attribution_source
+),
+booked AS (
+    -- "сколько из зарегистрировавшихся по каналу забронировали" — считается по
+    -- ПЕРВОМУ касанию аккаунта (u.attribution_source), не по каналу самой брони.
+    SELECT u.attribution_source AS channel, count(DISTINCT b.user_id) AS accounts_booked
+    FROM bookings b
+    JOIN users u ON u.id = b.user_id
+    WHERE u.attribution_source IS NOT NULL
+      AND u.created_at >= :period_from::timestamptz AND u.created_at < :period_to::timestamptz
+    GROUP BY u.attribution_source
+),
+bk AS (
+    -- "броней всего" / "дошло до arrived|completed" — считается по каналу
+    -- САМОЙ брони (b.attribution_source), не по каналу аккаунта.
+    SELECT attribution_source AS channel,
+           count(*) AS bookings_total,
+           count(*) FILTER (WHERE status IN ('arrived', 'completed')) AS visited
+    FROM bookings
+    WHERE attribution_source IS NOT NULL
+      AND created_at >= :period_from::timestamptz AND created_at < :period_to::timestamptz
+    GROUP BY attribution_source
+)
+SELECT
+    c.channel,
+    coalesce(regs.accounts_registered, 0) AS accounts_registered,
+    coalesce(booked.accounts_booked, 0)   AS accounts_booked,
+    coalesce(bk.bookings_total, 0)        AS bookings_total,
+    coalesce(bk.visited, 0)               AS visited
+FROM channels c
+LEFT JOIN regs   ON regs.channel = c.channel
+LEFT JOIN booked ON booked.channel = c.channel
+LEFT JOIN bk     ON bk.channel = c.channel
+ORDER BY c.channel;
+```
+
+Проверено 21.09 на одноразовой БД с синтетическими `tshirt`/`box`/опечаткой `tshrit`
+на обеих таблицах в разных пропорциях: отчёт вернул три строки по алфавиту, числа в
+каждой колонке совпали с ручным подсчётом по данным, канал без ни одной регистрации
+(только брони) и канал без ни одной брони (только регистрации) оба корректно попали в
+выдачу с нулём в недостающей колонке — `LEFT JOIN`+`coalesce` работает как задумано.
+Полгода спустя, когда марафон закончится, этот запрос ничего не нужно будет менять —
+единственная привязка к «сегодня» во всём разделе — это литералы окна в 10.1/10.2.
+
+### 10.4. Индексы, на которые опираются все три запроса
+
+Миграция `0115`: `idx_bookings_attribution_source (attribution_source, created_at)
+WHERE attribution_source IS NOT NULL`, `idx_users_attribution_source
+(attribution_source, created_at) WHERE attribution_source IS NOT NULL`,
+`idx_users_created_at (created_at)`, `idx_bookings_created_at (created_at)` — до этой
+миграции ни в `users`, ни в `bookings` не было индекса на голый `created_at`, список Б
+(10.2) без него шёл бы последовательным сканом всей таблицы `users`.

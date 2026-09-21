@@ -50,6 +50,15 @@ type CreateInput struct {
 	PromoCode string
 	Items     []ItemInput
 
+	// AttributionSource is the marathon QR channel tag ("tshirt", "box", ...
+	// spec marathon-qr-attribution-20260921 §5) as the caller sent it, RAW —
+	// validated and sanitized here, not by the transport layer, same posture
+	// as PromoCode above: an invalid or oversized value never fails the
+	// booking, it is silently dropped to NULL (spec §4 criterion 9). Unlike
+	// PromotionID/PromoCode this never gates anything; it is a label, not a
+	// campaign membership check.
+	AttributionSource string
+
 	// TableIDs pins the booking to specific tables (manual placement by staff).
 	TableIDs []uuid.UUID
 	// Force skips availability-based table selection (spec §4.2). It does NOT
@@ -141,9 +150,11 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	if err := validateCreate(in); err != nil {
 		return nil, err
 	}
-	if err := u.validatePromotion(ctx, in.PromotionID); err != nil {
+	promotionID, err := u.validatePromotion(ctx, in.PromotionID)
+	if err != nil {
 		return nil, err
 	}
+	in.PromotionID = promotionID
 	acc, err := resolveAccess(ctx, u.managers, actor, in.RestaurantID)
 	if err != nil {
 		return nil, err
@@ -294,6 +305,7 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 		Status: domain.BookingPending, Source: in.Source, Notes: in.Notes,
 		PromotionID: in.PromotionID, EventID: in.EventID,
 		PromoCodeID: promoCodeID(promo), PromoCode: promoCodeString(promo),
+		AttributionSource: sanitizedAttributionSource(in.AttributionSource),
 		// An overbooked party was placed against the venue's own rules just as a
 		// forced one was, so it carries the same flag — every listing and export
 		// that already surfaces forced_placement surfaces this too, instead of
@@ -646,8 +658,10 @@ func (u *createUseCase) selectTables(
 	return picked, nil
 }
 
-// validatePromotion confirms a caller-supplied promotion_id is a REAL,
-// currently live campaign before it is allowed anywhere near a booking row.
+// validatePromotion confirms a caller-supplied promotion_id names a REAL,
+// currently live campaign before it is allowed anywhere near a booking row,
+// and returns the promotion id the booking should actually be tagged with
+// (nil if it was dropped).
 //
 // The guest route (createMine) does not strip promotion_id the way it strips
 // TableIDs/Force/Overbook — a guest is EXPECTED to say "I came from campaign
@@ -664,20 +678,37 @@ func (u *createUseCase) selectTables(
 // promo_codes model the marathon spec describes for a later pass; this is the
 // minimum that closes the spoofing hole for the ONE mechanism the product
 // actually shipped (bookings.promotion_id, migration 0004).
-func (u *createUseCase) validatePromotion(ctx context.Context, promotionID *uuid.UUID) error {
+//
+// A DEAD promotion_id — never existed, draft, expired, hidden — is SILENTLY
+// DROPPED (nil, nil) rather than refused (spec marathon-qr-attribution-
+// 20260921 §4 criterion 10, replacing the previous "422, no booking" here).
+// The product reason: a guest whose app still carries a stale campaign id
+// (an old marathon link cached before this promo's window closed, spec §3
+// ugly case 4) must still be able to book — the booking simply comes out
+// with no campaign tag, exactly as if promotion_id had never been sent. This
+// does not weaken the antispoofing rule above: the booking can still never
+// end up tagged with a promotion nothing here verified as live, it just no
+// longer refuses the WHOLE booking for the id being stale.
+//
+// promos being entirely UNWIRED (u.promos == nil) is a different failure and
+// keeps refusing loudly: that is a bootstrap/infra gap ("no code exists here
+// to confirm anything"), not "this one id turned out to be stale", and
+// silently accepting an unverified promotion_id would be exactly the
+// spoofing hole this function exists to close.
+func (u *createUseCase) validatePromotion(ctx context.Context, promotionID *uuid.UUID) (*uuid.UUID, error) {
 	if promotionID == nil {
-		return nil
+		return nil, nil
 	}
 	if u.promos == nil {
-		return fmt.Errorf("%w: promotions are not available", domain.ErrValidation)
+		return nil, fmt.Errorf("%w: promotions are not available", domain.ErrValidation)
 	}
 	if _, err := u.promos.GetPublicDetail(ctx, *promotionID); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			return fmt.Errorf("%w: promotion is not active", domain.ErrValidation)
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
-	return nil
+	return promotionID, nil
 }
 
 // resolvePromoCode validates a guest-typed code and returns the campaign the
@@ -736,6 +767,18 @@ func promoCodeString(res *domain.PromoCodeResolution) *string {
 	}
 	code := res.Code
 	return &code
+}
+
+// sanitizedAttributionSource validates the raw channel tag the caller sent
+// (spec marathon-qr-attribution-20260921 §4 criterion 9): a valid tag is
+// stored as-is, anything else — empty, wrong shape, oversized — becomes nil.
+// Never an error: this field never fails a booking, no matter what it holds.
+func sanitizedAttributionSource(raw string) *string {
+	s, ok := domain.SanitizeAttributionSource(raw)
+	if !ok {
+		return nil
+	}
+	return &s
 }
 
 func validateCreate(in CreateInput) error {

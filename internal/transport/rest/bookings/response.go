@@ -24,7 +24,12 @@ type bookingResponse struct {
 	// PromoCode is the normalized code this booking was created with, null for
 	// every booking that carries none. Written once, at creation: a later PATCH
 	// of the booking cannot change it.
-	PromoCode              *string    `json:"promo_code"`
+	PromoCode *string `json:"promo_code"`
+	// AttributionSource is the marathon QR channel tag this booking was
+	// created under (migration 0115), null for the vast majority of
+	// bookings. Written once at creation, unaffected by PATCH — see
+	// domain.Booking.AttributionSource.
+	AttributionSource      *string    `json:"attribution_source"`
 	EventID                *string    `json:"event_id"`
 	CreatedByAdmin         bool       `json:"created_by_admin"`
 	ForcedPlacement        bool       `json:"forced_placement"`
@@ -178,8 +183,9 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 		Name: b.Name, Phone: b.Phone, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: string(b.Status), Source: string(b.Source),
 		Notes: b.Notes, PromotionID: idPtr(b.PromotionID), PromoCode: b.PromoCode,
-		EventID:        idPtr(b.EventID),
-		CreatedByAdmin: b.CreatedByAdmin, ForcedPlacement: b.ForcedPlacement,
+		AttributionSource: b.AttributionSource,
+		EventID:           idPtr(b.EventID),
+		CreatedByAdmin:    b.CreatedByAdmin, ForcedPlacement: b.ForcedPlacement,
 		ConfirmedAt: b.ConfirmedAt, ArrivedAt: b.ArrivedAt, CancelledAt: b.CancelledAt,
 		CancelledBy: cancelledBy, CancellationReasonCode: b.CancellationReasonCode,
 		CancellationReason: b.CancellationReason,

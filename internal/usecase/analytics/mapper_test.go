@@ -171,6 +171,59 @@ func TestMapBookingPromotionID(t *testing.T) {
 	}
 }
 
+// TestMapBookingAttributionSource is spec marathon-qr-attribution-20260921
+// §4 criterion 8: unlike promotion_id this property is NOT restricted to the
+// campaign funnel steps — every event type (including cancelled/no_show)
+// must carry it when the outbox payload has it, because the channel report
+// (docs/runbook-admin.md §10) needs "how far did guests from this channel
+// get", not just the happy path.
+func TestMapBookingAttributionSource(t *testing.T) {
+	payloadWith := func(t *testing.T, source string) json.RawMessage {
+		t.Helper()
+		m := map[string]any{
+			"id": uuid.New(), "restaurant_id": uuid.New(), "user_id": uuid.New(),
+			"name": "Damir", "phone": "+77011234567", "email": "guest@example.com",
+			"guests": 2, "status": "x", "source": "guest_app",
+		}
+		if source != "" {
+			m["attribution_source"] = source
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	for _, tc := range []struct {
+		eventType string
+	}{
+		{"booking.created"}, {"booking.confirmed"}, {"booking.cancelled"}, {"booking.no_show"},
+	} {
+		ev, tracked, err := mapRow(SourceBookingOutbox, SourceRow{
+			ID: uuid.New(), EventType: tc.eventType, Payload: payloadWith(t, "tshirt"), CreatedAt: time.Now(),
+		})
+		if err != nil || !tracked {
+			t.Fatalf("%s: unexpected err=%v tracked=%v", tc.eventType, err, tracked)
+		}
+		if got := ev.Properties["attribution_source"]; got != "tshirt" {
+			t.Fatalf("%s: attribution_source = %v, want tshirt", tc.eventType, got)
+		}
+	}
+
+	// No channel tag on the booking: the property must be absent, not a
+	// null/empty string — same posture as promotion_id above.
+	ev, _, err := mapRow(SourceBookingOutbox, SourceRow{
+		ID: uuid.New(), EventType: "booking.created", Payload: payloadWith(t, ""), CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := ev.Properties["attribution_source"]; present {
+		t.Fatalf("attribution_source must be absent for a booking with no channel tag, got %v", ev.Properties["attribution_source"])
+	}
+}
+
 // TestMapBookingUntracked used to also list booking.arrived/booking.completed
 // here as deliberately untracked. The Almaty marathon funnel (Trello
 // CdwfIzDh / kvMSxhSl) needs "did the guest actually show up", so those two

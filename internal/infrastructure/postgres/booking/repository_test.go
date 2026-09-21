@@ -87,6 +87,7 @@ func TestBookingCRUDAndList(t *testing.T) {
 	b := newBooking(rid, base)
 	b.UserID = &uid
 	b.Notes = ptr("у окна")
+	b.AttributionSource = ptr("tshirt")
 	if err := repo.Create(ctx, b); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -98,6 +99,9 @@ func TestBookingCRUDAndList(t *testing.T) {
 	if got.Status != domain.BookingPending || got.Guests != 2 ||
 		got.UserID == nil || *got.UserID != uid || got.Notes == nil || *got.Notes != "у окна" {
 		t.Errorf("roundtrip mismatch: %+v", got)
+	}
+	if got.AttributionSource == nil || *got.AttributionSource != "tshirt" {
+		t.Errorf("attribution_source = %v, want tshirt", got.AttributionSource)
 	}
 	if !got.StartsAt.Equal(base) {
 		t.Errorf("starts_at = %v, want %v", got.StartsAt, base)
@@ -449,5 +453,42 @@ func TestBookingUpdateKeepsPromoCodeSnapshot(t *testing.T) {
 	}
 	if got.PromoCode == nil || *got.PromoCode != "MARATHON26" {
 		t.Errorf("promo_code = %v, want MARATHON26", got.PromoCode)
+	}
+}
+
+// TestBookingUpdateKeepsAttributionSourceSnapshot is the same INSERT-only
+// guarantee as TestBookingUpdateKeepsPromoCodeSnapshot, for
+// attribution_source (migration 0115, spec marathon-qr-attribution-20260921
+// §5): "which channel this booking was created under" must survive a PATCH
+// that does not even know the column exists.
+func TestBookingUpdateKeepsAttributionSourceSnapshot(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	uid := seedUser(t, pool)
+	repo := New(pool)
+
+	b := newBooking(rid, time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
+	b.UserID = &uid
+	b.AttributionSource = ptr("box")
+	if err := repo.Create(ctx, b); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	stale := *b
+	stale.AttributionSource = nil
+	stale.Guests = 6
+	if err := repo.Update(ctx, &stale); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Guests != 6 {
+		t.Errorf("guests = %d, want the update to have landed", got.Guests)
+	}
+	if got.AttributionSource == nil || *got.AttributionSource != "box" {
+		t.Errorf("attribution_source = %v, want box — Update must not rewrite it", got.AttributionSource)
 	}
 }

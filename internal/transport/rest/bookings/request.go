@@ -31,11 +31,20 @@ type createBookingRequest struct {
 	// (domain.NormalizePromoCode). Deliberately NOT blanked on the staff route
 	// the way Force/Overbook are — the refusal belongs in the usecase, which
 	// covers both routes and every other caller; see resolvePromoCode.
-	PromoCode string               `json:"promo_code"`
-	EventID   *string              `json:"event_id"`
-	Items     []bookingItemRequest `json:"items"`
-	TableIDs  []string             `json:"table_ids"`
-	Force     bool                 `json:"force"`
+	PromoCode string  `json:"promo_code"`
+	EventID   *string `json:"event_id"`
+	// AttributionSource is the marathon QR channel tag ("tshirt", "box", ...
+	// spec marathon-qr-attribution-20260921 §5) as sent, RAW — validated and
+	// sanitized in the usecase (domain.SanitizeAttributionSource), never
+	// here: an invalid value must never fail the request, it is silently
+	// dropped (spec §4 criterion 9). Not blanked on either route — unlike
+	// Force/Overbook/TableIDs this is not a staff power, both a guest and
+	// staff request may legitimately carry it (or, per spec §3 ugly case 9,
+	// legitimately not).
+	AttributionSource string               `json:"attribution_source"`
+	Items             []bookingItemRequest `json:"items"`
+	TableIDs          []string             `json:"table_ids"`
+	Force             bool                 `json:"force"`
 	// Overbook: seat this party even though a table-less venue's declared
 	// capacity does not fit it. Staff-only and blanked on the guest route, like
 	// Force — see createMine.
@@ -56,6 +65,7 @@ func (r createBookingRequest) toInput() (uc.CreateInput, error) {
 		Name: r.Name, Phone: r.Phone, Email: r.Email, Guests: r.Guests,
 		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force, Overbook: r.Overbook,
 		PromoCode: r.PromoCode, Source: domain.SourceApp,
+		AttributionSource: r.AttributionSource,
 	}
 	var err error
 	if in.RestaurantID, err = parseUUID(r.RestaurantID, "restaurant_id"); err != nil {

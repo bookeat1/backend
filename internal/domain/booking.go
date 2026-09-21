@@ -221,7 +221,15 @@ type Booking struct {
 	// PromoCode is the normalized code string as of this booking, kept so a
 	// listing or an export can show it without joining promo_codes and after
 	// the code's row is gone.
-	PromoCode              *string
+	PromoCode *string
+	// AttributionSource is the marathon QR channel tag ("tshirt", "box", ...)
+	// this booking was created under (migration 0115). Written ONLY by the
+	// INSERT, exactly like PromotionID/PromoCode/PromoCodeID above — a later
+	// PATCH never rewrites it (usecase/bookings.UpdateUseCase does not list
+	// it). Nil for the vast majority of bookings: no scan, a staff/phone
+	// booking, or a tag that failed domain.ValidAttributionSource and was
+	// silently dropped (spec marathon-qr-attribution-20260921 §4 criterion 9).
+	AttributionSource      *string
 	CreatedByAdmin         bool
 	ForcedPlacement        bool // manager placed it despite an occupied table
 	ConfirmedAt            *time.Time
