@@ -82,4 +82,14 @@ const (
 	// yet, retried next tick) / skipped (a source row that can never land, e.g.
 	// an overlapping table hold — logged and stepped over, never retried).
 	EventLegacySyncTick = "legacy_sync.tick"
+
+	// Kwaaka POS menu/stop-list sync (cmd/worker's kwaakasync loop, phase 1 of
+	// the Kwaaka integration). KwaakaSyncTick is one pass summary per
+	// restaurant: fetched (products in the response) / upserted / stopped
+	// (marked unavailable because Kwaaka's menu no longer returned them).
+	// KwaakaSyncFailed is one restaurant's fetch or write failing — logged so
+	// a single venue's bad data/outage does not hide inside a tick's aggregate
+	// counters and the pass still continues to the next restaurant.
+	EventKwaakaSyncTick   = "kwaaka_sync.tick"
+	EventKwaakaSyncFailed = "kwaaka_sync.failed"
 )

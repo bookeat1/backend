@@ -61,6 +61,10 @@ type Config struct {
 	// absent.
 	LegacySync LegacySyncConfig
 
+	// KwaakaSync configures the Kwaaka menu/stop-list background sync (phase 1
+	// of the Kwaaka POS integration). See KwaakaSyncConfig.
+	KwaakaSync KwaakaSyncConfig
+
 	// RateLimit configures middleware.RateLimit and the in-memory limiter
 	// backing it (per-client-IP request budgets, one per route tier — see
 	// that middleware's doc comment for which routes fall into which tier
@@ -462,6 +466,15 @@ type LegacySyncConfig struct {
 	BatchSize    int           // env: LEGACY_SYNC_BATCH_SIZE
 }
 
+// KwaakaSyncConfig configures cmd/worker's Kwaaka menu/stop-list sync loop
+// (phase 1 of the Kwaaka POS integration — see usecase/kwaakasync). The
+// worker is started only when the Kwaaka adapter's own config validates
+// (KWAAKA_BASE_URL + KWAAKA_TOKEN both set) — see
+// infrastructure/kwaaka.Config.Validate.
+type KwaakaSyncConfig struct {
+	TickInterval time.Duration // env: KWAAKA_SYNC_TICK_INTERVAL
+}
+
 // TicketsSweepConfig configures the pending-event-ticket sweep worker. The
 // StaleAfter default (100h) deliberately exceeds the payments HoldTTL default
 // (96h) so a ticket whose payment hold is still legitimately in flight is never
@@ -797,6 +810,10 @@ func NewConfig() (Config, error) {
 			MaxAttempts:      getEnvInt("PAYMENTS_RECONCILE_MAX_ATTEMPTS", 5),
 			ProviderMinGap:   getEnvDuration("PAYMENTS_RECONCILE_PROVIDER_MIN_GAP", 200*time.Millisecond),
 		},
+		KwaakaSync: KwaakaSyncConfig{
+			TickInterval: getEnvDuration("KWAAKA_SYNC_TICK_INTERVAL", 5*time.Minute),
+		},
+
 		LegacySync: LegacySyncConfig{
 			DatabaseURL:  getEnv("LEGACY_DB_URL", ""),
 			TickInterval: getEnvDuration("LEGACY_SYNC_TICK_INTERVAL", time.Minute),

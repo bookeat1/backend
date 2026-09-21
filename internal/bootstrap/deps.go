@@ -15,6 +15,7 @@ import (
 	"backend-core/internal/domain"
 	"backend-core/internal/infrastructure/amplitude"
 	"backend-core/internal/infrastructure/expopush"
+	"backend-core/internal/infrastructure/kwaaka"
 	"backend-core/internal/infrastructure/legacysource"
 	"backend-core/internal/infrastructure/mediastore"
 	"backend-core/internal/infrastructure/otpsender"
@@ -88,6 +89,7 @@ import (
 	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
+	"backend-core/internal/usecase/kwaakasync"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
 	"backend-core/internal/usecase/notifications"
@@ -1885,6 +1887,29 @@ func NewAnalyticsDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *ana
 //
 // The returned closer owns the legacy pool; RunWorker calls it on shutdown. The
 // connection string is a credential and is never logged.
+// NewKwaakaSyncWorker wires the Kwaaka menu/stop-list background sync (phase
+// 1 of the Kwaaka POS integration), or returns nil when the Kwaaka adapter is
+// not configured — same posture as NewPushReceiptWorker: with no
+// KWAAKA_BASE_URL/KWAAKA_TOKEN there is nothing to sync from, so a running
+// loop would only ever find zero linked restaurants to iterate (harmless, but
+// pointless to schedule).
+func NewKwaakaSyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaakasync.Worker {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka menu sync not started", slog.String("reason", err.Error()))
+		return nil
+	}
+	client := kwaaka.NewClient(nil, kwCfg)
+	return kwaakasync.NewWorker(
+		restrepo.New(db),
+		kwaaka.NewMenuSource(client),
+		menurepo.New(db),
+		sqltx.NewManager(db),
+		kwaakasync.Config{TickInterval: cfg.KwaakaSync.TickInterval},
+		log,
+	)
+}
+
 func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legacysync.Worker, func(), error) {
 	if cfg.LegacySync.DatabaseURL == "" {
 		log.Info("legacy sync disabled (LEGACY_DB_URL unset)")
