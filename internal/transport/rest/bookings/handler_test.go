@@ -195,6 +195,52 @@ func createBody(rid uuid.UUID, guests int) gin.H {
 	}
 }
 
+// TestCreateAttributionSourceFlowsThroughRequestAndResponse is spec
+// marathon-qr-attribution-20260921 §4 criterion 8: the wire field decodes off
+// the JSON body into uc.CreateInput.AttributionSource (raw, unvalidated —
+// sanitizing it is the usecase's job, see domain.SanitizeAttributionSource)
+// and the value the usecase returns on the booking reaches the response body
+// under the same key. A body with no attribution_source at all (criterion
+// 12, an old client) must decode to the empty string, not fail binding.
+func TestCreateAttributionSourceFlowsThroughRequestAndResponse(t *testing.T) {
+	d := newDeps()
+	r := newRouter(d)
+	headers := authHeader(uuid.New())
+	headers[idempotencyHeader] = "key-attribution"
+
+	body := createBody(uuid.New(), 2)
+	body["attribution_source"] = "tshirt"
+	w := do(r, http.MethodPost, "/api/v1/bookings", body, headers)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", w.Code, w.Body)
+	}
+	if d.create.lastIn.AttributionSource != "tshirt" {
+		t.Fatalf("CreateInput.AttributionSource = %q, want %q", d.create.lastIn.AttributionSource, "tshirt")
+	}
+	var resp struct {
+		Data struct {
+			AttributionSource *string `json:"attribution_source"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Data.AttributionSource == nil || *resp.Data.AttributionSource != "tshirt" {
+		t.Fatalf("response attribution_source = %v, want tshirt (body %s)", resp.Data.AttributionSource, w.Body)
+	}
+
+	// No field at all: must decode to "" and still create the booking (never
+	// a binding failure) — the old-client case, criterion 12.
+	headers[idempotencyHeader] = "key-no-attribution"
+	w2 := do(r, http.MethodPost, "/api/v1/bookings", createBody(uuid.New(), 2), headers)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", w2.Code, w2.Body)
+	}
+	if d.create.lastIn.AttributionSource != "" {
+		t.Fatalf("CreateInput.AttributionSource = %q, want empty for an old client", d.create.lastIn.AttributionSource)
+	}
+}
+
 // TestCreateIdempotency is the spec §7 contract: the same key with the same
 // body replays the first result and creates exactly one booking; the same key
 // with a different body is a conflict.

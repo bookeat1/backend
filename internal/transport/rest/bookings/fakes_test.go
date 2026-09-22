@@ -100,6 +100,10 @@ func (f *fakeKeys) Insert(_ context.Context, r *domain.IdempotencyRecord) error 
 type fakeCreate struct {
 	calls int
 	err   error
+	// lastIn records the CreateInput the handler actually built, so a test
+	// can assert on fields (e.g. AttributionSource) the usecase would have
+	// validated/sanitized — this fake does not reimplement that logic.
+	lastIn uc.CreateInput
 }
 
 func (f *fakeCreate) Create(_ context.Context, _ uc.Actor, in uc.CreateInput) (*uc.BookingDetails, error) {
@@ -107,11 +111,17 @@ func (f *fakeCreate) Create(_ context.Context, _ uc.Actor, in uc.CreateInput) (*
 		return nil, f.err
 	}
 	f.calls++
+	f.lastIn = in
 	guests := in.Guests
+	var attribution *string
+	if in.AttributionSource != "" {
+		attribution = &in.AttributionSource
+	}
 	return &uc.BookingDetails{Booking: domain.Booking{
 		ID: uuid.New(), RestaurantID: in.RestaurantID, UserID: in.UserID,
 		Name: in.Name, Guests: guests, StartsAt: in.StartsAt,
 		Status: domain.BookingPending, Source: in.Source,
+		AttributionSource: attribution,
 	}}, nil
 }
 
