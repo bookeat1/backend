@@ -136,6 +136,44 @@ func TestFetchMenu_SkipsProductsMissingIDOrName(t *testing.T) {
 	}
 }
 
+// TestFetchMenu_NoPriceForcesUnavailable asserts bug 2026-09-22: Kwaaka
+// omitting/zeroing a product's price must never let it publish as a free
+// dish, even when Kwaaka's own is_available (and the section's) say true.
+func TestFetchMenu_NoPriceForcesUnavailable(t *testing.T) {
+	body := `{"sections":[{"id":"sec-1","name":"Sec","is_available":true,"is_deleted":false}],"products":[
+		{"id":"no-price","section":"sec-1","name":[{"value":"No price"}],"is_available":true,"price":[]},
+		{"id":"zero-price","section":"sec-1","name":[{"value":"Zero price"}],"is_available":true,"price":[{"value":0}]},
+		{"id":"negative-price","section":"sec-1","name":[{"value":"Negative price"}],"is_available":true,"price":[{"value":-5}]},
+		{"id":"has-price","section":"sec-1","name":[{"value":"Has price"}],"is_available":true,"price":[{"value":1500}]}
+	]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	menu, err := NewMenuSource(testClient(t, srv)).FetchMenu(context.Background(), "r1")
+	if err != nil {
+		t.Fatalf("FetchMenu: %v", err)
+	}
+	byID := map[string]domain.KwaakaMenuProduct{}
+	for _, p := range menu.Products {
+		byID[p.ExternalID] = p
+	}
+
+	for _, id := range []string{"no-price", "zero-price", "negative-price"} {
+		p := byID[id]
+		if p.IsAvailable {
+			t.Errorf("%s: IsAvailable = true, want false (no positive price, even though Kwaaka sent is_available=true)", id)
+		}
+		if !domain.ValidPrice(p.Price) {
+			t.Errorf("%s: price %q must still be a well-formed price string", id, p.Price)
+		}
+	}
+	if p := byID["has-price"]; !p.IsAvailable {
+		t.Error("has-price: a product with a real positive price must keep Kwaaka's own is_available value")
+	}
+}
+
 func TestFetchMenu_EmptyRestaurantID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("must not call kwaaka with an empty restaurant id")

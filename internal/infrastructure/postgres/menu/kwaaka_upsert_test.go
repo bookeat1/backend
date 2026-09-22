@@ -72,6 +72,93 @@ func TestUpsertFromKwaaka_MatchesOnRestaurantAndKwaakaProductID(t *testing.T) {
 	}
 }
 
+// TestUpsertFromKwaaka_DoesNotBlankPhotoOrTranslationsOnEmptySync asserts the
+// 2026-09-22 bug fix: phase 1's Kwaaka adapter never sends translations and
+// often has no photo, so a routine re-sync's MenuItem arrives with
+// ImageURL/*I18n all nil. That must NOT erase a photo/translation a venue
+// manager uploaded by hand through the panel — but a sync that DOES carry a
+// new value must still apply it (this is "don't blank on absence", not
+// "never update").
+func TestUpsertFromKwaaka_DoesNotBlankPhotoOrTranslationsOnEmptySync(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "menu_items", "menu_categories", "restaurants")
+	ctx := context.Background()
+
+	rid := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO restaurants (id, name, city, price_category, kwaaka_restaurant_id) VALUES ($1,'R','Алматы','₸','kw-r1')`, rid); err != nil {
+		t.Fatalf("seed restaurant: %v", err)
+	}
+	repo := New(pool)
+	kwID := "kw-prod-1"
+
+	first := &domain.MenuItem{
+		ID: uuid.New(), RestaurantID: rid, Name: "Наггетсы", Price: "2890.00",
+		IsAvailable: true, KwaakaProductID: &kwID,
+	}
+	if err := repo.UpsertFromKwaaka(ctx, first); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	// Simulate a manager uploading a photo and kk/en translations through the
+	// panel after the dish first synced from Kwaaka.
+	uploadedPhoto := "https://cdn.example.com/nuggets.jpg"
+	if _, err := pool.Exec(ctx,
+		`UPDATE menu_items SET image_url=$1, name_i18n=$2, description_i18n=$3, category_i18n=$4 WHERE id=$5`,
+		uploadedPhoto, `{"kk":"Наггеттер","en":"Nuggets"}`, `{"kk":"Сипаттама","en":"Description"}`,
+		`{"kk":"Негізгі","en":"Main"}`, first.ID); err != nil {
+		t.Fatalf("simulate manual photo/translation upload: %v", err)
+	}
+
+	// A routine Kwaaka re-sync: same shape the worker actually builds — no
+	// ImageURL, no *I18n (phase 1 never maps them).
+	resync := &domain.MenuItem{
+		ID: uuid.New(), RestaurantID: rid, Name: "Наггетсы 9 шт", Price: "3100.00",
+		IsAvailable: true, KwaakaProductID: &kwID,
+	}
+	if err := repo.UpsertFromKwaaka(ctx, resync); err != nil {
+		t.Fatalf("resync upsert: %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, resync.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Name != "Наггетсы 9 шт" {
+		t.Errorf("name = %q, want the fresh value from Kwaaka to still apply", got.Name)
+	}
+	if !got.HasImage() || *got.ImageURL != uploadedPhoto {
+		t.Errorf("image_url = %v, want it to survive a sync that sent no image (%q)", got.ImageURL, uploadedPhoto)
+	}
+	if got.NameI18n["en"] != "Nuggets" || got.NameI18n["kk"] != "Наггеттер" {
+		t.Errorf("name_i18n = %v, want the manually-added translations to survive", got.NameI18n)
+	}
+	if got.DescriptionI18n["en"] != "Description" {
+		t.Errorf("description_i18n = %v, want it to survive", got.DescriptionI18n)
+	}
+	if got.CategoryI18n["en"] != "Main" {
+		t.Errorf("category_i18n = %v, want it to survive", got.CategoryI18n)
+	}
+
+	// Now a sync that DOES carry a new photo — it must actually apply, this
+	// protection is only against blanking, not a freeze.
+	newPhoto := ptr("https://cdn.example.com/new-nuggets.jpg")
+	withPhoto := &domain.MenuItem{
+		ID: uuid.New(), RestaurantID: rid, Name: "Наггетсы 9 шт", Price: "3100.00",
+		IsAvailable: true, ImageURL: newPhoto, KwaakaProductID: &kwID,
+	}
+	if err := repo.UpsertFromKwaaka(ctx, withPhoto); err != nil {
+		t.Fatalf("upsert with photo: %v", err)
+	}
+	got2, err := repo.GetByID(ctx, withPhoto.ID)
+	if err != nil {
+		t.Fatalf("get after photo update: %v", err)
+	}
+	if !got2.HasImage() || *got2.ImageURL != *newPhoto {
+		t.Errorf("image_url = %v, want the newly-sent Kwaaka photo %q to apply", got2.ImageURL, *newPhoto)
+	}
+}
+
 // TestMarkUnavailableExceptKwaakaIDs_StopListsWhatFellOut asserts the
 // "removed from Kwaaka's menu entirely" case: a dish whose id is not in the
 // latest pass' keep set goes dark, but a hand-entered dish (no
