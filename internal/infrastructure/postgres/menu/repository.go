@@ -447,6 +447,15 @@ func i18nFromDB(b []byte) domain.I18n {
 // the columns Kwaaka actually owns are written on conflict — is_featured and
 // top_pick_position are deliberately absent from the UPDATE SET list, per
 // domain.MenuItemRepository.UpsertFromKwaaka's doc comment.
+//
+// image_url/name_i18n/description_i18n/category_i18n use
+// COALESCE(EXCLUDED.x, menu_items.x) rather than a flat overwrite: phase 1's
+// Kwaaka adapter never sends translations and the POS often has no photo, so
+// m.ImageURL/*I18n arrive nil on every routine sync. A flat EXCLUDED.x would
+// blank out a photo or kk/en translation a venue manager uploaded by hand
+// through the panel on every 5-minute tick — see bug report 2026-09-22. A
+// value Kwaaka DOES send (non-nil) still applies as usual; this only protects
+// against being overwritten by absence, not against a real update.
 func (r *Repository) UpsertFromKwaaka(ctx context.Context, m *domain.MenuItem) error {
 	if m.KwaakaProductID == nil || strings.TrimSpace(*m.KwaakaProductID) == "" {
 		return fmt.Errorf("%w: upsert from kwaaka requires a kwaaka_product_id", domain.ErrValidation)
@@ -462,11 +471,13 @@ func (r *Repository) UpsertFromKwaaka(ctx context.Context, m *domain.MenuItem) e
 		VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$9,$10,$11,$12,$13,$14,$15)
 		ON CONFLICT (restaurant_id, kwaaka_product_id) WHERE kwaaka_product_id IS NOT NULL
 		DO UPDATE SET
-			name=EXCLUDED.name, name_i18n=EXCLUDED.name_i18n,
-			description=EXCLUDED.description, description_i18n=EXCLUDED.description_i18n,
-			price=EXCLUDED.price, image_url=EXCLUDED.image_url,
+			name=EXCLUDED.name, name_i18n=COALESCE(EXCLUDED.name_i18n, menu_items.name_i18n),
+			description=EXCLUDED.description,
+			description_i18n=COALESCE(EXCLUDED.description_i18n, menu_items.description_i18n),
+			price=EXCLUDED.price, image_url=COALESCE(EXCLUDED.image_url, menu_items.image_url),
 			is_available=EXCLUDED.is_available,
-			category=EXCLUDED.category, category_i18n=EXCLUDED.category_i18n,
+			category=EXCLUDED.category,
+			category_i18n=COALESCE(EXCLUDED.category_i18n, menu_items.category_i18n),
 			updated_at=EXCLUDED.updated_at
 		RETURNING id`
 	args := []any{
