@@ -102,6 +102,14 @@ func mapMenu(m rawMenu) domain.KwaakaMenu {
 			// a guest as one Kwaaka flagged directly — see doc.go.
 			available = available && sec.IsAvailable && !sec.IsDeleted
 		}
+		if !hasPositivePrice(p.Price) {
+			// A dish with no real price from the POS must never publish as
+			// "free" — force it off the shelf regardless of whatever
+			// is_available Kwaaka sent for the product/section. This
+			// overrides, it never re-enables: a dish Kwaaka already marked
+			// unavailable for its own reasons stays unavailable either way.
+			available = false
+		}
 
 		out.Products = append(out.Products, domain.KwaakaMenuProduct{
 			ExternalID:  id,
@@ -133,11 +141,22 @@ func firstStr(vs []string) string {
 // priceString converts Kwaaka's first Price entry into the decimal-string
 // format domain.ValidPrice expects, without ever letting the float leak
 // beyond this one formatting call. A missing/negative price maps to "0.00"
-// rather than being upserted as garbage — a dish with no price is safer shown
-// as free-to-fix-in-the-panel than as whatever a malformed payload contained.
+// rather than being upserted as garbage. Note this value alone does NOT mean
+// the dish is safe to publish — a "0.00" (or any non-positive) price forces
+// IsAvailable to false in mapMenu (see hasPositivePrice) so it never reaches
+// a guest as a free dish; "0.00" here only keeps the stored price column a
+// well-formed decimal string.
 func priceString(ps []rawPrice) string {
 	if len(ps) == 0 || ps[0].Value < 0 {
 		return "0.00"
 	}
 	return fmt.Sprintf("%.2f", ps[0].Value)
+}
+
+// hasPositivePrice reports whether Kwaaka actually sent a usable, strictly
+// positive price for the product. Missing, empty, zero and negative all read
+// as "no real price" — see mapMenu's use of this to force IsAvailable=false
+// instead of ever letting a priceless dish publish as free.
+func hasPositivePrice(ps []rawPrice) bool {
+	return len(ps) > 0 && ps[0].Value > 0
 }

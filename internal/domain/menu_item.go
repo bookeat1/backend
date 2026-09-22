@@ -246,6 +246,11 @@ type MenuItemRepository interface {
 	// through the panel, and a POS sync must not silently drop them because a
 	// dish's price changed in the kitchen. Only the fields Kwaaka actually owns
 	// (name, description, price, availability, category, image) are written.
+	// ImageURL/NameI18n/DescriptionI18n/CategoryI18n specifically: a nil/empty
+	// value on m means "Kwaaka did not send this field", not "clear it" — the
+	// implementation must keep the existing column value in that case (a
+	// manager's hand-uploaded photo or kk/en translation must survive every
+	// sync tick), only overwriting when Kwaaka actually sent a value.
 	UpsertFromKwaaka(ctx context.Context, m *MenuItem) error
 	// MarkUnavailableExceptKwaakaIDs sets is_available=false for every
 	// Kwaaka-sourced dish (kwaaka_product_id IS NOT NULL) of restaurantID whose
