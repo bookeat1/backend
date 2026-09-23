@@ -374,7 +374,7 @@ func (u *webhookUseCase) applyToPayment(ctx context.Context, gw domain.PaymentGa
 	case domain.WebhookPaymentAuthorized:
 		return u.applyAuthorized(ctx, gw, p, event)
 	case domain.WebhookPaymentCaptured:
-		return u.applyCaptured(ctx, p, event)
+		return u.applyCaptured(ctx, gw, p, event)
 	case domain.WebhookPaymentFailed:
 		return u.applyFailed(ctx, p, event)
 	case domain.WebhookPaymentVoided:
@@ -530,11 +530,111 @@ func (u *webhookUseCase) compensateLostRace(ctx context.Context, gw domain.Payme
 	return nil
 }
 
-// applyCaptured moves authorized → captured and books the split into the
-// ledger (spec §9.2) in the SAME transaction as the status write.
-func (u *webhookUseCase) applyCaptured(ctx context.Context, p *domain.Payment, event *domain.WebhookEvent) error {
+// oneStagePurpose is an OPTIONAL acquirer capability, the same pattern as
+// create.go's amountGranularity: whether Authorize, for a given purpose,
+// settles the charge in ONE stage (no hold ever exists to convert) rather
+// than the ordinary two-stage hold-then-capture. Only TipTopPay implements it
+// today (RequireConfirmation=false for a purpose that
+// domain.PaymentPurpose.CapturesImmediately()); every other adapter is
+// two-stage for every purpose, so it is not part of domain.PaymentGateway —
+// the domain must not carry a method every other acquirer would answer
+// "never" to.
+type oneStagePurpose interface {
+	SettlesImmediately(purpose domain.PaymentPurpose) bool
+}
+
+// settlesImmediately reports whether gw claims to settle purpose in one stage.
+// An acquirer that does not implement oneStagePurpose is assumed strictly
+// two-stage — the safe default, since treating an ordinary acquirer as
+// one-stage would let an out-of-order `captured` delivery (report item #14)
+// silently skip the hold it should have gone through first.
+func settlesImmediately(gw domain.PaymentGateway, purpose domain.PaymentPurpose) bool {
+	g, ok := gw.(oneStagePurpose)
+	return ok && g.SettlesImmediately(purpose)
+}
+
+// compensateLostRaceCaptured is compensateLostRace's counterpart for a payment
+// captured DIRECTLY from `created` (a one-stage acquirer charge — TipTopPay's
+// RequireConfirmation=false for a pre-order). By the time the CAS on
+// idx_payments_live_per_booking is lost here, the acquirer has ALREADY
+// CHARGED the guest (unlike compensateLostRace's hold, which is merely
+// reserved and never became real money), so the loser's compensation is a
+// REFUND: calling Void on an acquirer transaction it already completed would
+// either be rejected outright or, worse, silently misinterpreted.
+//
+// Symmetric to compensateLostRace: it first re-reads the payment (a
+// legitimate duplicate delivery of this SAME payment's own already-applied
+// capture must not be refunded a second time), refunds the full amount, then
+// moves this payment to `failed` — it never became the booking's live
+// payment, exactly like the void-compensated case.
+func (u *webhookUseCase) compensateLostRaceCaptured(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment) error {
+	current, err := u.payments.GetByID(ctx, p.ID)
+	if err != nil {
+		return fmt.Errorf("re-read payment %s before compensation: %w", p.ID, err)
+	}
+	if current.Status != domain.PaymentCreated {
+		// This payment's own state already moved on. Nothing to compensate.
+		return nil
+	}
+	if p.ProviderPaymentID == nil {
+		return fmt.Errorf("compensate lost race for payment %s: no provider payment id", p.ID)
+	}
+
+	// External call, deliberately outside any DB transaction.
+	if _, err := gw.Refund(ctx, *p.ProviderPaymentID, p.Total()); err != nil {
+		logging.FromContext(ctx).Error("payment.compensation_refund_failed",
+			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+		// Answered as an error so the acquirer's own retry schedule tries the
+		// callback again; a retried Refund on an amount already returned is
+		// expected to be safe (TipTopPay rejects over-refunding).
+		return fmt.Errorf("refund lost-race charge for payment %s: %w", p.ID, err)
+	}
+
+	now := time.Now()
+	failureCode := "lost_booking_race"
+	failureMessage := "another payment for the same booking was captured first; this charge was refunded"
+	txErr := u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := u.payments.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCreated, domain.PaymentFailed, now); err != nil {
+			return err
+		}
+		p.Status = domain.PaymentFailed
+		p.FailedAt = &now
+		p.FailureCode = &failureCode
+		p.FailureMessage = &failureMessage
+		return publishPaymentEvent(ctx, u.outbox, p, domain.EventPaymentFailed, now)
+	})
+	if txErr != nil {
+		return txErr
+	}
+	logging.FromContext(ctx).Warn(logging.EventPaymentFailed,
+		slog.String("payment_id", p.ID.String()),
+		slog.String("booking_id", p.BookingID.String()),
+		slog.String("reason", failureCode),
+	)
+	return nil
+}
+
+// applyCaptured moves authorized → captured (the ordinary two-stage path) or
+// created → captured (a one-stage acquirer charge, e.g. TipTopPay's
+// RequireConfirmation=false for a pre-order — see domain.PaymentCreated's
+// transition table entry) and books the split into the ledger (spec §9.2) in
+// the SAME transaction as the status write.
+func (u *webhookUseCase) applyCaptured(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
 	if p.Status == domain.PaymentCaptured {
 		return nil
+	}
+	from := p.Status
+	if from == domain.PaymentCreated && !settlesImmediately(gw, p.Purpose) {
+		// domain.PaymentCreated → PaymentCaptured is a legal STATE transition
+		// (a genuinely one-stage acquirer charge), but this specific acquirer
+		// does not claim to settle THIS purpose in one stage — so `captured`
+		// arriving while the payment is still `created` here means the
+		// `authorized` notification was lost or delivered out of order (report
+		// item #14), not a legitimate skip of the hold. Refuse exactly as if
+		// the transition did not exist, rather than silently accept a capture
+		// that never went through an authorization we can account for.
+		return fmt.Errorf("webhook captured on payment %s (currently %s): acquirer is two-stage for purpose %s, this is out-of-order delivery: %w",
+			p.ID, p.Status, p.Purpose, domain.ErrInvalidStatus)
 	}
 	if err := domain.ValidatePaymentTransition(p.Status, domain.PaymentCaptured); err != nil {
 		return fmt.Errorf("webhook captured on payment %s (currently %s): %w", p.ID, p.Status, err)
@@ -559,7 +659,6 @@ func (u *webhookUseCase) applyCaptured(ctx context.Context, p *domain.Payment, e
 			"webhook captured amount %d minor for payment %s does not match the payment's own total %d minor — a partial capture is not supported yet, needs reconciliation",
 			event.Amount.AmountMinor, p.ID, p.AmountMinor)
 	}
-	from := p.Status
 	now := time.Now()
 	entries := captureLedgerEntries(*p, now)
 	if err := domain.ValidateLedgerBalance(entries); err != nil {
@@ -577,6 +676,13 @@ func (u *webhookUseCase) applyCaptured(ctx context.Context, p *domain.Payment, e
 		return publishPaymentEvent(ctx, u.outbox, p, domain.EventPaymentCaptured, now)
 	})
 	if err != nil {
+		if from == domain.PaymentCreated && errors.Is(err, domain.ErrAlreadyExists) {
+			// Lost the booking-level race on a ONE-STAGE charge: unlike the
+			// two-stage path (compensateLostRace), the acquirer has ALREADY
+			// taken the guest's money by this point — there was never a hold to
+			// release. The compensation is a refund, not a void.
+			return u.compensateLostRaceCaptured(ctx, gw, p)
+		}
 		return err
 	}
 	logging.FromContext(ctx).Info(logging.EventPaymentCaptured, slog.String("payment_id", p.ID.String()))

@@ -8,10 +8,14 @@
 //     login and API Secret as the password;
 //   - idempotency via the X-Request-ID header; a repeated id replays the stored
 //     result for one hour;
-//   - two-stage flow: POST /orders/create with RequireConfirmation=true creates
-//     a hosted payment page, POST /payments/confirm captures, POST
-//     /payments/void releases the hold, POST /payments/refund returns money,
-//     POST /payments/get and POST /v2/payments/find read state;
+//   - POST /orders/create creates a hosted payment page; POST /payments/confirm
+//     captures a hold, POST /payments/void releases one, POST /payments/refund
+//     returns money, POST /payments/get and POST /v2/payments/find read state;
+//   - RequireConfirmation on /orders/create picks two-stage (true, a hold that
+//     needs a later confirm/void) vs one-stage (false, the charge settles
+//     immediately). This adapter sends false for a purpose that captures
+//     immediately (a pre-order — owner decision 2026-09-23, see gateway.go's
+//     Authorize) and true otherwise (a deposit stays a hold);
 //   - every answer is the envelope {"Success":bool,"Message":string|null,
 //     "Model":{…}};
 //   - transaction statuses are AwaitingAuthentication / Authorized / Completed /
