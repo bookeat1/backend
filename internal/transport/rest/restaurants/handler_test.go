@@ -28,7 +28,11 @@ type fakeFacade struct {
 	gotVenueFilter domain.VenueStateFilter
 	gotFilter      domain.RestaurantFilter
 	gotSearch      domain.RestaurantSearchFilter
-	err            error
+	// gotUpdate is the SaveInput the last Update call actually received — what
+	// a test asserts on to prove the handler's authorization gate stripped (or
+	// let through) a superadmin-only field before it ever reached the facade.
+	gotUpdate uc.SaveInput
+	err       error
 }
 
 func (f *fakeFacade) List(_ context.Context, flt domain.RestaurantFilter, vs domain.VenueStateFilter) ([]domain.RestaurantListItem, int, error) {
@@ -54,8 +58,15 @@ func (f *fakeFacade) Categories(context.Context) ([]domain.RestaurantCategory, e
 func (f *fakeFacade) Create(context.Context, uc.SaveInput) (*domain.RestaurantAggregate, error) {
 	return nil, domain.ErrForbidden
 }
-func (f *fakeFacade) Update(context.Context, uuid.UUID, uc.SaveInput) (*domain.RestaurantAggregate, error) {
-	return nil, domain.ErrForbidden
+func (f *fakeFacade) Update(_ context.Context, _ uuid.UUID, in uc.SaveInput) (*domain.RestaurantAggregate, error) {
+	f.gotUpdate = in
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.agg == nil {
+		return nil, domain.ErrForbidden
+	}
+	return f.agg, nil
 }
 func (f *fakeFacade) SetActive(context.Context, uuid.UUID, bool) error             { return nil }
 func (f *fakeFacade) SubmitPartnership(context.Context, uc.PartnershipInput) error { return nil }
