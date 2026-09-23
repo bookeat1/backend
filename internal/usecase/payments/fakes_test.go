@@ -898,6 +898,12 @@ type fakeGateway struct {
 
 	name domain.PaymentProvider
 
+	// oneStage, when non-nil, makes this fake implement oneStagePurpose
+	// (webhook.go) — a stand-in for TipTopPay's RequireConfirmation=false path.
+	// nil (the default for every existing test) means the fake behaves like an
+	// ordinary two-stage acquirer, i.e. it does NOT implement oneStagePurpose.
+	oneStage func(domain.PaymentPurpose) bool
+
 	// authorizeDelay forces concurrent callers to actually overlap inside
 	// Authorize instead of one goroutine racing to completion before the next
 	// one even starts — a real acquirer's network round-trip does this for
@@ -1035,6 +1041,17 @@ func (f *fakeGateway) VerifyWebhook(raw []byte, headers map[string]string) (*dom
 }
 
 func (f *fakeGateway) Name() domain.PaymentProvider { return f.name }
+
+// SettlesImmediately makes fakeGateway satisfy oneStagePurpose (webhook.go)
+// whenever a test sets oneStage — every other test leaves it nil and gets
+// `false`, i.e. an ordinary two-stage acquirer, unchanged from before this
+// method existed.
+func (f *fakeGateway) SettlesImmediately(purpose domain.PaymentPurpose) bool {
+	if f.oneStage == nil {
+		return false
+	}
+	return f.oneStage(purpose)
+}
 
 func (f *fakeGateway) callCount(op string) int {
 	f.mu.Lock()

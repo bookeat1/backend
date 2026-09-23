@@ -13,6 +13,7 @@ func TestValidatePaymentTransition(t *testing.T) {
 		want error
 	}{
 		{"created → authorized", PaymentCreated, PaymentAuthorized, nil},
+		{"created → captured (one-stage acquirer charge, e.g. TipTopPay preorder)", PaymentCreated, PaymentCaptured, nil},
 		{"created → failed", PaymentCreated, PaymentFailed, nil},
 		{"created → expired (checkout abandoned)", PaymentCreated, PaymentExpired, nil},
 		{"authorized → captured", PaymentAuthorized, PaymentCaptured, nil},
@@ -30,7 +31,6 @@ func TestValidatePaymentTransition(t *testing.T) {
 		{"partially_refunded → refunded", PaymentPartiallyRefunded, PaymentRefunded, nil},
 
 		// Money that was never taken cannot be given back.
-		{"created → captured skips the hold", PaymentCreated, PaymentCaptured, ErrInvalidStatus},
 		{"created → voided", PaymentCreated, PaymentVoided, ErrInvalidStatus},
 		{"created → refunded", PaymentCreated, PaymentRefunded, ErrInvalidStatus},
 		{"authorized → refunded", PaymentAuthorized, PaymentRefunded, ErrInvalidStatus},

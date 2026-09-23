@@ -59,6 +59,19 @@ func New(cfg Config, client *payment.Client, log *slog.Logger) (*Gateway, error)
 // Name reports the provider code this adapter serves.
 func (g *Gateway) Name() domain.PaymentProvider { return domain.ProviderTipTopPay }
 
+// SettlesImmediately reports whether Authorize, for this purpose, settles the
+// charge in ONE stage (RequireConfirmation=false — no hold ever exists to
+// convert) rather than the ordinary two-stage hold. It is the OPTIONAL
+// capability usecase/payments.applyCaptured type-asserts for before ever
+// accepting a `captured` webhook against a payment still `created`: without
+// it, that would be indistinguishable from an out-of-order delivery (the
+// `authorized` notification lost or delayed) on a genuinely two-stage
+// acquirer. Kept in exact lockstep with Authorize's own RequireConfirmation
+// decision — see there for why.
+func (g *Gateway) SettlesImmediately(purpose domain.PaymentPurpose) bool {
+	return purpose.CapturesImmediately()
+}
+
 // ---------------------------------------------------------------------------
 // domain.PaymentGateway
 // ---------------------------------------------------------------------------
@@ -86,13 +99,28 @@ type createOrderRequest struct {
 	Splits []splitEntry `json:"Splits,omitempty"`
 }
 
-// Authorize creates a hosted payment page with RequireConfirmation=true, i.e.
-// a two-stage payment: the guest's funds are held, not taken (spec §2).
+// Authorize creates a hosted payment page.
+//
+// RequireConfirmation depends on what the guest is paying for
+// (domain.PaymentPurpose.CapturesImmediately):
+//
+//   - a DEPOSIT stays a two-stage hold (RequireConfirmation=true): the guest's
+//     funds are blocked, not taken, and are only captured later if the
+//     cancellation policy forfeits them (spec §2 as originally written);
+//   - a PRE-ORDER or TICKET is charged in one stage (RequireConfirmation=false,
+//     owner decision 2026-09-23): the kitchen starts on a pre-order the moment
+//     payment succeeds, so an uncaptured 96-hour hold that might never be
+//     confirmed is exactly the risk this avoids — food gets prepared with no
+//     guarantee of payment, or a guest's card stays blocked for days over a
+//     dish that was never served. TipTopPay settles the charge in the SAME
+//     step the guest completes 3-D Secure; the `pay` notification that follows
+//     already carries Status=Completed (see mapping.go's mapNotification and
+//     domain.PaymentCreated's captured transition).
 //
 // It returns the ORDER id in ProviderPaymentID and PaymentCreated as the
-// status: at this point nobody has paid anything. The hold materialises later,
-// announced by the `pay` notification — see the package doc on the two
-// identifiers.
+// status regardless of which mode was used: at this point nobody has paid
+// anything, one-stage or not. The outcome materialises later, announced by the
+// `pay` notification — see the package doc on the two identifiers.
 //
 // req.CallbackURL is intentionally not sent: TipTopPay resolves notification
 // endpoints per terminal (configured in the dashboard or via
@@ -115,7 +143,7 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 		Email:               req.CustomerEmail,
 		Phone:               req.CustomerPhone,
 		InvoiceID:           req.PaymentID.String(),
-		RequireConfirmation: true,
+		RequireConfirmation: !req.Purpose.CapturesImmediately(),
 		JSONData:            metadata(req),
 		Splits:              splits,
 	}

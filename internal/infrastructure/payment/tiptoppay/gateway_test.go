@@ -125,7 +125,7 @@ func authorizeRequest() domain.AuthorizeRequest {
 
 // ---------------------------------------------------------------------------
 
-func TestAuthorizeCreatesATwoStageOrder(t *testing.T) {
+func TestAuthorizeCreatesATwoStageOrderForADeposit(t *testing.T) {
 	f := newFakeAcquirer(t, func(path string, _ int, _ map[string]any, w http.ResponseWriter) {
 		if path != "/orders/create" {
 			t.Errorf("unexpected path %s", path)
@@ -163,7 +163,7 @@ func TestAuthorizeCreatesATwoStageOrder(t *testing.T) {
 		t.Errorf("authorization header not sent as HTTP Basic")
 	}
 	if sent.Body["RequireConfirmation"] != true {
-		t.Error("RequireConfirmation must be true — the two-stage flow is mandatory")
+		t.Error("RequireConfirmation must be true for a deposit — it stays a two-stage hold")
 	}
 	// Money must travel as an exact decimal, never as a float literal.
 	if sent.Body["Amount"] != 10350.0 {
@@ -171,6 +171,50 @@ func TestAuthorizeCreatesATwoStageOrder(t *testing.T) {
 	}
 	if sent.Body["InvoiceId"] != req.PaymentID.String() {
 		t.Errorf("InvoiceId = %v, want our payment id", sent.Body["InvoiceId"])
+	}
+}
+
+// TestAuthorizeChargesAPreorderImmediately is the owner decision (2026-09-23):
+// a pre-order must not sit as an uncaptured hold while the kitchen starts
+// cooking, so TipTopPay is told to settle it in one stage.
+func TestAuthorizeChargesAPreorderImmediately(t *testing.T) {
+	f := newFakeAcquirer(t, func(path string, _ int, _ map[string]any, w http.ResponseWriter) {
+		if path != "/orders/create" {
+			t.Errorf("unexpected path %s", path)
+		}
+		ok(w, `{"Id":"gASGZVgUN21hcpPF","Number":2130,"Currency":"KZT","Url":"https://orders.tiptoppay.kz/d/gASGZVgUN21hcpPF","Status":"Created","StatusCode":0}`)
+	})
+	g := f.gateway(t, nil)
+
+	req := authorizeRequest()
+	req.Purpose = domain.PurposePreorder
+	if _, err := g.Authorize(context.Background(), req); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+
+	sent := f.seen()[0]
+	if sent.Body["RequireConfirmation"] != false {
+		t.Error("RequireConfirmation must be false for a pre-order — it is charged in one stage")
+	}
+}
+
+// TestAuthorizeChargesATicketImmediately mirrors the pre-order case for the
+// other purpose that CapturesImmediately.
+func TestAuthorizeChargesATicketImmediately(t *testing.T) {
+	f := newFakeAcquirer(t, func(path string, _ int, _ map[string]any, w http.ResponseWriter) {
+		ok(w, `{"Id":"gASGZVgUN21hcpPF","Number":2130,"Currency":"KZT","Url":"https://orders.tiptoppay.kz/d/gASGZVgUN21hcpPF","Status":"Created","StatusCode":0}`)
+	})
+	g := f.gateway(t, nil)
+
+	req := authorizeRequest()
+	req.Purpose = domain.PurposeTicket
+	if _, err := g.Authorize(context.Background(), req); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+
+	sent := f.seen()[0]
+	if sent.Body["RequireConfirmation"] != false {
+		t.Error("RequireConfirmation must be false for a ticket — it is charged in one stage")
 	}
 }
 
