@@ -368,5 +368,71 @@ func TestSubmitPartnershipValidates(t *testing.T) {
 	}
 }
 
+// --- KwaakaRestaurantID: the only non-SQL way to link/unlink a venue's POS
+// aggregator (see SaveInput's doc comment) ---
+
+// TestUpdateSetsKwaakaRestaurantID proves a PATCH with a non-empty value links
+// the venue, trimmed of surrounding whitespace.
+func TestUpdateSetsKwaakaRestaurantID(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+		ID: id, Name: "Old", City: domain.CityAlmaty, PriceCategory: domain.PriceLow,
+	}}}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), id, SaveInput{KwaakaRestaurantID: strp("  kw-42  ")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got == nil || got.KwaakaRestaurantID == nil || *got.KwaakaRestaurantID != "kw-42" {
+		t.Errorf("KwaakaRestaurantID = %v, want \"kw-42\" (trimmed)", got.KwaakaRestaurantID)
+	}
+}
+
+// TestUpdateClearsKwaakaRestaurantIDOnEmptyString proves an explicit empty
+// string unlinks the venue (drops it out of
+// usecase/kwaakasync.RestaurantSource without a hand-run SQL UPDATE).
+func TestUpdateClearsKwaakaRestaurantIDOnEmptyString(t *testing.T) {
+	id := uuid.New()
+	kwaaka := "kw-42"
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+		ID: id, Name: "Old", City: domain.CityAlmaty, PriceCategory: domain.PriceLow,
+		KwaakaRestaurantID: &kwaaka,
+	}}}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), id, SaveInput{KwaakaRestaurantID: strp("")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got == nil || got.KwaakaRestaurantID != nil {
+		t.Errorf("KwaakaRestaurantID = %v, want nil (cleared)", got.KwaakaRestaurantID)
+	}
+}
+
+// TestUpdatePreservesKwaakaRestaurantIDWhenOmitted proves omitting the field
+// entirely (nil, not empty string) leaves the stored link untouched — the same
+// read-modify-write rule every other scalar in SaveInput follows.
+func TestUpdatePreservesKwaakaRestaurantIDWhenOmitted(t *testing.T) {
+	id := uuid.New()
+	kwaaka := "kw-42"
+	repo := &fakeRestaurantRepo{agg: &domain.RestaurantAggregate{Restaurant: domain.Restaurant{
+		ID: id, Name: "Old", City: domain.CityAlmaty, PriceCategory: domain.PriceLow,
+		KwaakaRestaurantID: &kwaaka,
+	}}}
+	f := NewFacade(repo, &fakeRelated{}, &fakeCategories{}, &fakePartners{}, &inlineTx{})
+
+	_, err := f.Update(context.Background(), id, SaveInput{Name: strp("New name")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := repo.updated
+	if got == nil || got.KwaakaRestaurantID == nil || *got.KwaakaRestaurantID != "kw-42" {
+		t.Errorf("KwaakaRestaurantID = %v, want it preserved (\"kw-42\")", got.KwaakaRestaurantID)
+	}
+}
+
 // Manager/staff-role tests moved to managers_test.go (RBAC is a big enough
 // surface to deserve its own file, separate from the catalog facade above).
