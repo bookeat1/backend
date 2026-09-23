@@ -66,7 +66,8 @@ const (
 // present with an empty set is valid but terminal.
 //
 //	created ──authorize──▶ authorized ──capture──▶ capturing ──▶ captured
-//	   │                       │                                    │
+//	   │  │                    │                                    │
+//	   │  └──charge(1-stage)───────────────────────────────────────▶│
 //	   │                       ├──void──▶ voiding ──▶ voided        ├──refund(part)──▶ partially_refunded
 //	   │                       ├──expire──▶ expired                 └──refund(full)──▶ refunded
 //	   └──fail──▶ failed       └──fail──▶ failed      partially_refunded ──▶ refunded
@@ -78,6 +79,16 @@ const (
 //     capturing/voiding claim) exist because a webhook may report the
 //     acquirer's own outcome directly, without ever going through this
 //     usecase's local claim;
+//   - created → captured (skipping authorized/capturing entirely) exists for a
+//     one-stage acquirer charge: TipTopPay's RequireConfirmation=false for a
+//     purpose that PaymentPurpose.CapturesImmediately() (a pre-order, so the
+//     kitchen never starts on an uncertain hold) settles the payment in the
+//     SAME step the guest completes 3-D Secure, and the single `pay`
+//     notification that follows already carries Status=Completed — there is no
+//     intermediate `authorized` state to pass through. A lost booking-level
+//     race on THIS transition (webhook.go's compensateLostRaceCaptured) must
+//     REFUND, never void: unlike the two-stage path, the money has already
+//     been taken by the time the CAS is attempted;
 //   - a second partial refund does NOT change the status, so it is not a
 //     transition at all — the usecase only calls ValidatePaymentTransition when
 //     the status actually changes;
@@ -87,6 +98,7 @@ const (
 var paymentTransitions = map[PaymentStatus]map[PaymentStatus]struct{}{
 	PaymentCreated: {
 		PaymentAuthorized: {},
+		PaymentCaptured:   {}, // one-stage acquirer charge, see the doc above
 		PaymentFailed:     {},
 		PaymentExpired:    {},
 	},

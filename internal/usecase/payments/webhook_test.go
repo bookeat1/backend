@@ -304,6 +304,180 @@ func TestHandleWebhook_ConcurrentAuthorizeRaceCompensatesTheLoser(t *testing.T) 
 	}
 }
 
+// testOneStagePayment is testPayment's counterpart for a one-stage acquirer
+// charge (TipTopPay, RequireConfirmation=false): a pre-order, so
+// PaymentPurpose.CapturesImmediately() is true and the ONLY thing standing
+// between `created` and `captured` is the acquirer's own single settlement,
+// never a local hold.
+func testOneStagePayment(bookingID uuid.UUID, status domain.PaymentStatus, providerPaymentID string) *domain.Payment {
+	p := testPayment(bookingID, status, providerPaymentID)
+	p.Provider = domain.ProviderTipTopPay
+	p.Purpose = domain.PurposePreorder
+	return p
+}
+
+func newOneStageGateway() *fakeGateway {
+	gw := newFakeGateway(domain.ProviderTipTopPay)
+	gw.oneStage = func(domain.PaymentPurpose) bool { return true }
+	return gw
+}
+
+// TestHandleWebhook_OneStageAcquirerCapturesDirectlyFromCreated is the owner
+// decision (2026-09-23): a pre-order paid through TipTopPay with
+// RequireConfirmation=false settles in ONE stage, so its single `pay`
+// notification carries Status=Completed and the payment goes straight from
+// `created` to `captured` — there never was a hold to convert. See
+// domain.PaymentCreated's transition table entry and webhook.go's
+// oneStagePurpose.
+func TestHandleWebhook_OneStageAcquirerCapturesDirectlyFromCreated(t *testing.T) {
+	p := testOneStagePayment(uuid.New(), domain.PaymentCreated, "txn-1")
+	repo := newFakePaymentRepo(p)
+	events := newFakeEventRepo()
+	ledger := newFakeLedgerRepo()
+	outbox := newFakePaymentOutbox()
+	gw := newOneStageGateway()
+	resolver := newFakeGatewayResolver(gw)
+	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox}
+	u := NewWebhookUseCase(repo, events, ledger, outbox, resolver, tx).(*webhookUseCase)
+
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderTipTopPay, ProviderEventID: "evt-1", ProviderPaymentID: "txn-1",
+		Type: domain.WebhookPaymentCaptured, Status: domain.PaymentCaptured,
+		Amount: domain.Money{AmountMinor: p.AmountMinor, Currency: p.Currency}, SignatureValid: true,
+	})
+
+	if err := u.HandleWebhook(context.Background(), domain.ProviderTipTopPay, []byte("body"), nil); err != nil {
+		t.Fatalf("HandleWebhook() error = %v", err)
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentCaptured {
+		t.Fatalf("status = %s, want captured", stored.Status)
+	}
+	if stored.CapturedAt == nil {
+		t.Fatalf("CapturedAt not set")
+	}
+	if len(ledger.entries) == 0 {
+		t.Fatalf("no ledger entries booked for the one-stage capture")
+	}
+	found := false
+	for _, ty := range outbox.types() {
+		if ty == domain.EventPaymentCaptured {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("outbox events = %v, want payment.captured", outbox.types())
+	}
+}
+
+// TestHandleWebhook_TwoStageAcquirerCapturedFromCreatedIsOutOfOrder guards the
+// opposite: an ORDINARY two-stage acquirer (the fakeGateway default — no
+// oneStage configured) must NOT accept `captured` while the payment is still
+// `created`, even though the state machine now allows the transition in the
+// abstract. Report item #14's scenario (the `authorized` notification lost or
+// delivered late) must keep failing loudly, not be silently reinterpreted as a
+// one-stage settlement just because one now exists for a different acquirer.
+func TestHandleWebhook_TwoStageAcquirerCapturedFromCreatedIsOutOfOrder(t *testing.T) {
+	p := testPayment(uuid.New(), domain.PaymentCreated, "gw-1")
+	u, repo, _, _, outbox, gw := newWebhookHarness(p)
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-1", ProviderPaymentID: "gw-1",
+		Type: domain.WebhookPaymentCaptured, Status: domain.PaymentCaptured, SignatureValid: true,
+	})
+
+	err := u.HandleWebhook(context.Background(), domain.ProviderFreedomPay, []byte("body"), nil)
+	if !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("error = %v, want ErrInvalidStatus (out-of-order, not a one-stage settlement)", err)
+	}
+	stored, _ := repo.GetByID(context.Background(), p.ID)
+	if stored.Status != domain.PaymentCreated {
+		t.Fatalf("status = %s, want unchanged created", stored.Status)
+	}
+	if len(outbox.types()) != 0 {
+		t.Fatalf("outbox got %d events from a rejected out-of-order capture, want 0", len(outbox.types()))
+	}
+}
+
+// TestHandleWebhook_ConcurrentOneStageCaptureRaceRefundsTheLoser is
+// TestHandleWebhook_ConcurrentAuthorizeRaceCompensatesTheLoser's counterpart
+// for a one-stage acquirer: two payments for the SAME booking both settle
+// directly from `created` to `captured`. Only one may become the booking's
+// live payment (idx_payments_live_per_booking); the loser's money was
+// ALREADY taken by the acquirer (unlike a hold), so it must be REFUNDED, never
+// voided.
+func TestHandleWebhook_ConcurrentOneStageCaptureRaceRefundsTheLoser(t *testing.T) {
+	bookingID := uuid.New()
+	p1 := testOneStagePayment(bookingID, domain.PaymentCreated, "txn-1")
+	p2 := testOneStagePayment(bookingID, domain.PaymentCreated, "txn-2")
+	repo := newFakePaymentRepo(p1, p2)
+	events := newFakeEventRepo()
+	ledger := newFakeLedgerRepo()
+	outbox := newFakePaymentOutbox()
+	gw := newOneStageGateway()
+	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox}
+
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	errs := make([]error, 2)
+	pairs := []struct {
+		id, evt, ppid string
+	}{{p1.ID.String(), "evt-1", "txn-1"}, {p2.ID.String(), "evt-2", "txn-2"}}
+
+	for i, pr := range pairs {
+		wg.Add(1)
+		go func(i int, providerEventID, providerPaymentID string) {
+			defer wg.Done()
+			start.Wait()
+			ev := &domain.WebhookEvent{
+				Provider: domain.ProviderTipTopPay, ProviderEventID: providerEventID,
+				ProviderPaymentID: providerPaymentID, Type: domain.WebhookPaymentCaptured,
+				Status: domain.PaymentCaptured, Amount: domain.Money{AmountMinor: 1_035_000, Currency: domain.CurrencyKZT},
+				SignatureValid: true,
+			}
+			resolver := &fakeGatewayResolver{byProvider: map[domain.PaymentProvider]domain.PaymentGateway{domain.ProviderTipTopPay: &fakeGatewayView{base: gw, verify: verifyOK(ev)}}}
+			uu := NewWebhookUseCase(repo, events, ledger, outbox, resolver, tx).(*webhookUseCase)
+			errs[i] = uu.HandleWebhook(context.Background(), domain.ProviderTipTopPay, []byte(providerEventID), nil)
+		}(i, pr.evt, pr.ppid)
+	}
+	start.Done()
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d error = %v", i, err)
+		}
+	}
+
+	got1, _ := repo.GetByID(context.Background(), p1.ID)
+	got2, _ := repo.GetByID(context.Background(), p2.ID)
+	statuses := map[domain.PaymentStatus]int{got1.Status: 1, got2.Status: 1}
+	if statuses[domain.PaymentCaptured] != 1 {
+		t.Fatalf("want exactly one payment captured, got p1=%s p2=%s", got1.Status, got2.Status)
+	}
+	if statuses[domain.PaymentFailed] != 1 {
+		t.Fatalf("want exactly one payment failed (refunded), got p1=%s p2=%s", got1.Status, got2.Status)
+	}
+	if gw.callCount("refund") != 1 {
+		t.Fatalf("refund called %d times, want exactly 1 (only the loser's charge returned)", gw.callCount("refund"))
+	}
+	if gw.callCount("void") != 0 {
+		t.Fatalf("void called %d times, want 0 — the loser's money was already taken, not held", gw.callCount("void"))
+	}
+	failedCount, capturedCount := 0, 0
+	for _, ty := range outbox.types() {
+		switch ty {
+		case domain.EventPaymentFailed:
+			failedCount++
+		case domain.EventPaymentCaptured:
+			capturedCount++
+		}
+	}
+	if failedCount != 1 || capturedCount != 1 {
+		t.Fatalf("outbox events = %v, want exactly one captured and one failed", outbox.types())
+	}
+}
+
 // fakeGatewayView lets two concurrent HandleWebhook calls share the same
 // underlying fakeGateway (so Void call counts are observed on one place)
 // while each carries its own VerifyWebhook behaviour.
@@ -321,6 +495,9 @@ func (v *fakeGatewayView) Capture(ctx context.Context, id string, amount domain.
 func (v *fakeGatewayView) Void(ctx context.Context, id string) error { return v.base.Void(ctx, id) }
 func (v *fakeGatewayView) Refund(ctx context.Context, id string, amount domain.Money) (*domain.GatewayRefund, error) {
 	return v.base.Refund(ctx, id, amount)
+}
+func (v *fakeGatewayView) SettlesImmediately(purpose domain.PaymentPurpose) bool {
+	return v.base.SettlesImmediately(purpose)
 }
 func (v *fakeGatewayView) Get(ctx context.Context, id string) (*domain.GatewayPayment, error) {
 	return v.base.Get(ctx, id)
