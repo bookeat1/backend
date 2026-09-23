@@ -122,6 +122,7 @@ func (h *Handler) adminList(c *gin.Context) {
 	for _, it := range items {
 		resp := listItemToResponse(it, lang)
 		attachKwaakaRestaurantID(&resp, it.Restaurant)
+		attachFreeCancelWindowMinutes(&resp, it.Restaurant)
 		out = append(out, resp)
 	}
 	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
@@ -406,6 +407,7 @@ func (h *Handler) adminGet(c *gin.Context) {
 	}
 	resp := aggregateToResponse(agg, "", h.bookingRules)
 	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
 	response.OK(c.Writer, resp)
 }
 
@@ -493,6 +495,7 @@ func (h *Handler) create(c *gin.Context) {
 	// scalar fields and post it as the next value of the column.
 	resp := aggregateToResponse(agg, "", h.bookingRules)
 	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
 	response.Created(c.Writer, resp)
 }
 
@@ -537,6 +540,7 @@ func (h *Handler) update(c *gin.Context) {
 	// previously-stored value, exactly like is_premium/display_order already
 	// are on this same read.
 	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
 	response.OK(c.Writer, resp)
 }
 
