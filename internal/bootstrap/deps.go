@@ -1465,6 +1465,17 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
+	// The platform zone a venue's booking time is rendered in when the venue
+	// stores none of its own — the SAME fallback bookings and payouts use, so a
+	// venue's day means one thing across the system. An unusable platform value
+	// degrades to UTC here rather than crashing the worker: this is the wording
+	// of a message, not a payout boundary.
+	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("platform timezone fallback is unusable, guest and whatsapp notifications will render times in UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		waFallbackZone = time.UTC
+	}
 	notifVenues := notificationrepo.NewVenues(db)
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
@@ -1474,6 +1485,8 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		notifVenues,
 		notifVenues, // same reader, also implements the booking-rules footer's port
 		newBookingRulesDefaults(cfg),
+		notifVenues, // also implements the venue timezone port
+		waFallbackZone,
 		guestSender,
 		guestSender != nil,
 		log,
@@ -1485,7 +1498,9 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	// table's own unique key, not the delivery ledger.
 	feedNotifier := notifications.NewFeedNotifier(
 		notificationrepo.NewFeed(db),
-		notificationrepo.NewVenues(db),
+		notifVenues,
+		notifVenues,
+		waFallbackZone,
 		log,
 	)
 
@@ -1519,17 +1534,6 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		log.Warn("whatsapp venue alerts not configured (no access token / phone number id) — the channel will no-op")
 	default:
 		waSender = whatsapp.NewSender(waCfg).Send
-	}
-	// The platform zone a venue's booking time is rendered in when the venue
-	// stores none of its own — the SAME fallback bookings and payouts use, so a
-	// venue's day means one thing across the system. An unusable platform value
-	// degrades to UTC here rather than crashing the worker: this is the wording
-	// of a message, not a payout boundary.
-	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
-	if err != nil {
-		log.Error("platform timezone fallback is unusable, whatsapp alerts will render times in UTC",
-			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
-		waFallbackZone = time.UTC
 	}
 	whatsAppNotifier := notifications.NewWhatsAppNotifier(
 		restrepo.NewManagers(db),

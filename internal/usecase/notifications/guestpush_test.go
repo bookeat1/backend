@@ -49,7 +49,7 @@ func newGuestHarness(t *testing.T, tokens ...domain.DevicePushToken) *guestHarne
 	h.n = NewGuestPushNotifier(h.tokens, h.deliv, h.tickets,
 		NewGuestNotificationGate(h.prefs), fakeVenues{name: "Ocean Basket"},
 		fakeVenues{name: "Ocean Basket"}, testBookingRulesDefaults,
-		h.sender.send, true, discardLog())
+		fakeVenues{}, nil, h.sender.send, true, discardLog())
 	return h
 }
 
@@ -226,7 +226,7 @@ func TestGuestPushDisabledIsNoop(t *testing.T) {
 	n := NewGuestPushNotifier(newFakeDeviceTokens(guestToken(uid)), newFakeDeliveries(),
 		newFakePushTickets(), NewGuestNotificationGate(newFakeGuestPrefs()),
 		fakeVenues{name: "Ocean Basket"}, fakeVenues{name: "Ocean Basket"}, testBookingRulesDefaults,
-		sender.send, false, discardLog())
+		fakeVenues{}, nil, sender.send, false, discardLog())
 
 	if err := n.Notify(context.Background(), guestEvent(uid, domain.EventBookingConfirmed)); err != nil {
 		t.Fatalf("notify: %v", err)
@@ -261,7 +261,7 @@ func TestGuestPushInterestedEvents(t *testing.T) {
 // phone number or the device token.
 func TestGuestMessageContentIsMinimal(t *testing.T) {
 	e := guestEvent(uuid.New(), domain.EventBookingReminder)
-	msg, ok := buildGuestMessage(e, "Ocean Basket", "")
+	msg, ok := buildGuestMessage(e, "Ocean Basket", "", time.UTC)
 	if !ok {
 		t.Fatal("no template for booking.reminder")
 	}
@@ -403,7 +403,7 @@ func TestBookingRulesFooterOnConfirmed(t *testing.T) {
 		log:           discardLog(),
 	}
 	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
-	footer := n.bookingRulesFooter(context.Background(), e)
+	footer := n.bookingRulesFooter(context.Background(), e, time.UTC)
 	if !strings.Contains(footer, "25 мин") {
 		t.Errorf("footer %q must name the venue's own hold time (25), not the platform default", footer)
 	}
@@ -426,7 +426,7 @@ func TestBookingRulesFooterOnReminder(t *testing.T) {
 		log:           discardLog(),
 	}
 	e := guestEvent(uuid.New(), domain.EventBookingReminder)
-	footer := n.bookingRulesFooter(context.Background(), e)
+	footer := n.bookingRulesFooter(context.Background(), e, time.UTC)
 	if !strings.Contains(footer, "10 мин") {
 		t.Errorf("footer %q must name the venue's own hold time", footer)
 	}
@@ -439,7 +439,7 @@ func TestBookingRulesFooterOnReminder(t *testing.T) {
 func TestBookingRulesFooterOmittedOnCancelled(t *testing.T) {
 	n := &GuestPushNotifier{rules: fakeVenues{}, rulesDefaults: testBookingRulesDefaults, log: discardLog()}
 	e := guestEvent(uuid.New(), domain.EventBookingCancelled)
-	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+	if footer := n.bookingRulesFooter(context.Background(), e, time.UTC); footer != "" {
 		t.Errorf("footer = %q, want empty for booking.cancelled", footer)
 	}
 }
@@ -453,7 +453,7 @@ func TestBookingRulesFooterSwallowsReaderError(t *testing.T) {
 		log:           discardLog(),
 	}
 	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
-	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+	if footer := n.bookingRulesFooter(context.Background(), e, time.UTC); footer != "" {
 		t.Errorf("footer = %q, want empty when the reader errors", footer)
 	}
 }
@@ -463,7 +463,7 @@ func TestBookingRulesFooterSwallowsReaderError(t *testing.T) {
 func TestBookingRulesFooterNilReaderIsNoop(t *testing.T) {
 	n := &GuestPushNotifier{log: discardLog()}
 	e := guestEvent(uuid.New(), domain.EventBookingConfirmed)
-	if footer := n.bookingRulesFooter(context.Background(), e); footer != "" {
+	if footer := n.bookingRulesFooter(context.Background(), e, time.UTC); footer != "" {
 		t.Errorf("footer = %q, want empty with no rules reader wired", footer)
 	}
 }
