@@ -256,12 +256,16 @@ func (f *facade) ListMine(ctx context.Context, actor Actor, flt domain.BookingFi
 // ListByRestaurant is the venue calendar: managers of that restaurant and
 // admins only. The restaurant filter is pinned to the route parameter.
 func (f *facade) ListByRestaurant(ctx context.Context, actor Actor, restaurantID uuid.UUID, flt domain.BookingFilter) ([]domain.Booking, int, error) {
-	if _, err := requireStaff(ctx, f.managers, actor, restaurantID); err != nil {
+	acc, err := requireStaff(ctx, f.managers, actor, restaurantID)
+	if err != nil {
 		return nil, 0, err
 	}
 	if err := validateFilter(flt); err != nil {
 		return nil, 0, err
 	}
+	// A booking behind an unpaid pre-order is not the venue's yet; only the
+	// platform admin sees it (flagged awaiting_preorder_payment in the response).
+	flt.HideUnreleased = !acc.admin
 	rid := restaurantID
 	flt.RestaurantID = &rid
 	flt.UserID = nil
@@ -398,6 +402,9 @@ func (f *facade) load(ctx context.Context, actor Actor, id uuid.UUID) (*domain.B
 	acc, err := authorize(ctx, f.managers, actor, b)
 	if err != nil {
 		return nil, access{}, err
+	}
+	if b.AwaitingPreorderPayment() && acc.manager && !acc.admin && !acc.owner {
+		return nil, access{}, fmt.Errorf("%w: booking", domain.ErrNotFound)
 	}
 	return b, acc, nil
 }

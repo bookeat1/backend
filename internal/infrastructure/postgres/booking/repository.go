@@ -150,6 +150,9 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 	if f.PromotionID != nil {
 		add("promotion_id = $%d", *f.PromotionID)
 	}
+	if f.HideUnreleased {
+		where = append(where, "released_to_venue_at IS NOT NULL")
+	}
 	if len(f.Statuses) > 0 {
 		add("status = ANY($%d)", statusStrings(f.Statuses))
 	}

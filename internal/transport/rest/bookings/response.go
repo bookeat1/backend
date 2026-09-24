@@ -41,6 +41,9 @@ type bookingResponse struct {
 	CancellationReason     *string    `json:"cancellation_reason"`
 	CreatedAt              time.Time  `json:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at"`
+	// AwaitingPreorderPayment is true while the booking is hidden from the venue
+	// because the pre-order payment is not authorized yet. Additive.
+	AwaitingPreorderPayment bool `json:"awaiting_preorder_payment"`
 }
 
 type bookingDetailsResponse struct {
@@ -190,6 +193,7 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 		CancelledBy: cancelledBy, CancellationReasonCode: b.CancellationReasonCode,
 		CancellationReason: b.CancellationReason,
 		CreatedAt:          b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		AwaitingPreorderPayment: b.AwaitingPreorderPayment(),
 	}
 }
 

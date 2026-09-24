@@ -297,9 +297,13 @@ type BookingFilter struct {
 	// and UserID, the facade never overwrites this: it is orthogonal to "whose
 	// bookings" and "which venue's bookings" and composes with both.
 	PromotionID *uuid.UUID
-	Statuses    []BookingStatus
-	From        *time.Time // starts_at >= From
-	To          *time.Time // starts_at <  To
+	// HideUnreleased drops bookings still hidden behind an unpaid pre-order
+	// (released_to_venue_at IS NULL). Set for every venue-facing listing; a guest
+	// listing their own bookings and the platform admin leave it false.
+	HideUnreleased bool
+	Statuses       []BookingStatus
+	From           *time.Time // starts_at >= From
+	To             *time.Time // starts_at <  To
 	// CalendarDate is "the venue's day", still unresolved: a date carries no
 	// zone, so only the usecase — which knows WHOSE calendar is being asked
 	// about — may turn it into From/To. It never reaches a repository; the
