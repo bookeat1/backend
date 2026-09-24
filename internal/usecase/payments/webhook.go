@@ -487,7 +487,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 		// The booking gate: the venue first hears about a pre-order booking in
 		// the very transaction that makes its money real. A duplicate delivery
 		// never gets here (the CAS above fails), and Release is idempotent.
-		if p.Purpose == domain.PurposePreorder && p.BookingID != uuid.Nil && u.releaser != nil {
+		if p.Purpose != domain.PurposeTicket && p.BookingID != uuid.Nil && u.releaser != nil {
 			return u.releaser.ReleaseForPayment(ctx, p.BookingID)
 		}
 		return nil

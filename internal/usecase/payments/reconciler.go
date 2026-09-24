@@ -73,6 +73,7 @@ type Reconciler struct {
 	// paid guest with no ticket (capture). Optional (WithReconcilerObserver);
 	// nil for a deploy with no ticketing wired.
 	ticketObserver PaymentSubjectObserver
+	webhookOpts    []WebhookOption
 }
 
 // ReconcilerOption configures the reconciler without breaking the positional
@@ -94,10 +95,23 @@ func WithReconcilerObserver(obs PaymentSubjectObserver) ReconcilerOption {
 // (needs ticketObserver). Both were previously nil in the two ad-hoc literals,
 // which is exactly why reconciler-driven transitions never reached the ticket.
 func (r *Reconciler) applier() *webhookUseCase {
-	return &webhookUseCase{
+	u := &webhookUseCase{
 		payments: r.payments, ledger: r.ledger, outbox: r.outbox,
 		gateways: r.gateways, tx: r.tx, ticketObserver: r.ticketObserver,
 	}
+	// The same booking-side hooks a real webhook has (late-cancel settlement,
+	// booking gate release, hold TTL): a transition found by the reconciler must
+	// hand the booking to the venue exactly as a delivered webhook would.
+	for _, o := range r.webhookOpts {
+		o(u)
+	}
+	return u
+}
+
+// WithReconcilerWebhookOptions passes webhook options through to the state
+// machine the reconciler replays lost events with.
+func WithReconcilerWebhookOptions(opts ...WebhookOption) ReconcilerOption {
+	return func(r *Reconciler) { r.webhookOpts = append(r.webhookOpts, opts...) }
 }
 
 // ReconcilerConfig is the worker's own scheduling and safety configuration,
@@ -648,6 +662,14 @@ func (r *Reconciler) reconcileLostWebhook(ctx context.Context, now time.Time, re
 // "unknown", it is confirmed correct).
 func (r *Reconciler) resolveLostWebhook(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, resp *domain.GatewayPayment, now time.Time) (bool, string, error) {
 	if resp.Status == p.Status {
+		if p.Status == domain.PaymentAuthorized && p.RequiresConfirmation {
+			// Nothing was lost at the acquirer, but a pre-order hold on an
+			// ALREADY CONFIRMED booking whose capture did not go through is
+			// finished here (a cancelled booking is voided by the same replay).
+			if err := r.applier().captureHeldPreorderIfConfirmed(ctx, p); err != nil {
+				return false, "", err
+			}
+		}
 		return true, "", nil
 	}
 	eventType, ok := eventTypeForStatus(resp.Status)

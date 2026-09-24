@@ -219,3 +219,13 @@ func resolveSettings(o domain.PaymentSettingsOverride, cfg Config) domain.Paymen
 	}
 	return s
 }
+
+// PreorderPaidOnline reports whether a venue with this override takes its
+// pre-order payment online (payments enabled AND pre-order payment required),
+// resolved against the global config exactly as the payment-create path does.
+// It gates the hidden-booking flow: a booking is only hidden behind a payment
+// the guest can actually make.
+func PreorderPaidOnline(o domain.PaymentSettingsOverride, cfg Config) bool {
+	s := resolveSettings(o, cfg.withDefaults())
+	return s.Enabled && s.PreorderPaymentRequired
+}

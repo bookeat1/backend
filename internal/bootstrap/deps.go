@@ -495,7 +495,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
-		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg)
+		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg,
+		bookings.WithPreorderGate(preorderGateAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}))
+	// The booking gate: hands a hidden pre-order booking to the venue in the
+	// same transaction as the payment's created -> authorized transition.
+	bookingReleaser := bookings.NewReleaser(bookingRepo, bookingRepo, bookingHistory, bookingOutbox, restRepo, bookingCfg)
 
 	paymentsRepo := paymentrepo.New(db)
 	paymentRefundsRepo := paymentrepo.NewRefunds(db)
@@ -549,6 +553,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		paymentGateways, txm,
 		payments.WithPaymentSubjectObserver(ticketObserver),
 		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel),
+		payments.WithBookingReleaser(bookingReleaser),
 		payments.WithHoldTTL(cfg.Payments.HoldTTL))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
@@ -633,7 +638,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
-		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
+		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}),
+		bookings.WithPreorderCapturer(preorderCapturerAdapter{uc: paymentDepositCancel}))
 
 	// Restaurant admin panel (Ф1): an RBAC-guarded orchestration over the
 	// existing building blocks. It reuses restaurantManagers for the RBAC
@@ -1075,6 +1081,58 @@ func (a depositSettlerAdapter) SettleDepositOnCancel(ctx context.Context, bookin
 	return err
 }
 
+// preorderGateAdapter answers the booking gate's question from the venue's
+// payment override and the global payments config — the same resolution the
+// payment-create path uses, so a booking is never hidden behind a payment the
+// guest cannot make.
+type preorderGateAdapter struct {
+	settings interface {
+		GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
+	}
+	cfg payments.Config
+}
+
+func (a preorderGateAdapter) PreorderPaidOnline(ctx context.Context, restaurantID uuid.UUID) (bool, error) {
+	o, err := a.settings.GetPaymentOverride(ctx, restaurantID)
+	if err != nil {
+		return false, err
+	}
+	return payments.PreorderPaidOnline(o, a.cfg), nil
+}
+
+// preorderCapturerAdapter binds payments' capture-on-confirmation to the
+// bookings status usecase (type-asserted: the constructor returns the narrower
+// DepositCancellationUseCase interface).
+type preorderCapturerAdapter struct {
+	uc payments.DepositCancellationUseCase
+}
+
+func (a preorderCapturerAdapter) CaptureOnConfirm(ctx context.Context, bookingID uuid.UUID) error {
+	c, ok := a.uc.(payments.PreorderConfirmationUseCase)
+	if !ok {
+		return nil
+	}
+	_, err := c.CaptureOnConfirm(ctx, bookingID)
+	return err
+}
+
+// preorderHoldAdapter tells the booking worker whether a booking's pre-order is
+// a live hold, from the payments repository.
+type preorderHoldAdapter struct {
+	payments domain.PaymentRepository
+}
+
+func (a preorderHoldAdapter) HasPreorderHold(ctx context.Context, bookingID uuid.UUID) (bool, error) {
+	p, err := a.payments.GetLiveByBookingID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return p.Purpose == domain.PurposePreorder && p.RequiresConfirmation && p.Status == domain.PaymentAuthorized, nil
+}
+
 // venueLocationAdapter implements usecase/bookings' venueLocationResolver: it
 // answers which zone a venue's calendar day is measured in, for the ?date=
 // filter of the venue calendar.
@@ -1175,10 +1233,12 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	restRepo := restrepo.New(db)
 	txm := sqltx.NewManager(db)
 	wcfg := bookings.WorkerConfig{
-		TickInterval: cfg.Worker.TickInterval,
-		NoShowGrace:  cfg.Worker.NoShowGrace,
-		ReminderLead: cfg.Worker.ReminderLead,
-		BatchSize:    cfg.Worker.BatchSize,
+		TickInterval:    cfg.Worker.TickInterval,
+		NoShowGrace:     cfg.Worker.NoShowGrace,
+		ReminderLead:    cfg.Worker.ReminderLead,
+		BatchSize:       cfg.Worker.BatchSize,
+		AwaitPaymentTTL: cfg.Payments.PreorderAwaitPaymentTTL,
+		ConfirmMax:      cfg.Payments.PreorderConfirmMax,
 	}
 	// The pre-visit guest reminder pass. OFF by default, and deliberately so:
 	// while the old Supabase system is still live it sends its own 60' and 30'
@@ -1208,7 +1268,8 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 			slog.String("error", gwErr.Error()))
 		return bookings.NewWorker(
 			bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
-			restRepo, txm, newBookingConfig(cfg), wcfg, log, reminders)
+			restRepo, txm, newBookingConfig(cfg), wcfg, log, reminders,
+			bookings.WithWorkerPreorderGate(bookingRepo, nil))
 	}
 	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), txm)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}
@@ -1224,7 +1285,8 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	return bookings.NewWorker(
 		bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
 		restRepo, txm, newBookingConfig(cfg), wcfg, log,
-		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}), reminders)
+		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}), reminders,
+		bookings.WithWorkerPreorderGate(bookingRepo, preorderHoldAdapter{payments: paymentsRepo}))
 }
 
 // newPaymentGateways builds the acquirer registry from whatever adapters this
@@ -1319,6 +1381,17 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 	// reaches its ticket (seat freed / ticket marked paid) instead of stranding
 	// it `pending` forever.
 	ticketObserver := tickets.NewPaymentObserver(eventticketrepo.New(db))
+	bookingRepo := bookingrepo.New(db)
+	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), sqltx.NewManager(db))
+	reconcilePaymentsRepo := paymentrepo.New(db)
+	reconcileLedger := paymentrepo.NewLedger(db)
+	reconcileOutbox := paymentrepo.NewOutbox(db)
+	reconcileRefund := payments.NewRefundUseCase(reconcilePaymentsRepo, paymentrepo.NewRefunds(db), reconcileLedger, reconcileOutbox,
+		gateways, restaurantManagers, bookingRepo,
+		cancelDeadlineAdapter{settings: restrepo.New(db), cfg: newPaymentsConfig(cfg)}, sqltx.NewManager(db), newPaymentsConfig(cfg))
+	reconcileSettler := payments.NewDepositCancellationUseCase(reconcilePaymentsRepo, reconcileLedger, reconcileOutbox,
+		gateways, restaurantManagers, bookingRepo,
+		cancelDeadlineAdapter{settings: restrepo.New(db), cfg: newPaymentsConfig(cfg)}, reconcileRefund, sqltx.NewManager(db))
 	return payments.NewReconciler(
 		paymentrepo.New(db), paymentrepo.NewRefunds(db), paymentrepo.NewLedger(db),
 		paymentrepo.NewOutbox(db), gateways, sqltx.NewManager(db),
@@ -1330,7 +1403,12 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			MaxAttempts:      cfg.PaymentsReconciler.MaxAttempts,
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
 		}, log,
-		payments.WithReconcilerObserver(ticketObserver)), nil
+		payments.WithReconcilerObserver(ticketObserver),
+		payments.WithReconcilerWebhookOptions(
+			payments.WithLateCancelSettlement(bookingRepo, reconcileSettler),
+			payments.WithBookingReleaser(bookings.NewReleaser(bookingRepo, bookingRepo,
+				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg))),
+			payments.WithHoldTTL(cfg.Payments.HoldTTL))), nil
 }
 
 // NewTicketSweeper builds the pending-ticket sweep worker: it releases seats
