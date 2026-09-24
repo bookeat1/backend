@@ -254,6 +254,20 @@ type Booking struct {
 	ReleasedToVenueAt *time.Time
 }
 
+// Cancellation reason codes written by the system for pre-order bookings
+// (owner decisions 2026-09-24). Clients branch on the code, not the text.
+const (
+	// CancelReasonPreorderPaymentNotCompleted — the pre-order was not paid
+	// within the payment window.
+	CancelReasonPreorderPaymentNotCompleted = "preorder_payment_not_completed"
+	// CancelReasonVenueNoAnswer — the venue did not answer a pre-order booking
+	// with a held payment in time; silence is never a confirmation.
+	CancelReasonVenueNoAnswer = "venue_no_answer"
+	// CancelReasonPreorderCaptureFailed — the acquirer definitively refused to
+	// take the held pre-order after the venue confirmed.
+	CancelReasonPreorderCaptureFailed = "preorder_capture_failed"
+)
+
 // AwaitingPreorderPayment reports whether the booking is still hidden from the
 // venue while its pre-order payment is outstanding.
 func (b Booking) AwaitingPreorderPayment() bool {

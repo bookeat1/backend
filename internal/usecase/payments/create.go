@@ -294,6 +294,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		Provider: provider, ProviderPaymentID: nullableStr(gwResp.ProviderPaymentID), Purpose: purpose,
 		Status: domain.PaymentCreated, AmountMinor: total.AmountMinor, BaseAmountMinor: base.AmountMinor,
 		FeeMinor: fee.AmountMinor, Currency: total.Currency, IdempotencyKey: dbKey,
+		RequiresConfirmation: requiresConfirmation(gw, purpose),
 		PaymentURL: nullableStr(gwResp.PaymentURL), ExpiresAt: &expiresAt,
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -511,4 +512,26 @@ func roundToGatewayGranularity(gw domain.PaymentGateway, base, fee, total domain
 			"%w: rounding to the acquirer's %d-minor step broke base+fee=total", domain.ErrValidation, unit)
 	}
 	return newFee, newTotal, nil
+}
+
+// onePayGateway is an OPTIONAL acquirer capability: the acquirer is one-stage
+// for every purpose (Kaspi Pay), so nothing it takes can be voided later.
+type onePayGateway interface {
+	CapturesOnPay() bool
+}
+
+// requiresConfirmation decides, ONCE, whether a payment is a two-stage hold
+// (true: capture on the venue's confirmation, void otherwise) or a one-stage
+// charge. A ticket is always one-stage; a deposit and — since the owner
+// decision of 2026-09-24 — a pre-order are holds unless the acquirer cannot
+// hold at all. The answer is stored on the payment: the webhook and every
+// settlement branch read the stored value, never the purpose.
+func requiresConfirmation(gw domain.PaymentGateway, purpose domain.PaymentPurpose) bool {
+	if purpose == domain.PurposeTicket {
+		return false
+	}
+	if g, ok := gw.(onePayGateway); ok && g.CapturesOnPay() {
+		return false
+	}
+	return true
 }

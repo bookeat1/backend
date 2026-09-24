@@ -188,6 +188,12 @@ func (u *depositCancellationUseCase) settlePreorder(ctx context.Context, p *doma
 	if p.Status == domain.PaymentRefunded || p.Status == domain.PaymentPartiallyRefunded {
 		return p, nil // already refunded — nothing more to do
 	}
+	if p.Status == domain.PaymentVoided {
+		return p, nil // already released
+	}
+	if p.Status == domain.PaymentAuthorized && p.RequiresConfirmation {
+		return u.settleHeldPreorder(ctx, p, in)
+	}
 	if p.Status != domain.PaymentCaptured {
 		// Still authorized (immediate capture pending/declined) or capturing:
 		// the money is not yet the venue's to refund. The reconciler / capture
@@ -258,5 +264,82 @@ func (u *depositCancellationUseCase) shouldCapture(ctx context.Context, p *domai
 		return !cancelledAt.Before(deadline), nil
 	default:
 		return false, fmt.Errorf("%w: unknown refund trigger %q", domain.ErrValidation, in.Trigger)
+	}
+}
+
+// settleHeldPreorder settles a pre-order that is still a HOLD (authorized, never
+// captured) when its booking closes. Owner decisions 2026-09-24:
+//
+//   - the venue never confirmed the booking (it refused, stayed silent, or the
+//     guest cancelled first): VOID, whatever the timing — it accepted nothing
+//     and the kitchen never started, so the guest is never charged;
+//   - the booking WAS confirmed but the capture had not gone through yet (an
+//     outage between confirmation and capture): the ordinary policy applies —
+//     a no-show or a guest cancelling inside the free-cancel window forfeits
+//     to the venue (capture), any other cancellation releases (void).
+func (u *depositCancellationUseCase) settleHeldPreorder(ctx context.Context, p *domain.Payment, in DepositCancelInput) (*domain.Payment, error) {
+	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	if err != nil {
+		return nil, err
+	}
+	if b.ConfirmedAt != nil {
+		forfeit, err := u.shouldCapture(ctx, p, in)
+		if err != nil {
+			return nil, err
+		}
+		if forfeit {
+			return u.capvoid.captureHold(ctx, p)
+		}
+	}
+	reason := "pre-order booking closed before the venue confirmed it"
+	if in.Reason != nil {
+		reason = *in.Reason
+	}
+	out, err := u.capvoid.voidHold(ctx, p, reason)
+	if err != nil {
+		return nil, err
+	}
+	logging.FromContext(ctx).Info("payment.preorder_hold_released",
+		slog.String("payment_id", p.ID.String()),
+		slog.String("booking_id", p.BookingID.String()),
+		slog.String("trigger", string(in.Trigger)))
+	return out, nil
+}
+
+// PreorderConfirmationUseCase takes the money of a pre-order HOLD when the
+// venue confirms the booking (owner decision 2026-09-24: no partial capture —
+// the whole hold is taken or the booking is refused and the hold voided).
+type PreorderConfirmationUseCase interface {
+	// CaptureOnConfirm captures the booking's pre-order hold in full. It is a
+	// no-op (nil, nil) for a booking with no pre-order hold, and idempotent: an
+	// already captured payment is returned as is, and two concurrent callers
+	// (cabinet + Telegram) race on one authorized -> capturing CAS, so exactly
+	// one /payments/confirm call is ever made.
+	//
+	// domain.ErrProviderDeclined means the acquirer definitively refused (the
+	// hold expired or was released by the bank): the caller cancels the
+	// booking. Any other error leaves the outcome open for the reconciler.
+	CaptureOnConfirm(ctx context.Context, bookingID uuid.UUID) (*domain.Payment, error)
+}
+
+// CaptureOnConfirm implements PreorderConfirmationUseCase.
+func (u *depositCancellationUseCase) CaptureOnConfirm(ctx context.Context, bookingID uuid.UUID) (*domain.Payment, error) {
+	p, err := u.payments.GetLiveByBookingID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if p.Purpose != domain.PurposePreorder || !p.RequiresConfirmation {
+		return nil, nil // deposit / one-stage: nothing to capture on confirmation
+	}
+	switch p.Status {
+	case domain.PaymentCaptured, domain.PaymentCapturing:
+		return p, nil
+	case domain.PaymentAuthorized:
+		return u.capvoid.captureHold(ctx, p)
+	default:
+		return nil, fmt.Errorf("%w: pre-order hold is %s, cannot capture on confirmation", domain.ErrInvalidStatus, p.Status)
 	}
 }
