@@ -650,6 +650,13 @@ const (
 	// exists for this exact subject (the partial unique index, never a
 	// read-then-write check — see the double-click scenario in the spec).
 	CodeCampaignInProgress ErrorCode = "campaign_in_progress"
+
+	// Kwaaka kitchen-order settings (superadmin API).
+	CodeKwaakaNotLinked       ErrorCode = "kwaaka_not_linked"
+	CodeKwaakaTablePoolNeeded ErrorCode = "kwaaka_table_pool_required"
+	CodeKwaakaTableUnknown    ErrorCode = "kwaaka_table_unknown"
+	// CodePreorderSentToKitchen — the pre-order already went to the POS.
+	CodePreorderSentToKitchen ErrorCode = "preorder_sent_to_kitchen"
 )
 
 // codedError attaches an ErrorCode to an error without hiding it: Unwrap keeps

@@ -28,6 +28,11 @@ const (
 	// transaction that stamps bookings.guest_reminder_sent_at — so it is emitted
 	// at most once per booking, restart or no restart.
 	EventBookingReminder BookingEventType = "booking.reminder"
+	// EventBookingKitchenOrderAttention tells the VENUE (never the guest) that
+	// the pre-order's kitchen order needs a human: failed, failed_unknown,
+	// cancel_failed, rescheduled, pos_cancelled (Kwaaka phase 2). Written once
+	// per transition, in the transaction of the transition.
+	EventBookingKitchenOrderAttention BookingEventType = "booking.kitchen_order_attention"
 )
 
 // BookingOutboxEvent is a transactional-outbox row. It is inserted in the same
