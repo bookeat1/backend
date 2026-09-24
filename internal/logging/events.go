@@ -92,4 +92,13 @@ const (
 	// counters and the pass still continues to the next restaurant.
 	EventKwaakaSyncTick   = "kwaaka_sync.tick"
 	EventKwaakaSyncFailed = "kwaaka_sync.failed"
+
+	// Kwaaka kitchen orders (phase 2). Only ids of the booking and the venue
+	// are ever logged with these — no names, phones or request bodies.
+	EventKwaakaOrderSent          = "kwaaka_order.sent"
+	EventKwaakaOrderFailed        = "kwaaka_order.failed"
+	EventKwaakaOrderAuthFailed    = "kwaaka_order.auth_failed"
+	EventKwaakaOrderPoolExhausted = "kwaaka_order.pool_exhausted"
+	EventKwaakaOrderCancelled     = "kwaaka_order.cancelled"
+	EventKwaakaOrderCancelFailed  = "kwaaka_order.cancel_failed"
 )

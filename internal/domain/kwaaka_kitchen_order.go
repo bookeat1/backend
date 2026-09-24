@@ -214,6 +214,9 @@ type KitchenOrderRepository interface {
 	// the pool's, pool non-empty, booking confirmed/arrived within ±12h of now,
 	// no order row yet, at least one non-cancelled item.
 	ListCandidates(ctx context.Context, now time.Time, limit int) ([]KitchenCandidate, error)
+	// GetClaimSubject is LockClaimSubject without the row lock, for the cheap
+	// "is this booking due yet" pre-check outside any transaction.
+	GetClaimSubject(ctx context.Context, bookingID uuid.UUID) (*KitchenClaimSubject, error)
 	// LockClaimSubject reads the booking FOR UPDATE with items and payment.
 	// Must run inside a transaction. ErrNotFound when the booking is gone.
 	LockClaimSubject(ctx context.Context, bookingID uuid.UUID) (*KitchenClaimSubject, error)
