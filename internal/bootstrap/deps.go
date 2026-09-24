@@ -1414,6 +1414,14 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 	reconcileSettler := payments.NewDepositCancellationUseCase(reconcilePaymentsRepo, reconcileLedger, reconcileOutbox,
 		gateways, restaurantManagers, bookingRepo,
 		cancelDeadlineAdapter{settings: restrepo.New(db), cfg: newPaymentsConfig(cfg)}, reconcileRefund, sqltx.NewManager(db))
+	// A hold the acquirer released, found by the reconciler instead of a webhook,
+	// must cancel its pending booking exactly as the webhook path does.
+	reconcileHoldLost := &holdLostAdapter{}
+	reconcileHoldLost.uc, _ = bookings.NewStatusUseCase(bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
+		restrepo.New(db), restaurantManagers, sqltx.NewManager(db), newBookingConfig(cfg),
+		bookings.WithDepositSettler(depositSettlerAdapter{uc: reconcileSettler})).(interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	})
 	return payments.NewReconciler(
 		paymentrepo.New(db), paymentrepo.NewRefunds(db), paymentrepo.NewLedger(db),
 		paymentrepo.NewOutbox(db), gateways, sqltx.NewManager(db),
@@ -1430,7 +1438,8 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			payments.WithLateCancelSettlement(bookingRepo, reconcileSettler),
 			payments.WithBookingReleaser(bookings.NewReleaser(bookingRepo, bookingRepo,
 				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg))),
-			payments.WithHoldTTL(cfg.Payments.HoldTTL))), nil
+			payments.WithHoldTTL(cfg.Payments.HoldTTL),
+			payments.WithHoldLostCanceller(reconcileHoldLost))), nil
 }
 
 // NewTicketSweeper builds the pending-ticket sweep worker: it releases seats
