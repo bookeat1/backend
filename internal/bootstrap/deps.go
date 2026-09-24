@@ -199,6 +199,10 @@ type Deps struct {
 	// TelegramAnswerer acknowledges a press and rewrites the alert. Nil when the
 	// bot token is unset, which is also when the webhook stays unmounted.
 	TelegramAnswerer telegramhook.Answerer
+	// KwaakaWebhooks is the inbox the Kwaaka status webhook writes to;
+	// KwaakaWebhookSecret is the X-Webhook-Secret value (empty = check skipped).
+	KwaakaWebhooks      domain.KwaakaWebhookRepository
+	KwaakaWebhookSecret string
 	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
 	TelegramWebhookSecret string
 	// StaffBotAnswerer is the SECOND bot's own answerer. A callback query can
@@ -721,6 +725,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		VenueToday:            venuedashboarduc.NewTodayUseCase(venuedashboardrepo.NewToday(db)),
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
+		KwaakaWebhooks:        kwaakaorder.NewWebhooks(db),
+		KwaakaWebhookSecret:   strings.TrimSpace(cfg.KwaakaOrders.WebhookSecret),
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
 		StaffBotAnswerer:      newStaffBotSender(cfg),
 		StaffBotMessenger:     newStaffBotMessenger(cfg),
@@ -1995,7 +2001,7 @@ func NewKwaakaOrdersWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaa
 			MaxAttempts: cfg.KwaakaOrders.MaxAttempts,
 		},
 		log,
-	)
+	).WithInbox(kwaakaorder.NewWebhooks(db), cfg.KwaakaOrders.StatusReconcile)
 }
 
 func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legacysync.Worker, func(), error) {
