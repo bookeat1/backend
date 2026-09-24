@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -147,9 +148,9 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 		JSONData:            metadata(req),
 		Splits:              splits,
 	}
-	if req.ReturnURL != "" {
-		body.SuccessRedirectURL = req.ReturnURL
-		body.FailRedirectURL = req.ReturnURL
+	if ret := g.redirectURL(req.ReturnURL); ret != "" {
+		body.SuccessRedirectURL = ret
+		body.FailRedirectURL = ret
 	}
 
 	var model orderModel
@@ -534,4 +535,28 @@ func sanitise(s string) string {
 		return "rejected"
 	}
 	return s
+}
+
+// redirectURL returns the URL TipTopPay may redirect the guest to. The
+// acquirer accepts only absolute http(s) URLs ("Address must be a valid URL"),
+// but the mobile app sends an app deep link (bookeat://booking/{id}/payment).
+// Anything that is not http(s) is replaced by Config.ReturnFallbackURL; with no
+// fallback configured it returns "" so the redirect fields are omitted and the
+// order is still created.
+func (g *Gateway) redirectURL(returnURL string) string {
+	if isHTTPURL(returnURL) {
+		return strings.TrimSpace(returnURL)
+	}
+	if isHTTPURL(g.cfg.ReturnFallbackURL) {
+		return strings.TrimSpace(g.cfg.ReturnFallbackURL)
+	}
+	return ""
+}
+
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Scheme == "https" || u.Scheme == "http"
 }
