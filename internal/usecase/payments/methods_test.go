@@ -149,3 +149,48 @@ func TestCreateWithoutMethodKeepsWorking(t *testing.T) {
 	}
 	_ = uuid.Nil
 }
+
+func TestPaymentFeeTermsMatchCheckoutGrossUp(t *testing.T) {
+	h := methodsHarness(t, false, true, false, true, true)
+	rid := h.booking.RestaurantID
+	ctx := context.Background()
+
+	// Platform default (no venue override) and the venue's own rate.
+	for _, tc := range []struct {
+		name      string
+		override  *int
+		wantRate  int
+		wantTotal int64
+	}{
+		{"platform default", nil, 350, 362695},
+		{"venue override", intPtr(500), 500, 368422},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := h.settings.byRestaurant[rid]
+			o.ServiceFeeBps = tc.override
+			h.settings.byRestaurant[rid] = o
+			terms, err := h.uc.PaymentFeeTerms(ctx, rid)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if terms.RateBps != tc.wantRate {
+				t.Fatalf("rate = %d, want %d", terms.RateBps, tc.wantRate)
+			}
+			base := domain.Money{AmountMinor: 350000, Currency: "KZT"}
+			fee, total, err := domain.GrossUpForAcquirerWithMinimum(base, terms.RateBps, terms.MinFeeMinor)
+			if err != nil || total.AmountMinor != tc.wantTotal || fee.AmountMinor != tc.wantTotal-350000 {
+				t.Fatalf("fee=%d total=%d err=%v, want total %d", fee.AmountMinor, total.AmountMinor, err, tc.wantTotal)
+			}
+		})
+	}
+}
+
+func TestPaymentFeeTermsRefusedWhenPaymentsOff(t *testing.T) {
+	h := methodsHarness(t, true, true, true, true, true)
+	o := h.settings.byRestaurant[h.booking.RestaurantID]
+	o.PaymentsEnabled = boolPtr(false)
+	h.settings.byRestaurant[h.booking.RestaurantID] = o
+	if _, err := h.uc.PaymentFeeTerms(context.Background(), h.booking.RestaurantID); err == nil {
+		t.Fatal("want error for a venue with payments off")
+	}
+}

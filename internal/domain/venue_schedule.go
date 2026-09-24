@@ -99,6 +99,18 @@ type PublicVenueState struct {
 	// right now; the same computation as AcceptsOnlinePayment (which is true iff
 	// this is non-empty). nil = not computed, must reach the client as ABSENT.
 	PaymentMethods []PaymentMethod
+	// PaymentFee is the EFFECTIVE service-fee terms a payment for this venue
+	// would be grossed up with. nil when not computed or when the venue does
+	// not accept online payments; must reach the client as an ABSENT field.
+	PaymentFee *PaymentFeeTerms
+}
+
+// PaymentFeeTerms are the inputs of GrossUpForAcquirerWithMinimum as the
+// checkout resolves them for one venue: the client feeds them to the same
+// formula to show the total before a payment exists.
+type PaymentFeeTerms struct {
+	RateBps     int
+	MinFeeMinor int64
 }
 
 // OpenNowKnown reports the venue's server-computed "open right now" answer and
