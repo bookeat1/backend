@@ -2,6 +2,7 @@ package payments
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -52,8 +53,23 @@ func adoptTransactionID(ctx context.Context, repo domain.PaymentRepository, gw d
 	if g := gw.(placeholderProviderID); g.IsPlaceholderProviderID(id) {
 		return nil // the callback carries no real transaction id either
 	}
-	if err := repo.SetProviderPaymentID(ctx, p.ID, id); err != nil {
-		return fmt.Errorf("store provider transaction id for payment %s: %w", p.ID, err)
+	if err := repo.SetProviderPaymentID(ctx, p.ID, p.ProviderPaymentID, id); err != nil {
+		if !errors.Is(err, domain.ErrAlreadyExists) {
+			return fmt.Errorf("store provider transaction id for payment %s: %w", p.ID, err)
+		}
+		// Either a concurrent writer already stored the real id (adopt it), or
+		// the id belongs to another payment — a permanent conflict that
+		// retrying the callback can never fix. Log and let the callback apply:
+		// the status transition matters more, and refund/void heal the id via
+		// ensureTransactionID.
+		if cur, gerr := repo.GetByID(ctx, p.ID); gerr == nil && cur.ProviderPaymentID != nil &&
+			!isPlaceholderProviderID(gw, cur.ProviderPaymentID) {
+			p.ProviderPaymentID = cur.ProviderPaymentID
+			return nil
+		}
+		logging.FromContext(ctx).Error("payment.provider_transaction_id_conflict",
+			slog.String("payment_id", p.ID.String()), slog.String("provider", string(p.Provider)))
+		return nil
 	}
 	p.ProviderPaymentID = &id
 	return nil
@@ -78,11 +94,30 @@ func ensureTransactionID(ctx context.Context, repo domain.PaymentRepository, gw 
 	if err != nil {
 		return fmt.Errorf("resolve transaction id of payment %s: %w", p.ID, err)
 	}
+	// /v2/payments/find returns the LAST operation for the invoice — possibly a
+	// declined attempt. Only a transaction that took, held or released money
+	// may become the payment's id. Retryable: the caller fails and tries later.
+	// TODO(verify): whether a refund operation can be the "last operation" for
+	// the invoice (it would carry the refund's own TransactionId).
+	switch found.Status {
+	case domain.PaymentAuthorized, domain.PaymentCaptured, domain.PaymentVoided:
+	default:
+		return fmt.Errorf("resolve transaction id of payment %s: acquirer reports last operation as %q, not a settled transaction: %w",
+			p.ID, found.Status, domain.ErrInvalidStatus)
+	}
 	id := strings.TrimSpace(found.ProviderPaymentID)
 	if id == "" || gw.(placeholderProviderID).IsPlaceholderProviderID(id) {
 		return fmt.Errorf("resolve transaction id of payment %s: acquirer returned no transaction: %w", p.ID, domain.ErrInvalidStatus)
 	}
-	if err := repo.SetProviderPaymentID(ctx, p.ID, id); err != nil {
+	if err := repo.SetProviderPaymentID(ctx, p.ID, p.ProviderPaymentID, id); err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			// Lost the compare-and-swap: a webhook stored the id meanwhile.
+			if cur, gerr := repo.GetByID(ctx, p.ID); gerr == nil && cur.ProviderPaymentID != nil &&
+				!isPlaceholderProviderID(gw, cur.ProviderPaymentID) {
+				p.ProviderPaymentID = cur.ProviderPaymentID
+				return nil
+			}
+		}
 		return fmt.Errorf("store provider transaction id for payment %s: %w", p.ID, err)
 	}
 	logging.FromContext(ctx).Info("payment.provider_transaction_id_healed",
