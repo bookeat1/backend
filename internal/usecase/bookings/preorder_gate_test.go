@@ -45,7 +45,7 @@ func TestConfirmHiddenBookingIsRefusedWithNarrowCode(t *testing.T) {
 	if !errors.Is(err, domain.ErrAlreadyExists) {
 		t.Fatalf("error = %v, want ErrAlreadyExists (409)", err)
 	}
-	if code := domain.CodeOf(err); code != domain.CodeBookingAwaitingPayment {
+	if code, _ := domain.CodeOf(err); code != domain.CodeBookingAwaitingPayment {
 		t.Fatalf("code = %q, want %q", code, domain.CodeBookingAwaitingPayment)
 	}
 	if c.calls != 0 || len(h.bookings.statuses) != 0 {
@@ -77,8 +77,8 @@ func TestConfirmWithDefinitiveDeclineCancelsAsSystem(t *testing.T) {
 	if _, err := h.uc.Confirm(context.Background(), h.manager, h.booking.ID, nil); err != nil {
 		t.Fatalf("confirm itself must succeed: %v", err)
 	}
-	b := h.bookings.byID[h.booking.ID]
-	if b.Status != domain.BookingCancelled {
+	b := lastUpdated(h.bookings, h.booking.ID)
+	if h.bookings.byID[h.booking.ID].Status != domain.BookingCancelled || b == nil {
 		t.Fatalf("status = %s, want cancelled after a declined capture", b.Status)
 	}
 	if b.CancelledBy == nil || *b.CancelledBy != domain.CancelledBySystem ||
@@ -167,7 +167,7 @@ func TestWorkerCancelsUnpaidHiddenBookingAfterTTL(t *testing.T) {
 	if res.Unpaid != 1 || h.statusOf(old.ID) != domain.BookingCancelled || h.statusOf(fresh.ID) != domain.BookingPending {
 		t.Fatalf("res=%+v old=%s fresh=%s, want only the 31-minute-old booking cancelled", res, h.statusOf(old.ID), h.statusOf(fresh.ID))
 	}
-	if code := h.bookings.byID[old.ID].CancellationReasonCode; code == nil || *code != domain.CancelReasonPreorderPaymentNotCompleted {
+	if code := lastUpdated(h.bookings, old.ID).CancellationReasonCode; code == nil || *code != domain.CancelReasonPreorderPaymentNotCompleted {
 		t.Fatalf("reason = %v", code)
 	}
 }
@@ -197,7 +197,7 @@ func TestWorkerVenueSilenceCancelsHeldBookingInsteadOfAutoConfirm(t *testing.T) 
 	if h.statusOf(held.ID) != domain.BookingCancelled || res.NoAnswer != 1 {
 		t.Fatalf("held: status=%s res=%+v, want cancelled/NoAnswer=1", h.statusOf(held.ID), res)
 	}
-	if code := h.bookings.byID[held.ID].CancellationReasonCode; code == nil || *code != domain.CancelReasonVenueNoAnswer {
+	if code := lastUpdated(h.bookings, held.ID).CancellationReasonCode; code == nil || *code != domain.CancelReasonVenueNoAnswer {
 		t.Fatalf("reason = %v, want venue_no_answer", code)
 	}
 	if h.statusOf(plain.ID) != domain.BookingConfirmed {
@@ -224,4 +224,15 @@ func TestWorkerHeldBookingSLACountsFromRelease(t *testing.T) {
 	if h.statusOf(b.ID) != domain.BookingPending {
 		t.Fatalf("status = %s, want pending: the venue has had 20 of 120 minutes", h.statusOf(b.ID))
 	}
+}
+
+// lastUpdated is the last full-row Update the fake recorded for a booking (the
+// fake keeps them apart from the status writes).
+func lastUpdated(f *fakeBookings, id uuid.UUID) *domain.Booking {
+	for i := len(f.updated) - 1; i >= 0; i-- {
+		if f.updated[i].ID == id {
+			return f.updated[i]
+		}
+	}
+	return nil
 }
