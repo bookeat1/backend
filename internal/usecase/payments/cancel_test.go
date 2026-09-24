@@ -290,6 +290,7 @@ func TestPreorderCapturedImmediatelyOnAuthorization(t *testing.T) {
 	ctx := context.Background()
 	pre := testPayment(uuid.New(), domain.PaymentCreated, "gw-pre")
 	pre.Purpose = domain.PurposePreorder
+	pre.RequiresConfirmation = false // a one-stage link issued before the hold rollout
 	u, repo, _, ledger, _, gw := newWebhookHarness(pre)
 	gw.verifyFn = verifyOK(&domain.WebhookEvent{
 		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-pre", ProviderPaymentID: "gw-pre",
@@ -342,6 +343,7 @@ func TestPreorderCapture_DeclineLeavesEventUnprocessed_RetrySucceeds(t *testing.
 	ctx := context.Background()
 	pre := testPayment(uuid.New(), domain.PaymentCreated, "gw-pre-retry")
 	pre.Purpose = domain.PurposePreorder
+	pre.RequiresConfirmation = false // a one-stage link issued before the hold rollout
 	u, repo, events, ledger, _, gw := newWebhookHarness(pre)
 	gw.captureErr = domain.ErrProviderDeclined
 	gw.verifyFn = verifyOK(&domain.WebhookEvent{
