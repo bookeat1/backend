@@ -1250,6 +1250,7 @@ func newPaymentGateways(cfg PaymentsConfig, providers domain.PaymentProviderRepo
 	}
 
 	ttpCfg := tiptoppay.ConfigFromEnv()
+	ttpCfg.ReturnFallbackURL = cfg.PublicBaseURL
 	if err := ttpCfg.Validate(); err != nil {
 		log.Warn("tiptoppay adapter not configured, skipping", slog.String("reason", err.Error()))
 	} else {
