@@ -112,6 +112,11 @@ type restaurantResponse struct {
 	// acquirer lookup failed is never advertised as payable, and never as
 	// definitively unpayable either.
 	AcceptsOnlinePayment *bool `json:"accepts_online_payment,omitempty"`
+	// PaymentMethods lists the methods ("kaspi", "card") the venue can actually
+	// take right now; accepts_online_payment is true iff it is non-empty. A
+	// pointer so "not computed" (absent) differs from "none" (`[]`). Detail
+	// read only, same rule as accepts_online_payment.
+	PaymentMethods *[]string `json:"payment_methods,omitempty"`
 	// PreorderMinAmountMinor is the venue's optional minimum pre-order total,
 	// in int64 MINOR units (restaurants.preorder_min_amount_minor). Served by
 	// the DETAIL read only, same rule as AcceptsOnlinePayment above: a listing
@@ -272,6 +277,13 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	if st.AcceptsOnlinePayment != nil {
 		pay := *st.AcceptsOnlinePayment
 		resp.AcceptsOnlinePayment = &pay
+	}
+	if st.PaymentMethods != nil {
+		ms := make([]string, 0, len(st.PaymentMethods))
+		for _, m := range st.PaymentMethods {
+			ms = append(ms, string(m))
+		}
+		resp.PaymentMethods = &ms
 	}
 	if st.Schedule == nil {
 		return

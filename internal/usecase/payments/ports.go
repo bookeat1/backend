@@ -120,6 +120,9 @@ func authorizeStaffPermission(ctx context.Context, managers managerChecker, acto
 type gatewayResolver interface {
 	Resolve(ctx context.Context, preferred domain.PaymentProvider) (domain.PaymentGateway, error)
 	ForRefund(provider domain.PaymentProvider) (domain.PaymentGateway, error)
+	// ResolveMethod picks the adapter for a new payment by payment method
+	// (kaspi | card) — see infrastructure/payment.Registry.ResolveMethod.
+	ResolveMethod(ctx context.Context, method domain.PaymentMethod) (domain.PaymentGateway, error)
 }
 
 // bookingReader is the minimal slice of domain.BookingRepository this package

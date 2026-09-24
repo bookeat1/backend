@@ -85,14 +85,6 @@ func (g venueGate) settings(ctx context.Context, restaurantID uuid.UUID) (domain
 	return s, nil
 }
 
-// gateway resolves the acquirer for a NEW payment (check 2): the venue's
-// preferred provider when it is usable, otherwise the platform default. Thin on
-// purpose — it exists so both callers resolve through the SAME call, with the
-// same fallback, instead of one of them asking a different question.
-func (g venueGate) gateway(ctx context.Context, preferred domain.PaymentProvider) (domain.PaymentGateway, error) {
-	return g.gateways.Resolve(ctx, preferred)
-}
-
 // account reads the venue's identity at this acquirer
 // (restaurant_split_accounts). A venue with no row gets (nil, nil): most
 // acquirers settle onto one platform account and need no per-venue address at
@@ -168,28 +160,135 @@ func (g venueGate) accountUsable(ctx context.Context, gw domain.PaymentGateway, 
 //     field out of the payload entirely rather than publish a guess, because
 //     "we did not compute it" and "you may not pay" are different statements.
 func (u *createUseCase) AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error) {
+	methods, err := u.AvailablePaymentMethods(ctx, restaurantID)
+	if err != nil {
+		return false, err
+	}
+	return len(methods) > 0, nil
+}
+
+// AvailablePaymentMethods lists the methods (kaspi, card — in that order) a
+// guest could actually pay this venue with right now: the venue's master switch
+// is on, the method is switched on for the venue, an acquirer resolves for it
+// and, where that acquirer needs a per-venue account (Kaspi), the venue has one.
+// A method that is switched on but not usable (Kaspi without a bound account, no
+// enabled card provider) is NOT listed. Same (definite / error) contract as
+// AcceptsOnlinePayment.
+func (u *createUseCase) AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error) {
 	if restaurantID == uuid.Nil {
-		return false, fmt.Errorf("%w: restaurant required", domain.ErrValidation)
+		return nil, fmt.Errorf("%w: restaurant required", domain.ErrValidation)
 	}
 	g := u.gate()
-
 	settings, err := g.settings(ctx, restaurantID)
 	if err != nil {
 		if errors.Is(err, errVenuePaymentsDisabled) {
-			return false, nil
+			return []domain.PaymentMethod{}, nil
 		}
-		return false, err
+		return nil, err
 	}
+	out := []domain.PaymentMethod{}
+	for _, m := range domain.PaymentMethods {
+		_, ok, err := g.methodGateway(ctx, restaurantID, settings, m)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
 
-	gw, err := g.gateway(ctx, settings.Provider)
+// methodEnabled reports whether the venue has switched the method on.
+func methodEnabled(s domain.PaymentSettings, m domain.PaymentMethod) bool {
+	switch m {
+	case domain.MethodKaspi:
+		return s.KaspiEnabled
+	case domain.MethodCard:
+		return s.CardEnabled
+	}
+	return false
+}
+
+// methodGateway is checks 2 and 3 for one method (check 1, the master switch,
+// is g.settings). (nil, false, nil) is a definite "not available"; an error is
+// "could not find out".
+func (g venueGate) methodGateway(ctx context.Context, restaurantID uuid.UUID, s domain.PaymentSettings, m domain.PaymentMethod) (domain.PaymentGateway, bool, error) {
+	if !methodEnabled(s, m) {
+		return nil, false, nil
+	}
+	gw, err := g.gateways.ResolveMethod(ctx, m)
 	if err != nil {
 		if providerUnusable(err) {
-			return false, nil
+			return nil, false, nil
 		}
-		return false, err
+		return nil, false, err
 	}
+	ok, err := g.accountUsable(ctx, gw, restaurantID)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	return gw, true, nil
+}
 
-	return g.accountUsable(ctx, gw, restaurantID)
+// resolveEnabledMethod is methodGateway WITHOUT the account check: the method is
+// switched on and an acquirer resolves for it. (nil, false, nil) = definite no.
+func (g venueGate) resolveEnabledMethod(ctx context.Context, s domain.PaymentSettings, m domain.PaymentMethod) (domain.PaymentGateway, bool, error) {
+	if !methodEnabled(s, m) {
+		return nil, false, nil
+	}
+	gw, err := g.gateways.ResolveMethod(ctx, m)
+	if err != nil {
+		if providerUnusable(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return gw, true, nil
+}
+
+// pickMethodGateway chooses the acquirer for a NEW payment.
+//
+// With an explicit method that method is used or the call is refused with a
+// 422 — never a silent switch to the other one. Without one (older clients) the
+// venue's legacy preferred provider orders the methods (kaspi first when it
+// preferred kaspi, otherwise card first) and the first AVAILABLE one wins.
+//
+// A method that is enabled and has an acquirer but no usable venue account is
+// deliberately still returned when nothing better exists: the checkout then
+// fails further down with the specific, long-standing error (split_account_missing
+// / the adapter's refusal) instead of a generic one.
+func (g venueGate) pickMethodGateway(ctx context.Context, restaurantID uuid.UUID, s domain.PaymentSettings, requested domain.PaymentMethod) (domain.PaymentGateway, error) {
+	notAvailable := func(m domain.PaymentMethod) error {
+		return fmt.Errorf("%w: payment method %s is not available for this restaurant", domain.ErrValidation, m)
+	}
+	if requested != "" {
+		if !requested.Valid() {
+			return nil, fmt.Errorf("%w: unknown payment method %q", domain.ErrValidation, requested)
+		}
+		gw, ok, err := g.resolveEnabledMethod(ctx, s, requested)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, notAvailable(requested)
+		}
+		return gw, nil
+	}
+	order := []domain.PaymentMethod{domain.MethodCard, domain.MethodKaspi}
+	if s.Provider == domain.ProviderKaspi {
+		order = []domain.PaymentMethod{domain.MethodKaspi, domain.MethodCard}
+	}
+	for _, m := range order {
+		gw, ok, err := g.resolveEnabledMethod(ctx, s, m)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return gw, nil
+		}
+	}
+	return nil, errVenuePaymentsDisabled
 }
 
 // providerUnusable separates "this deployment cannot take a new payment through

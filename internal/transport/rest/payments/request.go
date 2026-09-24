@@ -17,11 +17,16 @@ import (
 // somewhere else entirely.
 type createPaymentRequest struct {
 	ReturnURL string `json:"return_url"`
+	// Method is optional: "kaspi" or "card". Absent = server picks (legacy).
+	Method string `json:"method"`
 }
 
 func (r createPaymentRequest) validate() error {
 	if strings.TrimSpace(r.ReturnURL) == "" {
 		return fmt.Errorf("%w: return_url is required", domain.ErrValidation)
+	}
+	if m := domain.PaymentMethod(strings.TrimSpace(r.Method)); m != "" && !m.Valid() {
+		return fmt.Errorf("%w: method must be kaspi or card", domain.ErrValidation)
 	}
 	return nil
 }

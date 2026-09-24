@@ -51,6 +51,9 @@ type paymentSettingsWriter interface {
 	// the floor). GetPaymentOverride reads them back for the panel.
 	UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, required bool, minMinor *int64) error
 	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
+	// UpdatePaymentMethods writes payments_enabled (nil = inherit global) and the
+	// kaspi/card method switches.
+	UpdatePaymentMethods(ctx context.Context, restaurantID uuid.UUID, paymentsEnabled *bool, kaspi, card bool) error
 }
 
 // telegramSettings is the slice of the notification-settings repo this package

@@ -20,7 +20,8 @@ import (
 // numbering above.
 const paymentSettingsCols = `payments_enabled, deposit_required, deposit_amount_minor,
 	preorder_payment_required, service_fee_bps, payment_provider,
-	free_cancel_window_minutes, preorder_min_amount_minor`
+	free_cancel_window_minutes, preorder_min_amount_minor,
+	payment_kaspi_enabled, payment_card_enabled`
 
 // UpdateFreeCancelWindow sets the venue's money-path free-cancellation window
 // (restaurants.free_cancel_window_minutes, migration 0034/0035). A single
@@ -84,8 +85,9 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		provider        *string
 		freeCancelWin   *int
 		preorderMin     *int64
+		kaspiOn, cardOn bool
 	)
-	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider, &freeCancelWin, &preorderMin)
+	err := row.Scan(&paymentsEnabled, &depositRequired, &depositMinor, &preorderPay, &feeBps, &provider, &freeCancelWin, &preorderMin, &kaspiOn, &cardOn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.PaymentSettingsOverride{}, domain.ErrNotFound
 	}
@@ -104,6 +106,8 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		// "use the global default", the uniform override shape.
 		FreeCancelWindowMinutes: freeCancelWin,
 		PreorderMinAmountMinor:  preorderMin,
+		KaspiEnabled:            &kaspiOn,
+		CardEnabled:             &cardOn,
 	}
 	// Only a known, valid provider code is trusted as an override — an unknown
 	// value (should never happen behind the admin panel, but this column has
@@ -117,4 +121,23 @@ func (r *Repository) GetPaymentOverride(ctx context.Context, restaurantID uuid.U
 		}
 	}
 	return out, nil
+}
+
+// UpdatePaymentMethods writes the venue's master payments switch
+// (payments_enabled; nil = NULL = inherit the global PAYMENTS_ENABLED) and the
+// two method switches (migration 0116) in one atomic UPDATE. ErrNotFound when
+// the restaurant does not exist.
+func (r *Repository) UpdatePaymentMethods(ctx context.Context, restaurantID uuid.UUID, paymentsEnabled *bool, kaspi, card bool) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE restaurants
+		    SET payments_enabled=$2, payment_kaspi_enabled=$3, payment_card_enabled=$4, updated_at=now()
+		  WHERE id=$1`,
+		restaurantID, paymentsEnabled, kaspi, card)
+	if err != nil {
+		return mapWrite(err, "update payment methods")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
 }
