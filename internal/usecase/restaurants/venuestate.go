@@ -91,6 +91,7 @@ type VenueState struct {
 // enricher then leaves the field nil rather than publishing a guess.
 type venuePaymentChecker interface {
 	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+	AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error)
 }
 
 // WithVenuePayments teaches the venue DETAIL read whether the venue can take an
@@ -242,13 +243,16 @@ func (v *VenueState) attachPayment(ctx context.Context, st *domain.PublicVenueSt
 	if v.payments == nil {
 		return
 	}
-	accepts, err := v.payments.AcceptsOnlinePayment(ctx, restaurantID)
+	methods, err := v.payments.AvailablePaymentMethods(ctx, restaurantID)
 	if err != nil {
 		slog.Warn("venue online-payment check failed, serving venue without accepts_online_payment",
 			"restaurant_id", restaurantID, "error", err)
 		return
 	}
+	// accepts_online_payment is true iff at least one method is available.
+	accepts := len(methods) > 0
 	st.AcceptsOnlinePayment = &accepts
+	st.PaymentMethods = methods
 }
 
 // usable reports whether this enricher can do anything at all. A nil receiver

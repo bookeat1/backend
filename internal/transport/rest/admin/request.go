@@ -273,3 +273,19 @@ func (r acquirerAccountRequest) toInput() adminuc.AcquirerAccount {
 		IsActive:   r.IsActive,
 	}
 }
+
+// paymentMethodsRequest replaces a venue's payments switch and methods.
+// payments_enabled: true/false = explicit, null/absent = inherit the global
+// switch. methods: full list of ENABLED methods ("kaspi", "card"); absent = none.
+type paymentMethodsRequest struct {
+	PaymentsEnabled *bool    `json:"payments_enabled"`
+	Methods         []string `json:"methods"`
+}
+
+func (r paymentMethodsRequest) toInput() adminuc.PaymentMethodsInput {
+	ms := make([]domain.PaymentMethod, 0, len(r.Methods))
+	for _, m := range r.Methods {
+		ms = append(ms, domain.PaymentMethod(strings.TrimSpace(m)))
+	}
+	return adminuc.PaymentMethodsInput{PaymentsEnabled: r.PaymentsEnabled, Methods: ms}
+}

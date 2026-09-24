@@ -95,6 +95,10 @@ type PublicVenueState struct {
 	// hides a payment button, which is safe; a client told "false" because we
 	// could not look is being lied to.
 	AcceptsOnlinePayment *bool
+	// PaymentMethods lists the methods (kaspi, card) available for this venue
+	// right now; the same computation as AcceptsOnlinePayment (which is true iff
+	// this is non-empty). nil = not computed, must reach the client as ABSENT.
+	PaymentMethods []PaymentMethod
 }
 
 // OpenNowKnown reports the venue's server-computed "open right now" answer and

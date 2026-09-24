@@ -285,3 +285,17 @@ func acquirerAccountToResponse(a uc.AcquirerAccount) acquirerAccountResponse {
 		IsActive:   a.IsActive,
 	}
 }
+
+type paymentMethodsResponse struct {
+	PaymentsEnabled   *bool    `json:"payments_enabled"`
+	Methods           []string `json:"methods"`
+	KaspiAccountBound bool     `json:"kaspi_account_bound"`
+}
+
+func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsResponse {
+	ms := make([]string, 0, len(v.Methods))
+	for _, m := range v.Methods {
+		ms = append(ms, string(m))
+	}
+	return paymentMethodsResponse{PaymentsEnabled: v.PaymentsEnabled, Methods: ms, KaspiAccountBound: v.KaspiAccountBound}
+}

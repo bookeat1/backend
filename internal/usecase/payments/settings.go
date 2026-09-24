@@ -188,5 +188,15 @@ func resolveSettings(o domain.PaymentSettingsOverride, cfg Config) domain.Paymen
 	if o.Provider != nil {
 		s.Provider = *o.Provider
 	}
+	// Method switches: explicit columns win; without them derive from the
+	// legacy preferred provider so an old row behaves exactly as before.
+	s.KaspiEnabled = s.Provider == domain.ProviderKaspi
+	s.CardEnabled = !s.KaspiEnabled
+	if o.KaspiEnabled != nil {
+		s.KaspiEnabled = *o.KaspiEnabled
+	}
+	if o.CardEnabled != nil {
+		s.CardEnabled = *o.CardEnabled
+	}
 	return s
 }

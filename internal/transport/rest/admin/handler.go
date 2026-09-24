@@ -49,6 +49,10 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/restaurants/:id/payment-settings/acquirer-account", h.getAcquirerAccount)
 	rg.PUT("/admin/restaurants/:id/payment-settings/acquirer-account", h.setAcquirerAccount)
 
+	// Payment settings: master switch + enabled methods (kaspi/card). Superadmin only.
+	rg.GET("/admin/restaurants/:id/payment-settings/methods", h.getPaymentMethods)
+	rg.PUT("/admin/restaurants/:id/payment-settings/methods", h.setPaymentMethods)
+
 	// Notification settings: the venue's Telegram alert chat.
 	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
 	rg.PUT("/admin/restaurants/:id/notification-settings/telegram", h.setTelegramChat)
@@ -222,6 +226,41 @@ func (h *Handler) setAcquirerAccount(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, acquirerAccountToResponse(account))
+}
+
+// getPaymentMethods returns the venue's payments switch and enabled methods.
+// SUPERADMIN ONLY (enforced in the usecase).
+func (h *Handler) getPaymentMethods(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	v, err := h.panel.GetPaymentMethods(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, paymentMethodsToResponse(v))
+}
+
+// setPaymentMethods replaces the venue's payments switch and enabled methods.
+// SUPERADMIN ONLY (enforced in the usecase).
+func (h *Handler) setPaymentMethods(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req paymentMethodsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	v, err := h.panel.SetPaymentMethods(c.Request.Context(), actor, rid, req.toInput())
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, paymentMethodsToResponse(v))
 }
 
 // ---- Notification settings (Telegram) --------------------------------------

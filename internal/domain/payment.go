@@ -459,7 +459,13 @@ type PaymentSettings struct {
 	DepositAmountMinor      int64
 	PreorderPaymentRequired bool
 	ServiceFeeBps           int             // 350 = 3.5%
-	Provider                PaymentProvider // must be an enabled one, else the default
+	Provider                PaymentProvider // legacy preferred acquirer; only a hint for a request without a method
+	// KaspiEnabled / CardEnabled: which payment methods the venue has switched
+	// on (restaurants.payment_kaspi_enabled / payment_card_enabled, migration
+	// 0116). Whether a method is actually AVAILABLE also needs a usable
+	// acquirer and, for kaspi, a bound account — see usecase/payments.venueGate.
+	KaspiEnabled bool
+	CardEnabled  bool
 	// FreeCancelWindow is the per-restaurant free-cancellation window used by
 	// the MONEY path (migration 0034/0035, restaurants.free_cancel_window_minutes):
 	// a deposit HOLD is released to the guest (voided) only when the booking is
@@ -478,6 +484,10 @@ type PaymentSettingsOverride struct {
 	PreorderPaymentRequired *bool
 	ServiceFeeBps           *int
 	Provider                *PaymentProvider
+	// KaspiEnabled / CardEnabled override the method switches. nil derives them
+	// from the legacy Provider (kaspi => kaspi on, anything else => card on).
+	KaspiEnabled *bool
+	CardEnabled  *bool
 	// FreeCancelWindowMinutes overrides the money-path free-cancellation
 	// window per restaurant (restaurants.free_cancel_window_minutes). Unlike
 	// the other fields it maps to a NOT NULL column, so in practice it is

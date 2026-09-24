@@ -2,6 +2,7 @@ package restaurant
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -143,5 +144,45 @@ func TestUpdatePreorderSettings(t *testing.T) {
 
 	if err := repo.UpdatePreorderSettings(ctx, uuid.New(), true, nil); err != domain.ErrNotFound {
 		t.Errorf("update on missing restaurant err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPaymentMethodsRoundTrip: a fresh venue defaults to card on / kaspi off
+// (migration 0116, existing behaviour), and UpdatePaymentMethods is read back.
+func TestPaymentMethodsRoundTrip(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
+	repo := New(pool)
+	ctx := context.Background()
+
+	m := &domain.Restaurant{ID: uuid.New(), Name: "Methods Bistro", City: domain.CityAlmaty, PriceCategory: domain.PriceMid, IsActive: true}
+	if err := repo.Create(ctx, m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	o, err := repo.GetPaymentOverride(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if o.KaspiEnabled == nil || *o.KaspiEnabled || o.CardEnabled == nil || !*o.CardEnabled {
+		t.Fatalf("fresh venue methods = kaspi %v card %v, want false/true", o.KaspiEnabled, o.CardEnabled)
+	}
+
+	on := true
+	if err := repo.UpdatePaymentMethods(ctx, m.ID, &on, true, false); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	o, _ = repo.GetPaymentOverride(ctx, m.ID)
+	if o.PaymentsEnabled == nil || !*o.PaymentsEnabled || !*o.KaspiEnabled || *o.CardEnabled {
+		t.Fatalf("after update: %+v", o)
+	}
+	if err := repo.UpdatePaymentMethods(ctx, m.ID, nil, false, true); err != nil {
+		t.Fatalf("update nil: %v", err)
+	}
+	o, _ = repo.GetPaymentOverride(ctx, m.ID)
+	if o.PaymentsEnabled != nil {
+		t.Fatalf("payments_enabled = %v, want NULL (inherit)", *o.PaymentsEnabled)
+	}
+	if err := repo.UpdatePaymentMethods(ctx, uuid.New(), nil, true, true); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("missing venue: err = %v, want ErrNotFound", err)
 	}
 }
