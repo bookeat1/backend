@@ -58,7 +58,10 @@ func (f *fakeOrders) Insert(_ context.Context, o *domain.KitchenOrder) (bool, er
 	f.row = &c
 	return true, nil
 }
-func (f *fakeOrders) GetByID(context.Context, uuid.UUID) (*domain.KitchenOrder, error) {
+func (f *fakeOrders) GetByID(_ context.Context, id uuid.UUID) (*domain.KitchenOrder, error) {
+	if f.row == nil || f.row.ID != id {
+		return nil, domain.ErrNotFound
+	}
 	c := *f.row
 	return &c, nil
 }
@@ -66,7 +69,11 @@ func (f *fakeOrders) GetByBookingID(context.Context, uuid.UUID) (*domain.Kitchen
 	c := *f.row
 	return &c, nil
 }
-func (f *fakeOrders) GetByPosOrderID(context.Context, string) (*domain.KitchenOrder, error) {
+func (f *fakeOrders) GetByPosOrderID(_ context.Context, id string) (*domain.KitchenOrder, error) {
+	if f.row != nil && f.row.KwaakaOrderID != nil && *f.row.KwaakaOrderID == id {
+		c := *f.row
+		return &c, nil
+	}
 	return nil, domain.ErrNotFound
 }
 func (f *fakeOrders) ListByBookingIDs(context.Context, []uuid.UUID) (map[uuid.UUID]domain.KitchenOrderView, error) {
@@ -152,3 +159,34 @@ func newTestWorker(o *fakeOrders, st fakeSettings, pos *fakePOS, ob *fakeOutbox,
 	w.now = func() time.Time { return now }
 	return w
 }
+
+type fakeHooks struct {
+	ev       []domain.KwaakaWebhookEvent
+	outcome  map[uuid.UUID]string
+	deferred map[uuid.UUID]time.Time
+}
+
+func newFakeHooks(evs ...domain.KwaakaWebhookEvent) *fakeHooks {
+	return &fakeHooks{ev: evs, outcome: map[uuid.UUID]string{}, deferred: map[uuid.UUID]time.Time{}}
+}
+func (f *fakeHooks) Insert(context.Context, *domain.KwaakaWebhookEvent) (bool, error) {
+	return true, nil
+}
+func (f *fakeHooks) LockDue(context.Context, time.Time, int) ([]domain.KwaakaWebhookEvent, error) {
+	var out []domain.KwaakaWebhookEvent
+	for _, e := range f.ev {
+		if _, done := f.outcome[e.ID]; !done {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+func (f *fakeHooks) Finish(_ context.Context, id uuid.UUID, o string, _ *string, _ *uuid.UUID) error {
+	f.outcome[id] = o
+	return nil
+}
+func (f *fakeHooks) Defer(_ context.Context, id uuid.UUID, next time.Time) error {
+	f.deferred[id] = next
+	return nil
+}
+func (f *fakeHooks) PruneProcessed(context.Context, time.Time, int) (int, error) { return 0, nil }

@@ -13,7 +13,8 @@ func (w *Worker) Tick(ctx context.Context) {
 	stages := []struct {
 		name string
 		fn   func(context.Context) error
-	}{{"claim", w.ClaimPass}, {"send", w.SendPass}, {"cancel", w.CancelSweep}, {"reschedule", w.RescheduleSweep}}
+	}{{"claim", w.ClaimPass}, {"send", w.SendPass}, {"cancel", w.CancelSweep}, {"reschedule", w.RescheduleSweep},
+		{"inbox", w.ProcessInbox}, {"poll", w.PollPass}, {"prune", w.PruneInbox}}
 	for _, st := range stages {
 		if err := st.fn(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			w.log.Error("kwaaka orders stage failed", slog.String("stage", st.name), slog.String("error", err.Error()))
@@ -28,11 +29,18 @@ func (w *Worker) Run(ctx context.Context, tick time.Duration) error {
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
+	// Webhooks are applied on a faster beat than the send loop.
+	inbox := time.NewTicker(5 * time.Second)
+	defer inbox.Stop()
 	w.log.Info("kwaaka orders worker started", slog.Duration("tick", tick), slog.Bool("sending_enabled", w.cfg.Enabled))
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-inbox.C:
+			if err := w.ProcessInbox(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				w.log.Error("kwaaka orders stage failed", slog.String("stage", "inbox"), slog.String("error", err.Error()))
+			}
 		case <-t.C:
 			w.Tick(ctx)
 		}

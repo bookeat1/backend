@@ -43,14 +43,16 @@ func (c Config) withDefaults() Config {
 // Worker runs the kitchen-order loop. Dependencies are positional, as in the
 // other usecases.
 type Worker struct {
-	orders   domain.KitchenOrderRepository
-	settings domain.KwaakaOrderSettingsRepository
-	pos      domain.KwaakaOrderPOS
-	outbox   Outbox
-	tx       domain.TxManager
-	cfg      Config
-	log      *slog.Logger
-	now      func() time.Time
+	orders    domain.KitchenOrderRepository
+	settings  domain.KwaakaOrderSettingsRepository
+	pos       domain.KwaakaOrderPOS
+	outbox    Outbox
+	tx        domain.TxManager
+	hooks     domain.KwaakaWebhookRepository
+	pollEvery time.Duration
+	cfg       Config
+	log       *slog.Logger
+	now       func() time.Time
 }
 
 // NewWorker builds the worker.
