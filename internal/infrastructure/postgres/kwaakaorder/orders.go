@@ -147,6 +147,14 @@ func (r *Orders) ListCandidates(ctx context.Context, now time.Time, limit int) (
 }
 
 func (r *Orders) LockClaimSubject(ctx context.Context, bookingID uuid.UUID) (*domain.KitchenClaimSubject, error) {
+	return r.claimSubject(ctx, bookingID, " FOR UPDATE OF b")
+}
+
+func (r *Orders) GetClaimSubject(ctx context.Context, bookingID uuid.UUID) (*domain.KitchenClaimSubject, error) {
+	return r.claimSubject(ctx, bookingID, "")
+}
+
+func (r *Orders) claimSubject(ctx context.Context, bookingID uuid.UUID, lock string) (*domain.KitchenClaimSubject, error) {
 	q := sqltx.From(ctx, r.pool)
 	var s domain.KitchenClaimSubject
 	var status string
@@ -155,7 +163,7 @@ func (r *Orders) LockClaimSubject(ctx context.Context, bookingID uuid.UUID) (*do
 		`SELECT b.id, b.restaurant_id, b.status, b.name, b.phone, b.guests, b.starts_at, b.ends_at,
 		        b.confirmed_at, b.arrived_at, r.timezone, r.kwaaka_restaurant_id
 		   FROM bookings b JOIN restaurants r ON r.id = b.restaurant_id
-		  WHERE b.id = $1 FOR UPDATE OF b`, bookingID).
+		  WHERE b.id = $1`+lock, bookingID).
 		Scan(&s.BookingID, &s.RestaurantID, &status, &s.Name, &s.Phone, &s.Guests, &s.StartsAt, &s.EndsAt,
 			&s.ConfirmedAt, &s.ArrivedAt, &tz, &kw)
 	if err != nil {
