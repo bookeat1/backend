@@ -435,6 +435,9 @@ type PaymentRepository interface {
 	// idx_payments_expires from migration 0007). Same non-locking-across-the-
 	// acquirer-call caveat as ClaimStale.
 	ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]Payment, error)
+	// ExtendHoldExpiry moves expires_at of an `authorized` payment forward to
+	// expiresAt (never backwards). No-op when the payment is not authorized.
+	ExtendHoldExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error
 	// RecordReconcileAttempt is the CAS-guarded write behind ReconcileAttempts
 	// / LastReconcileAttemptAt / NeedsManualReview (migration 0010): a single
 	// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1,
@@ -555,6 +558,7 @@ type AuthorizeRequest struct {
 	Purpose        PaymentPurpose
 	Description    string        // shown to the guest; service wording only (spec §9.4)
 	HoldTTL        time.Duration // zero = the acquirer's own default
+	LinkTTL        time.Duration // lifetime of the unpaid payment link; zero = fall back to HoldTTL
 	ReturnURL      string        // where the guest lands after the payment page
 	CallbackURL    string        // our webhook endpoint for this provider
 	CustomerPhone  string        // E.164

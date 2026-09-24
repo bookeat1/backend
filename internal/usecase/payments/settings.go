@@ -41,6 +41,11 @@ type Config struct {
 	DepositRequired         bool
 	PreorderPaymentRequired bool
 	HoldTTL                 time.Duration
+	// LinkTTL is how long an UNPAID booking/preorder payment link stays payable
+	// (payments.expires_at until the guest authorises, and the acquirer's link
+	// lifetime where it has one). Distinct from HoldTTL, which stays the
+	// authorization-hold and event-ticket lifetime.
+	LinkTTL time.Duration
 	// FreeCancelWindow is the global default free-cancellation window for the
 	// money path, applied to any restaurant that has not overridden
 	// free_cancel_window_minutes. Owner-confirmed default 120 minutes (see
@@ -76,9 +81,20 @@ const (
 	// cost is absorbed off the guest's side. Kept configurable for the day that
 	// changes, but 0 is the default and an explicit 0 must survive withDefaults.
 	defaultRefundAcquiringBps = 0
+	defaultLinkTTL            = 15 * time.Minute
 	defaultHoldTTL            = 96 * time.Hour    // stays below FreedomPay's 5-day auto-clear
 	defaultFreeCancelWindow   = 120 * time.Minute // owner-confirmed default (migration 0034)
 )
+
+// linkTTLFor is the lifetime of an unpaid payment link for the purpose: booking
+// payments (deposit, preorder) use the short LinkTTL; event tickets keep the
+// long HoldTTL. Expects a withDefaults-normalised Config.
+func (c Config) linkTTLFor(purpose domain.PaymentPurpose) time.Duration {
+	if purpose == domain.PurposeTicket {
+		return c.HoldTTL
+	}
+	return c.LinkTTL
+}
 
 func (c Config) withDefaults() Config {
 	if c.DefaultProvider == "" {
@@ -94,6 +110,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.HoldTTL <= 0 {
 		c.HoldTTL = defaultHoldTTL
+	}
+	if c.LinkTTL <= 0 {
+		c.LinkTTL = defaultLinkTTL
 	}
 	if c.FreeCancelWindow <= 0 {
 		c.FreeCancelWindow = defaultFreeCancelWindow

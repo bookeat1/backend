@@ -244,6 +244,20 @@ func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.Paym
 	return out, nil
 }
 
+func (f *fakePaymentRepo) ExtendHoldExpiry(_ context.Context, id uuid.UUID, expiresAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byID[id]
+	if !ok || p.Status != domain.PaymentAuthorized {
+		return nil
+	}
+	if p.ExpiresAt == nil || p.ExpiresAt.Before(expiresAt) {
+		e := expiresAt
+		p.ExpiresAt = &e
+	}
+	return nil
+}
+
 // ClaimExpiredHolds mimics `SELECT ... WHERE status = 'authorized' AND
 // expires_at IS NOT NULL AND expires_at < $before ORDER BY expires_at LIMIT
 // $limit` (idx_payments_expires).

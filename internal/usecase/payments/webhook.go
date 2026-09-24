@@ -37,6 +37,16 @@ type webhookUseCase struct {
 	// together by WithLateCancelSettlement. Both nil = the previous behaviour.
 	bookings    bookingReader
 	lateSettler DepositCancellationUseCase
+	// holdTTL, when set, re-bases a deposit hold's expires_at at the moment it
+	// is authorised: the pre-payment expires_at is the (short) link lifetime,
+	// which must not void a hold the guest has just placed.
+	holdTTL time.Duration
+}
+
+// WithHoldTTL enables extending a deposit's expires_at to authorisation time
+// plus ttl when the payment becomes authorized.
+func WithHoldTTL(ttl time.Duration) WebhookOption {
+	return func(u *webhookUseCase) { u.holdTTL = ttl }
 }
 
 // PaymentSubjectObserver is notified after a webhook has successfully applied a
@@ -431,6 +441,13 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 	txErr := u.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := u.payments.CompareAndSwapStatus(ctx, p.ID, from, domain.PaymentAuthorized, now); err != nil {
 			return err
+		}
+		if u.holdTTL > 0 && !p.Purpose.CapturesImmediately() {
+			exp := now.Add(u.holdTTL)
+			if err := u.payments.ExtendHoldExpiry(ctx, p.ID, exp); err != nil {
+				return err
+			}
+			p.ExpiresAt = &exp
 		}
 		p.Status = domain.PaymentAuthorized
 		p.AuthorizedAt = &now

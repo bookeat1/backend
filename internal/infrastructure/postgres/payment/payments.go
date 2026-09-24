@@ -417,6 +417,17 @@ func (r *Repository) ClaimExpiredHolds(ctx context.Context, before time.Time, li
 	return out, nil
 }
 
+// ExtendHoldExpiry only ever moves expires_at forward, and only for an
+// authorized row, so a late or duplicated call cannot shorten a hold.
+func (r *Repository) ExtendHoldExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error {
+	if _, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE payments SET expires_at=$2 WHERE id=$1 AND status='authorized' AND (expires_at IS NULL OR expires_at < $2)`,
+		id, expiresAt); err != nil {
+		return mapWrite(err, "extend payment hold expiry")
+	}
+	return nil
+}
+
 // RecordReconcileAttempt is CAS-guarded the same way as CompareAndSwapStatus:
 // `UPDATE ... WHERE id = $1 AND status = $2 RETURNING ...`. Zero rows means
 // the row's status already moved on (or the id is unknown) between the

@@ -108,12 +108,16 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 	if g.cfg.TestingMode {
 		params.Set("pg_testing_mode", "1")
 	}
-	if req.HoldTTL > 0 {
+	linkTTL := req.LinkTTL
+	if linkTTL <= 0 {
+		linkTTL = req.HoldTTL
+	}
+	if linkTTL > 0 {
 		// TODO(verify): pg_lifetime is documented as the lifetime of the
 		// payment (the link), and it is unclear whether it also bounds the
 		// hold. Sent as seconds; check on the sandbox what an expired
 		// pg_lifetime does to an already authorised hold.
-		params.Set("pg_lifetime", strconv.FormatInt(int64(req.HoldTTL/time.Second), 10))
+		params.Set("pg_lifetime", strconv.FormatInt(int64(linkTTL/time.Second), 10))
 	}
 	// Merchant parameters are echoed back to pg_result_url. They must not start
 	// with "pg_" — that namespace belongs to the gateway.
