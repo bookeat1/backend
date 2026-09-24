@@ -65,7 +65,7 @@ func ptrInt(i int) *int    { return &i }
 // the harness clock.
 func (h *workerHarness) booking(rid uuid.UUID, status domain.BookingStatus, createdAgo, endedAgo time.Duration) *domain.Booking {
 	end := h.now.Add(-endedAgo)
-	return &domain.Booking{
+	return &domain.Booking{ReleasedToVenueAt: releasedAt(), 
 		ID: uuid.New(), RestaurantID: rid, Name: "Дамир", Phone: "+77071234567",
 		PhoneNormalized: "+77071234567", Guests: 2, Status: status,
 		Source:   domain.SourceApp,

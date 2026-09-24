@@ -733,3 +733,7 @@ func (f *fakeCapacity) PeakTaken(_ context.Context, _ uuid.UUID, from time.Time)
 	}
 	return peak, nil
 }
+
+// releasedAt is the released_to_venue_at of a booking that is visible to the
+// venue — every fixture except the ones exercising the pre-order gate.
+func releasedAt() *time.Time { t := time.Now().Add(-time.Hour); return &t }

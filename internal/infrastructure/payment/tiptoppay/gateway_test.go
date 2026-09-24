@@ -174,10 +174,10 @@ func TestAuthorizeCreatesATwoStageOrderForADeposit(t *testing.T) {
 	}
 }
 
-// TestAuthorizeChargesAPreorderImmediately is the owner decision (2026-09-23):
+// TestAuthorizeHoldsAPreorderForConfirmation is the owner decision (2026-09-23):
 // a pre-order must not sit as an uncaptured hold while the kitchen starts
 // cooking, so TipTopPay is told to settle it in one stage.
-func TestAuthorizeChargesAPreorderImmediately(t *testing.T) {
+func TestAuthorizeHoldsAPreorderForConfirmation(t *testing.T) {
 	f := newFakeAcquirer(t, func(path string, _ int, _ map[string]any, w http.ResponseWriter) {
 		if path != "/orders/create" {
 			t.Errorf("unexpected path %s", path)
@@ -193,8 +193,8 @@ func TestAuthorizeChargesAPreorderImmediately(t *testing.T) {
 	}
 
 	sent := f.seen()[0]
-	if sent.Body["RequireConfirmation"] != false {
-		t.Error("RequireConfirmation must be false for a pre-order — it is charged in one stage")
+	if sent.Body["RequireConfirmation"] != true {
+		t.Error("RequireConfirmation must be true for a pre-order — held, captured when the venue confirms (owner decision 2026-09-24)")
 	}
 }
 

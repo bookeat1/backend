@@ -18,7 +18,7 @@ func testPayment(bookingID uuid.UUID, status domain.PaymentStatus, providerPayme
 	return &domain.Payment{
 		ID: uuid.New(), BookingID: bookingID, RestaurantID: uuid.New(),
 		Provider: domain.ProviderFreedomPay, ProviderPaymentID: &pid,
-		Purpose: domain.PurposeDeposit, Status: status,
+		Purpose: domain.PurposeDeposit, Status: status, RequiresConfirmation: true,
 		AmountMinor: 1_035_000, BaseAmountMinor: 1_000_000, FeeMinor: 35_000,
 		Currency: domain.CurrencyKZT, IdempotencyKey: bookingID.String() + ":k",
 		CreatedAt: now, UpdatedAt: now,
@@ -313,6 +313,7 @@ func testOneStagePayment(bookingID uuid.UUID, status domain.PaymentStatus, provi
 	p := testPayment(bookingID, status, providerPaymentID)
 	p.Provider = domain.ProviderTipTopPay
 	p.Purpose = domain.PurposePreorder
+	p.RequiresConfirmation = false
 	return p
 }
 
