@@ -719,6 +719,10 @@ func (f *fakeVenuePayments) AvailablePaymentMethods(_ context.Context, restauran
 	return []domain.PaymentMethod{}, nil
 }
 
+func (f *fakeVenuePayments) PaymentFeeTerms(_ context.Context, _ uuid.UUID) (domain.PaymentFeeTerms, error) {
+	return domain.PaymentFeeTerms{RateBps: 350, MinFeeMinor: 2500}, nil
+}
+
 func newPaymentFlagFacade(t *testing.T, id uuid.UUID, pay *fakeVenuePayments) Facade {
 	t.Helper()
 	rest := domain.Restaurant{ID: id}

@@ -199,6 +199,24 @@ func (u *createUseCase) AvailablePaymentMethods(ctx context.Context, restaurantI
 	return out, nil
 }
 
+// PaymentFeeTerms returns the effective inputs of the gross-up the checkout
+// applies (CreateForBooking: domain.GrossUpForAcquirerWithMinimum(base,
+// settings.ServiceFeeBps, cfg.AcquirerMinFeeMinor)): the venue's own rate when
+// set, else the platform default, and the acquirer's minimum. Resolved through
+// the same gate.settings, so the guest-facing numbers cannot drift from the
+// charge. A venue with payments off yields errVenuePaymentsDisabled.
+func (u *createUseCase) PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error) {
+	if restaurantID == uuid.Nil {
+		return domain.PaymentFeeTerms{}, fmt.Errorf("%w: restaurant required", domain.ErrValidation)
+	}
+	g := u.gate()
+	s, err := g.settings(ctx, restaurantID)
+	if err != nil {
+		return domain.PaymentFeeTerms{}, err
+	}
+	return domain.PaymentFeeTerms{RateBps: s.ServiceFeeBps, MinFeeMinor: g.cfg.AcquirerMinFeeMinor}, nil
+}
+
 // methodEnabled reports whether the venue has switched the method on.
 func methodEnabled(s domain.PaymentSettings, m domain.PaymentMethod) bool {
 	switch m {

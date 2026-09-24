@@ -32,6 +32,9 @@ type CreateUseCase interface {
 	// can take right now; empty means none. AcceptsOnlinePayment is true iff
 	// this is non-empty.
 	AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error)
+	// PaymentFeeTerms returns the effective service-fee rate and acquirer
+	// minimum the checkout grosses a base amount up with for this venue.
+	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
 }
 
 // CreateInput is a checkout request.
