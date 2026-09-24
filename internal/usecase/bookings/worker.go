@@ -46,6 +46,23 @@ type Worker struct {
 	now         func() time.Time // injectable clock for tests
 	deposits    DepositSettler
 	reminders   domain.BookingReminderRepository
+	// release and holds drive the pre-order gate (owner decisions 2026-09-24);
+	// both nil = the previous behaviour.
+	release domain.BookingReleaseRepository
+	holds   PreorderHoldChecker
+}
+
+// PreorderHoldChecker reports whether a booking's pre-order is currently a live
+// HOLD (authorized, not yet captured). Silence of the venue on such a booking is
+// a cancellation, never an auto-confirmation.
+type PreorderHoldChecker interface {
+	HasPreorderHold(ctx context.Context, bookingID uuid.UUID) (bool, error)
+}
+
+// WithWorkerPreorderGate wires the hidden-booking payment deadline (release) and
+// the held-booking venue deadline (holds).
+func WithWorkerPreorderGate(release domain.BookingReleaseRepository, holds PreorderHoldChecker) WorkerOption {
+	return func(w *Worker) { w.release, w.holds = release, holds }
 }
 
 // WorkerOption configures optional worker dependencies without breaking the
@@ -83,6 +100,13 @@ type WorkerConfig struct {
 	ReminderLead time.Duration
 	// BatchSize caps how many bookings one pass claims per stage.
 	BatchSize int
+	// AwaitPaymentTTL is how long a booking hidden behind an unpaid pre-order
+	// lives before the system cancels it (D_pay, min age).
+	// env: PAYMENTS_PREORDER_AWAIT_PAYMENT_TTL
+	AwaitPaymentTTL time.Duration
+	// ConfirmMax caps the venue's answer time for a booking with a held
+	// pre-order (D_venue). env: PAYMENTS_PREORDER_CONFIRM_MAX
+	ConfirmMax time.Duration
 }
 
 const (
@@ -90,6 +114,13 @@ const (
 	defaultNoShowGrace  = 30 * time.Minute
 	defaultReminderLead = 60 * time.Minute
 	defaultBatchSize    = 100
+
+	DefaultAwaitPaymentTTL = 30 * time.Minute
+	DefaultConfirmMax      = 24 * time.Hour
+	// MaxConfirmMax is the hard ceiling checked at startup (spec criterion 23).
+	MaxConfirmMax = 72 * time.Hour
+	// minVenueAnswer: the venue always gets at least this long after release.
+	minVenueAnswer = 15 * time.Minute
 )
 
 func (c WorkerConfig) withDefaults() WorkerConfig {
@@ -104,6 +135,12 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = defaultBatchSize
+	}
+	if c.AwaitPaymentTTL <= 0 {
+		c.AwaitPaymentTTL = DefaultAwaitPaymentTTL
+	}
+	if c.ConfirmMax <= 0 {
+		c.ConfirmMax = DefaultConfirmMax
 	}
 	return c
 }
@@ -137,6 +174,8 @@ type TickResult struct {
 	Confirmed int // pending/waitlist auto-confirmed
 	Escalated int // confirm SLA breached, venue has auto_confirm off
 	Abandoned int // pending/waitlist the venue never answered → cancelled
+	Unpaid    int // hidden pre-order booking never paid → cancelled
+	NoAnswer  int // held pre-order booking the venue never answered → cancelled
 	Completed int // arrived → completed
 	NoShow    int // confirmed → no_show
 	Reminded  int // pre-visit guest reminders emitted
@@ -189,7 +228,14 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	// Deposit settlements to run AFTER the passes commit: each makes an external
 	// acquirer call, which must never run inside the pass transaction (it holds
 	// the ClaimDue row locks). Collected here, settled by settleDeposits below.
-	var abandonedIDs, noShowIDs []uuid.UUID
+	var abandonedIDs, noShowIDs, unpaidIDs, noAnswerIDs []uuid.UUID
+	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
+		ids, n, err := w.processUnpaidHidden(ctx, now)
+		unpaidIDs, res.Unpaid = ids, n
+		return err
+	}); err != nil {
+		return res, fmt.Errorf("unpaid preorder pass: %w", err)
+	}
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
 		ids, r, err := w.processAbandoned(ctx, now)
 		abandonedIDs = ids
@@ -199,8 +245,9 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 		return res, fmt.Errorf("abandoned pass: %w", err)
 	}
 	if err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		r, err := w.processConfirmSLA(ctx, now)
-		res.Confirmed, res.Escalated = r.Confirmed, r.Escalated
+		r, ids, err := w.processConfirmSLA(ctx, now)
+		noAnswerIDs = ids
+		res.Confirmed, res.Escalated, res.NoAnswer = r.Confirmed, r.Escalated, r.NoAnswer
 		res.Skipped += r.Skipped
 		return err
 	}); err != nil {
@@ -230,6 +277,8 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	// fatal: a settlement error is logged and left for the reconciliation worker.
 	w.settleDeposits(ctx, noShowIDs, domain.RefundTriggerNoShow)
 	w.settleDeposits(ctx, abandonedIDs, domain.RefundTriggerVenueCancel)
+	w.settleDeposits(ctx, unpaidIDs, domain.RefundTriggerVenueCancel)
+	w.settleDeposits(ctx, noAnswerIDs, domain.RefundTriggerVenueCancel)
 	return res, nil
 }
 
@@ -260,45 +309,82 @@ func (w *Worker) settleDeposits(ctx context.Context, bookingIDs []uuid.UUID, tri
 // is re-checked against its venue's resolved policy. That is safe: the set of
 // unanswered bookings is small by construction (auto-confirm is on by default
 // and drains it every tick) and BatchSize bounds the pass either way.
-func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResult, error) {
+func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResult, []uuid.UUID, error) {
 	var res TickResult
+	var noAnswer []uuid.UUID
 	due, err := w.bookings.ClaimDue(ctx,
 		[]domain.BookingStatus{domain.BookingPending, domain.BookingWaitlist},
 		domain.ClaimByCreatedAt, now, w.wcfg.BatchSize)
 	if err != nil {
-		return res, err
+		return res, nil, err
 	}
 	for i := range due {
 		b := due[i]
-		rest, err := w.restaurants.GetByID(ctx, b.RestaurantID)
-		if err != nil {
-			return res, fmt.Errorf("load restaurant %s: %w", b.RestaurantID, err)
-		}
-		policy := resolvePolicy(rest.Restaurant, w.cfg)
-		if now.Before(b.CreatedAt.Add(policy.ConfirmSLA)) {
+		if b.ReleasedToVenueAt == nil {
+			// Hidden behind an unpaid pre-order: the venue has not even been
+			// told, so its SLA has not started and nothing may auto-confirm it.
 			res.Skipped++
 			continue
+		}
+		rest, err := w.restaurants.GetByID(ctx, b.RestaurantID)
+		if err != nil {
+			return res, nil, fmt.Errorf("load restaurant %s: %w", b.RestaurantID, err)
+		}
+		policy := resolvePolicy(rest.Restaurant, w.cfg)
+		if now.Before(b.ReleasedToVenueAt.Add(policy.ConfirmSLA)) {
+			res.Skipped++
+			continue
+		}
+		if w.holds != nil && b.Status == domain.BookingPending {
+			held, err := w.holds.HasPreorderHold(ctx, b.ID)
+			if err != nil {
+				return res, nil, err
+			}
+			if held {
+				// Silence is never a confirmation when money is on hold: at
+				// D_venue the booking is cancelled and the hold voided.
+				if now.Before(w.venueDeadline(b, policy)) {
+					res.Skipped++
+					continue
+				}
+				code := domain.CancelReasonVenueNoAnswer
+				ok, err := w.transition(ctx, &b, domain.BookingCancelled, now, code,
+					func(b *domain.Booking, at time.Time) {
+						by := domain.CancelledBySystem
+						b.CancelledBy, b.CancelledAt, b.CancellationReasonCode = &by, &at, &code
+					})
+				if err != nil {
+					return res, nil, err
+				}
+				if !ok {
+					res.Skipped++
+					continue
+				}
+				res.NoAnswer++
+				noAnswer = append(noAnswer, b.ID)
+				continue
+			}
 		}
 		if !policy.AutoConfirm {
 			// Escalate at most once per booking; the venue keeps ownership of
 			// the decision and the booking stays pending.
 			exists, err := w.outbox.ExistsForBooking(ctx, b.ID, domain.EventBookingEscalated)
 			if err != nil {
-				return res, err
+				return res, nil, err
 			}
 			if exists {
 				res.Skipped++
 				continue
 			}
 			if err := publish(ctx, w.outbox, &b, domain.EventBookingEscalated, now); err != nil {
-				return res, err
+				return res, nil, err
 			}
 			res.Escalated++
 			continue
 		}
 		ok, err := w.transition(ctx, &b, domain.BookingConfirmed, now, "confirm sla elapsed, venue auto-confirm", nil)
 		if err != nil {
-			return res, err
+			return res, nil, err
 		}
 		if !ok {
 			res.Skipped++
@@ -306,7 +392,7 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 		}
 		res.Confirmed++
 	}
-	return res, nil
+	return res, noAnswer, nil
 }
 
 // abandonedReason is written to booking_status_history and to the booking's
@@ -480,4 +566,54 @@ func (w *Worker) transition(
 		return false, err
 	}
 	return true, nil
+}
+
+// venueDeadline is D_venue: min(released + venue SLA, released + ConfirmMax,
+// starts_at), but never earlier than released + 15 minutes.
+func (w *Worker) venueDeadline(b domain.Booking, policy domain.BookingPolicy) time.Time {
+	rel := *b.ReleasedToVenueAt
+	d := rel.Add(policy.ConfirmSLA)
+	if m := rel.Add(w.wcfg.ConfirmMax); m.Before(d) {
+		d = m
+	}
+	if b.StartsAt.Before(d) {
+		d = b.StartsAt
+	}
+	if floor := rel.Add(minVenueAnswer); d.Before(floor) {
+		d = floor
+	}
+	return d
+}
+
+// processUnpaidHidden cancels bookings that stayed hidden behind an unpaid
+// pre-order past D_pay (created + AwaitPaymentTTL, and no live payment link):
+// the guest closed the page, the card was declined or the link expired. The
+// table is freed by the status trigger; the guest is told through the ordinary
+// cancelled event. Returns the cancelled ids so any leftover payment is settled
+// after the transaction.
+func (w *Worker) processUnpaidHidden(ctx context.Context, now time.Time) ([]uuid.UUID, int, error) {
+	if w.release == nil {
+		return nil, 0, nil
+	}
+	due, err := w.release.ClaimUnpaidHidden(ctx, now.Add(-w.wcfg.AwaitPaymentTTL), w.wcfg.BatchSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	var ids []uuid.UUID
+	code := domain.CancelReasonPreorderPaymentNotCompleted
+	for i := range due {
+		b := due[i]
+		ok, err := w.transition(ctx, &b, domain.BookingCancelled, now, code,
+			func(b *domain.Booking, at time.Time) {
+				by := domain.CancelledBySystem
+				b.CancelledBy, b.CancelledAt, b.CancellationReasonCode = &by, &at, &code
+			})
+		if err != nil {
+			return nil, 0, err
+		}
+		if ok {
+			ids = append(ids, b.ID)
+		}
+	}
+	return ids, len(ids), nil
 }

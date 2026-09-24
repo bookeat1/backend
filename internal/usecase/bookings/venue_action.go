@@ -79,6 +79,9 @@ func (u *statusUseCase) DecideAsVenue(
 	if b.Status == to {
 		return VenueDecisionResult{Booking: b, Applied: false}, nil
 	}
+	if b.AwaitingPreorderPayment() {
+		return VenueDecisionResult{}, errAwaitingPayment()
+	}
 	if err := domain.ValidateTransition(b.Status, to); err != nil {
 		return VenueDecisionResult{Booking: b, Conflict: true}, nil
 	}
@@ -112,6 +115,10 @@ func (u *statusUseCase) DecideAsVenue(
 	})
 	if err != nil {
 		return VenueDecisionResult{}, err
+	}
+	u.settleDepositAfterTransition(ctx, b, to)
+	if to == domain.BookingConfirmed {
+		u.captureAfterConfirm(ctx, b)
 	}
 	return VenueDecisionResult{Booking: b, Applied: true}, nil
 }

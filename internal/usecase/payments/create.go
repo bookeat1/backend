@@ -295,7 +295,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		Status: domain.PaymentCreated, AmountMinor: total.AmountMinor, BaseAmountMinor: base.AmountMinor,
 		FeeMinor: fee.AmountMinor, Currency: total.Currency, IdempotencyKey: dbKey,
 		RequiresConfirmation: requiresConfirmation(gw, purpose),
-		PaymentURL: nullableStr(gwResp.PaymentURL), ExpiresAt: &expiresAt,
+		PaymentURL:           nullableStr(gwResp.PaymentURL), ExpiresAt: &expiresAt,
 		CreatedAt: now, UpdatedAt: now,
 	}
 
