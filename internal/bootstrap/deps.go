@@ -42,6 +42,7 @@ import (
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
+	kwaakaorder "backend-core/internal/infrastructure/postgres/kwaakaorder"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	notificationrepo "backend-core/internal/infrastructure/postgres/notification"
@@ -89,6 +90,7 @@ import (
 	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
+	"backend-core/internal/usecase/kwaakaorders"
 	"backend-core/internal/usecase/kwaakasync"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
@@ -742,7 +744,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// availability lookup, restRepo = the venue's preorder minimum, paymentsRepo
 		// = the "already paid → frozen" guard.
 		Preorder: preorder.NewUseCase(bookingRepo, menuItems, bookingItems, restRepo,
-			restaurantManagers, paymentsRepo, txm),
+			restaurantManagers, paymentsRepo, txm).WithKitchenOrders(kwaakaorder.NewOrders(db)),
 		// Server-side map preview. Always constructed, even without a provider
 		// key: the endpoint then answers a clean map_not_configured instead of
 		// disappearing from the routing table, so the app gets one stable
@@ -1964,6 +1966,34 @@ func NewKwaakaSyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaaka
 		menurepo.New(db),
 		sqltx.NewManager(db),
 		kwaakasync.Config{TickInterval: cfg.KwaakaSync.TickInterval},
+		log,
+	)
+}
+
+// NewKwaakaOrdersWorker wires the kitchen-order loop (phase 2), or nil when the
+// Kwaaka adapter is not configured. The loop itself starts sending only with
+// KWAAKA_ORDERS_ENABLED=true; without it the worker still cancels orders that
+// were already sent.
+func NewKwaakaOrdersWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaakaorders.Worker {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka kitchen orders not started", slog.String("reason", err.Error()))
+		return nil
+	}
+	if !cfg.KwaakaOrders.Enabled {
+		log.Info("kwaaka kitchen orders: sending disabled (KWAAKA_ORDERS_ENABLED=false), cancels still run")
+	}
+	return kwaakaorders.NewWorker(
+		kwaakaorder.NewOrders(db),
+		kwaakaorder.NewSettings(db),
+		kwaaka.NewOrderPOS(kwaaka.NewClient(nil, kwCfg)),
+		bookingrepo.NewOutbox(db),
+		sqltx.NewManager(db),
+		kwaakaorders.Config{
+			Enabled:     cfg.KwaakaOrders.Enabled,
+			DefaultLead: cfg.KwaakaOrders.Lead,
+			MaxAttempts: cfg.KwaakaOrders.MaxAttempts,
+		},
 		log,
 	)
 }
