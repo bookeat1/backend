@@ -77,6 +77,7 @@ func TestCreateTableOrderClassification(t *testing.T) {
 
 func TestCreateTableOrderTimeoutIsUnknown(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body) // server only notices a dropped client after the body is read
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
