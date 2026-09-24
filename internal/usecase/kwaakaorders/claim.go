@@ -53,6 +53,9 @@ func (w *Worker) ClaimPass(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
+		if !vc.settings.OrdersEnabled || len(vc.settings.Pool) == 0 || vc.settings.KwaakaRestaurantID != sub.KwaakaID {
+			continue // venue switched off / no pool / linkage changed: zero POS calls
+		}
 		if !dueAt(sub, w.leadFor(vc.settings), vc.settings.EnabledAt, now).Send {
 			continue
 		}
