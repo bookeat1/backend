@@ -338,7 +338,13 @@ func (u *depositCancellationUseCase) CaptureOnConfirm(ctx context.Context, booki
 	case domain.PaymentCaptured, domain.PaymentCapturing:
 		return p, nil
 	case domain.PaymentAuthorized:
-		return u.capvoid.captureHold(ctx, p)
+		out, err := u.capvoid.captureHold(ctx, p)
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			// Lost the authorized -> capturing CAS to a concurrent confirmer
+			// (cabinet + Telegram): that caller owns the single /payments/confirm.
+			return p, nil
+		}
+		return out, err
 	default:
 		return nil, fmt.Errorf("%w: pre-order hold is %s, cannot capture on confirmation", domain.ErrInvalidStatus, p.Status)
 	}
