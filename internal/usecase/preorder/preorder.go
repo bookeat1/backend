@@ -112,6 +112,12 @@ type paymentReader interface {
 	HasInFlightForBooking(ctx context.Context, bookingID uuid.UUID) (bool, error)
 }
 
+// kitchenOrderReader is the slice of domain.KitchenOrderRepository the
+// pre-order lock needs.
+type kitchenOrderReader interface {
+	GetByBookingID(ctx context.Context, bookingID uuid.UUID) (*domain.KitchenOrder, error)
+}
+
 // UseCase attaches/reads a booking's pre-order.
 type UseCase struct {
 	bookings bookingReader
@@ -121,6 +127,14 @@ type UseCase struct {
 	managers managerChecker
 	payments paymentReader
 	tx       domain.TxManager
+	kitchen  kitchenOrderReader // optional, see WithKitchenOrders
+}
+
+// WithKitchenOrders enables the "already sent to the POS" lock (Kwaaka phase 2).
+// Optional so venues and tests without the integration behave as before.
+func (u *UseCase) WithKitchenOrders(r kitchenOrderReader) *UseCase {
+	u.kitchen = r
+	return u
 }
 
 // NewUseCase constructs the pre-order usecase.
@@ -196,6 +210,21 @@ func (u *UseCase) Replace(ctx context.Context, actor Actor, bookingID uuid.UUID,
 	default:
 		return nil, domain.WithCode(domain.CodePreorderBookingClosed,
 			fmt.Errorf("%w: booking is %s, its pre-order can no longer be changed", domain.ErrValidation, b.Status))
+	}
+
+	// Sent to the POS kitchen: closed to EVERYONE (guest, staff, admin). No new
+	// booking lock is taken: a send only happens under an already effective lock
+	// (payment captured/in flight, or status arrived), so the race window with
+	// this read is theoretical (plan B7).
+	if u.kitchen != nil {
+		ko, err := u.kitchen.GetByBookingID(ctx, bookingID)
+		switch {
+		case err == nil && ko.Status.LocksPreorder():
+			return nil, domain.WithCode(domain.CodePreorderSentToKitchen,
+				fmt.Errorf("%w: the pre-order was already sent to the venue kitchen", domain.ErrValidation))
+		case err != nil && !errors.Is(err, domain.ErrNotFound):
+			return nil, err
+		}
 	}
 
 	// Once the booking is CONFIRMED the pre-order is closed TO THE GUEST: the

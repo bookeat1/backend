@@ -33,6 +33,17 @@ func (s KitchenOrderStatus) Valid() bool {
 	return false
 }
 
+// LocksPreorder: once the order left for the POS (or may have), the pre-order
+// text there no longer follows edits, so PUT /bookings/:id/preorder is refused.
+// failed and cancelled keep the earlier ADR-030 rules.
+func (s KitchenOrderStatus) LocksPreorder() bool {
+	switch s {
+	case KitchenOrderSending, KitchenOrderSent, KitchenOrderFailedUnknown, KitchenOrderCancelling, KitchenOrderCancelFailed:
+		return true
+	}
+	return false
+}
+
 // Terminal reports whether no further transition is legal from s.
 func (s KitchenOrderStatus) Terminal() bool {
 	switch s {
