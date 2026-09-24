@@ -266,6 +266,9 @@ const (
 	// CancelReasonPreorderCaptureFailed — the acquirer definitively refused to
 	// take the held pre-order after the venue confirmed.
 	CancelReasonPreorderCaptureFailed = "preorder_capture_failed"
+	// CancelReasonPreorderHoldReleased — the acquirer released the held pre-order
+	// (bank void / hold expiry) before the venue confirmed the booking.
+	CancelReasonPreorderHoldReleased = "preorder_hold_released"
 )
 
 // AwaitingPreorderPayment reports whether the booking is still hidden from the

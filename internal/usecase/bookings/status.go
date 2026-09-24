@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -258,10 +259,24 @@ func (u *statusUseCase) captureAfterConfirm(ctx context.Context, b *domain.Booki
 	}
 }
 
+// CancelPendingOnHoldLost cancels a PENDING booking as the system because the
+// acquirer released its pre-order hold (scenario 12). Any other status is left
+// alone: a confirmed booking's money is the capture/refund path's business.
+// Bound in bootstrap to payments.WithHoldLostCanceller.
+func (u *statusUseCase) CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error {
+	return u.cancelBySystemIf(ctx, id, domain.CancelReasonPreorderHoldReleased, domain.BookingPending)
+}
+
 // cancelBySystem cancels a live booking as the system with a machine-readable
 // reason code, then releases any hold. Idempotent: a booking that already left
 // a cancellable state is left alone.
 func (u *statusUseCase) cancelBySystem(ctx context.Context, id uuid.UUID, code string) error {
+	return u.cancelBySystemIf(ctx, id, code)
+}
+
+// cancelBySystemIf is cancelBySystem restricted to the given current statuses
+// (none = any cancellable one).
+func (u *statusUseCase) cancelBySystemIf(ctx context.Context, id uuid.UUID, code string, only ...domain.BookingStatus) error {
 	var b *domain.Booking
 	at := time.Now()
 	err := u.tx.WithinTx(ctx, func(ctx context.Context) error {
@@ -270,6 +285,9 @@ func (u *statusUseCase) cancelBySystem(ctx context.Context, id uuid.UUID, code s
 			return err
 		}
 		if domain.ValidateTransition(cur.Status, domain.BookingCancelled) != nil {
+			return nil
+		}
+		if len(only) > 0 && !slices.Contains(only, cur.Status) {
 			return nil
 		}
 		from := cur.Status

@@ -549,11 +549,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// the same policy instead of quietly staying taken.
 	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
+	// Bound to the booking status usecase right after it is built (it needs the
+	// payments deposit-cancel usecase, so it cannot exist yet).
+	holdLost := &holdLostAdapter{}
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, txm,
 		payments.WithPaymentSubjectObserver(ticketObserver),
 		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel),
 		payments.WithBookingReleaser(bookingReleaser),
+		payments.WithHoldLostCanceller(holdLost),
 		payments.WithHoldTTL(cfg.Payments.HoldTTL))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
@@ -640,6 +644,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}),
 		bookings.WithPreorderCapturer(preorderCapturerAdapter{uc: paymentDepositCancel}))
+	holdLost.uc, _ = bookingStatus.(interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	})
 
 	// Restaurant admin panel (Ф1): an RBAC-guarded orchestration over the
 	// existing building blocks. It reuses restaurantManagers for the RBAC
@@ -1114,6 +1121,21 @@ func (a preorderCapturerAdapter) CaptureOnConfirm(ctx context.Context, bookingID
 	}
 	_, err := c.CaptureOnConfirm(ctx, bookingID)
 	return err
+}
+
+// holdLostAdapter is filled once the booking status usecase exists; until then
+// (and if the assertion ever fails) it is a no-op rather than a nil deref.
+type holdLostAdapter struct {
+	uc interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	}
+}
+
+func (a *holdLostAdapter) CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error {
+	if a.uc == nil {
+		return nil
+	}
+	return a.uc.CancelPendingOnHoldLost(ctx, id)
 }
 
 // preorderHoldAdapter tells the booking worker whether a booking's pre-order is

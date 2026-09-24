@@ -30,7 +30,7 @@ func newStatusHarness(t *testing.T, status domain.BookingStatus, startsIn time.D
 	t.Helper()
 	rid := uuid.New()
 	guestID := uuid.New()
-	b := &domain.Booking{ReleasedToVenueAt: releasedAt(), 
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Name: "Дамир",
 		PhoneNormalized: "+77071234567", Guests: 2, Status: status,
 		StartsAt: time.Now().Add(startsIn), EndsAt: time.Now().Add(startsIn + 2*time.Hour),

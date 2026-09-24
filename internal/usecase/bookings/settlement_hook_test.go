@@ -46,7 +46,7 @@ func (f *fakeDepositSettler) triggerFor(id uuid.UUID) (domain.RefundTrigger, boo
 func TestStatus_GuestCancelSettlesDeposit(t *testing.T) {
 	rid := uuid.New()
 	guestID := uuid.New()
-	b := &domain.Booking{ReleasedToVenueAt: releasedAt(), 
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Name: "G",
 		PhoneNormalized: "+77071234567", Guests: 2, Status: domain.BookingConfirmed,
 		StartsAt: time.Now().Add(24 * time.Hour), EndsAt: time.Now().Add(26 * time.Hour),
@@ -76,7 +76,7 @@ func TestStatus_GuestCancelSettlesDeposit(t *testing.T) {
 func TestStatus_VenueRejectSettlesDeposit(t *testing.T) {
 	rid := uuid.New()
 	managerID := uuid.New()
-	b := &domain.Booking{ReleasedToVenueAt: releasedAt(), 
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, Name: "G",
 		PhoneNormalized: "+77071234567", Guests: 2, Status: domain.BookingPending,
 		StartsAt: time.Now().Add(24 * time.Hour), EndsAt: time.Now().Add(26 * time.Hour),
@@ -141,7 +141,7 @@ func TestWorker_NoShowSettlesDeposit(t *testing.T) {
 func TestStatus_LateGuestCancelStillSettlesDeposit(t *testing.T) {
 	rid := uuid.New()
 	guestID := uuid.New()
-	b := &domain.Booking{ReleasedToVenueAt: releasedAt(), 
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Name: "G",
 		PhoneNormalized: "+77071234567", Guests: 2, Status: domain.BookingConfirmed,
 		StartsAt: time.Now().Add(20 * time.Minute), EndsAt: time.Now().Add(2 * time.Hour), // minutes away → late

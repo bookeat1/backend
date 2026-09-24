@@ -221,3 +221,51 @@ func TestWebhookAuthorized_PreorderHoldOnConfirmedBookingCaptures(t *testing.T) 
 		t.Fatalf("capture called %d times, want 1", gw.callCount("capture"))
 	}
 }
+
+type fakeHoldLost struct {
+	mu    sync.Mutex
+	calls []uuid.UUID
+}
+
+func (f *fakeHoldLost) CancelPendingOnHoldLost(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, id)
+	return nil
+}
+
+// Scenario 12: the acquirer voids/expires the hold before the venue answered ->
+// the booking is cancelled by the system. A voided one-stage or deposit payment
+// does not touch the booking.
+func TestWebhookVoided_LostPreorderHoldCancelsBooking(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*domain.Payment)
+		wantCall bool
+	}{
+		{"preorder hold", func(p *domain.Payment) {}, true},
+		{"deposit", func(p *domain.Payment) { p.Purpose = domain.PurposeDeposit }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := heldPreorder(uuid.New())
+			tc.mutate(p)
+			u, repo, _, _, _, gw := newWebhookHarness(p)
+			hl := &fakeHoldLost{}
+			u.holdLost = hl
+			gw.verifyFn = verifyOK(&domain.WebhookEvent{
+				Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-v", ProviderPaymentID: "gw-hold",
+				Type: domain.WebhookPaymentVoided, Status: domain.PaymentVoided, SignatureValid: true,
+			})
+			if err := u.HandleWebhook(ctx, domain.ProviderFreedomPay, []byte("b"), nil); err != nil {
+				t.Fatalf("HandleWebhook: %v", err)
+			}
+			if stored, _ := repo.GetByID(ctx, p.ID); stored.Status != domain.PaymentVoided {
+				t.Fatalf("status = %s, want voided", stored.Status)
+			}
+			if got := len(hl.calls) == 1; got != tc.wantCall {
+				t.Fatalf("hold-lost calls = %v, want call=%v", hl.calls, tc.wantCall)
+			}
+		})
+	}
+}
