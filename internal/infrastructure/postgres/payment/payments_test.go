@@ -610,3 +610,44 @@ func TestPaymentTransactionRollbackLeavesNoTrace(t *testing.T) {
 		t.Fatalf("ledger has %d rows after rollback, want 0", len(rows))
 	}
 }
+
+func TestPaymentExtendHoldExpiry(t *testing.T) {
+	pool, ctx := setup(t)
+	rid := seedRestaurant(t, pool)
+	repo := New(pool)
+
+	bid := seedBooking(t, pool, rid)
+	p := newPayment(bid, rid)
+	exp := time.Now().Add(15 * time.Minute)
+	p.ExpiresAt = &exp
+	if err := repo.Create(ctx, p); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	later := time.Now().Add(96 * time.Hour)
+	// Not authorized yet: no-op.
+	if err := repo.ExtendHoldExpiry(ctx, p.ID, later); err != nil {
+		t.Fatalf("extend created: %v", err)
+	}
+	got, _ := repo.GetByID(ctx, p.ID)
+	if got.ExpiresAt.After(exp.Add(time.Second)) {
+		t.Fatalf("created payment must not be extended, got %v", got.ExpiresAt)
+	}
+	if err := repo.CompareAndSwapStatus(ctx, p.ID, domain.PaymentCreated, domain.PaymentAuthorized, time.Now()); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if err := repo.ExtendHoldExpiry(ctx, p.ID, later); err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	got, _ = repo.GetByID(ctx, p.ID)
+	if got.ExpiresAt.Before(later.Add(-time.Second)) {
+		t.Fatalf("authorized payment not extended, got %v", got.ExpiresAt)
+	}
+	// Never backwards.
+	if err := repo.ExtendHoldExpiry(ctx, p.ID, exp); err != nil {
+		t.Fatalf("extend back: %v", err)
+	}
+	got, _ = repo.GetByID(ctx, p.ID)
+	if got.ExpiresAt.Before(later.Add(-time.Second)) {
+		t.Fatalf("expiry moved backwards: %v", got.ExpiresAt)
+	}
+}

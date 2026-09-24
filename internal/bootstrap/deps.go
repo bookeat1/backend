@@ -548,7 +548,8 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, txm,
 		payments.WithPaymentSubjectObserver(ticketObserver),
-		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel))
+		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel),
+		payments.WithHoldTTL(cfg.Payments.HoldTTL))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
 		paymentOutboxRepo, paymentSettings, paymentGateways, restaurantManagers, txm, paymentsCfg)
@@ -967,6 +968,7 @@ func newPaymentsConfig(cfg Config) payments.Config {
 		DepositRequired:              cfg.Payments.DepositRequired,
 		PreorderPaymentRequired:      cfg.Payments.PreorderPaymentRequired,
 		HoldTTL:                      cfg.Payments.HoldTTL,
+		LinkTTL:                      cfg.Payments.LinkTTL,
 		FreeCancelWindow:             cfg.Payments.FreeCancelWindow,
 		SplitEnabled:                 cfg.Payments.SplitEnabled,
 		PlatformSplitAccountRef:      cfg.Payments.PlatformSplitAccountRef,

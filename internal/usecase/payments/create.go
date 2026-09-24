@@ -253,7 +253,8 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 
 	paymentID := uuid.New()
 	now := time.Now()
-	expiresAt := now.Add(u.cfg.HoldTTL)
+	linkTTL := u.cfg.linkTTLFor(purpose)
+	expiresAt := now.Add(linkTTL)
 
 	gwResp, err := gw.Authorize(ctx, domain.AuthorizeRequest{
 		PaymentID:      paymentID,
@@ -263,6 +264,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		Purpose:        purpose,
 		Description:    descriptionFor(purpose),
 		HoldTTL:        u.cfg.HoldTTL,
+		LinkTTL:        linkTTL,
 		ReturnURL:      in.ReturnURL,
 		CallbackURL:    in.CallbackURL,
 		CustomerPhone:  booking.PhoneNormalized,
