@@ -9,6 +9,10 @@
 -- so nothing already visible disappears.
 ALTER TABLE bookings ADD COLUMN released_to_venue_at timestamptz NULL;
 UPDATE bookings SET released_to_venue_at = created_at;
+-- Rows inserted WITHOUT the column (legacy sync, ETL, any future writer) are
+-- visible: the DEFAULT applies only when the column is omitted. The gate writes
+-- an explicit NULL to hide a booking.
+ALTER TABLE bookings ALTER COLUMN released_to_venue_at SET DEFAULT now();
 CREATE INDEX idx_bookings_unreleased ON bookings (created_at)
     WHERE released_to_venue_at IS NULL AND status = 'pending';
 
