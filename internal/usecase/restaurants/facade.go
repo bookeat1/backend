@@ -161,6 +161,16 @@ type SaveInput struct {
 	IsPopular    *bool
 	IsPremium    *bool
 	DisplayOrder *int
+	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator for the
+	// menu-sync worker (usecase/kwaakasync) — the ONLY way to set it before this
+	// field existed was hand-editing the row. Same PATCH semantics as every
+	// other pointer field here: nil = untouched; an explicit empty string clears
+	// the link (see applyRestaurant, mirrors LateArrivalText's clear sentinel
+	// below). Superadmin-only, same bucket as IsPremium/DisplayOrder — a venue's
+	// own staff must not be able to repoint their own POS integration; the
+	// authorization gate is in transport/rest/restaurants.Handler.update, not
+	// here (this facade has no notion of the caller's role).
+	KwaakaRestaurantID *string
 
 	// HoldMinutes / LateArrivalText(+I18n) are the venue's optional
 	// booking-rules-copy override (Trello BNjLdfSP). Same PATCH semantics as
@@ -606,6 +616,17 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	}
 	if in.DisplayOrder != nil {
 		m.DisplayOrder = in.DisplayOrder
+	}
+	if in.KwaakaRestaurantID != nil {
+		if trimmed := strings.TrimSpace(*in.KwaakaRestaurantID); trimmed == "" {
+			// Empty string is this endpoint's "unlink" sentinel, same as
+			// LateArrivalText's clear-to-default below — a venue dropped from
+			// Kwaaka must be able to fall out of RestaurantSource without a
+			// hand-run SQL UPDATE (see usecase/kwaakasync/ports.go).
+			m.KwaakaRestaurantID = nil
+		} else {
+			m.KwaakaRestaurantID = &trimmed
+		}
 	}
 	if in.PriceMin != nil {
 		m.PriceMin = in.PriceMin

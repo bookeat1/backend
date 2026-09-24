@@ -120,7 +120,10 @@ func (h *Handler) adminList(c *gin.Context) {
 	lang := resolveLocale(c)
 	out := make([]restaurantResponse, 0, len(items))
 	for _, it := range items {
-		out = append(out, listItemToResponse(it, lang))
+		resp := listItemToResponse(it, lang)
+		attachKwaakaRestaurantID(&resp, it.Restaurant)
+		attachFreeCancelWindowMinutes(&resp, it.Restaurant)
+		out = append(out, resp)
 	}
 	page, perPage := domain.NormalizePaging(f.Page, f.PerPage)
 	response.OK(c.Writer, response.NewPage(out, total, page, perPage))
@@ -402,7 +405,10 @@ func (h *Handler) adminGet(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
+	resp := aggregateToResponse(agg, "", h.bookingRules)
+	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
+	response.OK(c.Writer, resp)
 }
 
 // attachFavorites sets IsFavorite on each element of out (in place, matched
@@ -487,7 +493,10 @@ func (h *Handler) create(c *gin.Context) {
 	// write, its answer is what the editor's form re-reads, and a browser
 	// sending Accept-Language: ru would get the ru TRANSLATION back in the
 	// scalar fields and post it as the next value of the column.
-	response.Created(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
+	resp := aggregateToResponse(agg, "", h.bookingRules)
+	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
+	response.Created(c.Writer, resp)
 }
 
 func (h *Handler) update(c *gin.Context) {
@@ -517,6 +526,7 @@ func (h *Handler) update(c *gin.Context) {
 		in.IsPopular = nil
 		in.IsPremium = nil
 		in.DisplayOrder = nil
+		in.KwaakaRestaurantID = nil
 	}
 	agg, err := h.facade.Update(c.Request.Context(), id, in)
 	if err != nil {
@@ -524,7 +534,14 @@ func (h *Handler) update(c *gin.Context) {
 		return
 	}
 	// NOT localized — see create above and adminGet below.
-	response.OK(c.Writer, aggregateToResponse(agg, "", h.bookingRules))
+	resp := aggregateToResponse(agg, "", h.bookingRules)
+	// kwaaka_restaurant_id is echoed back even for a non-admin caller: the
+	// write itself was already stripped above, so this can only ever be the
+	// previously-stored value, exactly like is_premium/display_order already
+	// are on this same read.
+	attachKwaakaRestaurantID(&resp, agg.Restaurant)
+	attachFreeCancelWindowMinutes(&resp, agg.Restaurant)
+	response.OK(c.Writer, resp)
 }
 
 func (h *Handler) deactivate(c *gin.Context) {

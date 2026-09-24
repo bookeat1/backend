@@ -46,7 +46,12 @@ type saveRestaurantRequest struct {
 	IsPopular        *bool              `json:"is_popular"`
 	IsPremium        *bool              `json:"is_premium"`
 	DisplayOrder     *int               `json:"display_order"`
-	Images           []imageInput       `json:"images"`
+	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator (see
+	// uc.SaveInput's doc comment). Superadmin-only, same as the marketing/
+	// curation fields above — handler.update strips it for a non-admin caller.
+	// Absent = unchanged; an explicit empty string unlinks the venue.
+	KwaakaRestaurantID *string      `json:"kwaaka_restaurant_id"`
+	Images             []imageInput `json:"images"`
 	// Features is still PARSED, but only so that a client which still sends the
 	// old free-text array gets a clear 422 instead of a silent no-op. The
 	// free-text table behind it was dropped in migration 0082; a venue's
@@ -106,7 +111,8 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
-		HoldMinutes: r.HoldMinutes, LateArrivalText: r.LateArrivalText,
+		KwaakaRestaurantID: r.KwaakaRestaurantID,
+		HoldMinutes:        r.HoldMinutes, LateArrivalText: r.LateArrivalText,
 		LateArrivalTextI18n: domain.I18nPatch(r.LateArrivalTextI18n),
 	}
 	if r.CategoryID != nil {

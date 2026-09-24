@@ -56,7 +56,17 @@ type restaurantResponse struct {
 	IsPopular    *bool               `json:"is_popular"`
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
-	PrimaryImage *string             `json:"primary_image,omitempty"`
+	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator
+	// (restaurants.kwaaka_restaurant_id). Unlike the fields above, it is NOT
+	// filled by baseFromDomain — it is attached explicitly, only by the
+	// cabinet/superadmin routes (adminList, adminGet, create, update; see
+	// attachKwaakaRestaurantID), so the public, unauthenticated catalog
+	// (list/search/get) never serves an internal POS identifier. omitempty:
+	// absent for both "not attached" (public route) and "not linked" (nil in
+	// the database) — a client has no action to take on either, so collapsing
+	// them costs nothing.
+	KwaakaRestaurantID *string `json:"kwaaka_restaurant_id,omitempty"`
+	PrimaryImage       *string `json:"primary_image,omitempty"`
 	// PrimaryImageCard / PrimaryImageDetail are the resized derivatives of
 	// PrimaryImage (see internal/media). Additive: PrimaryImage keeps naming
 	// the original exactly as before, so an app build that has not been
@@ -131,6 +141,18 @@ type restaurantResponse struct {
 	// Served by the DETAIL read only (same rule as PreorderMinAmountMinor
 	// above) — the underlying columns are not loaded by the catalog listing.
 	BookingRules *bookingRulesResponse `json:"booking_rules,omitempty"`
+	// FreeCancelWindowMinutes is the EXACT stored
+	// restaurants.free_cancel_window_minutes, in minutes — unlike
+	// BookingRules.FreeCancelHours (rounded to the nearest hour for the
+	// guest-facing copy), this is the raw money-path column the cabinet's
+	// edit form needs to redisplay what it just saved without losing
+	// precision (e.g. 1 minute must not read back as "0"). Same attachment
+	// rule as KwaakaRestaurantID above: NOT filled by baseFromDomain, only by
+	// the cabinet/superadmin routes (see attachFreeCancelWindowMinutes), so
+	// the public catalog keeps serving only the rounded hours it always has.
+	// nil/omitted on a catalog-listing row (the column is not loaded there)
+	// and on the public routes (never attached).
+	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes,omitempty"`
 }
 
 // bookingRulesResponse is domain.EffectiveBookingRules on the wire — already
@@ -530,6 +552,33 @@ func applyDerivedCuisineType(resp *restaurantResponse, cs []domain.Cuisine, lang
 		return
 	}
 	resp.CuisineType = domain.JoinCuisineNames(cs, lang)
+}
+
+// attachKwaakaRestaurantID copies r.KwaakaRestaurantID onto resp. Copied, not
+// aliased (same rule as applyVenueState): the response must not share a
+// pointer with the domain value the facade may still mutate. Called only from
+// the cabinet/superadmin routes — see restaurantResponse.KwaakaRestaurantID's
+// doc comment for why this is not folded into baseFromDomain.
+func attachKwaakaRestaurantID(resp *restaurantResponse, r domain.Restaurant) {
+	if r.KwaakaRestaurantID == nil {
+		return
+	}
+	id := *r.KwaakaRestaurantID
+	resp.KwaakaRestaurantID = &id
+}
+
+// attachFreeCancelWindowMinutes copies r.FreeCancelWindowMinutes onto resp.
+// Copied, not aliased, for the same reason as attachKwaakaRestaurantID.
+// Called only from the cabinet/superadmin routes — see
+// restaurantResponse.FreeCancelWindowMinutes's doc comment for why this is
+// not folded into baseFromDomain or into ResolveBookingRules's already-
+// rounded FreeCancelHours.
+func attachFreeCancelWindowMinutes(resp *restaurantResponse, r domain.Restaurant) {
+	if r.FreeCancelWindowMinutes == nil {
+		return
+	}
+	minutes := *r.FreeCancelWindowMinutes
+	resp.FreeCancelWindowMinutes = &minutes
 }
 
 func categoryToResponse(c domain.RestaurantCategory) categoryResponse {

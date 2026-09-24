@@ -1,6 +1,7 @@
 package restaurants
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -137,5 +138,87 @@ func TestAdminGetRejectsMalformedID(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/restaurants/not-a-uuid", nil))
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("GET with a bad id = %d, want 422 (body %s)", w.Code, w.Body.String())
+	}
+}
+
+// freeCancelField unmarshals both the rounded, guest-facing hours (inside
+// booking_rules) and the new exact-minutes field, so a test can tell "the
+// rounding still exists for guests" apart from "the cabinet gets the exact
+// number back".
+type freeCancelField struct {
+	BookingRules struct {
+		FreeCancelHours int `json:"free_cancel_hours"`
+	} `json:"booking_rules"`
+	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes"`
+}
+
+// TestAdminGetServesExactFreeCancelWindowMinutes is the regression for the
+// live bug: a venue with a non-hour-aligned window (1 minute) saved through
+// the admin panel and, on the next page load, saw "0" instead of "1" because
+// the panel only had `free_cancel_hours` (1 minute rounds DOWN to 0 hours) to
+// read from. The cabinet detail read must carry the exact stored minutes so
+// the edit form never has to derive it by multiplying a rounded value back
+// out.
+func TestAdminGetServesExactFreeCancelWindowMinutes(t *testing.T) {
+	id := uuid.New()
+	agg := hiddenVenue(id)
+	minutes := 1
+	agg.FreeCancelWindowMinutes = &minutes
+	r := newScopedRouter(&fakeFacade{agg: agg})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/restaurants/"+id.String(), nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	var got freeCancelField
+	if err := json.Unmarshal(decodeEnvelopeData(t, w.Body.Bytes()), &got); err != nil {
+		t.Fatalf("decode data: %v", err)
+	}
+	if got.BookingRules.FreeCancelHours != 0 {
+		t.Errorf("booking_rules.free_cancel_hours = %d, want the still-rounded 0 (guest copy is unchanged by this fix)",
+			got.BookingRules.FreeCancelHours)
+	}
+	if got.FreeCancelWindowMinutes == nil || *got.FreeCancelWindowMinutes != 1 {
+		t.Errorf("free_cancel_window_minutes = %v, want the exact stored 1, not the rounded-down hours value",
+			got.FreeCancelWindowMinutes)
+	}
+}
+
+// TestAdminGetOmitsFreeCancelWindowMinutesWhenNotLoaded covers a
+// catalog-listing-shaped aggregate (the column not loaded, nil) — the field
+// must be omitted, not serialized as a misleading 0.
+func TestAdminGetOmitsFreeCancelWindowMinutesWhenNotLoaded(t *testing.T) {
+	id := uuid.New()
+	agg := hiddenVenue(id) // FreeCancelWindowMinutes left nil
+	r := newScopedRouter(&fakeFacade{agg: agg})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/restaurants/"+id.String(), nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("free_cancel_window_minutes")) {
+		t.Errorf("body carries free_cancel_window_minutes when the column was never loaded: %s", w.Body.String())
+	}
+}
+
+// TestPublicGetOmitsFreeCancelWindowMinutes proves the exact-minutes field
+// stays cabinet-only, same as kwaaka_restaurant_id — the public route keeps
+// serving only the rounded guest-facing hours it always has.
+func TestPublicGetOmitsFreeCancelWindowMinutes(t *testing.T) {
+	id := uuid.New()
+	agg := &domain.RestaurantAggregate{Restaurant: activeVenue(id)}
+	minutes := 90
+	agg.FreeCancelWindowMinutes = &minutes
+	r := newScopedRouter(&fakeFacade{agg: agg})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/restaurants/"+id.String(), nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("free_cancel_window_minutes")) {
+		t.Errorf("public GET body carries free_cancel_window_minutes, want it cabinet-only: %s", w.Body.String())
 	}
 }
