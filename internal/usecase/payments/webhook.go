@@ -41,6 +41,9 @@ type webhookUseCase struct {
 	// transaction as the payment's created -> authorized transition. Optional
 	// (WithBookingReleaser); nil = no gate (the previous behaviour).
 	releaser bookingReleaser
+	// holdLost cancels a still-pending booking whose pre-order hold the acquirer
+	// released on its own (voided / expired). Optional (WithHoldLostCanceller).
+	holdLost holdLostCanceller
 	// holdTTL, when set, re-bases a deposit hold's expires_at at the moment it
 	// is authorised: the pre-payment expires_at is the (short) link lifetime,
 	// which must not void a hold the guest has just placed.
@@ -110,6 +113,30 @@ func WithLateCancelSettlement(bookings bookingReader, settler DepositCancellatio
 // It is idempotent: releasing an already-released booking changes nothing.
 type bookingReleaser interface {
 	ReleaseForPayment(ctx context.Context, bookingID uuid.UUID) error
+}
+
+// holdLostCanceller is the local port for scenario 12: the acquirer voided or
+// expired a pre-order hold before the venue confirmed the booking, so the
+// booking has no money behind it and is cancelled by the system. It must be a
+// no-op for any booking that is not pending, and idempotent.
+type holdLostCanceller interface {
+	CancelPendingOnHoldLost(ctx context.Context, bookingID uuid.UUID) error
+}
+
+// WithHoldLostCanceller wires the hold-lost cancellation (see holdLostCanceller).
+func WithHoldLostCanceller(c holdLostCanceller) WebhookOption {
+	return func(u *webhookUseCase) { u.holdLost = c }
+}
+
+// cancelBookingIfHoldLost runs after a voided/expired transition of a payment
+// that WAS an authorized pre-order hold. Its error is returned so the event
+// stays unprocessed and is retried.
+func (u *webhookUseCase) cancelBookingIfHoldLost(ctx context.Context, was domain.PaymentStatus, p *domain.Payment) error {
+	if u.holdLost == nil || was != domain.PaymentAuthorized || !p.RequiresConfirmation ||
+		p.Purpose != domain.PurposePreorder || p.BookingID == uuid.Nil {
+		return nil
+	}
+	return u.holdLost.CancelPendingOnHoldLost(ctx, p.BookingID)
 }
 
 // WithBookingReleaser wires the booking gate (see bookingReleaser).
@@ -823,7 +850,7 @@ func (u *webhookUseCase) applyVoided(ctx context.Context, p *domain.Payment, eve
 		return err
 	}
 	logging.FromContext(ctx).Info(logging.EventPaymentVoided, slog.String("payment_id", p.ID.String()))
-	return nil
+	return u.cancelBookingIfHoldLost(ctx, from, p)
 }
 
 func (u *webhookUseCase) applyExpired(ctx context.Context, p *domain.Payment, event *domain.WebhookEvent) error {
@@ -846,7 +873,7 @@ func (u *webhookUseCase) applyExpired(ctx context.Context, p *domain.Payment, ev
 		return err
 	}
 	logging.FromContext(ctx).Info(logging.EventPaymentExpired, slog.String("payment_id", p.ID.String()))
-	return nil
+	return u.cancelBookingIfHoldLost(ctx, from, p)
 }
 
 // storeInvalidEvent records an unverified callback as evidence (spec §7:
