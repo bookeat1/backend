@@ -438,6 +438,12 @@ type PaymentRepository interface {
 	// ExtendHoldExpiry moves expires_at of an `authorized` payment forward to
 	// expiresAt (never backwards). No-op when the payment is not authorized.
 	ExtendHoldExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error
+	// SetProviderPaymentID replaces provider_payment_id for a payment whose
+	// acquirer-side id was not known (or was only a placeholder such as an
+	// order id) at creation. Idempotent: setting the current value is a no-op.
+	// Returns ErrNotFound for an unknown payment and ErrAlreadyExists when
+	// another payment of the same provider already owns that id.
+	SetProviderPaymentID(ctx context.Context, id uuid.UUID, providerPaymentID string) error
 	// RecordReconcileAttempt is the CAS-guarded write behind ReconcileAttempts
 	// / LastReconcileAttemptAt / NeedsManualReview (migration 0010): a single
 	// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1,

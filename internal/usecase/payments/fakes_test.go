@@ -244,6 +244,23 @@ func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.Paym
 	return out, nil
 }
 
+func (f *fakePaymentRepo) SetProviderPaymentID(_ context.Context, id uuid.UUID, providerPaymentID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	for _, o := range f.byID {
+		if o.ID != id && o.Provider == p.Provider && o.ProviderPaymentID != nil && *o.ProviderPaymentID == providerPaymentID {
+			return domain.ErrAlreadyExists
+		}
+	}
+	v := providerPaymentID
+	p.ProviderPaymentID = &v
+	return nil
+}
+
 func (f *fakePaymentRepo) ExtendHoldExpiry(_ context.Context, id uuid.UUID, expiresAt time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -962,6 +979,30 @@ type fakeGateway struct {
 	getFn    func(providerPaymentID string, callN int) (*domain.GatewayPayment, error)
 
 	verifyFn func([]byte, map[string]string) (*domain.WebhookEvent, error)
+
+	// placeholder, when non-nil, makes the fake implement
+	// placeholderProviderID (provider_id.go) and merchantIDFinder — a stand-in
+	// for TipTopPay, whose Authorize returns an ORDER id that no refund/void
+	// call accepts. findFn answers FindByMerchantPaymentID.
+	placeholder func(string) bool
+	findFn      func(merchantPaymentID string) (*domain.GatewayPayment, error)
+	findN       int
+	// refundIDs / capturedIDs record which provider id each call received.
+	refundIDs []string
+}
+
+func (f *fakeGateway) IsPlaceholderProviderID(id string) bool {
+	return f.placeholder != nil && f.placeholder(id)
+}
+
+func (f *fakeGateway) FindByMerchantPaymentID(_ context.Context, merchantPaymentID string) (*domain.GatewayPayment, error) {
+	f.mu.Lock()
+	f.findN++
+	f.mu.Unlock()
+	if f.findFn == nil {
+		return nil, errors.New("fakeGateway: no findFn configured")
+	}
+	return f.findFn(merchantPaymentID)
 }
 
 func newFakeGateway(name domain.PaymentProvider) *fakeGateway { return &fakeGateway{name: name} }
@@ -1018,6 +1059,7 @@ func (f *fakeGateway) Void(_ context.Context, providerPaymentID string) error {
 func (f *fakeGateway) Refund(_ context.Context, providerPaymentID string, amount domain.Money) (*domain.GatewayRefund, error) {
 	f.mu.Lock()
 	f.refundN++
+	f.refundIDs = append(f.refundIDs, providerPaymentID)
 	f.mu.Unlock()
 	if f.refundErr != nil {
 		return nil, f.refundErr

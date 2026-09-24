@@ -218,6 +218,17 @@ func (u *webhookUseCase) resolveAndApply(ctx context.Context, gw domain.PaymentG
 		return err
 	}
 
+	// TipTopPay: the payment row still holds the ORDER id from Authorize; the
+	// callback is the first time we learn the numeric TransactionId that
+	// refund / void / confirm require. Store it before applying.
+	if aerr := adoptTransactionID(ctx, u.payments, gw, p, event); aerr != nil {
+		if rerr := u.events.RecordProcessingError(ctx, row.ID, aerr.Error()); rerr != nil {
+			logging.FromContext(ctx).Error("payment.webhook_error_not_recorded",
+				slog.String("event_id", row.ID.String()), slog.String("error", rerr.Error()))
+		}
+		return aerr
+	}
+
 	// Report item #16 (minor): backfill payment_id now that it is known, even
 	// if apply() is about to fail — idx_payment_events_payment exists so
 	// reconciliation can find every event for a payment, including the ones

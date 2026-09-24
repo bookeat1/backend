@@ -97,6 +97,22 @@ func (r *Repository) Update(ctx context.Context, p *domain.Payment) error {
 	return nil
 }
 
+// SetProviderPaymentID stores the acquirer-side id learned after creation
+// (TipTopPay: the numeric TransactionId, while Authorize can only return the
+// ORDER id). The unique (provider, provider_payment_id) index rejects an id
+// that already belongs to another payment.
+func (r *Repository) SetProviderPaymentID(ctx context.Context, id uuid.UUID, providerPaymentID string) error {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE payments SET provider_payment_id=$2, updated_at=now() WHERE id=$1`, id, providerPaymentID)
+	if err != nil {
+		return mapWrite(err, "set payment provider id")
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Payment, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+paymentCols+` FROM payments WHERE id=$1`, id)
 	p, err := scanPayment(row)

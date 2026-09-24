@@ -344,6 +344,10 @@ func (u *ticketPaymentUseCase) claimTicketRefund(ctx context.Context, p *domain.
 		return nil, fmt.Errorf("payment %s has no provider payment id: %w", p.ID, domain.ErrValidation)
 	}
 
+	if herr := ensureTransactionID(ctx, u.payments, gw, p); herr != nil {
+		return nil, herr
+	}
+
 	// External call, deliberately outside any DB transaction.
 	gwResp, gwErr := gw.Refund(ctx, *p.ProviderPaymentID, domain.Money{AmountMinor: settlement.GuestMinor, Currency: p.Currency})
 	switch {
