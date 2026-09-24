@@ -435,6 +435,12 @@ type PaymentRepository interface {
 	// idx_payments_expires from migration 0007). Same non-locking-across-the-
 	// acquirer-call caveat as ClaimStale.
 	ClaimExpiredHolds(ctx context.Context, before time.Time, limit int) ([]Payment, error)
+	// SetProviderPaymentID replaces provider_payment_id for a payment whose
+	// acquirer-side id was not known (or was only a placeholder such as an
+	// order id) at creation. Idempotent: setting the current value is a no-op.
+	// Returns ErrNotFound for an unknown payment and ErrAlreadyExists when
+	// another payment of the same provider already owns that id.
+	SetProviderPaymentID(ctx context.Context, id uuid.UUID, providerPaymentID string) error
 	// RecordReconcileAttempt is the CAS-guarded write behind ReconcileAttempts
 	// / LastReconcileAttemptAt / NeedsManualReview (migration 0010): a single
 	// `UPDATE payments SET reconcile_attempts = reconcile_attempts + 1,

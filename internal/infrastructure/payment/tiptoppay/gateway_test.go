@@ -567,3 +567,17 @@ func (f *fakeAcquirer) seen() []recorded {
 	defer f.mu.Unlock()
 	return append([]recorded(nil), f.requests...)
 }
+
+func TestIsPlaceholderProviderID(t *testing.T) {
+	g := testGateway(t)
+	for id, want := range map[string]bool{
+		"ApWFpiKnfDuxMXSa": true,  // order id from /orders/create
+		"":                 true,  // nothing stored is not a transaction id
+		"2726227":          false, // numeric TransactionId
+		" 2726227 ":        false,
+	} {
+		if got := g.IsPlaceholderProviderID(id); got != want {
+			t.Errorf("IsPlaceholderProviderID(%q) = %v, want %v", id, got, want)
+		}
+	}
+}

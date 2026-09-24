@@ -483,14 +483,8 @@ func (u *refundUseCase) settleWithRefund(ctx context.Context, p *domain.Payment,
 // settleWithRefund) only needs to act on Succeeded; anything else is
 // returned as an error.
 func (u *refundUseCase) claimAndCallGateway(ctx context.Context, p *domain.Payment, existing *domain.PaymentRefund, settlement domain.Settlement, now time.Time) error {
-	if err := u.refunds.CompareAndSwapStatus(u.tx.Detach(ctx), existing.ID, domain.RefundCreated, domain.RefundInFlight, now); err != nil {
-		if errors.Is(err, domain.ErrAlreadyExists) {
-			return fmt.Errorf("%w: a refund attempt for payment %s is already in flight", domain.ErrAlreadyExists, p.ID)
-		}
-		return err
-	}
-	existing.Status = domain.RefundInFlight
-
+	// Resolve everything that can fail BEFORE the attempt is claimed in_flight,
+	// so a failure here leaves the refund in `created` and retryable.
 	gw, err := u.gateways.ForRefund(p.Provider)
 	if err != nil {
 		return err
@@ -498,6 +492,19 @@ func (u *refundUseCase) claimAndCallGateway(ctx context.Context, p *domain.Payme
 	if p.ProviderPaymentID == nil {
 		return fmt.Errorf("payment %s has no provider payment id: %w", p.ID, domain.ErrValidation)
 	}
+	// A payment captured before its TransactionId was stored still carries the
+	// order id; resolve it first (no-op for every other acquirer).
+	if herr := ensureTransactionID(ctx, u.payments, gw, p); herr != nil {
+		return herr
+	}
+
+	if err := u.refunds.CompareAndSwapStatus(u.tx.Detach(ctx), existing.ID, domain.RefundCreated, domain.RefundInFlight, now); err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			return fmt.Errorf("%w: a refund attempt for payment %s is already in flight", domain.ErrAlreadyExists, p.ID)
+		}
+		return err
+	}
+	existing.Status = domain.RefundInFlight
 
 	// External call, deliberately outside any DB transaction.
 	//
