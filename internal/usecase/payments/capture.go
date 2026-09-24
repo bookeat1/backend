@@ -164,6 +164,9 @@ func (u *captureVoidUseCase) captureHold(ctx context.Context, p *domain.Payment)
 		// to release the claim unconditionally.
 		return nil, u.releaseCaptureClaim(ctx, p, err)
 	}
+	if herr := ensureTransactionID(ctx, u.payments, gw, p); herr != nil {
+		return nil, u.releaseCaptureClaim(ctx, p, herr)
+	}
 
 	// External call, deliberately outside any DB transaction.
 	if _, err := gw.Capture(ctx, *p.ProviderPaymentID, p.Total()); err != nil {
@@ -330,6 +333,9 @@ func (u *captureVoidUseCase) voidHold(ctx context.Context, p *domain.Payment, re
 		// The acquirer was never reached — nothing ambiguous, safe to
 		// release the claim unconditionally.
 		return nil, u.releaseVoidClaim(ctx, p, err)
+	}
+	if herr := ensureTransactionID(ctx, u.payments, gw, p); herr != nil {
+		return nil, u.releaseVoidClaim(ctx, p, herr)
 	}
 
 	// External call, deliberately outside any DB transaction.

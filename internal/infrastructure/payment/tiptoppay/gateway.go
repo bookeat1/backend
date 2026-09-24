@@ -73,6 +73,15 @@ func (g *Gateway) SettlesImmediately(purpose domain.PaymentPurpose) bool {
 	return purpose.CapturesImmediately()
 }
 
+// IsPlaceholderProviderID reports whether a stored provider payment id is NOT a
+// numeric TransactionId, i.e. it is the ORDER id Authorize returned. Confirm,
+// void, refund and get all need the TransactionId; see
+// usecase/payments.placeholderProviderID.
+func (g *Gateway) IsPlaceholderProviderID(providerPaymentID string) bool {
+	_, err := strconv.ParseInt(strings.TrimSpace(providerPaymentID), 10, 64)
+	return err != nil
+}
+
 // ---------------------------------------------------------------------------
 // domain.PaymentGateway
 // ---------------------------------------------------------------------------

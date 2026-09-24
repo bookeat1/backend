@@ -97,6 +97,36 @@ func (r *Repository) Update(ctx context.Context, p *domain.Payment) error {
 	return nil
 }
 
+// SetProviderPaymentID stores the acquirer-side id learned after creation
+// (TipTopPay: the numeric TransactionId, while Authorize can only return the
+// ORDER id). The unique (provider, provider_payment_id) index rejects an id
+// that already belongs to another payment.
+func (r *Repository) SetProviderPaymentID(ctx context.Context, id uuid.UUID, expected *string, providerPaymentID string) error {
+	// Compare-and-swap on the current value: a concurrent webhook that already
+	// stored the real TransactionId must not be overwritten (no lost update).
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE payments SET provider_payment_id=$3, updated_at=now()
+		 WHERE id=$1 AND provider_payment_id IS NOT DISTINCT FROM $2`, id, expected, providerPaymentID)
+	if err != nil {
+		return mapWrite(err, "set payment provider id")
+	}
+	if tag.RowsAffected() == 0 {
+		var cur *string
+		qerr := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT provider_payment_id FROM payments WHERE id=$1`, id).Scan(&cur)
+		if errors.Is(qerr, pgx.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		if qerr != nil {
+			return fmt.Errorf("check payment provider id: %w", qerr)
+		}
+		if cur != nil && *cur == providerPaymentID {
+			return nil // already the wanted value
+		}
+		return domain.ErrAlreadyExists
+	}
+	return nil
+}
+
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Payment, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx, `SELECT `+paymentCols+` FROM payments WHERE id=$1`, id)
 	p, err := scanPayment(row)

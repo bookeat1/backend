@@ -477,6 +477,12 @@ func (r *Reconciler) processRefund(ctx context.Context, rf *domain.PaymentRefund
 		return r.bumpRefundAttempt(ctx, rf, now, res)
 	}
 
+	if herr := ensureTransactionID(ctx, r.payments, gw, p); herr != nil {
+		r.log.Warn(logging.EventPaymentReconcileUnknown,
+			slog.String("refund_id", rf.ID.String()), slog.String("error", herr.Error()))
+		return r.bumpRefundAttempt(ctx, rf, now, res)
+	}
+
 	r.pace.wait()
 	// External call, deliberately outside any DB transaction. Payment-level
 	// Get is the only signal available: neither adapter exposes a
@@ -799,6 +805,12 @@ func (r *Reconciler) processPayment(ctx context.Context, p *domain.Payment, now 
 	if err != nil {
 		r.log.Warn("payment.reconcile_gateway_unavailable",
 			slog.String("payment_id", p.ID.String()), slog.String("error", err.Error()))
+		return r.bumpPaymentAttempt(ctx, p, now, res)
+	}
+
+	if herr := ensureTransactionID(ctx, r.payments, gw, p); herr != nil {
+		r.log.Warn(logging.EventPaymentReconcileUnknown,
+			slog.String("payment_id", p.ID.String()), slog.String("error", herr.Error()))
 		return r.bumpPaymentAttempt(ctx, p, now, res)
 	}
 
