@@ -685,7 +685,10 @@ type fakeVenues struct {
 	rules             domain.BookingRulesOverride
 	freeCancelMinutes *int
 	rulesErr          error
+	tz                string // Timezone() answer; empty = venue stores none
 }
+
+func (f fakeVenues) Timezone(context.Context, uuid.UUID) (string, error) { return f.tz, nil }
 
 func (f fakeVenues) Name(context.Context, uuid.UUID) (string, error) { return f.name, nil }
 

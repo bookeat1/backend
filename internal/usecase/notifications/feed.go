@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -34,6 +35,7 @@ import (
 type FeedNotifier struct {
 	feed   domain.NotificationFeedRepository
 	venues venueNameReader
+	clock  venueClock
 	log    *slog.Logger
 }
 
@@ -41,9 +43,11 @@ type FeedNotifier struct {
 func NewFeedNotifier(
 	feed domain.NotificationFeedRepository,
 	venues venueNameReader,
+	zones venueTimezoneReader,
+	fallbackZone *time.Location,
 	log *slog.Logger,
 ) *FeedNotifier {
-	return &FeedNotifier{feed: feed, venues: venues, log: log}
+	return &FeedNotifier{feed: feed, venues: venues, clock: newVenueClock(zones, fallbackZone, log), log: log}
 }
 
 var _ Notifier = (*FeedNotifier)(nil)
@@ -84,7 +88,7 @@ func (f *FeedNotifier) Notify(ctx context.Context, e Event) error {
 		}
 	}
 
-	feedType, title, body, ok := buildFeedEntry(e, venue)
+	feedType, title, body, ok := buildFeedEntry(e, venue, f.clock.location(ctx, e.RestaurantID))
 	if !ok {
 		// An event type Interested claims but buildFeedEntry has no text for — a
 		// programming error, not a delivery failure. Drain it rather than retry
@@ -115,10 +119,9 @@ func (f *FeedNotifier) Notify(ctx context.Context, e Event) error {
 // buildFeedEntry renders the RU title+body and maps the booking event type to
 // the AppNotification.type the mobile client branches on: confirmed+cancelled →
 // "booking", reminder → "reminder". Returns ok=false for an event type it has no
-// template for. Times render in the process local zone, the same convention the
-// push channels use.
-func buildFeedEntry(e Event, venue string) (domain.NotificationFeedType, string, string, bool) {
-	when := e.StartsAt.Local().Format("02.01 в 15:04")
+// template for. Times render in loc, the venue's zone.
+func buildFeedEntry(e Event, venue string, loc *time.Location) (domain.NotificationFeedType, string, string, bool) {
+	when := e.StartsAt.In(loc).Format("02.01 в 15:04")
 	at := ""
 	if venue != "" {
 		at = "«" + venue + "» · "
