@@ -284,3 +284,17 @@ func TestClaimPassNoHTTPWhenOffOrMismatched(t *testing.T) {
 		t.Fatalf("%+v", fo.inserted[0])
 	}
 }
+
+func TestAlertPayloadCarriesRestaurantID(t *testing.T) {
+	row := sendingRow(1)
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosRejected, Message: "bad"}}}
+	_, ob := run(t, row, pos, nil)
+	if len(ob.events) != 1 {
+		t.Fatalf("events %d", len(ob.events))
+	}
+	var p map[string]any
+	_ = json.Unmarshal(ob.events[0].Payload, &p)
+	if p["restaurant_id"] != row.RestaurantID.String() || p["reason"] != "failed" {
+		t.Fatalf("%v", p)
+	}
+}

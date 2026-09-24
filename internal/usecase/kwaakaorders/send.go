@@ -16,7 +16,14 @@ import (
 // transaction. reason ∈ failed | failed_unknown | cancel_failed | rescheduled |
 // pos_cancelled.
 func (w *Worker) alert(ctx context.Context, o *domain.KitchenOrder, reason, errText string) error {
-	payload, err := json.Marshal(map[string]string{"reason": reason, "error_text": errText})
+	// The dispatcher takes the venue from the payload's restaurant_id, so it is
+	// mandatory here; name/starts_at only feed the alert text.
+	var snap domain.KitchenSnapshot
+	_ = json.Unmarshal(o.RequestSnapshot, &snap)
+	payload, err := json.Marshal(map[string]any{
+		"restaurant_id": o.RestaurantID, "name": snap.CustomerName, "starts_at": o.BookingStartsAt,
+		"reason": reason, "error_text": errText,
+	})
 	if err != nil {
 		return err
 	}

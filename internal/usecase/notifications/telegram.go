@@ -114,7 +114,8 @@ func (t *TelegramNotifier) Channel() domain.NotificationChannel { return domain.
 // answer it) and to a CANCELLATION (the venue needs to free the table). The
 // cancellation is filtered further in Notify — see the CancelledBy skip.
 func (t *TelegramNotifier) Interested(et domain.BookingEventType) bool {
-	return et == domain.EventBookingCreated || et == domain.EventBookingCancelled
+	return et == domain.EventBookingCreated || et == domain.EventBookingCancelled ||
+		et == domain.EventBookingKitchenOrderAttention
 }
 
 func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
@@ -283,6 +284,9 @@ func (t *TelegramNotifier) recordDelivered(ctx context.Context, e Event) error {
 // no payment data — only what staff already see in the venue cabinet: that a
 // booking came in, for when, for how many, under what name.
 func buildTelegramText(e Event) string {
+	if e.Type == domain.EventBookingKitchenOrderAttention {
+		return kitchenAttentionText(e)
+	}
 	title := "Новая бронь"
 	if e.Type == domain.EventBookingCancelled {
 		// A restaurant-side cancel is filtered out before send, so here the actor
