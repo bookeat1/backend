@@ -246,6 +246,31 @@ type Booking struct {
 	OriginalBookingTime    *string
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	// ReleasedToVenueAt is when the booking became visible to the venue. NULL
+	// means it is HIDDEN: it carries a pre-order whose payment has not been
+	// authorized yet, so the venue is not notified and cannot see or confirm
+	// it (owner decision 2026-09-24). Set in the same transaction as the
+	// pre-order payment's created -> authorized transition.
+	ReleasedToVenueAt *time.Time
+}
+
+// AwaitingPreorderPayment reports whether the booking is still hidden from the
+// venue while its pre-order payment is outstanding.
+func (b Booking) AwaitingPreorderPayment() bool {
+	return b.ReleasedToVenueAt == nil && b.Status == BookingPending
+}
+
+// BookingReleaseRepository is the gate between a pre-order booking and the
+// venue. It is separate from BookingRepository so existing fakes stay valid.
+type BookingReleaseRepository interface {
+	// Release stamps released_to_venue_at = at on a PENDING booking that is still
+	// hidden. It reports whether THIS call released it: false means it was
+	// already released (a duplicate delivery) or is no longer pending.
+	Release(ctx context.Context, id uuid.UUID, at time.Time) (bool, error)
+	// ClaimUnpaidHidden locks up to limit hidden pending bookings created before
+	// `before` that have no payment still awaiting the guest (a `created`
+	// payment whose link has not expired). FOR UPDATE SKIP LOCKED.
+	ClaimUnpaidHidden(ctx context.Context, before time.Time, limit int) ([]Booking, error)
 }
 
 // BookingFilter narrows a booking listing. Zero-value fields are ignored.
