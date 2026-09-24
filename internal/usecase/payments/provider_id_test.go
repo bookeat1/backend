@@ -168,3 +168,122 @@ func TestSettle_NumericIDSkipsLookup(t *testing.T) {
 		t.Fatalf("find called %d times, want 0", h.gw.findN)
 	}
 }
+
+// find returns the LAST operation for the invoice, possibly a declined attempt:
+// its id must not be persisted, and the real webhook id must win afterwards.
+func TestEnsureTransactionID_DeclinedLastOperationThenWebhookWins(t *testing.T) {
+	p := orderIDPayment(uuid.New(), domain.PaymentCreated)
+	u, repo, _, _, _, gw := newWebhookHarness(p)
+	gw.placeholder = numericOnly
+	gw.oneStage = func(domain.PaymentPurpose) bool { return true }
+	gw.findFn = func(string) (*domain.GatewayPayment, error) {
+		return &domain.GatewayPayment{ProviderPaymentID: "111", Status: domain.PaymentFailed}, nil
+	}
+	ctx := context.Background()
+	cur, _ := repo.GetByID(ctx, p.ID)
+	if err := ensureTransactionID(ctx, repo, gw, cur); !errors.Is(err, domain.ErrInvalidStatus) {
+		t.Fatalf("ensureTransactionID() error = %v, want ErrInvalidStatus for a declined operation", err)
+	}
+	if got, _ := repo.GetByID(ctx, p.ID); *got.ProviderPaymentID != "ApWFpiKnfDuxMXSa" {
+		t.Fatalf("declined id persisted: %q", *got.ProviderPaymentID)
+	}
+
+	gw.verifyFn = verifyOK(&domain.WebhookEvent{
+		Provider: domain.ProviderFreedomPay, ProviderEventID: "evt-ok", ProviderPaymentID: "222",
+		MerchantPaymentID: p.ID.String(), Type: domain.WebhookPaymentCaptured, Status: domain.PaymentCaptured,
+		Amount: domain.Money{AmountMinor: p.AmountMinor, Currency: p.Currency}, SignatureValid: true,
+	})
+	if err := u.HandleWebhook(ctx, domain.ProviderFreedomPay, []byte("b"), nil); err != nil {
+		t.Fatalf("HandleWebhook() error = %v", err)
+	}
+	if got, _ := repo.GetByID(ctx, p.ID); *got.ProviderPaymentID != "222" {
+		t.Fatalf("final id = %q, want 222", *got.ProviderPaymentID)
+	}
+}
+
+// A stale in-memory copy (order id) must not overwrite an id a concurrent
+// webhook already stored: the compare-and-swap loses and the stored id is adopted.
+func TestEnsureTransactionID_ConcurrentWebhookNotOverwritten(t *testing.T) {
+	p := orderIDPayment(uuid.New(), domain.PaymentCaptured)
+	repo := newFakePaymentRepo(p)
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	gw.placeholder = numericOnly
+	ctx := context.Background()
+	stale, _ := repo.GetByID(ctx, p.ID)
+	gw.findFn = func(string) (*domain.GatewayPayment, error) {
+		// the webhook lands while find is in flight
+		_ = repo.SetProviderPaymentID(ctx, p.ID, stale.ProviderPaymentID, "222")
+		return &domain.GatewayPayment{ProviderPaymentID: "333", Status: domain.PaymentCaptured}, nil
+	}
+	if err := ensureTransactionID(ctx, repo, gw, stale); err != nil {
+		t.Fatalf("ensureTransactionID() error = %v", err)
+	}
+	if got, _ := repo.GetByID(ctx, p.ID); *got.ProviderPaymentID != "222" || *stale.ProviderPaymentID != "222" {
+		t.Fatalf("stored=%q in-memory=%q, want both 222 (webhook wins)", *got.ProviderPaymentID, *stale.ProviderPaymentID)
+	}
+}
+
+// A permanent id conflict (unique index: another payment owns the id) must not
+// make the callback retry forever: adoptTransactionID logs and returns nil so the
+// status transition still applies; the placeholder stays for ensureTransactionID.
+func TestAdoptTransactionID_PermanentConflictDoesNotFailCallback(t *testing.T) {
+	other := orderIDPayment(uuid.New(), domain.PaymentCaptured)
+	other.ProviderPaymentID = strPtrTest("2726227")
+	p := orderIDPayment(uuid.New(), domain.PaymentCreated)
+	repo := newFakePaymentRepo(p, other)
+	gw := newFakeGateway(domain.ProviderFreedomPay)
+	gw.placeholder = numericOnly
+	cur, _ := repo.GetByID(context.Background(), p.ID)
+	err := adoptTransactionID(context.Background(), repo, gw, cur, &domain.WebhookEvent{
+		Type: domain.WebhookPaymentCaptured, ProviderPaymentID: "2726227",
+	})
+	if err != nil {
+		t.Fatalf("adoptTransactionID() error = %v, want nil (log and proceed)", err)
+	}
+	if got, _ := repo.GetByID(context.Background(), p.ID); *got.ProviderPaymentID != "ApWFpiKnfDuxMXSa" {
+		t.Fatalf("id = %q, want the placeholder untouched", *got.ProviderPaymentID)
+	}
+}
+
+// Ticket refund: a failing find (timeout) must leave the attempt retryable
+// (created, not in_flight), send no refund, and a retry then succeeds once.
+func TestRefundTicket_FindTimeoutLeavesAttemptRetryable(t *testing.T) {
+	uc, payments, refunds, _, gw := ticketPaymentHarness(t, 350)
+	gw.placeholder = numericOnly
+	calls := 0
+	gw.findFn = func(string) (*domain.GatewayPayment, error) {
+		calls++
+		if calls == 1 {
+			return nil, domain.ErrProviderOutcomeUnknown
+		}
+		return &domain.GatewayPayment{ProviderPaymentID: "2726227", Status: domain.PaymentCaptured}, nil
+	}
+	ticketID := uuid.New()
+	pid := "ApWFpiKnfDuxMXSa"
+	captured := &domain.Payment{
+		ID: uuid.New(), EventTicketID: &ticketID, RestaurantID: uuid.New(),
+		Provider: domain.ProviderFreedomPay, ProviderPaymentID: &pid, Purpose: domain.PurposeTicket,
+		Status: domain.PaymentCaptured, AmountMinor: 36269, BaseAmountMinor: 35000, FeeMinor: 1269,
+		Currency: domain.CurrencyKZT, IdempotencyKey: "k",
+	}
+	payments.byID[captured.ID] = captured
+	in := TicketRefundInput{PaymentID: captured.ID, IdempotencyKey: "refund-1"}
+	ctx := context.Background()
+
+	if _, err := uc.RefundTicket(ctx, Actor{}, in); err == nil {
+		t.Fatalf("first RefundTicket() error = nil, want the find failure")
+	}
+	if gw.callCount("refund") != 0 {
+		t.Fatalf("refund sent %d times after a failed lookup, want 0", gw.callCount("refund"))
+	}
+	rf, err := refunds.GetByIdempotencyKey(ctx, captured.ID, "refund-1")
+	if err != nil || rf.Status != domain.RefundCreated {
+		t.Fatalf("attempt = %+v err=%v, want status created (retryable)", rf, err)
+	}
+	if _, err := uc.RefundTicket(ctx, Actor{}, in); err != nil {
+		t.Fatalf("retry RefundTicket() error = %v", err)
+	}
+	if gw.callCount("refund") != 1 || gw.refundIDs[0] != "2726227" {
+		t.Fatalf("refunds=%d ids=%v, want exactly one with 2726227", gw.callCount("refund"), gw.refundIDs)
+	}
+}

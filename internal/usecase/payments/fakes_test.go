@@ -244,12 +244,20 @@ func (f *fakePaymentRepo) ClaimStale(ctx context.Context, statuses []domain.Paym
 	return out, nil
 }
 
-func (f *fakePaymentRepo) SetProviderPaymentID(_ context.Context, id uuid.UUID, providerPaymentID string) error {
+func (f *fakePaymentRepo) SetProviderPaymentID(_ context.Context, id uuid.UUID, expected *string, providerPaymentID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.byID[id]
 	if !ok {
 		return domain.ErrNotFound
+	}
+	same := (p.ProviderPaymentID == nil && expected == nil) ||
+		(p.ProviderPaymentID != nil && expected != nil && *p.ProviderPaymentID == *expected)
+	if !same {
+		if p.ProviderPaymentID != nil && *p.ProviderPaymentID == providerPaymentID {
+			return nil
+		}
+		return domain.ErrAlreadyExists
 	}
 	for _, o := range f.byID {
 		if o.ID != id && o.Provider == p.Provider && o.ProviderPaymentID != nil && *o.ProviderPaymentID == providerPaymentID {
