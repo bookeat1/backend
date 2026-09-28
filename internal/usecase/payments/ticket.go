@@ -148,7 +148,7 @@ func (u *ticketPaymentUseCase) CreateForTicket(ctx context.Context, actor Actor,
 
 	paymentID := uuid.New()
 	now := time.Now()
-	expiresAt := now.Add(u.cfg.HoldTTL)
+	expiresAt := now.Add(u.cfg.linkTTLFor(domain.PurposeTicket))
 	ticketID := in.EventTicketID
 
 	gwResp, err := gw.Authorize(ctx, domain.AuthorizeRequest{

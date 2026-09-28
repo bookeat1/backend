@@ -91,6 +91,8 @@ type VenueState struct {
 // enricher then leaves the field nil rather than publishing a guess.
 type venuePaymentChecker interface {
 	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+	AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error)
+	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
 }
 
 // WithVenuePayments teaches the venue DETAIL read whether the venue can take an
@@ -242,13 +244,28 @@ func (v *VenueState) attachPayment(ctx context.Context, st *domain.PublicVenueSt
 	if v.payments == nil {
 		return
 	}
-	accepts, err := v.payments.AcceptsOnlinePayment(ctx, restaurantID)
+	methods, err := v.payments.AvailablePaymentMethods(ctx, restaurantID)
 	if err != nil {
 		slog.Warn("venue online-payment check failed, serving venue without accepts_online_payment",
 			"restaurant_id", restaurantID, "error", err)
 		return
 	}
+	// accepts_online_payment is true iff at least one method is available.
+	accepts := len(methods) > 0
 	st.AcceptsOnlinePayment = &accepts
+	st.PaymentMethods = methods
+	if !accepts {
+		return
+	}
+	// Fee terms are best-effort on top of the flag: failing to read them omits
+	// payment_fee only (the client then shows no pre-payment total).
+	terms, err := v.payments.PaymentFeeTerms(ctx, restaurantID)
+	if err != nil {
+		slog.Warn("venue payment fee terms lookup failed, serving venue without payment_fee",
+			"restaurant_id", restaurantID, "error", err)
+		return
+	}
+	st.PaymentFee = &terms
 }
 
 // usable reports whether this enricher can do anything at all. A nil receiver

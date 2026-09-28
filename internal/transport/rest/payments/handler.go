@@ -219,6 +219,7 @@ func (h *Handler) createPayment(c *gin.Context) {
 	p, err := h.create.CreateForBooking(c.Request.Context(), actor, uc.CreateInput{
 		BookingID: id, IdempotencyKey: c.GetHeader(idempotencyHeader),
 		ReturnURL: req.ReturnURL, CallbackURL: callbackURL,
+		Method: domain.PaymentMethod(strings.TrimSpace(req.Method)),
 	})
 	if err != nil {
 		response.HandleError(c.Writer, err)

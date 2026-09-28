@@ -406,6 +406,11 @@ type PaymentsConfig struct {
 	// instead of expiring, which is the opposite of what an expiry should do.
 	HoldTTL time.Duration // env: PAYMENTS_HOLD_TTL
 
+	// LinkTTL is how long an unpaid booking/preorder payment link lives
+	// (expires_at and the acquirer's link lifetime). Event-ticket payments and
+	// the authorization hold keep HoldTTL.
+	LinkTTL time.Duration // env: PAYMENTS_LINK_TTL
+
 	// FreeCancelWindow is the GLOBAL default free-cancellation window for the
 	// money path, applied to any restaurant that has not overridden
 	// free_cancel_window_minutes (migration 0034/0035). A deposit hold is
@@ -807,6 +812,7 @@ func NewConfig() (Config, error) {
 			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired:      getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
 			HoldTTL:                      getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			LinkTTL:                      getEnvDuration("PAYMENTS_LINK_TTL", 15*time.Minute),
 			FreeCancelWindow:             getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
 			PublicBaseURL:                strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
 			SplitEnabled:                 getEnvBool("PAYMENTS_SPLIT_ENABLED", false),

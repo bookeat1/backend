@@ -34,6 +34,22 @@ func (p PaymentProvider) Valid() bool {
 	return p == ProviderFreedomPay || p == ProviderTipTopPay || p == ProviderPartnersPay || p == ProviderKaspi
 }
 
+// PaymentMethod is what a guest picks at checkout and what a venue switches on:
+// `kaspi` is Kaspi Pay on its own; `card` stands for every other acquirer and
+// resolves to the platform's single enabled non-Kaspi provider.
+type PaymentMethod string
+
+const (
+	MethodKaspi PaymentMethod = "kaspi"
+	MethodCard  PaymentMethod = "card"
+)
+
+// Valid reports whether m is a known method.
+func (m PaymentMethod) Valid() bool { return m == MethodKaspi || m == MethodCard }
+
+// PaymentMethods lists the methods in the order the API serves them.
+var PaymentMethods = []PaymentMethod{MethodKaspi, MethodCard}
+
 // PaymentProviderSetting is a row of the acquirer registry, managed from the
 // admin panel. Credentials are never here — keys live in env only (spec §8).
 //

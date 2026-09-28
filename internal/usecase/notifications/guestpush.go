@@ -114,6 +114,7 @@ type GuestPushNotifier struct {
 	tickets    domain.PushTicketRepository
 	gate       *GuestNotificationGate
 	venues     venueNameReader
+	clock      venueClock // venue-zone resolver for the times in the text
 	// rules / rulesDefaults render the booking-rules footer (Trello BNjLdfSP)
 	// on booking.confirmed / booking.reminder — see bookingRulesFooter.
 	rules         venueBookingRulesReader
@@ -143,6 +144,8 @@ func NewGuestPushNotifier(
 	venues venueNameReader,
 	rules venueBookingRulesReader,
 	rulesDefaults restaurants.BookingRulesDefaults,
+	zones venueTimezoneReader,
+	fallbackZone *time.Location,
 	send MobilePushSender,
 	enabled bool,
 	log *slog.Logger,
@@ -150,7 +153,8 @@ func NewGuestPushNotifier(
 	return &GuestPushNotifier{
 		tokens: tokens, deliveries: deliveries, tickets: tickets, gate: gate, venues: venues,
 		rules: rules, rulesDefaults: rulesDefaults,
-		send: send, enabled: enabled && send != nil, log: log,
+		clock: newVenueClock(zones, fallbackZone, log),
+		send:  send, enabled: enabled && send != nil, log: log,
 	}
 }
 
@@ -229,7 +233,8 @@ func (g *GuestPushNotifier) Notify(ctx context.Context, e Event) error {
 			return fmt.Errorf("guest push: read venue name: %w", err)
 		}
 	}
-	msg, ok := buildGuestMessage(e, venue, g.bookingRulesFooter(ctx, e))
+	loc := g.clock.location(ctx, e.RestaurantID)
+	msg, ok := buildGuestMessage(e, venue, g.bookingRulesFooter(ctx, e, loc), loc)
 	if !ok {
 		// An event type Interested claims but buildGuestMessage has no text for
 		// — a programming error, not a delivery failure. Drain it rather than
@@ -315,7 +320,7 @@ func (g *GuestPushNotifier) recordTicket(ctx context.Context, ticketID string, d
 // reader is not wired or the lookup fails: this text is an enhancement, the
 // same posture buildGuestMessage's venue name already has — a booking must
 // never fail to notify a guest because a policy lookup hiccuped.
-func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event) string {
+func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event, loc *time.Location) string {
 	if g.rules == nil {
 		return ""
 	}
@@ -334,8 +339,8 @@ func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event) str
 
 	switch e.Type {
 	case domain.EventBookingConfirmed:
-		holdUntil := e.StartsAt.Add(time.Duration(eff.HoldMinutes) * time.Minute).Local().Format("15:04")
-		freeCancelUntil := e.StartsAt.Add(-time.Duration(eff.FreeCancelHours) * time.Hour).Local().Format("02.01 в 15:04")
+		holdUntil := e.StartsAt.Add(time.Duration(eff.HoldMinutes) * time.Minute).In(loc).Format("15:04")
+		freeCancelUntil := e.StartsAt.Add(-time.Duration(eff.FreeCancelHours) * time.Hour).In(loc).Format("02.01 в 15:04")
 		return fmt.Sprintf(" Стол держим %d мин. (до %s). %s Бесплатная отмена — до %s.",
 			eff.HoldMinutes, holdUntil, eff.LateArrivalText, freeCancelUntil)
 	case domain.EventBookingReminder:
@@ -350,16 +355,14 @@ func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event) str
 // size. No phone, no payment data, no token. Returns ok=false for an event type
 // it has no template for.
 //
-// Times are rendered in the process's local zone, the same convention the staff
-// channels use (see buildTelegramText). The venue's own timezone would be more
-// correct for a guest travelling abroad — deliberately deferred rather than
-// half-solved here, since it would need the venue policy in the notifier.
+// Times are rendered in loc, the VENUE's zone (see venueClock): the guest turns
+// up at the venue's clock, and the server process runs in UTC.
 //
 // rulesFooter is the optional booking-rules copy (Trello BNjLdfSP) computed by
 // bookingRulesFooter — already "" for every event type that does not carry
 // one, so this function appends it blindly rather than re-checking e.Type.
-func buildGuestMessage(e Event, venue string, rulesFooter string) (MobilePushMessage, bool) {
-	when := e.StartsAt.Local().Format("02.01 в 15:04")
+func buildGuestMessage(e Event, venue string, rulesFooter string, loc *time.Location) (MobilePushMessage, bool) {
+	when := e.StartsAt.In(loc).Format("02.01 в 15:04")
 	at := ""
 	if venue != "" {
 		at = "«" + venue + "» · "

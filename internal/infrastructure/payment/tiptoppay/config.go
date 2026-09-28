@@ -72,6 +72,12 @@ type Config struct {
 	// live by the terminal the Public ID belongs to.
 	TestMode bool // TIPTOPPAY_TEST_MODE
 
+	// ReturnFallbackURL is the https page used as Success/FailRedirectUrl when
+	// the client's return_url is not an http(s) URL (e.g. the mobile deep link
+	// bookeat://...). Set by bootstrap from PAYMENTS_PUBLIC_BASE_URL, not read
+	// from the environment here.
+	ReturnFallbackURL string
+
 	// SplitsEnabled says this terminal is set up for split payments
 	// («Сплитование платежей» — it is switched on by TipTop Pay's manager on
 	// request, it is not something an integration can turn on for itself).

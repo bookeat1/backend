@@ -126,7 +126,7 @@ func (f *fakeFeed) MarkAllRead(_ context.Context, userID uuid.UUID) error {
 var _ domain.NotificationFeedRepository = (*fakeFeed)(nil)
 
 func newFeedNotifier(feed domain.NotificationFeedRepository) *FeedNotifier {
-	return NewFeedNotifier(feed, fakeVenues{name: "Ocean Basket"}, discardLog())
+	return NewFeedNotifier(feed, fakeVenues{name: "Ocean Basket"}, fakeVenues{}, nil, discardLog())
 }
 
 func TestFeedNotifierWritesRowPerType(t *testing.T) {

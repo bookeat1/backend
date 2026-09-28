@@ -3,6 +3,7 @@ package payments
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -265,6 +266,20 @@ func (f *fakePaymentRepo) SetProviderPaymentID(_ context.Context, id uuid.UUID, 
 	}
 	v := providerPaymentID
 	p.ProviderPaymentID = &v
+	return nil
+}
+
+func (f *fakePaymentRepo) ExtendHoldExpiry(_ context.Context, id uuid.UUID, expiresAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.byID[id]
+	if !ok || p.Status != domain.PaymentAuthorized {
+		return nil
+	}
+	if p.ExpiresAt == nil || p.ExpiresAt.Before(expiresAt) {
+		e := expiresAt
+		p.ExpiresAt = &e
+	}
 	return nil
 }
 
@@ -1147,6 +1162,32 @@ func (f *fakeGatewayResolver) Resolve(_ context.Context, preferred domain.Paymen
 		return g, nil // any configured gateway stands in for "the default"
 	}
 	return nil, errors.New("fakeGatewayResolver: no gateway configured")
+}
+
+// ResolveMethod mirrors Registry.ResolveMethod: kaspi is the kaspi gateway or
+// nothing; card is any configured non-kaspi gateway (lowest name for determinism).
+func (f *fakeGatewayResolver) ResolveMethod(_ context.Context, m domain.PaymentMethod) (domain.PaymentGateway, error) {
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	notFound := fmt.Errorf("fakeGatewayResolver: no gateway for method %s: %w", m, domain.ErrNotFound)
+	switch m {
+	case domain.MethodKaspi:
+		if g, ok := f.byProvider[domain.ProviderKaspi]; ok {
+			return g, nil
+		}
+	case domain.MethodCard:
+		var best domain.PaymentProvider
+		for p := range f.byProvider {
+			if p != domain.ProviderKaspi && (best == "" || p < best) {
+				best = p
+			}
+		}
+		if best != "" {
+			return f.byProvider[best], nil
+		}
+	}
+	return nil, notFound
 }
 
 func (f *fakeGatewayResolver) ForRefund(provider domain.PaymentProvider) (domain.PaymentGateway, error) {

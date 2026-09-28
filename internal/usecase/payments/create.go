@@ -28,6 +28,13 @@ type CreateUseCase interface {
 	// payment at all. See the implementation for the (false, nil) vs error
 	// distinction — the caller must not publish "could not compute" as "no".
 	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+	// AvailablePaymentMethods lists the payment methods (kaspi, card) the venue
+	// can take right now; empty means none. AcceptsOnlinePayment is true iff
+	// this is non-empty.
+	AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error)
+	// PaymentFeeTerms returns the effective service-fee rate and acquirer
+	// minimum the checkout grosses a base amount up with for this venue.
+	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
 }
 
 // CreateInput is a checkout request.
@@ -45,6 +52,9 @@ type CreateInput struct {
 	// The transport layer builds it per-provider (it must match the route the
 	// signature is computed against, see freedompay.Config.ResultScriptName).
 	CallbackURL string
+	// Method is the guest's chosen payment method (kaspi | card). Empty keeps
+	// the pre-methods behaviour: the venue's legacy preferred provider decides.
+	Method domain.PaymentMethod
 }
 
 type createUseCase struct {
@@ -186,7 +196,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		return nil, err
 	}
 
-	gw, err := u.gate().gateway(ctx, settings.Provider)
+	gw, err := u.gate().pickMethodGateway(ctx, booking.RestaurantID, settings, in.Method)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +256,8 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 
 	paymentID := uuid.New()
 	now := time.Now()
-	expiresAt := now.Add(u.cfg.HoldTTL)
+	linkTTL := u.cfg.linkTTLFor(purpose)
+	expiresAt := now.Add(linkTTL)
 
 	gwResp, err := gw.Authorize(ctx, domain.AuthorizeRequest{
 		PaymentID:      paymentID,
@@ -256,6 +267,7 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		Purpose:        purpose,
 		Description:    descriptionFor(purpose),
 		HoldTTL:        u.cfg.HoldTTL,
+		LinkTTL:        linkTTL,
 		ReturnURL:      in.ReturnURL,
 		CallbackURL:    in.CallbackURL,
 		CustomerPhone:  booking.PhoneNormalized,

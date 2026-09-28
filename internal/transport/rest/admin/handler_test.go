@@ -476,6 +476,10 @@ func (fakePaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, _ 
 	return nil
 }
 
+func (fakePaySettings) UpdatePaymentMethods(_ context.Context, _ uuid.UUID, _ *bool, _, _ bool) error {
+	return nil
+}
+
 func (fakePaySettings) GetPaymentOverride(_ context.Context, _ uuid.UUID) (domain.PaymentSettingsOverride, error) {
 	return domain.PaymentSettingsOverride{}, nil
 }

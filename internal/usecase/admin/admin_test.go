@@ -261,6 +261,16 @@ func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaura
 	return nil
 }
 
+func (f *fakePaymentSettings) UpdatePaymentMethods(_ context.Context, _ uuid.UUID, pe *bool, kaspi, card bool) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.override.PaymentsEnabled = pe
+	f.override.KaspiEnabled = &kaspi
+	f.override.CardEnabled = &card
+	return nil
+}
+
 func (f *fakePaymentSettings) GetPaymentOverride(_ context.Context, _ uuid.UUID) (domain.PaymentSettingsOverride, error) {
 	if f.err != nil {
 		return domain.PaymentSettingsOverride{}, f.err

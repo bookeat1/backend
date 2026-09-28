@@ -156,3 +156,45 @@ func TestGetAcquirerAccountIsRefusedToAStranger(t *testing.T) {
 		t.Fatalf("err = %v, want domain.ErrForbidden", err)
 	}
 }
+
+func TestPaymentMethodsSuperadminRoundTrip(t *testing.T) {
+	h, accounts := newAcquirerHarness(nil)
+	rid := uuid.New()
+	ctx := context.Background()
+	on := true
+
+	got, err := h.uc.SetPaymentMethods(ctx, superadmin(), rid, PaymentMethodsInput{
+		PaymentsEnabled: &on, Methods: []domain.PaymentMethod{domain.MethodKaspi, domain.MethodCard},
+	})
+	if err != nil {
+		t.Fatalf("SetPaymentMethods: %v", err)
+	}
+	if got.PaymentsEnabled == nil || !*got.PaymentsEnabled || len(got.Methods) != 2 || got.KaspiAccountBound {
+		t.Fatalf("got %+v, want enabled, both methods, kaspi unbound", got)
+	}
+	accounts.stored[acquirerKey(domain.ProviderKaspi, rid)] = &domain.RestaurantSplitAccount{
+		RestaurantID: rid, Provider: domain.ProviderKaspi, AccountRef: "7", IsActive: true,
+	}
+	got, err = h.uc.SetPaymentMethods(ctx, superadmin(), rid, PaymentMethodsInput{Methods: []domain.PaymentMethod{domain.MethodCard}})
+	if err != nil {
+		t.Fatalf("SetPaymentMethods(card): %v", err)
+	}
+	if got.PaymentsEnabled != nil || len(got.Methods) != 1 || got.Methods[0] != domain.MethodCard || !got.KaspiAccountBound {
+		t.Fatalf("got %+v, want inherit, [card], kaspi bound", got)
+	}
+}
+
+func TestPaymentMethodsForbiddenForNonSuperadminAndRejectsUnknown(t *testing.T) {
+	h, _ := newAcquirerHarness(nil)
+	rid := uuid.New()
+	owner := Actor{UserID: uuid.New(), Role: domain.RoleUser}
+	if _, err := h.uc.GetPaymentMethods(context.Background(), owner, rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("get: err = %v, want ErrForbidden", err)
+	}
+	if _, err := h.uc.SetPaymentMethods(context.Background(), owner, rid, PaymentMethodsInput{}); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("set: err = %v, want ErrForbidden", err)
+	}
+	if _, err := h.uc.SetPaymentMethods(context.Background(), superadmin(), rid, PaymentMethodsInput{Methods: []domain.PaymentMethod{"crypto"}}); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("unknown: err = %v, want ErrValidation", err)
+	}
+}

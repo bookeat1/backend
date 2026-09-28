@@ -34,6 +34,8 @@ func newWholeUnitCreateHarness(t *testing.T, b *domain.Booking, deposit int64, f
 		DepositRequired:    boolPtr(true),
 		DepositAmountMinor: int64Ptr(deposit),
 		ServiceFeeBps:      intPtr(feeBps),
+		KaspiEnabled:       boolPtr(true),
+		CardEnabled:        boolPtr(false),
 	}
 	gw := newFakeGateway(domain.ProviderKaspi)
 	resolver := &fakeGatewayResolver{byProvider: map[domain.PaymentProvider]domain.PaymentGateway{

@@ -708,6 +708,21 @@ func (f *fakeVenuePayments) AcceptsOnlinePayment(_ context.Context, restaurantID
 	return f.accepts[restaurantID], nil
 }
 
+func (f *fakeVenuePayments) AvailablePaymentMethods(_ context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error) {
+	f.asked = append(f.asked, restaurantID)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.accepts[restaurantID] {
+		return []domain.PaymentMethod{domain.MethodCard}, nil
+	}
+	return []domain.PaymentMethod{}, nil
+}
+
+func (f *fakeVenuePayments) PaymentFeeTerms(_ context.Context, _ uuid.UUID) (domain.PaymentFeeTerms, error) {
+	return domain.PaymentFeeTerms{RateBps: 350, MinFeeMinor: 2500}, nil
+}
+
 func newPaymentFlagFacade(t *testing.T, id uuid.UUID, pay *fakeVenuePayments) Facade {
 	t.Helper()
 	rest := domain.Restaurant{ID: id}

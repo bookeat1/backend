@@ -298,3 +298,41 @@ func TestRegistryConfigured(t *testing.T) {
 		t.Error("tiptoppay should not be configured")
 	}
 }
+
+func TestResolveMethod(t *testing.T) {
+	ctx := context.Background()
+	kaspi, freedom, tip := fakeGateway{domain.ProviderKaspi}, fakeGateway{domain.ProviderFreedomPay}, fakeGateway{domain.ProviderTipTopPay}
+
+	t.Run("card skips a Kaspi default and takes the enabled non-Kaspi provider", func(t *testing.T) {
+		r, _ := NewRegistry(settings(row(domain.ProviderKaspi, true, true, 1), row(domain.ProviderTipTopPay, true, false, 5)), "", kaspi, tip)
+		g, err := r.ResolveMethod(ctx, domain.MethodCard)
+		if err != nil || g.Name() != domain.ProviderTipTopPay {
+			t.Fatalf("got %v, %v; want tiptoppay", g, err)
+		}
+	})
+	t.Run("card prefers the non-Kaspi default", func(t *testing.T) {
+		r, _ := NewRegistry(settings(row(domain.ProviderFreedomPay, true, true, 9), row(domain.ProviderTipTopPay, true, false, 1)), "", freedom, tip)
+		g, err := r.ResolveMethod(ctx, domain.MethodCard)
+		if err != nil || g.Name() != domain.ProviderFreedomPay {
+			t.Fatalf("got %v, %v; want freedompay", g, err)
+		}
+	})
+	t.Run("card with only Kaspi enabled is not available", func(t *testing.T) {
+		r, _ := NewRegistry(settings(row(domain.ProviderKaspi, true, true, 1)), "", kaspi)
+		if _, err := r.ResolveMethod(ctx, domain.MethodCard); !errors.Is(err, ErrNoEnabledProvider) {
+			t.Fatalf("err = %v, want ErrNoEnabledProvider", err)
+		}
+	})
+	t.Run("kaspi never falls back to another acquirer", func(t *testing.T) {
+		r, _ := NewRegistry(settings(row(domain.ProviderKaspi, false, false, 1), row(domain.ProviderFreedomPay, true, true, 2)), "", kaspi, freedom)
+		if _, err := r.ResolveMethod(ctx, domain.MethodKaspi); !errors.Is(err, ErrProviderDisabled) {
+			t.Fatalf("err = %v, want ErrProviderDisabled", err)
+		}
+	})
+	t.Run("kaspi enabled resolves", func(t *testing.T) {
+		r, _ := NewRegistry(settings(row(domain.ProviderKaspi, true, false, 1)), "", kaspi)
+		if g, err := r.ResolveMethod(ctx, domain.MethodKaspi); err != nil || g.Name() != domain.ProviderKaspi {
+			t.Fatalf("got %v, %v", g, err)
+		}
+	})
+}

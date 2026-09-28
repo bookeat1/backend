@@ -608,3 +608,37 @@ func TestListingPayloadOmitsPreorderMinAmountMinorEvenWhenSet(t *testing.T) {
 		})
 	}
 }
+
+// TestDetailPayloadCarriesPaymentFee: payment_fee is served as
+// {rate_bps, min_fee_minor} when computed and omitted otherwise.
+func TestDetailPayloadCarriesPaymentFee(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	for _, tc := range []struct {
+		name string
+		fee  *domain.PaymentFeeTerms
+	}{{"present", &domain.PaymentFeeTerms{RateBps: 350, MinFeeMinor: 2500}}, {"absent", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &domain.PublicVenueState{AcceptsOnlineBookings: true, PaymentFee: tc.fee}
+			r := newTestRouter(&fakeFacade{
+				item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+				agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+			})
+			raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+			field, ok := raw["payment_fee"]
+			if tc.fee == nil {
+				if ok {
+					t.Fatalf("payment_fee must be omitted, got %s", field)
+				}
+				return
+			}
+			var got struct {
+				RateBps     int   `json:"rate_bps"`
+				MinFeeMinor int64 `json:"min_fee_minor"`
+			}
+			if !ok || json.Unmarshal(field, &got) != nil || got.RateBps != 350 || got.MinFeeMinor != 2500 {
+				t.Fatalf("payment_fee = %s (present=%v)", field, ok)
+			}
+		})
+	}
+}

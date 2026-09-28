@@ -140,6 +140,49 @@ func (r *Registry) Resolve(ctx context.Context, preferred domain.PaymentProvider
 	return r.Default(ctx)
 }
 
+// ResolveMethod picks the gateway for a NEW payment by payment method.
+//
+//   - kaspi: the Kaspi adapter, which must exist and be enabled in the registry
+//     (no fallback: a guest who chose Kaspi must never be charged elsewhere).
+//   - card: the platform's single active non-Kaspi provider — the default
+//     provider when it is not Kaspi, else the enabled non-Kaspi provider with
+//     the lowest priority.
+func (r *Registry) ResolveMethod(ctx context.Context, m domain.PaymentMethod) (domain.PaymentGateway, error) {
+	switch m {
+	case domain.MethodKaspi:
+		return r.For(ctx, domain.ProviderKaspi)
+	case domain.MethodCard:
+		return r.defaultExcluding(ctx, domain.ProviderKaspi)
+	}
+	return nil, fmt.Errorf("payment method %q: %w", m, ErrProviderUnknown)
+}
+
+// defaultExcluding is Default() restricted to providers other than `not`.
+func (r *Registry) defaultExcluding(ctx context.Context, not domain.PaymentProvider) (domain.PaymentGateway, error) {
+	if setting, err := r.settings.GetDefault(ctx); err == nil {
+		if setting.Provider != not {
+			if g, ok := r.gateways[setting.Provider]; ok {
+				return g, nil
+			}
+		}
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return nil, fmt.Errorf("read default provider: %w", err)
+	}
+	enabled, err := r.settings.ListEnabled(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list enabled providers: %w", err)
+	}
+	for _, s := range enabled { // ordered by priority
+		if s.Provider == not {
+			continue
+		}
+		if g, ok := r.gateways[s.Provider]; ok {
+			return g, nil
+		}
+	}
+	return nil, ErrNoEnabledProvider
+}
+
 // Default returns the gateway for the enabled default provider: the
 // payment_providers row marked is_default, then PAYMENTS_DEFAULT_PROVIDER, then
 // the enabled provider with the lowest priority.
