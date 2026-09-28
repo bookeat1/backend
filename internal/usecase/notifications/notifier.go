@@ -52,6 +52,16 @@ type Event struct {
 	// "the bank released the hold" instead of one generic message for all four.
 	// Empty on a venue/guest cancellation and on every non-cancel event.
 	CancellationReasonCode *string
+	// HoldAmountMinor / HoldCurrency and VenueAnswerDeadlineAt carry the
+	// pre-order hold's money and answer deadline (spec
+	// preorder-hold-capture-on-confirm-20260924 §criterion 25) — nil/zero on
+	// every event except a booking.created release with a live hold that still
+	// needs a venue answer. A staff channel uses them to add the "заблокировано
+	// N ₸, ответьте до…" line; a channel that ignores them (web push, WhatsApp's
+	// fixed approved template) is unaffected.
+	HoldAmountMinor       *int64
+	HoldCurrency          domain.Currency
+	VenueAnswerDeadlineAt *time.Time
 }
 
 // Notifier is one outbound channel. Notify MUST be idempotent under redelivery
@@ -81,6 +91,9 @@ type outboxPayload struct {
 	StartsAt               time.Time          `json:"starts_at"`
 	CancelledBy            domain.CancelledBy `json:"cancelled_by,omitempty"`
 	CancellationReasonCode *string            `json:"cancellation_reason_code,omitempty"`
+	HoldAmountMinor        *int64             `json:"hold_amount_minor,omitempty"`
+	HoldCurrency           domain.Currency    `json:"hold_currency,omitempty"`
+	VenueAnswerDeadlineAt  *time.Time         `json:"venue_answer_deadline_at,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -101,5 +114,8 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		GuestUserID:            p.UserID,
 		CancelledBy:            p.CancelledBy,
 		CancellationReasonCode: p.CancellationReasonCode,
+		HoldAmountMinor:        p.HoldAmountMinor,
+		HoldCurrency:           p.HoldCurrency,
+		VenueAnswerDeadlineAt:  p.VenueAnswerDeadlineAt,
 	}, nil
 }

@@ -108,14 +108,22 @@ func logTransition(ctx context.Context, b *domain.Booking, from *domain.BookingS
 }
 
 // publish inserts one outbox event describing the booking's current state.
+// opts augment the payload with data available only at the call site (not a
+// Booking field) — today, exactly one: the release path's hold amount +
+// venue-answer deadline (withHoldNotice).
 func publish(
 	ctx context.Context,
 	outbox domain.BookingOutboxRepository,
 	b *domain.Booking,
 	eventType domain.BookingEventType,
 	at time.Time,
+	opts ...payloadOption,
 ) error {
-	payload, err := json.Marshal(newBookingPayload(b))
+	p := newBookingPayload(b)
+	for _, opt := range opts {
+		opt(&p)
+	}
+	payload, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
@@ -167,6 +175,33 @@ type bookingPayload struct {
 	// see createUseCase.sanitizedAttributionSource. Omitted for the vast
 	// majority of bookings that carry no channel tag.
 	AttributionSource *string `json:"attribution_source,omitempty"`
+	// HoldAmountMinor / HoldCurrency and VenueAnswerDeadlineAt are populated
+	// ONLY on the booking.created event the release path (release.go) publishes
+	// for a booking that still carries a live pre-order hold and must wait for
+	// the venue to answer — never on any other event, and never when the venue
+	// auto-confirms on create (no deadline applies then). See withHoldNotice.
+	// Spec preorder-hold-capture-on-confirm-20260924 §criterion 25: "the venue
+	// notification about a booking with a hold carries the pre-order amount and
+	// D_venue".
+	HoldAmountMinor       *int64          `json:"hold_amount_minor,omitempty"`
+	HoldCurrency          domain.Currency `json:"hold_currency,omitempty"`
+	VenueAnswerDeadlineAt *time.Time      `json:"venue_answer_deadline_at,omitempty"`
+}
+
+// payloadOption augments a bookingPayload with data the caller has but that is
+// not itself a Booking field — see publish.
+type payloadOption func(*bookingPayload)
+
+// withHoldNotice fills the money+deadline line release.go's ReleaseForPayment
+// computes right before publishing booking.created for a booking released with
+// a live pre-order hold.
+func withHoldNotice(amount domain.Money, deadline time.Time) payloadOption {
+	return func(p *bookingPayload) {
+		minor := amount.AmountMinor
+		p.HoldAmountMinor = &minor
+		p.HoldCurrency = amount.Currency
+		p.VenueAnswerDeadlineAt = &deadline
+	}
 }
 
 func newBookingPayload(b *domain.Booking) bookingPayload {

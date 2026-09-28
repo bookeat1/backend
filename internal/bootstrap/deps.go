@@ -498,8 +498,13 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg,
 		bookings.WithPreorderGate(preorderGateAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}))
 	// The booking gate: hands a hidden pre-order booking to the venue in the
-	// same transaction as the payment's created -> authorized transition.
-	bookingReleaser := bookings.NewReleaser(bookingRepo, bookingRepo, bookingHistory, bookingOutbox, restRepo, bookingCfg)
+	// same transaction as the payment's created -> authorized transition. The
+	// hold-notice option lets the venue's "new booking" alert carry the
+	// pre-order amount + D_venue deadline (spec §criterion 25); paymentrepo.New
+	// here is a fresh, cheap-to-construct-twice repo, same reasoning as every
+	// other "constructed once for wiring, once for the real thing" repo above.
+	bookingReleaser := bookings.NewReleaser(bookingRepo, bookingRepo, bookingHistory, bookingOutbox, restRepo, bookingCfg,
+		bookings.WithReleaserVenueNotice(preorderHoldAdapter{payments: paymentrepo.New(db)}, cfg.Payments.PreorderConfirmMax))
 
 	paymentsRepo := paymentrepo.New(db)
 	paymentRefundsRepo := paymentrepo.NewRefunds(db)
@@ -1160,6 +1165,26 @@ func (a preorderHoldAdapter) HasPreorderHold(ctx context.Context, bookingID uuid
 	return p.Purpose == domain.PurposePreorder && p.RequiresConfirmation && p.Status == domain.PaymentAuthorized, nil
 }
 
+// LivePreorderHold implements bookings.PreorderHoldNotice: same live-hold test
+// as HasPreorderHold above, plus the amount the venue's release notification
+// needs to print. AmountMinor (not BaseAmountMinor) — the guest's card is
+// blocked for the total including the service fee, and that total is exactly
+// what gets captured on confirmation, so it is the number that must not
+// surprise the venue later.
+func (a preorderHoldAdapter) LivePreorderHold(ctx context.Context, bookingID uuid.UUID) (domain.Money, bool, error) {
+	p, err := a.payments.GetLiveByBookingID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.Money{}, false, nil
+		}
+		return domain.Money{}, false, err
+	}
+	if p.Purpose != domain.PurposePreorder || !p.RequiresConfirmation || p.Status != domain.PaymentAuthorized {
+		return domain.Money{}, false, nil
+	}
+	return p.Total(), true, nil
+}
+
 // venueLocationAdapter implements usecase/bookings' venueLocationResolver: it
 // answers which zone a venue's calendar day is measured in, for the ?date=
 // filter of the venue calendar.
@@ -1442,7 +1467,8 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 		payments.WithReconcilerWebhookOptions(
 			payments.WithLateCancelSettlement(bookingRepo, reconcileSettler),
 			payments.WithBookingReleaser(bookings.NewReleaser(bookingRepo, bookingRepo,
-				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg))),
+				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg),
+				bookings.WithReleaserVenueNotice(preorderHoldAdapter{payments: reconcilePaymentsRepo}, cfg.Payments.PreorderConfirmMax))),
 			payments.WithHoldTTL(cfg.Payments.HoldTTL),
 			payments.WithHoldLostCanceller(reconcileHoldLost))), nil
 }
@@ -1505,6 +1531,21 @@ func NewEventRecurrenceGenerator(cfg Config, db *pgxpool.Pool, log *slog.Logger)
 func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notifications.Dispatcher {
 	txm := sqltx.NewManager(db)
 
+	// The platform zone a venue's booking time is rendered in when the venue
+	// stores none of its own — the SAME fallback bookings and payouts use, so a
+	// venue's day means one thing across the system. An unusable platform value
+	// degrades to UTC here rather than crashing the worker: this is the wording
+	// of a message, not a payout boundary. Computed once, up front, so every
+	// channel below (Telegram's hold deadline, guest push, feed, WhatsApp) reads
+	// the SAME fallback and the SAME venue reader.
+	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("platform timezone fallback is unusable, guest and whatsapp notifications will render times in UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		waFallbackZone = time.UTC
+	}
+	notifVenues := notificationrepo.NewVenues(db)
+
 	pushCfg := webpush.Config{
 		PublicKey:  cfg.Push.VAPIDPublicKey,
 		PrivateKey: cfg.Push.VAPIDPrivateKey,
@@ -1543,7 +1584,7 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		tgSender,
 		tgCfg.Configured(),
 		log,
-	)
+	).WithVenueTimezones(notifVenues, waFallbackZone)
 	// Buttons go under the alert only when the venue can actually answer them:
 	// that needs both the bot token (to send) and the webhook secret (to receive
 	// the press). Buttons that lead nowhere are worse than none — staff press
@@ -1579,18 +1620,6 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
-	// The platform zone a venue's booking time is rendered in when the venue
-	// stores none of its own — the SAME fallback bookings and payouts use, so a
-	// venue's day means one thing across the system. An unusable platform value
-	// degrades to UTC here rather than crashing the worker: this is the wording
-	// of a message, not a payout boundary.
-	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
-	if err != nil {
-		log.Error("platform timezone fallback is unusable, guest and whatsapp notifications will render times in UTC",
-			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
-		waFallbackZone = time.UTC
-	}
-	notifVenues := notificationrepo.NewVenues(db)
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),

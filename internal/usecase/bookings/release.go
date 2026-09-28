@@ -25,6 +25,12 @@ type releaser struct {
 	outbox   domain.BookingOutboxRepository
 	rests    restaurantReader
 	cfg      Config
+	// holds and confirmMax drive the venue "booking created" money+deadline
+	// line (spec preorder-hold-capture-on-confirm-20260924 §criterion 25); both
+	// nil/zero = the line is simply omitted, same degrade-safe shape as every
+	// other WithReleaser* option below.
+	holds      PreorderHoldNotice
+	confirmMax time.Duration
 }
 
 // NewReleaser constructs the booking gate release.
@@ -35,8 +41,35 @@ func NewReleaser(
 	outbox domain.BookingOutboxRepository,
 	rests restaurantReader,
 	cfg Config,
+	opts ...ReleaserOption,
 ) Releaser {
-	return &releaser{bookings: bookings, release: release, history: history, outbox: outbox, rests: rests, cfg: cfg.withDefaults()}
+	r := &releaser{bookings: bookings, release: release, history: history, outbox: outbox, rests: rests, cfg: cfg.withDefaults()}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// ReleaserOption configures optional Releaser dependencies without breaking
+// the constructor's existing positional callers.
+type ReleaserOption func(*releaser)
+
+// PreorderHoldNotice reports the amount of a booking's live pre-order hold
+// (authorized, not yet captured), so the venue's "new booking" notification
+// can say how much is blocked. Mirrors PreorderHoldChecker's data source
+// (domain.PaymentRepository.GetLiveByBookingID) but returns the amount too,
+// since the worker's checker never needs to print money, only decide
+// auto-confirm vs escalate.
+type PreorderHoldNotice interface {
+	LivePreorderHold(ctx context.Context, bookingID uuid.UUID) (domain.Money, bool, error)
+}
+
+// WithReleaserVenueNotice wires the pre-order hold reader and the SAME
+// PAYMENTS_PREORDER_CONFIRM_MAX the confirm-SLA worker and
+// VenueAnswerDeadlineResolver use, so the deadline quoted to the venue at
+// release time can never disagree with the one the worker actually enforces.
+func WithReleaserVenueNotice(holds PreorderHoldNotice, confirmMax time.Duration) ReleaserOption {
+	return func(r *releaser) { r.holds, r.confirmMax = holds, confirmMax }
 }
 
 // ReleaseForPayment is idempotent: the conditional UPDATE reports false for an
@@ -55,14 +88,30 @@ func (r *releaser) ReleaseForPayment(ctx context.Context, bookingID uuid.UUID) e
 		return err
 	}
 	b.ReleasedToVenueAt = &now
-	if err := publish(ctx, r.outbox, b, domain.EventBookingCreated, now); err != nil {
-		return err
-	}
 	rest, err := r.rests.GetByID(ctx, b.RestaurantID)
 	if err != nil {
 		return err
 	}
-	if !resolvePolicy(rest.Restaurant, r.cfg).ConfirmOnCreate {
+	policy := resolvePolicy(rest.Restaurant, r.cfg)
+
+	var opts []payloadOption
+	// The money+deadline line applies only to a booking the venue must still
+	// ANSWER: one auto-confirmed in this same call needs no deadline (spec
+	// VenueAnswerDeadlineResolver has the identical guard for the read side).
+	if !policy.ConfirmOnCreate && r.holds != nil {
+		amount, held, herr := r.holds.LivePreorderHold(ctx, bookingID)
+		if herr != nil {
+			return herr
+		}
+		if held {
+			deadline := domain.VenueAnswerDeadline(now, b.StartsAt, policy.ConfirmSLA, r.confirmMax)
+			opts = append(opts, withHoldNotice(amount, deadline))
+		}
+	}
+	if err := publish(ctx, r.outbox, b, domain.EventBookingCreated, now, opts...); err != nil {
+		return err
+	}
+	if !policy.ConfirmOnCreate {
 		return nil
 	}
 	from := b.Status
