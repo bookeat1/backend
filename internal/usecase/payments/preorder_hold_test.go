@@ -28,6 +28,10 @@ type holdHarness struct {
 	ledger  *fakeLedgerRepo
 	gw      *fakeGateway
 	refunds *fakeRefundRepo
+	// booking is the SAME pointer the fakeBookingReader hands back, so a test
+	// can mutate its status in place to simulate a concurrent transition (e.g.
+	// a guest cancel racing an in-flight capture call).
+	booking *domain.Booking
 }
 
 func newHoldHarness(t *testing.T, p *domain.Payment, confirmed bool) *holdHarness {
@@ -49,7 +53,7 @@ func newHoldHarness(t *testing.T, p *domain.Payment, confirmed bool) *holdHarnes
 	tx := &fakeTx{payments: repo, ledger: ledger, outbox: outbox, refunds: refunds}
 	refundUC := NewRefundUseCase(repo, refunds, ledger, outbox, resolver, managers, bookings, dl, tx, Config{}.withDefaults())
 	uc := NewDepositCancellationUseCase(repo, ledger, outbox, resolver, managers, bookings, dl, refundUC, tx)
-	return &holdHarness{uc: uc, repo: repo, ledger: ledger, gw: gw, refunds: refunds}
+	return &holdHarness{uc: uc, repo: repo, ledger: ledger, gw: gw, refunds: refunds, booking: b}
 }
 
 // A booking the venue never confirmed voids the hold for EVERY trigger — even a
@@ -150,6 +154,50 @@ func TestCaptureOnConfirm_DeclineIsReported(t *testing.T) {
 	_, err := h.uc.(PreorderConfirmationUseCase).CaptureOnConfirm(ctx, p.BookingID)
 	if !errors.Is(err, domain.ErrProviderDeclined) {
 		t.Fatalf("error = %v, want ErrProviderDeclined", err)
+	}
+}
+
+// CaptureOnConfirm does not hold the booking's status for the duration of the
+// (external, unbounded-latency) gw.Capture call: if the guest cancels while
+// the HTTP call is in flight, the capture can still land successfully on a
+// booking that is now cancelled. Regression for PR #156 review Blocking 3
+// (part 1): the capture used to just succeed and stop there, leaving a
+// captured payment on a cancelled booking with no refund decision until some
+// later replayed webhook happened to fix it. Fix: re-check the booking right
+// after a successful capture and settle (refund) immediately if it raced to
+// closed.
+func TestCaptureOnConfirm_BookingCancelledDuringCaptureIsRefunded(t *testing.T) {
+	ctx := context.Background()
+	p := heldPreorder(uuid.New())
+	h := newHoldHarness(t, p, true)
+	// The booking is confirmed when CaptureOnConfirm starts (captureAfterConfirm
+	// always runs right after a confirm), but by the time the acquirer call
+	// returns, a concurrent guest cancel has already closed it — CancelledBy is
+	// left unset here on purpose: lateSettlementTrigger treats that as the
+	// venue's cancellation, i.e. a full refund, the safe default when we do not
+	// know who cancelled.
+	h.booking.Status = domain.BookingCancelled
+
+	c := h.uc.(PreorderConfirmationUseCase)
+	out, err := c.CaptureOnConfirm(ctx, p.BookingID)
+	if err != nil {
+		t.Fatalf("CaptureOnConfirm: %v", err)
+	}
+	if out == nil || out.Status != domain.PaymentCaptured {
+		t.Fatalf("capture itself must still succeed (the acquirer already took the money), got %+v", out)
+	}
+	if h.gw.callCount("capture") != 1 {
+		t.Fatalf("capture called %d times, want 1", h.gw.callCount("capture"))
+	}
+	stored, err := h.repo.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if stored.Status != domain.PaymentRefunded {
+		t.Fatalf("status = %s, want refunded: a captured pre-order on a cancelled booking must be settled immediately", stored.Status)
+	}
+	if h.gw.callCount("refund") != 1 {
+		t.Fatalf("refund called %d times, want 1", h.gw.callCount("refund"))
 	}
 }
 

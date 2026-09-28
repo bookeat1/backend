@@ -226,6 +226,67 @@ func TestWorkerHeldBookingSLACountsFromRelease(t *testing.T) {
 	}
 }
 
+// D_venue (VenueAnswerDeadline) is min(released+SLA, released+ConfirmMax,
+// starts_at) — it can fall strictly BEFORE released+ConfirmSLA when the visit
+// itself starts sooner than the SLA window. Regression for PR #156 review
+// Blocking 1: the worker used to gate every held booking on the FULL
+// ConfirmSLA before ever consulting venueDeadline, so a booking whose
+// starts_at had already passed stayed `pending` — money held, no cancellation
+// — until released+120m instead of at the deadline the guest/venue were
+// actually quoted.
+func TestWorkerHeldBookingCancelsAtStartsAtDeadlineBeforeFullSLA(t *testing.T) {
+	rid := uuid.New()
+	h := newWorkerHarness(t)
+	h.venue(rid, nil, nil) // default policy: SLA 120m, auto_confirm true
+	held := h.booking(rid, domain.BookingPending, 3*time.Hour, -5*time.Hour)
+	h.bookings.byID[held.ID] = held
+	h.w.release, h.w.holds = fakeRelease{h.bookings}, fakeHolds{held.ID: true}
+	// Released 90 minutes ago — inside the 120m SLA window, so the OLD
+	// (buggy) gate would still be sleeping on this booking. But starts_at was
+	// 5 minutes ago: D_venue = starts_at, already in the past.
+	rel := h.now.Add(-90 * time.Minute)
+	held.ReleasedToVenueAt = &rel
+	held.StartsAt = h.now.Add(-5 * time.Minute)
+	held.EndsAt = held.StartsAt.Add(2 * time.Hour)
+
+	res, err := h.w.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if h.statusOf(held.ID) != domain.BookingCancelled || res.NoAnswer != 1 {
+		t.Fatalf("status=%s res=%+v, want cancelled/NoAnswer=1 (D_venue=starts_at already passed, even though the 120m SLA has not elapsed)",
+			h.statusOf(held.ID), res)
+	}
+	if code := lastUpdated(h.bookings, held.ID).CancellationReasonCode; code == nil || *code != domain.CancelReasonVenueNoAnswer {
+		t.Fatalf("reason = %v, want venue_no_answer", code)
+	}
+}
+
+// The MinVenueAnswerWindow floor (15m) still applies: a booking released just
+// now with starts_at seconds away must NOT be cancelled before the venue has
+// had at least 15 minutes to answer.
+func TestWorkerHeldBookingRespectsMinVenueAnswerWindow(t *testing.T) {
+	rid := uuid.New()
+	h := newWorkerHarness(t)
+	h.venue(rid, nil, nil)
+	held := h.booking(rid, domain.BookingPending, 3*time.Hour, -5*time.Hour)
+	h.bookings.byID[held.ID] = held
+	h.w.release, h.w.holds = fakeRelease{h.bookings}, fakeHolds{held.ID: true}
+	rel := h.now.Add(-10 * time.Minute) // released 10 minutes ago
+	held.ReleasedToVenueAt = &rel
+	held.StartsAt = h.now.Add(-1 * time.Minute) // starts_at already passed
+	held.EndsAt = held.StartsAt.Add(2 * time.Hour)
+
+	res, err := h.w.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if h.statusOf(held.ID) != domain.BookingPending || res.NoAnswer != 0 {
+		t.Fatalf("status=%s res=%+v, want still pending: the venue has only had 10 of its guaranteed 15 minutes",
+			h.statusOf(held.ID), res)
+	}
+}
+
 // lastUpdated is the last full-row Update the fake recorded for a booking (the
 // fake keeps them apart from the status writes).
 func lastUpdated(f *fakeBookings, id uuid.UUID) *domain.Booking {
