@@ -34,7 +34,7 @@ type reconcilerHarness struct {
 // ago" relative to h.now() unless they are the same instant.
 var reconcilerHarnessNow = time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 
-func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain.Payment, refunds []*domain.PaymentRefund) *reconcilerHarness {
+func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain.Payment, refunds []*domain.PaymentRefund, opts ...ReconcilerOption) *reconcilerHarness {
 	t.Helper()
 	pr := newFakePaymentRepo(payments...)
 	rr := newFakeRefundRepo()
@@ -54,7 +54,7 @@ func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain
 		payments: pr, refunds: rr, ledger: ledger, outbox: outbox, gw: gw,
 		now: reconcilerHarnessNow,
 	}
-	h.r = NewReconciler(pr, rr, ledger, outbox, resolver, tx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.r = NewReconciler(pr, rr, ledger, outbox, resolver, tx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), opts...)
 	h.r.now = func() time.Time { return h.now }
 	return h
 }
@@ -278,6 +278,56 @@ func TestReconciler_StuckVoiding_AcquirerVoided_Finishes(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("outbox events = %v, want payment.voided", h.outbox.types())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// lost webhook: deposit hold TTL must be re-based, same as a real webhook
+// ---------------------------------------------------------------------------
+
+// lostWebhookDepositPayment builds a deposit that never got its authorization
+// webhook: still `created` locally, but the acquirer already assigned a
+// provider id and (unbeknownst to us) authorized it. ExpiresAt is left at the
+// short pre-payment (link) lifetime, already in the past by the time the
+// reconciler gets to it — exactly PR #152's shorter TTL default.
+func lostWebhookDepositPayment(bookingID uuid.UUID, providerPaymentID string, now time.Time) *domain.Payment {
+	p := testPayment(bookingID, domain.PaymentCreated, providerPaymentID)
+	p.StatusChangedAt = now.Add(-2 * time.Hour) // stale past LostWebhookAfter
+	expired := now.Add(-5 * time.Minute)        // pre-payment link TTL, already lapsed
+	p.ExpiresAt = &expired
+	return p
+}
+
+// TestReconciler_LostDepositWebhook_ConfirmsAndDoesNotVoidAsExpired is the
+// PR #158 code-review bug: a lost webhook confirmed through applier() (built
+// without WithHoldTTL) left the pre-payment ExpiresAt untouched, so the SAME
+// tick's reconcileExpiredHolds pass then voided the just-confirmed deposit as
+// "expired" — cancelling money the guest had actually already paid. The fix
+// wires WithReconcilerHoldTTL through applier() so the replayed webhook
+// re-bases ExpiresAt exactly like a real one would.
+func TestReconciler_LostDepositWebhook_ConfirmsAndDoesNotVoidAsExpired(t *testing.T) {
+	bookingID := uuid.New()
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: time.Hour, BatchSize: 10, MaxAttempts: 3}
+	const holdTTL = 96 * time.Hour
+	h := newReconcilerHarness(t, cfg, nil, nil, WithReconcilerHoldTTL(holdTTL))
+	p := lostWebhookDepositPayment(bookingID, "gw-1", h.now)
+	h.payments.byID[p.ID] = p
+	// The acquirer's own view: the hold went through.
+	h.gw.getResp = &domain.GatewayPayment{ProviderPaymentID: "gw-1", Status: domain.PaymentAuthorized}
+
+	res, err := h.r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if res.Resolved < 1 {
+		t.Fatalf("got %+v, want at least 1 resolved (the lost-webhook pass)", res)
+	}
+	got, _ := h.payments.GetByID(context.Background(), p.ID)
+	if got.Status != domain.PaymentAuthorized {
+		t.Fatalf("status = %s, want authorized — the reconciler voided a deposit it had just confirmed", got.Status)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.After(h.now) {
+		t.Fatalf("expires_at = %v, want re-based to roughly now+%s (matching WithHoldTTL's own behaviour)", got.ExpiresAt, holdTTL)
 	}
 }
 

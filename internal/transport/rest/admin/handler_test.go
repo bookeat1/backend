@@ -510,3 +510,52 @@ func (fakeTelegramSettings) SetWhatsAppPhone(_ context.Context, _ uuid.UUID, _ s
 func (fakeTelegramSettings) ClearWhatsAppPhone(_ context.Context, _ uuid.UUID) error {
 	return nil
 }
+
+// TestGetPaymentMethodsIncludesGlobalFlag guards the wire-up end to end
+// (bootstrap -> usecase -> HTTP response): a venue with no
+// payments_enabled override must still let the superadmin panel show what
+// "as on the platform" currently resolves to (B1). Fails before the fix
+// because paymentMethodsResponse had no payments_enabled_global field at
+// all — the assertion below would see a JSON key that doesn't exist.
+func TestGetPaymentMethodsIncludesGlobalFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	uc := adminuc.NewUseCase(
+		fakePerms{allow: true}, &fakeRest{}, &fakeMenu{}, &fakeWH{}, &fakeOverrides{}, &fakeGuests{},
+		&fakeBookingList{}, &fakeBookingTx{}, fakePaySettings{}, fakeTelegramSettings{},
+		adminuc.WithPaymentsGlobalEnabled(true),
+	)
+	r := gin.New()
+	api := r.Group("/api/v1")
+	authed := api.Group("")
+	// The route is superadmin-only: the usecase gate checks actor.Role, not
+	// the middleware, so a RoleAdmin actor here (unlike newHarness's
+	// RoleRestaurant) is what actually exercises the GET path.
+	authed.Use(middleware.Auth(fakeIssuer{}, fakeUsers{role: domain.RoleAdmin}))
+	scoped := authed.Group("")
+	scoped.Use(middleware.RequireRestaurantManager(fakeManagers{manages: true}, "id"))
+	NewHandler(uc).RegisterRoutes(scoped)
+
+	rid := uuid.New()
+	w := do(r, http.MethodGet, base(rid)+"/payment-settings/methods", nil, nil, uuid.New())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body)
+	}
+	var body struct {
+		Data struct {
+			PaymentsEnabled       *bool `json:"payments_enabled"`
+			PaymentsEnabledGlobal *bool `json:"payments_enabled_global"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, w.Body)
+	}
+	if body.Data.PaymentsEnabled != nil {
+		t.Fatalf("payments_enabled = %v, want nil (venue has no override)", body.Data.PaymentsEnabled)
+	}
+	if body.Data.PaymentsEnabledGlobal == nil {
+		t.Fatalf("payments_enabled_global is missing from the response, want present (body %s)", w.Body)
+	}
+	if !*body.Data.PaymentsEnabledGlobal {
+		t.Fatalf("payments_enabled_global = false, want true (wired via WithPaymentsGlobalEnabled(true))")
+	}
+}

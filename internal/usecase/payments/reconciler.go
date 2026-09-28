@@ -73,7 +73,22 @@ type Reconciler struct {
 	// paid guest with no ticket (capture). Optional (WithReconcilerObserver);
 	// nil for a deploy with no ticketing wired.
 	ticketObserver PaymentSubjectObserver
-	webhookOpts    []WebhookOption
+	// webhookOpts carries the same booking-side WebhookOptions (late-cancel
+	// settlement, booking gate release, hold-lost cancellation, hold TTL) a
+	// real HTTP webhook is wired with, so a transition the reconciler replays
+	// applies identically — see applier() and WithReconcilerWebhookOptions.
+	webhookOpts []WebhookOption
+	// holdTTL mirrors webhookUseCase.holdTTL (WithHoldTTL) — see applier(). A
+	// deposit the reconciler confirms authorized via resolveLostWebhook goes
+	// through the EXACT SAME applyAuthorized code path a real webhook would,
+	// which only re-bases ExpiresAt when holdTTL is set; without it the
+	// pre-payment (short link) ExpiresAt survives into the confirmed hold, and
+	// the very next reconcileExpiredHolds pass voids a deposit that was just
+	// paid. Optional (WithReconcilerHoldTTL); zero means "do not re-base" (the
+	// webhookUseCase default too). Usually redundant with a WithHoldTTL inside
+	// webhookOpts (applier() sets both), kept as its own field so it holds even
+	// when webhookOpts is empty.
+	holdTTL time.Duration
 }
 
 // ReconcilerOption configures the reconciler without breaking the positional
@@ -88,6 +103,16 @@ func WithReconcilerObserver(obs PaymentSubjectObserver) ReconcilerOption {
 	return func(r *Reconciler) { r.ticketObserver = obs }
 }
 
+// WithReconcilerHoldTTL wires the same deposit hold-TTL the HTTP webhook uses
+// (bootstrap's payments.WithHoldTTL(cfg.Payments.HoldTTL)) into the
+// reconciler's own applier, so a deposit the reconciler confirms authorized
+// gets its ExpiresAt re-based exactly like a real webhook delivery would —
+// see the field doc on Reconciler.holdTTL for why this is money-safety
+// critical, not cosmetic.
+func WithReconcilerHoldTTL(ttl time.Duration) ReconcilerOption {
+	return func(r *Reconciler) { r.holdTTL = ttl }
+}
+
 // applier builds a webhookUseCase that shares the reconciler's repos, gateway
 // resolver AND ticket observer, so a transition the reconciler replays applies
 // identically to the way a real webhook would — including the immediate-capture
@@ -98,6 +123,7 @@ func (r *Reconciler) applier() *webhookUseCase {
 	u := &webhookUseCase{
 		payments: r.payments, ledger: r.ledger, outbox: r.outbox,
 		gateways: r.gateways, tx: r.tx, ticketObserver: r.ticketObserver,
+		holdTTL: r.holdTTL,
 	}
 	// The same booking-side hooks a real webhook has (late-cancel settlement,
 	// booking gate release, hold TTL): a transition found by the reconciler must

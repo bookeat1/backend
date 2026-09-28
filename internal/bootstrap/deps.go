@@ -672,6 +672,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// inside our Kaspi service). The SAME repo instance the checkout reads
 		// at Authorize time, so the panel and the charge can never disagree.
 		admin.WithAcquirerAccounts(paymentSplitAccounts),
+		// Read-only platform default for the panel's "as on the platform"
+		// label — same paymentsCfg.Enabled resolveSettings falls back to when
+		// a venue's payments_enabled is NULL.
+		admin.WithPaymentsGlobalEnabled(paymentsCfg.Enabled),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -1470,7 +1474,16 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg),
 				bookings.WithReleaserVenueNotice(preorderHoldAdapter{payments: reconcilePaymentsRepo}, cfg.Payments.PreorderConfirmMax))),
 			payments.WithHoldTTL(cfg.Payments.HoldTTL),
-			payments.WithHoldLostCanceller(reconcileHoldLost))), nil
+			payments.WithHoldLostCanceller(reconcileHoldLost)),
+		// Same hold TTL as the HTTP webhook (NewDeps's WithHoldTTL) — without it
+		// a deposit the reconciler confirms authorized via a replayed webhook
+		// keeps its short pre-payment ExpiresAt and gets voided as "expired" by
+		// the very next reconcileExpiredHolds pass, cancelling a payment that
+		// just succeeded. Redundant with the WithHoldTTL(cfg.Payments.HoldTTL)
+		// inside WithReconcilerWebhookOptions above (applier() sets both the
+		// same way) — kept explicit so this holds even if the webhook options
+		// above ever stop including it.
+		payments.WithReconcilerHoldTTL(cfg.Payments.HoldTTL)), nil
 }
 
 // NewTicketSweeper builds the pending-ticket sweep worker: it releases seats

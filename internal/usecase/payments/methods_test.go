@@ -150,6 +150,38 @@ func TestCreateWithoutMethodKeepsWorking(t *testing.T) {
 	_ = uuid.Nil
 }
 
+// TestCreateWithoutMethodFallsBackWhenPreferredProviderHasNoAccount is the
+// PR #158 code-review regression: a venue with Kaspi enabled (and preferred,
+// since the legacy Provider defaults to kaspi) but not yet bound to a Kaspi
+// company, AND card enabled and working (no account needed). A guest who
+// never picked an explicit method must still be routed to card — the same
+// method AvailablePaymentMethods already reports as available — instead of
+// pickMethodGateway greedily returning the unbound, unusable kaspi gateway
+// first and letting Authorize fail downstream with split_account_missing.
+func TestCreateWithoutMethodFallsBackWhenPreferredProviderHasNoAccount(t *testing.T) {
+	h := methodsHarness(t, true, true, false, true, true) // kaspi+card on, kaspi NOT bound
+
+	// The guest-facing card must already agree: card is the only one actually
+	// usable right now.
+	methods, err := h.uc.AvailablePaymentMethods(context.Background(), h.booking.RestaurantID)
+	if err != nil {
+		t.Fatalf("AvailablePaymentMethods: %v", err)
+	}
+	if !reflect.DeepEqual(methods, []domain.PaymentMethod{domain.MethodCard}) {
+		t.Fatalf("available methods = %v, want [card]", methods)
+	}
+
+	p, err := h.uc.CreateForBooking(context.Background(), Actor{}, CreateInput{
+		BookingID: h.booking.ID, IdempotencyKey: "no-method-fallback", ReturnURL: "https://app/r",
+	})
+	if err != nil {
+		t.Fatalf("CreateForBooking() without an explicit method error = %v — card was shown as available", err)
+	}
+	if p.Provider != domain.ProviderFreedomPay {
+		t.Fatalf("provider = %s, want %s (card, the only account-usable method)", p.Provider, domain.ProviderFreedomPay)
+	}
+}
+
 func TestPaymentFeeTermsMatchCheckoutGrossUp(t *testing.T) {
 	h := methodsHarness(t, false, true, false, true, true)
 	rid := h.booking.RestaurantID
