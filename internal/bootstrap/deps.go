@@ -1330,7 +1330,13 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			MaxAttempts:      cfg.PaymentsReconciler.MaxAttempts,
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
 		}, log,
-		payments.WithReconcilerObserver(ticketObserver)), nil
+		payments.WithReconcilerObserver(ticketObserver),
+		// Same hold TTL as the HTTP webhook (NewDeps's WithHoldTTL) — without it
+		// a deposit the reconciler confirms authorized via a replayed webhook
+		// keeps its short pre-payment ExpiresAt and gets voided as "expired" by
+		// the very next reconcileExpiredHolds pass, cancelling a payment that
+		// just succeeded.
+		payments.WithReconcilerHoldTTL(cfg.Payments.HoldTTL)), nil
 }
 
 // NewTicketSweeper builds the pending-ticket sweep worker: it releases seats
