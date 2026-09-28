@@ -186,6 +186,13 @@ type bookingPayload struct {
 	HoldAmountMinor       *int64          `json:"hold_amount_minor,omitempty"`
 	HoldCurrency          domain.Currency `json:"hold_currency,omitempty"`
 	VenueAnswerDeadlineAt *time.Time      `json:"venue_answer_deadline_at,omitempty"`
+	// ReleasedToVenueAt mirrors domain.Booking.ReleasedToVenueAt as of the
+	// moment this event was published: nil when the booking is still hidden
+	// behind an unpaid pre-order (spec §2 — the venue has never been shown
+	// it). A staff-facing channel MUST check this before announcing a
+	// cancellation: the venue cannot be told a booking it was never told
+	// about was cancelled. Guest-facing channels ignore it.
+	ReleasedToVenueAt *time.Time `json:"released_to_venue_at,omitempty"`
 }
 
 // payloadOption augments a bookingPayload with data the caller has but that is
@@ -210,6 +217,7 @@ func newBookingPayload(b *domain.Booking) bookingPayload {
 		Phone: b.PhoneNormalized, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: b.Status, Source: b.Source,
 		PromotionID: b.PromotionID, AttributionSource: b.AttributionSource,
+		ReleasedToVenueAt: b.ReleasedToVenueAt,
 	}
 	if b.CancelledBy != nil {
 		p.CancelledBy = *b.CancelledBy

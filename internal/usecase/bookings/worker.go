@@ -329,10 +329,13 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 			return res, nil, fmt.Errorf("load restaurant %s: %w", b.RestaurantID, err)
 		}
 		policy := resolvePolicy(rest.Restaurant, w.cfg)
-		if now.Before(b.ReleasedToVenueAt.Add(policy.ConfirmSLA)) {
-			res.Skipped++
-			continue
-		}
+		// D_venue (VenueAnswerDeadline) is min(releasedAt+ConfirmSLA,
+		// releasedAt+ConfirmMax, startsAt), so it can fall strictly BEFORE
+		// releasedAt+ConfirmSLA. A held booking must be checked against its
+		// own deadline first: gating on the full ConfirmSLA below (as a
+		// non-held booking is) would let the venue confirm and capture after
+		// the deadline it was quoted, whenever ConfirmMax or startsAt bites
+		// first.
 		if w.holds != nil && b.Status == domain.BookingPending {
 			held, err := w.holds.HasPreorderHold(ctx, b.ID)
 			if err != nil {
@@ -362,6 +365,10 @@ func (w *Worker) processConfirmSLA(ctx context.Context, now time.Time) (TickResu
 				noAnswer = append(noAnswer, b.ID)
 				continue
 			}
+		}
+		if now.Before(b.ReleasedToVenueAt.Add(policy.ConfirmSLA)) {
+			res.Skipped++
+			continue
 		}
 		if !policy.AutoConfirm {
 			// Escalate at most once per booking; the venue keeps ownership of
