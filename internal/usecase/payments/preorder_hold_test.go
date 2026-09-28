@@ -127,6 +127,39 @@ func TestCaptureOnConfirm_ConcurrentCallersCaptureOnce(t *testing.T) {
 	}
 }
 
+// A duplicated confirmation webhook/request (the cabinet retries, or Telegram
+// and a webhook redelivery both land) must not re-capture. Codex-review
+// addition to PR #156: covers sequential idempotency of CaptureOnConfirm,
+// complementing TestCaptureOnConfirm_ConcurrentCallersCaptureOnce's concurrent
+// case.
+func TestCaptureOnConfirm_DuplicateCallAfterCaptureIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	p := heldPreorder(uuid.New())
+	h := newHoldHarness(t, p, true)
+	c := h.uc.(PreorderConfirmationUseCase)
+
+	first, err := c.CaptureOnConfirm(ctx, p.BookingID)
+	if err != nil {
+		t.Fatalf("first CaptureOnConfirm: %v", err)
+	}
+	if first.Status != domain.PaymentCaptured {
+		t.Fatalf("first call status = %s, want captured", first.Status)
+	}
+	second, err := c.CaptureOnConfirm(ctx, p.BookingID)
+	if err != nil {
+		t.Fatalf("second (duplicate) CaptureOnConfirm: %v", err)
+	}
+	if second.Status != domain.PaymentCaptured {
+		t.Fatalf("second call status = %s, want captured", second.Status)
+	}
+	if n := h.gw.callCount("capture"); n != 1 {
+		t.Fatalf("capture called %d times across two confirmations, want exactly 1", n)
+	}
+	if bal, _ := h.ledger.BalanceByAccount(ctx, p.ID); bal[domain.AccountRestaurant] != -p.BaseAmountMinor {
+		t.Fatalf("restaurant credited %d, want exactly one credit of %d (no double booking)", bal[domain.AccountRestaurant], p.BaseAmountMinor)
+	}
+}
+
 // A one-stage pre-order (issued before the rollout) and a deposit have nothing to
 // capture on confirmation.
 func TestCaptureOnConfirm_NoHoldIsANoOp(t *testing.T) {
