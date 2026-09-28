@@ -101,13 +101,22 @@ func TestConfirmVersusWorkerCancelRace_CASPreventsMoneylessConfirm(t *testing.T)
 		go func() {
 			defer wg.Done()
 			<-start
-			_, tickErr = worker.Tick(ctx)
+			// Only the abandoned-pass, not the whole Tick: the booking's ends_at
+			// is set far enough in the past for processAbandoned to claim it
+			// (that IS the race under test), but running the full Tick would
+			// also let processExpired immediately flip a just-confirmed booking
+			// to no_show in the SAME call — a real cascade, but a different
+			// question from the one this test asks.
+			tickErr = txm.WithinTx(ctx, func(ctx context.Context) error {
+				_, _, err := worker.processAbandoned(ctx, time.Now())
+				return err
+			})
 		}()
 		close(start)
 		wg.Wait()
 
 		if tickErr != nil {
-			t.Fatalf("iteration %d: worker tick failed: %v", i, tickErr)
+			t.Fatalf("iteration %d: worker abandoned-pass failed: %v", i, tickErr)
 		}
 
 		var status_ string

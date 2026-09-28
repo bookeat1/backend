@@ -126,6 +126,10 @@ func (r *TodayRepository) attachPreorders(ctx context.Context, out *domain.Venue
 //     guest wants to come. Requests whose visit window has passed unanswered
 //     are closed by the background worker (see domain.bookingTransitions), so
 //     this list does not grow forever on its own.
+//   - released_to_venue_at IS NOT NULL. A booking still hidden behind an unpaid
+//     pre-order (spec §5, HideUnreleased) is not something the venue has been
+//     told about yet — the same gate BookingRepository.List applies for the
+//     venue's booking list and facade.load applies for a single booking's card.
 func (r *TodayRepository) awaiting(ctx context.Context, out *domain.VenueToday,
 	restaurantID uuid.UUID, now time.Time, limit int) error {
 
@@ -133,6 +137,7 @@ func (r *TodayRepository) awaiting(ctx context.Context, out *domain.VenueToday,
 		`SELECT `+todayColumns+`, count(*) OVER ()::int
 		   FROM bookings b
 		  WHERE b.restaurant_id = $1 AND b.status = 'pending'
+		    AND b.released_to_venue_at IS NOT NULL
 		  ORDER BY b.created_at, b.id
 		  LIMIT $3`, restaurantID, now, limit)
 	if err != nil {
@@ -172,6 +177,10 @@ func (r *TodayRepository) awaiting(ctx context.Context, out *domain.VenueToday,
 //
 // Cancelled bookings are left out: they are not work. No-shows and completed
 // ones stay — the day's list is what the room did, not only what is still ahead.
+//
+// released_to_venue_at IS NOT NULL for the same reason as awaiting() above: a
+// booking hidden behind an unpaid pre-order must not appear on either half of
+// this screen, only in the platform admin's view (spec criterion 16/17).
 func (r *TodayRepository) today(ctx context.Context, out *domain.VenueToday,
 	restaurantID uuid.UUID, now time.Time, limit int) error {
 
@@ -181,6 +190,7 @@ func (r *TodayRepository) today(ctx context.Context, out *domain.VenueToday,
 		   JOIN restaurants r ON r.id = b.restaurant_id
 		  WHERE b.restaurant_id = $1
 		    AND b.status <> 'cancelled'
+		    AND b.released_to_venue_at IS NOT NULL
 		    AND (b.starts_at AT TIME ZONE coalesce(r.timezone, 'Asia/Almaty'))::date
 		      = ($2::timestamptz AT TIME ZONE coalesce(r.timezone, 'Asia/Almaty'))::date
 		  ORDER BY b.starts_at, b.id
