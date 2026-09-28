@@ -153,6 +153,35 @@ func TestTelegram_UnknownOrSystemCancelSendsNeutralTitle(t *testing.T) {
 	}
 }
 
+// A booking that was cancelled while still hidden behind an unpaid pre-order
+// (processUnpaidHidden's timeout, or the guest cancelling before paying) was
+// NEVER shown to the venue (spec §2). Telegram must not announce a
+// cancellation for a booking the venue never knew existed — regression for PR
+// #156 review Blocking 2.
+func TestTelegram_NeverReleasedCancelNoAlert(t *testing.T) {
+	for _, by := range []domain.CancelledBy{domain.CancelledByGuest, domain.CancelledBySystem, ""} {
+		by := by
+		t.Run(string(by), func(t *testing.T) {
+			rest := uuid.New()
+			set := newFakeSettings()
+			set.tgChat[rest] = "-1001234567890"
+			sender := newRecordingTelegramSender()
+			tg := newTelegram(set, newFakeDeliveries(), sender.send, true)
+
+			ev, err := toEvent(cancelledEventNeverReleased(rest, by))
+			if err != nil {
+				t.Fatalf("toEvent: %v", err)
+			}
+			if err := tg.Notify(context.Background(), ev); err != nil {
+				t.Fatalf("notify: %v", err)
+			}
+			if n := len(sender.sends()); n != 0 {
+				t.Fatalf("sent %d messages for a booking never released to the venue, want 0", n)
+			}
+		})
+	}
+}
+
 // A restaurant with no connected chat id → nothing to send to → clean no-op.
 func TestTelegram_NoChatIDNoOp(t *testing.T) {
 	rest := uuid.New()

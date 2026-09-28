@@ -70,7 +70,7 @@ func (g *Gateway) Name() domain.PaymentProvider { return domain.ProviderTipTopPa
 // acquirer. Kept in exact lockstep with Authorize's own RequireConfirmation
 // decision — see there for why.
 func (g *Gateway) SettlesImmediately(purpose domain.PaymentPurpose) bool {
-	return purpose.CapturesImmediately()
+	return purpose == domain.PurposeTicket
 }
 
 // IsPlaceholderProviderID reports whether a stored provider payment id is NOT a
@@ -117,7 +117,11 @@ type createOrderRequest struct {
 //   - a DEPOSIT stays a two-stage hold (RequireConfirmation=true): the guest's
 //     funds are blocked, not taken, and are only captured later if the
 //     cancellation policy forfeits them (spec §2 as originally written);
-//   - a PRE-ORDER or TICKET is charged in one stage (RequireConfirmation=false,
+//   - a PRE-ORDER is a two-stage hold too (owner decision 2026-09-24, which
+//     reverses 2026-09-23): the guest's funds are blocked when the booking is
+//     placed, captured when the venue confirms, voided when it refuses, stays
+//     silent or the guest cancels first;
+//   - a TICKET is charged in one stage (RequireConfirmation=false,
 //     owner decision 2026-09-23): the kitchen starts on a pre-order the moment
 //     payment succeeds, so an uncaptured 96-hour hold that might never be
 //     confirmed is exactly the risk this avoids — food gets prepared with no
@@ -153,7 +157,7 @@ func (g *Gateway) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*
 		Email:               req.CustomerEmail,
 		Phone:               req.CustomerPhone,
 		InvoiceID:           req.PaymentID.String(),
-		RequireConfirmation: !req.Purpose.CapturesImmediately(),
+		RequireConfirmation: !g.SettlesImmediately(req.Purpose),
 		JSONData:            metadata(req),
 		Splits:              splits,
 	}

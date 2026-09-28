@@ -253,6 +253,11 @@ func (p PaymentPurpose) CapturesImmediately() bool {
 // computes these numbers (spec §8).
 type Payment struct {
 	ID uuid.UUID
+	// RequiresConfirmation records HOW this payment was sent to the acquirer:
+	// true = two-stage hold (confirm or void later), false = one-stage charge.
+	// Fixed at Authorize time; the webhook decides by it, never by purpose, so a
+	// link issued one-stage before a rollout and paid after is still one-stage.
+	RequiresConfirmation bool
 	// BookingID is the booking this payment pays for, or uuid.Nil for a payment
 	// whose subject is an event ticket instead (EventTicketID set). Exactly one
 	// of BookingID / EventTicketID is set — enforced by chk_payments_subject.

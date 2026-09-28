@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -58,6 +59,15 @@ type TelegramNotifier struct {
 	newSendWith TelegramActionSender
 	newActions  TelegramActions
 	newEnabled  bool
+
+	// clock resolves the venue's own timezone for the pre-order hold deadline
+	// line (spec preorder-hold-capture-on-confirm-20260924 §criterion 25).
+	// Defaults to UTC (see NewTelegramNotifier); WithVenueTimezones upgrades it
+	// to the real per-venue reader, same fallback-on-error shape as
+	// WhatsAppNotifier.venueLocation. Deliberately NOT used for the existing
+	// "Время: …" line above — that is a separate, pre-existing display and out
+	// of scope here.
+	clock venueClock
 }
 
 // NewTelegramNotifier builds the Telegram channel. Pass enabled=false (or a nil
@@ -72,7 +82,17 @@ func NewTelegramNotifier(
 	return &TelegramNotifier{
 		settings: settings, deliveries: deliveries,
 		send: send, enabled: enabled && send != nil, log: log,
+		clock: newVenueClock(nil, nil, log),
 	}
+}
+
+// WithVenueTimezones wires the per-venue timezone reader the hold-deadline
+// line renders in — the same reader and platform fallback the WhatsApp/guest
+// channels use. Left unset in tests / a deployment that skips it, in which
+// case the deadline (if any) prints in UTC rather than crashing.
+func (t *TelegramNotifier) WithVenueTimezones(zones venueTimezoneReader, fallback *time.Location) *TelegramNotifier {
+	t.clock = newVenueClock(zones, fallback, t.log)
+	return t
 }
 
 // WithActions turns the alert's buttons on. Both arguments must be non-nil:
@@ -142,6 +162,17 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		return nil
 	}
 
+	// A booking still hidden behind an unpaid pre-order was never shown to the
+	// venue (spec §2). Cancelling it — timeout on processUnpaidHidden, or the
+	// guest cancelling before paying — must not announce a cancellation for a
+	// booking the venue never knew existed.
+	if e.Type == domain.EventBookingCancelled && e.ReleasedToVenueAt == nil {
+		t.log.Info("telegram skipped: booking was never released to the venue, no cancel alert",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
+		return nil
+	}
+
 	cfg, err := t.settings.TelegramSettings(ctx, e.RestaurantID)
 	if err != nil {
 		return fmt.Errorf("telegram: read settings: %w", err)
@@ -170,7 +201,7 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		return nil
 	}
 
-	text := buildTelegramText(e)
+	text := buildTelegramText(e, t.clock.location(ctx, e.RestaurantID))
 	// Buttons only on a NEW booking: that is the only event the venue is being
 	// asked to answer. A cancellation alert with a "Confirm" button under it
 	// would be nonsense.
@@ -282,7 +313,11 @@ func (t *TelegramNotifier) recordDelivered(ctx context.Context, e Event) error {
 // buildTelegramText renders the non-sensitive booking alert in Russian. No OTP,
 // no payment data — only what staff already see in the venue cabinet: that a
 // booking came in, for when, for how many, under what name.
-func buildTelegramText(e Event) string {
+//
+// deadlineLoc is the venue's own timezone, used ONLY to render the pre-order
+// hold line's "ответьте до ЧЧ:ММ" (spec criterion 25); it is nil-safe to pass
+// time.UTC and has no effect on an event that carries no hold.
+func buildTelegramText(e Event, deadlineLoc *time.Location) string {
 	title := "Новая бронь"
 	if e.Type == domain.EventBookingCancelled {
 		// A restaurant-side cancel is filtered out before send, so here the actor
@@ -295,7 +330,41 @@ func buildTelegramText(e Event) string {
 			title = "❌ Бронь отменена"
 		}
 	}
-	return title + "\n" + telegramBookingDetails(e)
+	text := title + "\n" + telegramBookingDetails(e)
+	if line := holdNoticeLine(e, deadlineLoc); line != "" {
+		text += "\n" + line
+	}
+	return text
+}
+
+// holdNoticeLine renders the pre-order hold's money+deadline line for a
+// booking.created alert released with a live hold (spec
+// preorder-hold-capture-on-confirm-20260924 §criterion 25: "the venue
+// notification about a booking with a hold carries the pre-order amount and
+// D_venue"). Empty for every other event, and for a created event with no hold
+// (HoldAmountMinor nil — an ordinary booking, or one auto-confirmed on create,
+// which release.go never attaches a deadline to).
+func holdNoticeLine(e Event, loc *time.Location) string {
+	if e.Type != domain.EventBookingCreated || e.HoldAmountMinor == nil || e.VenueAnswerDeadlineAt == nil {
+		return ""
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	deadline := e.VenueAnswerDeadlineAt.In(loc).Format("15:04")
+	return fmt.Sprintf("Предзаказ оплачен (заблокировано %s), ответьте до %s, иначе бронь отменится.",
+		formatTenge(*e.HoldAmountMinor), deadline)
+}
+
+// formatTenge renders a minor-unit KZT amount the way a staff message reads
+// it: whole tenge, no kopecks. Every pre-order/hold amount in this system is
+// already a whole number of tenge in practice; minor units exist for exact
+// arithmetic (domain.Money), not because guests are ever charged fractions.
+func formatTenge(minor int64) string {
+	if minor < 0 {
+		minor = 0
+	}
+	return fmt.Sprintf("%d ₸", minor/100)
 }
 
 // telegramBookingDetails renders the shared, non-sensitive detail block reused

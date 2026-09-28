@@ -411,6 +411,14 @@ type PaymentsConfig struct {
 	// the authorization hold keep HoldTTL.
 	LinkTTL time.Duration // env: PAYMENTS_LINK_TTL
 
+	// PreorderAwaitPaymentTTL: a booking hidden behind an unpaid pre-order is
+	// cancelled by the system after this long (D_pay). env: PAYMENTS_PREORDER_AWAIT_PAYMENT_TTL
+	PreorderAwaitPaymentTTL time.Duration
+	// PreorderConfirmMax caps the venue's answer time for a booking whose
+	// pre-order is on hold (D_venue); silence past it cancels the booking and
+	// voids the hold. Must be <= 72h and < HoldTTL. env: PAYMENTS_PREORDER_CONFIRM_MAX
+	PreorderConfirmMax time.Duration
+
 	// FreeCancelWindow is the GLOBAL default free-cancellation window for the
 	// money path, applied to any restaurant that has not overridden
 	// free_cancel_window_minutes (migration 0034/0035). A deposit hold is
@@ -812,6 +820,8 @@ func NewConfig() (Config, error) {
 			DepositRequired:              getEnvBool("PAYMENTS_DEPOSIT_REQUIRED", false),
 			PreorderPaymentRequired:      getEnvBool("PAYMENTS_PREORDER_PAYMENT_REQUIRED", false),
 			HoldTTL:                      getEnvDuration("PAYMENTS_HOLD_TTL", 96*time.Hour),
+			PreorderAwaitPaymentTTL:      getEnvDuration("PAYMENTS_PREORDER_AWAIT_PAYMENT_TTL", 30*time.Minute),
+			PreorderConfirmMax:           getEnvDuration("PAYMENTS_PREORDER_CONFIRM_MAX", 24*time.Hour),
 			LinkTTL:                      getEnvDuration("PAYMENTS_LINK_TTL", 15*time.Minute),
 			FreeCancelWindow:             getEnvMinutes("PAYMENTS_FREE_CANCEL_WINDOW_MINUTES", 120),
 			PublicBaseURL:                strings.TrimRight(getEnv("PAYMENTS_PUBLIC_BASE_URL", ""), "/"),
@@ -1020,6 +1030,18 @@ func NewConfig() (Config, error) {
 	if (cfg.Auth.TestAccountPhone == "") != (cfg.Auth.TestAccountCode == "") {
 		return Config{}, fmt.Errorf(
 			"AUTH_TEST_ACCOUNT_PHONE and AUTH_TEST_ACCOUNT_CODE must be set together (or both left empty)")
+	}
+
+	// The hold outlives the venue's answer window, or a confirmation could find
+	// the hold already gone (spec criterion 23).
+	if cfg.Payments.PreorderConfirmMax <= 0 || cfg.Payments.PreorderConfirmMax > 72*time.Hour ||
+		cfg.Payments.PreorderConfirmMax >= cfg.Payments.HoldTTL {
+		return Config{}, fmt.Errorf(
+			"PAYMENTS_PREORDER_CONFIRM_MAX (%s) must be > 0, <= 72h and < PAYMENTS_HOLD_TTL (%s)",
+			cfg.Payments.PreorderConfirmMax, cfg.Payments.HoldTTL)
+	}
+	if cfg.Payments.PreorderAwaitPaymentTTL <= 0 {
+		return Config{}, fmt.Errorf("PAYMENTS_PREORDER_AWAIT_PAYMENT_TTL must be > 0")
 	}
 
 	return cfg, nil

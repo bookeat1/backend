@@ -41,6 +41,9 @@ type bookingResponse struct {
 	CancellationReason     *string    `json:"cancellation_reason"`
 	CreatedAt              time.Time  `json:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at"`
+	// AwaitingPreorderPayment is true while the booking is hidden from the venue
+	// because the pre-order payment is not authorized yet. Additive.
+	AwaitingPreorderPayment bool `json:"awaiting_preorder_payment"`
 }
 
 type bookingDetailsResponse struct {
@@ -56,9 +59,13 @@ type bookingDetailsResponse struct {
 	// screen never needs a second request to the venue detail endpoint for
 	// it. Nil when the resolver is not wired or the venue lookup failed —
 	// additive, the same posture as FreeCancelDeadline.
-	BookingRules *bookingRulesResponse  `json:"booking_rules,omitempty"`
-	Items        []bookingItemResponse  `json:"items"`
-	Tables       []bookingTableResponse `json:"tables"`
+	BookingRules *bookingRulesResponse `json:"booking_rules,omitempty"`
+	// VenueAnswerDeadline is venue_answer_deadline_at (spec criterion 24): the
+	// moment a booking held by a pre-order is cancelled, with its hold voided,
+	// if the venue never answers. Null when not applicable. Additive.
+	VenueAnswerDeadline *time.Time             `json:"venue_answer_deadline_at"`
+	Items               []bookingItemResponse  `json:"items"`
+	Tables              []bookingTableResponse `json:"tables"`
 }
 
 // bookingRulesResponse is domain.EffectiveBookingRules on the wire — already
@@ -190,15 +197,17 @@ func bookingToResponse(b domain.Booking) bookingResponse {
 		CancelledBy: cancelledBy, CancellationReasonCode: b.CancellationReasonCode,
 		CancellationReason: b.CancellationReason,
 		CreatedAt:          b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		AwaitingPreorderPayment: b.AwaitingPreorderPayment(),
 	}
 }
 
 func detailsToResponse(d *uc.BookingDetails) bookingDetailsResponse {
 	out := bookingDetailsResponse{
-		bookingResponse:    bookingToResponse(d.Booking),
-		FreeCancelDeadline: d.FreeCancelDeadline,
-		Items:              make([]bookingItemResponse, 0, len(d.Items)),
-		Tables:             make([]bookingTableResponse, 0, len(d.Tables)),
+		bookingResponse:     bookingToResponse(d.Booking),
+		FreeCancelDeadline:  d.FreeCancelDeadline,
+		VenueAnswerDeadline: d.VenueAnswerDeadline,
+		Items:               make([]bookingItemResponse, 0, len(d.Items)),
+		Tables:              make([]bookingTableResponse, 0, len(d.Tables)),
 	}
 	if r := d.BookingRules; r != nil {
 		out.BookingRules = &bookingRulesResponse{

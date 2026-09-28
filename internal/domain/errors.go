@@ -461,6 +461,11 @@ const (
 	// web-preorder-menu-20260908 §D2); additive, the message text is unchanged.
 	CodePreorderItemUnavailable ErrorCode = "preorder_item_unavailable"
 
+	// CodeBookingAwaitingPayment — a venue tried to act on (confirm) a booking
+	// that is still hidden from it because the guest's pre-order payment has
+	// not been authorized yet. 409; the booking becomes actionable by itself.
+	CodeBookingAwaitingPayment ErrorCode = "booking_awaiting_payment"
+
 	// CodePhoneUnchanged — the new number normalizes to the caller's CURRENT
 	// number. Nothing to verify and nothing to change; a plain validation_failed
 	// would make the app show a field error with no actionable reason. 422.

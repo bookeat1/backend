@@ -246,6 +246,77 @@ type Booking struct {
 	OriginalBookingTime    *string
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	// ReleasedToVenueAt is when the booking became visible to the venue. NULL
+	// means it is HIDDEN: it carries a pre-order whose payment has not been
+	// authorized yet, so the venue is not notified and cannot see or confirm
+	// it (owner decision 2026-09-24). Set in the same transaction as the
+	// pre-order payment's created -> authorized transition.
+	ReleasedToVenueAt *time.Time
+}
+
+// Cancellation reason codes written by the system for pre-order bookings
+// (owner decisions 2026-09-24). Clients branch on the code, not the text.
+const (
+	// CancelReasonPreorderPaymentNotCompleted — the pre-order was not paid
+	// within the payment window.
+	CancelReasonPreorderPaymentNotCompleted = "preorder_payment_not_completed"
+	// CancelReasonVenueNoAnswer — the venue did not answer a pre-order booking
+	// with a held payment in time; silence is never a confirmation.
+	CancelReasonVenueNoAnswer = "venue_no_answer"
+	// CancelReasonPreorderCaptureFailed — the acquirer definitively refused to
+	// take the held pre-order after the venue confirmed.
+	CancelReasonPreorderCaptureFailed = "preorder_capture_failed"
+	// CancelReasonPreorderHoldReleased — the acquirer released the held pre-order
+	// (bank void / hold expiry) before the venue confirmed the booking.
+	CancelReasonPreorderHoldReleased = "preorder_hold_released"
+)
+
+// AwaitingPreorderPayment reports whether the booking is still hidden from the
+// venue while its pre-order payment is outstanding.
+func (b Booking) AwaitingPreorderPayment() bool {
+	return b.ReleasedToVenueAt == nil && b.Status == BookingPending
+}
+
+// MinVenueAnswerWindow is the floor the venue always gets to answer a booking
+// held by a pre-order, however tight its own ConfirmSLA or the platform's
+// ConfirmMax are (owner decision 2026-09-24, spec §3 D_venue).
+const MinVenueAnswerWindow = 15 * time.Minute
+
+// VenueAnswerDeadline is D_venue (spec §3): the moment a booking held by a
+// pre-order is cancelled and its hold voided because the venue never answered.
+// min(releasedAt + confirmSLA, releasedAt + confirmMax, startsAt), floored at
+// releasedAt + MinVenueAnswerWindow so a venue is never given less than that
+// regardless of how tight the other three bounds are.
+//
+// This is the SAME computation the confirm-SLA worker enforces
+// (usecase/bookings.Worker.venueDeadline) and the one a booking response's
+// venue_answer_deadline_at field reports to the guest — kept here, in domain,
+// so the two call sites cannot drift apart.
+func VenueAnswerDeadline(releasedAt, startsAt time.Time, confirmSLA, confirmMax time.Duration) time.Time {
+	d := releasedAt.Add(confirmSLA)
+	if m := releasedAt.Add(confirmMax); m.Before(d) {
+		d = m
+	}
+	if startsAt.Before(d) {
+		d = startsAt
+	}
+	if floor := releasedAt.Add(MinVenueAnswerWindow); d.Before(floor) {
+		d = floor
+	}
+	return d
+}
+
+// BookingReleaseRepository is the gate between a pre-order booking and the
+// venue. It is separate from BookingRepository so existing fakes stay valid.
+type BookingReleaseRepository interface {
+	// Release stamps released_to_venue_at = at on a PENDING booking that is still
+	// hidden. It reports whether THIS call released it: false means it was
+	// already released (a duplicate delivery) or is no longer pending.
+	Release(ctx context.Context, id uuid.UUID, at time.Time) (bool, error)
+	// ClaimUnpaidHidden locks up to limit hidden pending bookings created before
+	// `before` that have no payment still awaiting the guest (a `created`
+	// payment whose link has not expired). FOR UPDATE SKIP LOCKED.
+	ClaimUnpaidHidden(ctx context.Context, before time.Time, limit int) ([]Booking, error)
 }
 
 // BookingFilter narrows a booking listing. Zero-value fields are ignored.
@@ -258,9 +329,13 @@ type BookingFilter struct {
 	// and UserID, the facade never overwrites this: it is orthogonal to "whose
 	// bookings" and "which venue's bookings" and composes with both.
 	PromotionID *uuid.UUID
-	Statuses    []BookingStatus
-	From        *time.Time // starts_at >= From
-	To          *time.Time // starts_at <  To
+	// HideUnreleased drops bookings still hidden behind an unpaid pre-order
+	// (released_to_venue_at IS NULL). Set for every venue-facing listing; a guest
+	// listing their own bookings and the platform admin leave it false.
+	HideUnreleased bool
+	Statuses       []BookingStatus
+	From           *time.Time // starts_at >= From
+	To             *time.Time // starts_at <  To
 	// CalendarDate is "the venue's day", still unresolved: a date carries no
 	// zone, so only the usecase — which knows WHOSE calendar is being asked
 	// about — may turn it into From/To. It never reaches a repository; the
@@ -280,9 +355,25 @@ type BookingRepository interface {
 	// List returns bookings matching f plus the total count, ordered by
 	// starts_at DESC.
 	List(ctx context.Context, f BookingFilter) ([]Booking, int, error)
-	// UpdateStatus writes the new status and its timestamp columns. Call inside
-	// a TxManager together with the history and outbox inserts.
+	// UpdateStatus writes the new status and its timestamp columns
+	// unconditionally. Call inside a TxManager together with the history and
+	// outbox inserts. It is a BLIND write: safe only when the caller already
+	// holds an exclusive claim on the row for the duration of the same
+	// transaction (a prior FOR UPDATE / conditional UPDATE that locked it, e.g.
+	// ClaimDue or release.go's own Release call). Use CompareAndSwapStatus for
+	// any transition a concurrent request could also be racing.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status BookingStatus, at time.Time) error
+	// CompareAndSwapStatus is UpdateStatus guarded by a precondition on the
+	// CURRENT status: the write only takes effect if the row is still `from`.
+	// This is the guard the venue-confirm / guest-cancel / worker-timeout race
+	// depends on: none of those paths hold a row lock across their own
+	// GetByID-then-decide gap, so without this the last writer wins
+	// unconditionally and a booking already cancelled by the worker can be
+	// resurrected as confirmed by a venue action that started a moment earlier.
+	// Zero rows affected because the id does not exist -> ErrNotFound; because
+	// the row exists but is no longer in `from` -> ErrAlreadyExists (mirrors
+	// PaymentRepository.CompareAndSwapStatus).
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to BookingStatus, at time.Time) error
 	// ClaimDue locks up to limit bookings in the given statuses whose `by`
 	// column is older than before, using FOR UPDATE SKIP LOCKED so parallel
 	// workers do not collide. Results are ordered by that same column, oldest
