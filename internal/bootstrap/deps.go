@@ -495,7 +495,16 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 
 	bookingCreate := bookings.NewCreateUseCase(bookingRepo, bookingLinks, bookingCapacity, bookingItems,
 		bookingHistory, bookingOutbox, bookingBlacklist, bookingRateLog, restRepo,
-		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg)
+		restRelated, restaurantManagers, promosFacade, promoCodesFacade, txm, bookingCfg,
+		bookings.WithPreorderGate(preorderGateAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}))
+	// The booking gate: hands a hidden pre-order booking to the venue in the
+	// same transaction as the payment's created -> authorized transition. The
+	// hold-notice option lets the venue's "new booking" alert carry the
+	// pre-order amount + D_venue deadline (spec §criterion 25); paymentrepo.New
+	// here is a fresh, cheap-to-construct-twice repo, same reasoning as every
+	// other "constructed once for wiring, once for the real thing" repo above.
+	bookingReleaser := bookings.NewReleaser(bookingRepo, bookingRepo, bookingHistory, bookingOutbox, restRepo, bookingCfg,
+		bookings.WithReleaserVenueNotice(preorderHoldAdapter{payments: paymentrepo.New(db)}, cfg.Payments.PreorderConfirmMax))
 
 	paymentsRepo := paymentrepo.New(db)
 	paymentRefundsRepo := paymentrepo.NewRefunds(db)
@@ -545,10 +554,15 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 	// the same policy instead of quietly staying taken.
 	paymentDepositCancel := payments.NewDepositCancellationUseCase(paymentsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, restaurantManagers, bookingRepo, cancelDeadline, paymentRefund, txm)
+	// Bound to the booking status usecase right after it is built (it needs the
+	// payments deposit-cancel usecase, so it cannot exist yet).
+	holdLost := &holdLostAdapter{}
 	paymentWebhook := payments.NewWebhookUseCase(paymentsRepo, paymentEventsRepo, paymentLedgerRepo, paymentOutboxRepo,
 		paymentGateways, txm,
 		payments.WithPaymentSubjectObserver(ticketObserver),
 		payments.WithLateCancelSettlement(bookingRepo, paymentDepositCancel),
+		payments.WithBookingReleaser(bookingReleaser),
+		payments.WithHoldLostCanceller(holdLost),
 		payments.WithHoldTTL(cfg.Payments.HoldTTL))
 	paymentStatus := payments.NewStatusUseCase(paymentsRepo, restaurantManagers)
 	ticketPayments := payments.NewTicketPaymentUseCase(paymentsRepo, paymentRefundsRepo, paymentLedgerRepo,
@@ -630,10 +644,19 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
 		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}),
-		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}))
+		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}),
+		// Same restaurant reader + hold checker the confirm-SLA worker uses
+		// (bookings.WithWorkerPreorderGate below), so venue_answer_deadline_at
+		// can never disagree with the deadline the worker actually enforces.
+		bookings.WithVenueAnswerDeadlineResolver(bookings.NewVenueAnswerDeadlineResolver(
+			restRepo, preorderHoldAdapter{payments: paymentsRepo}, bookingCfg, cfg.Payments.PreorderConfirmMax)))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
-		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}))
+		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}),
+		bookings.WithPreorderCapturer(preorderCapturerAdapter{uc: paymentDepositCancel}))
+	holdLost.uc, _ = bookingStatus.(interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	})
 
 	// Restaurant admin panel (Ф1): an RBAC-guarded orchestration over the
 	// existing building blocks. It reuses restaurantManagers for the RBAC
@@ -1079,6 +1102,93 @@ func (a depositSettlerAdapter) SettleDepositOnCancel(ctx context.Context, bookin
 	return err
 }
 
+// preorderGateAdapter answers the booking gate's question from the venue's
+// payment override and the global payments config — the same resolution the
+// payment-create path uses, so a booking is never hidden behind a payment the
+// guest cannot make.
+type preorderGateAdapter struct {
+	settings interface {
+		GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
+	}
+	cfg payments.Config
+}
+
+func (a preorderGateAdapter) PreorderPaidOnline(ctx context.Context, restaurantID uuid.UUID) (bool, error) {
+	o, err := a.settings.GetPaymentOverride(ctx, restaurantID)
+	if err != nil {
+		return false, err
+	}
+	return payments.PreorderPaidOnline(o, a.cfg), nil
+}
+
+// preorderCapturerAdapter binds payments' capture-on-confirmation to the
+// bookings status usecase (type-asserted: the constructor returns the narrower
+// DepositCancellationUseCase interface).
+type preorderCapturerAdapter struct {
+	uc payments.DepositCancellationUseCase
+}
+
+func (a preorderCapturerAdapter) CaptureOnConfirm(ctx context.Context, bookingID uuid.UUID) error {
+	c, ok := a.uc.(payments.PreorderConfirmationUseCase)
+	if !ok {
+		return nil
+	}
+	_, err := c.CaptureOnConfirm(ctx, bookingID)
+	return err
+}
+
+// holdLostAdapter is filled once the booking status usecase exists; until then
+// (and if the assertion ever fails) it is a no-op rather than a nil deref.
+type holdLostAdapter struct {
+	uc interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	}
+}
+
+func (a *holdLostAdapter) CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error {
+	if a.uc == nil {
+		return nil
+	}
+	return a.uc.CancelPendingOnHoldLost(ctx, id)
+}
+
+// preorderHoldAdapter tells the booking worker whether a booking's pre-order is
+// a live hold, from the payments repository.
+type preorderHoldAdapter struct {
+	payments domain.PaymentRepository
+}
+
+func (a preorderHoldAdapter) HasPreorderHold(ctx context.Context, bookingID uuid.UUID) (bool, error) {
+	p, err := a.payments.GetLiveByBookingID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return p.Purpose == domain.PurposePreorder && p.RequiresConfirmation && p.Status == domain.PaymentAuthorized, nil
+}
+
+// LivePreorderHold implements bookings.PreorderHoldNotice: same live-hold test
+// as HasPreorderHold above, plus the amount the venue's release notification
+// needs to print. AmountMinor (not BaseAmountMinor) — the guest's card is
+// blocked for the total including the service fee, and that total is exactly
+// what gets captured on confirmation, so it is the number that must not
+// surprise the venue later.
+func (a preorderHoldAdapter) LivePreorderHold(ctx context.Context, bookingID uuid.UUID) (domain.Money, bool, error) {
+	p, err := a.payments.GetLiveByBookingID(ctx, bookingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.Money{}, false, nil
+		}
+		return domain.Money{}, false, err
+	}
+	if p.Purpose != domain.PurposePreorder || !p.RequiresConfirmation || p.Status != domain.PaymentAuthorized {
+		return domain.Money{}, false, nil
+	}
+	return p.Total(), true, nil
+}
+
 // venueLocationAdapter implements usecase/bookings' venueLocationResolver: it
 // answers which zone a venue's calendar day is measured in, for the ?date=
 // filter of the venue calendar.
@@ -1179,10 +1289,12 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	restRepo := restrepo.New(db)
 	txm := sqltx.NewManager(db)
 	wcfg := bookings.WorkerConfig{
-		TickInterval: cfg.Worker.TickInterval,
-		NoShowGrace:  cfg.Worker.NoShowGrace,
-		ReminderLead: cfg.Worker.ReminderLead,
-		BatchSize:    cfg.Worker.BatchSize,
+		TickInterval:    cfg.Worker.TickInterval,
+		NoShowGrace:     cfg.Worker.NoShowGrace,
+		ReminderLead:    cfg.Worker.ReminderLead,
+		BatchSize:       cfg.Worker.BatchSize,
+		AwaitPaymentTTL: cfg.Payments.PreorderAwaitPaymentTTL,
+		ConfirmMax:      cfg.Payments.PreorderConfirmMax,
 	}
 	// The pre-visit guest reminder pass. OFF by default, and deliberately so:
 	// while the old Supabase system is still live it sends its own 60' and 30'
@@ -1212,7 +1324,8 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 			slog.String("error", gwErr.Error()))
 		return bookings.NewWorker(
 			bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
-			restRepo, txm, newBookingConfig(cfg), wcfg, log, reminders)
+			restRepo, txm, newBookingConfig(cfg), wcfg, log, reminders,
+			bookings.WithWorkerPreorderGate(bookingRepo, nil))
 	}
 	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), txm)
 	cancelDeadline := cancelDeadlineAdapter{settings: restRepo, cfg: newPaymentsConfig(cfg)}
@@ -1228,7 +1341,8 @@ func NewBookingWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *bookings.
 	return bookings.NewWorker(
 		bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
 		restRepo, txm, newBookingConfig(cfg), wcfg, log,
-		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}), reminders)
+		bookings.WithWorkerDepositSettler(depositSettlerAdapter{uc: depositCancel}), reminders,
+		bookings.WithWorkerPreorderGate(bookingRepo, preorderHoldAdapter{payments: paymentsRepo}))
 }
 
 // newPaymentGateways builds the acquirer registry from whatever adapters this
@@ -1323,6 +1437,25 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 	// reaches its ticket (seat freed / ticket marked paid) instead of stranding
 	// it `pending` forever.
 	ticketObserver := tickets.NewPaymentObserver(eventticketrepo.New(db))
+	bookingRepo := bookingrepo.New(db)
+	restaurantManagers := restaurants.NewManagerUseCase(restrepo.NewManagers(db), userrepo.New(db), sqltx.NewManager(db))
+	reconcilePaymentsRepo := paymentrepo.New(db)
+	reconcileLedger := paymentrepo.NewLedger(db)
+	reconcileOutbox := paymentrepo.NewOutbox(db)
+	reconcileRefund := payments.NewRefundUseCase(reconcilePaymentsRepo, paymentrepo.NewRefunds(db), reconcileLedger, reconcileOutbox,
+		gateways, restaurantManagers, bookingRepo,
+		cancelDeadlineAdapter{settings: restrepo.New(db), cfg: newPaymentsConfig(cfg)}, sqltx.NewManager(db), newPaymentsConfig(cfg))
+	reconcileSettler := payments.NewDepositCancellationUseCase(reconcilePaymentsRepo, reconcileLedger, reconcileOutbox,
+		gateways, restaurantManagers, bookingRepo,
+		cancelDeadlineAdapter{settings: restrepo.New(db), cfg: newPaymentsConfig(cfg)}, reconcileRefund, sqltx.NewManager(db))
+	// A hold the acquirer released, found by the reconciler instead of a webhook,
+	// must cancel its pending booking exactly as the webhook path does.
+	reconcileHoldLost := &holdLostAdapter{}
+	reconcileHoldLost.uc, _ = bookings.NewStatusUseCase(bookingRepo, bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db),
+		restrepo.New(db), restaurantManagers, sqltx.NewManager(db), newBookingConfig(cfg),
+		bookings.WithDepositSettler(depositSettlerAdapter{uc: reconcileSettler})).(interface {
+		CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error
+	})
 	return payments.NewReconciler(
 		paymentrepo.New(db), paymentrepo.NewRefunds(db), paymentrepo.NewLedger(db),
 		paymentrepo.NewOutbox(db), gateways, sqltx.NewManager(db),
@@ -1335,11 +1468,21 @@ func NewPaymentsReconciler(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*pay
 			ProviderMinGap:   cfg.PaymentsReconciler.ProviderMinGap,
 		}, log,
 		payments.WithReconcilerObserver(ticketObserver),
+		payments.WithReconcilerWebhookOptions(
+			payments.WithLateCancelSettlement(bookingRepo, reconcileSettler),
+			payments.WithBookingReleaser(bookings.NewReleaser(bookingRepo, bookingRepo,
+				bookingrepo.NewHistory(db), bookingrepo.NewOutbox(db), restrepo.New(db), newBookingConfig(cfg),
+				bookings.WithReleaserVenueNotice(preorderHoldAdapter{payments: reconcilePaymentsRepo}, cfg.Payments.PreorderConfirmMax))),
+			payments.WithHoldTTL(cfg.Payments.HoldTTL),
+			payments.WithHoldLostCanceller(reconcileHoldLost)),
 		// Same hold TTL as the HTTP webhook (NewDeps's WithHoldTTL) — without it
 		// a deposit the reconciler confirms authorized via a replayed webhook
 		// keeps its short pre-payment ExpiresAt and gets voided as "expired" by
 		// the very next reconcileExpiredHolds pass, cancelling a payment that
-		// just succeeded.
+		// just succeeded. Redundant with the WithHoldTTL(cfg.Payments.HoldTTL)
+		// inside WithReconcilerWebhookOptions above (applier() sets both the
+		// same way) — kept explicit so this holds even if the webhook options
+		// above ever stop including it.
 		payments.WithReconcilerHoldTTL(cfg.Payments.HoldTTL)), nil
 }
 
@@ -1401,6 +1544,21 @@ func NewEventRecurrenceGenerator(cfg Config, db *pgxpool.Pool, log *slog.Logger)
 func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *notifications.Dispatcher {
 	txm := sqltx.NewManager(db)
 
+	// The platform zone a venue's booking time is rendered in when the venue
+	// stores none of its own — the SAME fallback bookings and payouts use, so a
+	// venue's day means one thing across the system. An unusable platform value
+	// degrades to UTC here rather than crashing the worker: this is the wording
+	// of a message, not a payout boundary. Computed once, up front, so every
+	// channel below (Telegram's hold deadline, guest push, feed, WhatsApp) reads
+	// the SAME fallback and the SAME venue reader.
+	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
+	if err != nil {
+		log.Error("platform timezone fallback is unusable, guest and whatsapp notifications will render times in UTC",
+			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
+		waFallbackZone = time.UTC
+	}
+	notifVenues := notificationrepo.NewVenues(db)
+
 	pushCfg := webpush.Config{
 		PublicKey:  cfg.Push.VAPIDPublicKey,
 		PrivateKey: cfg.Push.VAPIDPrivateKey,
@@ -1439,7 +1597,7 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 		tgSender,
 		tgCfg.Configured(),
 		log,
-	)
+	).WithVenueTimezones(notifVenues, waFallbackZone)
 	// Buttons go under the alert only when the venue can actually answer them:
 	// that needs both the bot token (to send) and the webhook secret (to receive
 	// the press). Buttons that lead nowhere are worse than none — staff press
@@ -1475,18 +1633,6 @@ func NewNotificationDispatcher(cfg Config, db *pgxpool.Pool, log *slog.Logger) *
 	} else if !cfg.Push.GuestPushConfigured() {
 		log.Warn("guest push not configured (no GUEST_PUSH_PROVIDER) — guests will not be notified until it is set")
 	}
-	// The platform zone a venue's booking time is rendered in when the venue
-	// stores none of its own — the SAME fallback bookings and payouts use, so a
-	// venue's day means one thing across the system. An unusable platform value
-	// degrades to UTC here rather than crashing the worker: this is the wording
-	// of a message, not a payout boundary.
-	waFallbackZone, err := domain.LoadVenueLocation(cfg.Booking.TimezoneFallback)
-	if err != nil {
-		log.Error("platform timezone fallback is unusable, guest and whatsapp notifications will render times in UTC",
-			slog.String("timezone", cfg.Booking.TimezoneFallback), slog.String("error", err.Error()))
-		waFallbackZone = time.UTC
-	}
-	notifVenues := notificationrepo.NewVenues(db)
 	guestPush := notifications.NewGuestPushNotifier(
 		notificationrepo.NewDeviceTokens(db),
 		notificationrepo.NewDeliveries(db),

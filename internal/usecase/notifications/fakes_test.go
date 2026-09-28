@@ -508,8 +508,34 @@ func createdEvent(restaurantID uuid.UUID) domain.BookingOutboxEvent {
 
 // cancelledEvent builds a booking.cancelled outbox row with the given restaurant
 // and the actor that performed the cancellation (guest | restaurant | system |
-// "" for unknown).
+// "" for unknown). ReleasedToVenueAt is set to a past time — this models the
+// ordinary case, a booking the venue was already shown before it was
+// cancelled. See cancelledEventNeverReleased for the hidden-booking case.
 func cancelledEvent(restaurantID uuid.UUID, by domain.CancelledBy) domain.BookingOutboxEvent {
+	released := time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)
+	payload, _ := json.Marshal(outboxPayload{
+		RestaurantID:      restaurantID,
+		Name:              "Damir",
+		Phone:             "+77078692233",
+		Guests:            4,
+		StartsAt:          time.Date(2026, 8, 1, 19, 30, 0, 0, time.UTC),
+		CancelledBy:       by,
+		ReleasedToVenueAt: &released,
+	})
+	return domain.BookingOutboxEvent{
+		ID:        uuid.New(),
+		BookingID: uuid.New(),
+		EventType: domain.EventBookingCancelled,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+	}
+}
+
+// cancelledEventNeverReleased builds a booking.cancelled outbox row for a
+// booking that stayed hidden behind an unpaid pre-order its whole life:
+// ReleasedToVenueAt is nil, i.e. the venue was never shown it. Models the
+// worker's processUnpaidHidden timeout and a guest cancelling before paying.
+func cancelledEventNeverReleased(restaurantID uuid.UUID, by domain.CancelledBy) domain.BookingOutboxEvent {
 	payload, _ := json.Marshal(outboxPayload{
 		RestaurantID: restaurantID,
 		Name:         "Damir",

@@ -190,6 +190,19 @@ func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.Bo
 	return nil
 }
 
+func (f *fakeBookings) CompareAndSwapStatus(_ context.Context, id uuid.UUID, from, to domain.BookingStatus, at time.Time) error {
+	b, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if b.Status != from {
+		return domain.ErrAlreadyExists
+	}
+	f.statuses = append(f.statuses, statusWrite{ID: id, Status: to, At: at})
+	b.Status = to
+	return nil
+}
+
 type claimCall struct {
 	statuses []domain.BookingStatus
 	by       domain.ClaimColumn
@@ -733,3 +746,7 @@ func (f *fakeCapacity) PeakTaken(_ context.Context, _ uuid.UUID, from time.Time)
 	}
 	return peak, nil
 }
+
+// releasedAt is the released_to_venue_at of a booking that is visible to the
+// venue — every fixture except the ones exercising the pre-order gate.
+func releasedAt() *time.Time { t := time.Now().Add(-time.Hour); return &t }

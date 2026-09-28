@@ -75,6 +75,28 @@ type CreateInput struct {
 	// tables in table mode) would then start overbooking silently the day its
 	// venue switches modes. Overbooking has to be asked for by name.
 	Overbook bool
+
+	// AwaitPreorderPayment is set by a client that will attach a pre-order and
+	// pay for it right after creating the booking. When the venue takes
+	// pre-orders online the booking then stays HIDDEN from the venue until the
+	// payment is authorized (released_to_venue_at). Guest-only; ignored for
+	// staff bookings and for venues without online pre-order payment.
+	AwaitPreorderPayment bool
+}
+
+// PreorderGate answers whether a venue takes pre-order payment online, i.e.
+// whether the hidden-booking gate applies. Optional (WithPreorderGate); nil =
+// no gate, every booking is released at creation as before.
+type PreorderGate interface {
+	PreorderPaidOnline(ctx context.Context, restaurantID uuid.UUID) (bool, error)
+}
+
+// CreateOption configures optional creation dependencies.
+type CreateOption func(*createUseCase)
+
+// WithPreorderGate wires the booking gate (see PreorderGate).
+func WithPreorderGate(g PreorderGate) CreateOption {
+	return func(u *createUseCase) { u.gate = g }
 }
 
 // ItemInput is one pre-ordered menu position. Price is captured at booking time
@@ -112,6 +134,7 @@ type createUseCase struct {
 	promoCodes promoCodeRedeemer
 	tx         domain.TxManager
 	cfg        Config
+	gate       PreorderGate
 }
 
 // NewCreateUseCase constructs the booking creation usecase.
@@ -131,13 +154,18 @@ func NewCreateUseCase(
 	promoCodes promoCodeRedeemer,
 	tx domain.TxManager,
 	cfg Config,
+	opts ...CreateOption,
 ) CreateUseCase {
-	return &createUseCase{
+	u := &createUseCase{
 		bookings: bookings, links: links, capacity: capacity, items: items, history: history,
 		outbox: outbox, blacklist: blacklist, rateLog: rateLog,
 		restaurants: restaurants, schedule: schedule, managers: managers, promos: promos,
 		promoCodes: promoCodes, tx: tx, cfg: cfg.withDefaults(),
 	}
+	for _, o := range opts {
+		o(u)
+	}
+	return u
 }
 
 // Create runs the checks in a fixed order — cheap and unconditional first,
@@ -297,8 +325,19 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 	}
 
 	now := time.Now()
+	hidden := false
+	if in.AwaitPreorderPayment && !acc.staff() && u.gate != nil {
+		if hidden, err = u.gate.PreorderPaidOnline(ctx, in.RestaurantID); err != nil {
+			return nil, err
+		}
+	}
+	var released *time.Time
+	if !hidden {
+		released = &now
+	}
 	b := &domain.Booking{
-		ID: uuid.New(), RestaurantID: in.RestaurantID, UserID: in.UserID,
+		ReleasedToVenueAt: released,
+		ID:                uuid.New(), RestaurantID: in.RestaurantID, UserID: in.UserID,
 		Name: strings.TrimSpace(in.Name), Phone: in.Phone, Email: email,
 		PhoneNormalized: normalizedPhone, Guests: in.Guests,
 		StartsAt: startsAt, EndsAt: startsAt.Add(policy.Duration),
@@ -425,6 +464,19 @@ func (u *createUseCase) Create(ctx context.Context, actor Actor, in CreateInput)
 			if err := u.items.Create(ctx, buildItems(b.ID, in.Items, now)); err != nil {
 				return err
 			}
+		}
+		if hidden {
+			// Audit row only: the venue must not hear about this booking (no
+			// booking.created in the outbox) until its pre-order payment is
+			// authorized; ReleaseForPayment writes the event then.
+			if err := u.history.Create(ctx, &domain.BookingStatusChange{
+				ID: uuid.New(), BookingID: b.ID, ToStatus: b.Status,
+				ActorType: acc.actorType(), ActorID: actorID(actor), CreatedAt: now,
+			}); err != nil {
+				return err
+			}
+			logTransition(ctx, b, nil, acc.actorType())
+			return nil
 		}
 		if err := recordTransition(ctx, u.history, u.outbox, b, nil,
 			acc.actorType(), actorID(actor), nil, now); err != nil {

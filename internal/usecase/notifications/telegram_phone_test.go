@@ -19,7 +19,7 @@ func TestTelegramTextCarriesTheGuestPhone(t *testing.T) {
 		GuestPhone: "+77078692233",
 		Guests:     2,
 		StartsAt:   time.Date(2026, 7, 30, 19, 0, 0, 0, time.UTC),
-	})
+	}, time.UTC)
 
 	if !strings.Contains(text, "+77078692233") {
 		t.Fatalf("phone missing from the alert:\n%s", text)
@@ -33,7 +33,7 @@ func TestTelegramTextCarriesTheGuestPhone(t *testing.T) {
 // field empty). The line is dropped rather than printed empty: "Телефон:" with
 // nothing after it reads as a broken message, not as missing data.
 func TestTelegramTextOmitsAnEmptyPhoneLine(t *testing.T) {
-	text := buildTelegramText(Event{GuestName: "Гость", Guests: 4, StartsAt: time.Now()})
+	text := buildTelegramText(Event{GuestName: "Гость", Guests: 4, StartsAt: time.Now()}, time.UTC)
 
 	if strings.Contains(text, "Телефон") {
 		t.Fatalf("empty phone must not print a label:\n%s", text)

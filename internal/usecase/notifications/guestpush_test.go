@@ -283,6 +283,54 @@ func TestGuestMessageContentIsMinimal(t *testing.T) {
 	}
 }
 
+// Each of the four pre-order-hold system-cancellation reasons (owner decisions
+// 2026-09-24) gets its own body text — the guest must be able to tell "you
+// never paid" from "the venue never answered" from "the bank released your
+// card" without opening the app. A reason with no dedicated copy (or none at
+// all — a plain venue reject/cancel) keeps the original generic text.
+func TestCancelledGuestCopyDistinguishesPreorderHoldReasons(t *testing.T) {
+	reasonText := func(code *string) string {
+		e := guestEvent(uuid.New(), domain.EventBookingCancelled)
+		e.CancelledBy = domain.CancelledByRestaurant // an echoed cancel, not self
+		e.CancellationReasonCode = code
+		msg, ok := buildGuestMessage(e, "Ocean Basket", "", time.UTC)
+		if !ok {
+			t.Fatal("no template for booking.cancelled")
+		}
+		return msg.Body
+	}
+	code := func(s string) *string { return &s }
+
+	generic := reasonText(nil)
+	seen := map[string]string{"generic": generic}
+	for name, c := range map[string]*string{
+		"payment_not_completed": code(domain.CancelReasonPreorderPaymentNotCompleted),
+		"venue_no_answer":       code(domain.CancelReasonVenueNoAnswer),
+		"capture_failed":        code(domain.CancelReasonPreorderCaptureFailed),
+		"hold_released":         code(domain.CancelReasonPreorderHoldReleased),
+	} {
+		body := reasonText(c)
+		if body == generic {
+			t.Fatalf("%s: body identical to the generic cancellation text, want dedicated copy: %q", name, body)
+		}
+		for other, prev := range seen {
+			if body == prev {
+				t.Fatalf("%s and %s produced the same body, want distinct copy: %q", name, other, body)
+			}
+		}
+		seen[name] = body
+		if !strings.Contains(body, "4 чел.") {
+			t.Fatalf("%s: body dropped the party size: %q", name, body)
+		}
+	}
+
+	// An unrecognized / not-yet-mapped code must not crash and must fall back
+	// to the generic text rather than an empty suffix reading like a bug.
+	if got := reasonText(code("some_future_reason")); got != generic {
+		t.Fatalf("unmapped reason code = %q, want the generic text %q", got, generic)
+	}
+}
+
 // The outbox payload contract: the producer's user_id / cancelled_by reach the
 // decoded Event, which is what the guest channel routes on.
 func TestToEventCarriesGuestFields(t *testing.T) {

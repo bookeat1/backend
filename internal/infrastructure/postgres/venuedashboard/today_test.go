@@ -258,6 +258,63 @@ func TestGuestsCountTheWholeDayEvenWhenTheListIsTruncated(t *testing.T) {
 	}
 }
 
+// seedHiddenGuest inserts a PENDING booking whose pre-order payment is not
+// authorized yet (released_to_venue_at IS NULL): the venue has not been told
+// about it and must not see it on any part of this screen (spec criterion 16).
+func seedHiddenGuest(t *testing.T, ctx context.Context, pool *pgxpool.Pool, venue uuid.UUID,
+	name, phone string, guests int, createdAt, startsAt time.Time) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO bookings (id, restaurant_id, name, phone, phone_normalized, guests, status,
+		                       starts_at, ends_at, created_at, updated_at, source, released_to_venue_at)
+		 VALUES ($1,$2,$3,$4,$4,$5,'pending',$6::timestamptz,
+		         $6::timestamptz + interval '90 minutes',$7::timestamptz,$7::timestamptz,'app',NULL)`,
+		id, venue, name, phone, guests, startsAt, createdAt); err != nil {
+		t.Fatalf("seed hidden booking %s: %v", name, err)
+	}
+	return id
+}
+
+// A booking still hidden behind an unpaid pre-order must not appear in EITHER
+// block: not in "needs an answer" (it has not been told to the venue at all)
+// and not in the day's list, even though it is 'pending' and today's date —
+// exactly the two conditions that would otherwise put it in both. Regression
+// for the gap tech-lead review found: the list endpoint (BookingRepository.List
+// with HideUnreleased) and the booking card (facade.load) already gated this;
+// this dashboard screen did not.
+func TestHiddenBookingIsExcludedFromBothLists(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "booking_items", "bookings", "restaurants")
+	ctx := context.Background()
+
+	venue := seedVenue(t, ctx, pool, "Abay", "Asia/Almaty")
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+
+	seedHiddenGuest(t, ctx, pool, venue, "Скрытый", "+77010000001", 2,
+		now.Add(-3*time.Hour), now.Add(2*time.Hour))
+	seedGuest(t, ctx, pool, venue, "Видимый", "+77010000002", "pending", 3,
+		now.Add(-time.Hour), now.Add(3*time.Hour))
+
+	got, err := NewToday(pool).Today(ctx, venue, now, 20, 50)
+	if err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	if len(got.Awaiting) != 1 || got.Awaiting[0].Name != "Видимый" {
+		t.Fatalf("hidden booking leaked into the awaiting queue: %+v", got.Awaiting)
+	}
+	if got.AwaitingTotal != 1 {
+		t.Fatalf("awaiting_total = %d, want 1 (the hidden booking must not be counted)", got.AwaitingTotal)
+	}
+	if len(got.Today) != 1 || got.Today[0].Name != "Видимый" {
+		t.Fatalf("hidden booking leaked into today's list: %+v", got.Today)
+	}
+	if got.TodayTotal != 1 || got.Guests != 3 {
+		t.Fatalf("today_total/guests must not count the hidden booking: total=%d guests=%d",
+			got.TodayTotal, got.Guests)
+	}
+}
+
 // An empty venue must answer with empty lists and zeros — never nil, which
 // serialises as `null` and makes a client crash on .length.
 func TestEmptyVenueAnswersWithEmptyListsNotNil(t *testing.T) {
