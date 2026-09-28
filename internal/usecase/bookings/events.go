@@ -147,6 +147,12 @@ type bookingPayload struct {
 	// from one the guest performed themselves — the guest-facing notifier does
 	// not echo the latter back at them. Empty on every non-cancel event.
 	CancelledBy domain.CancelledBy `json:"cancelled_by,omitempty"`
+	// CancellationReasonCode is the machine-readable reason (domain.CancelReason*)
+	// a SYSTEM cancellation carries, so the guest push can tell "you never paid"
+	// apart from "the venue never answered" apart from a plain venue rejection
+	// instead of one generic "Бронь отменена" for all four. Empty on every
+	// non-system cancellation and every non-cancel event.
+	CancellationReasonCode *string `json:"cancellation_reason_code,omitempty"`
 	// PromotionID tags the booking with the campaign it was attached to at
 	// creation (e.g. the Almaty marathon's platform promo) — see
 	// createUseCase.validatePromotion, which already confirmed it names a real,
@@ -173,5 +179,6 @@ func newBookingPayload(b *domain.Booking) bookingPayload {
 	if b.CancelledBy != nil {
 		p.CancelledBy = *b.CancelledBy
 	}
+	p.CancellationReasonCode = b.CancellationReasonCode
 	return p
 }

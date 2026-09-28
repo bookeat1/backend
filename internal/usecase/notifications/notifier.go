@@ -46,6 +46,12 @@ type Event struct {
 	// The guest channel uses it to avoid echoing a cancellation the guest
 	// themselves just performed in the app.
 	CancelledBy domain.CancelledBy
+	// CancellationReasonCode is the machine-readable system-cancellation reason
+	// (domain.CancelReason*), so the guest push can render distinct copy for
+	// "you never paid" / "the venue never answered" / "the charge failed" /
+	// "the bank released the hold" instead of one generic message for all four.
+	// Empty on a venue/guest cancellation and on every non-cancel event.
+	CancellationReasonCode *string
 }
 
 // Notifier is one outbound channel. Notify MUST be idempotent under redelivery
@@ -67,13 +73,14 @@ type Notifier interface {
 // is the contract between the booking usecase (producer) and this dispatcher
 // (consumer), so only additive changes are safe on either side.
 type outboxPayload struct {
-	RestaurantID uuid.UUID          `json:"restaurant_id"`
-	UserID       *uuid.UUID         `json:"user_id,omitempty"`
-	Name         string             `json:"name"`
-	Phone        string             `json:"phone"`
-	Guests       int                `json:"guests"`
-	StartsAt     time.Time          `json:"starts_at"`
-	CancelledBy  domain.CancelledBy `json:"cancelled_by,omitempty"`
+	RestaurantID           uuid.UUID          `json:"restaurant_id"`
+	UserID                 *uuid.UUID         `json:"user_id,omitempty"`
+	Name                   string             `json:"name"`
+	Phone                  string             `json:"phone"`
+	Guests                 int                `json:"guests"`
+	StartsAt               time.Time          `json:"starts_at"`
+	CancelledBy            domain.CancelledBy `json:"cancelled_by,omitempty"`
+	CancellationReasonCode *string            `json:"cancellation_reason_code,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -83,15 +90,16 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		return Event{}, fmt.Errorf("decode outbox payload: %w", err)
 	}
 	return Event{
-		OutboxEventID: row.ID,
-		BookingID:     row.BookingID,
-		RestaurantID:  p.RestaurantID,
-		Type:          row.EventType,
-		GuestName:     p.Name,
-		GuestPhone:    p.Phone,
-		Guests:        p.Guests,
-		StartsAt:      p.StartsAt,
-		GuestUserID:   p.UserID,
-		CancelledBy:   p.CancelledBy,
+		OutboxEventID:          row.ID,
+		BookingID:              row.BookingID,
+		RestaurantID:           p.RestaurantID,
+		Type:                   row.EventType,
+		GuestName:              p.Name,
+		GuestPhone:             p.Phone,
+		Guests:                 p.Guests,
+		StartsAt:               p.StartsAt,
+		GuestUserID:            p.UserID,
+		CancelledBy:            p.CancelledBy,
+		CancellationReasonCode: p.CancellationReasonCode,
 	}, nil
 }
