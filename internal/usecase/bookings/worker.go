@@ -555,7 +555,18 @@ func (w *Worker) transition(
 			return false, err
 		}
 	}
-	if err := w.bookings.UpdateStatus(ctx, b.ID, to, at); err != nil {
+	// CompareAndSwapStatus, defense in depth: ClaimDue's FOR UPDATE SKIP LOCKED
+	// already holds this row's lock for the rest of the transaction, so `from`
+	// cannot have changed since the claim — but a venue action taken through a
+	// path that does not go through ClaimDue must never be able to win a race by
+	// clobbering a cancellation this transaction already committed to.
+	if err := w.bookings.CompareAndSwapStatus(ctx, b.ID, from, to, at); err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			w.log.Warn("booking worker lost a status race",
+				slog.String("booking_id", b.ID.String()),
+				slog.String("from", string(from)), slog.String("to", string(to)))
+			return false, nil
+		}
 		return false, err
 	}
 	b.Status = to

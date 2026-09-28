@@ -266,6 +266,50 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	return nil
 }
 
+// CompareAndSwapStatus is UpdateStatus with a precondition on the CURRENT
+// status, in one statement (never a read followed by a write). A concurrent
+// transition that already moved the row away from `from` — the confirm-SLA
+// worker cancelling it while a venue action is in flight, Telegram and the
+// cabinet answering at once — makes this affect zero rows instead of clobbering
+// that transition; classifyStatusMiss then tells "no such booking" apart from
+// "booking changed under us".
+func (r *Repository) CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to domain.BookingStatus, at time.Time) error {
+	set := []string{"status=$2", "updated_at=$3"}
+	switch to {
+	case domain.BookingConfirmed:
+		set = append(set, "confirmed_at=$3")
+	case domain.BookingArrived:
+		set = append(set, "arrived_at=$3")
+	case domain.BookingCancelled:
+		set = append(set, "cancelled_at=$3")
+	}
+	q := `UPDATE bookings SET ` + strings.Join(set, ", ") + ` WHERE id=$1 AND status=$4`
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id, string(to), at, string(from))
+	if err != nil {
+		return mapCapacityWrite(err, "compare-and-swap booking status")
+	}
+	if tag.RowsAffected() == 0 {
+		return r.classifyStatusMiss(ctx, id)
+	}
+	return nil
+}
+
+// classifyStatusMiss is called after a CAS-style UPDATE affected zero rows. It
+// makes exactly one extra read — after the write already failed, not before a
+// decision to write — solely to report ErrNotFound vs ErrAlreadyExists
+// accurately; it introduces no new race because no further write follows it.
+func (r *Repository) classifyStatusMiss(ctx context.Context, id uuid.UUID) error {
+	var exists bool
+	if err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM bookings WHERE id=$1)`, id).Scan(&exists); err != nil {
+		return fmt.Errorf("check booking existence: %w", err)
+	}
+	if !exists {
+		return domain.ErrNotFound
+	}
+	return domain.ErrAlreadyExists
+}
+
 // ClaimDue locks due bookings with FOR UPDATE SKIP LOCKED. It must run inside a
 // TxManager transaction — outside one the locks are released immediately and
 // two workers can pick up the same row.

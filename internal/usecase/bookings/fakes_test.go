@@ -190,6 +190,19 @@ func (f *fakeBookings) UpdateStatus(_ context.Context, id uuid.UUID, s domain.Bo
 	return nil
 }
 
+func (f *fakeBookings) CompareAndSwapStatus(_ context.Context, id uuid.UUID, from, to domain.BookingStatus, at time.Time) error {
+	b, ok := f.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if b.Status != from {
+		return domain.ErrAlreadyExists
+	}
+	f.statuses = append(f.statuses, statusWrite{ID: id, Status: to, At: at})
+	b.Status = to
+	return nil
+}
+
 type claimCall struct {
 	statuses []domain.BookingStatus
 	by       domain.ClaimColumn

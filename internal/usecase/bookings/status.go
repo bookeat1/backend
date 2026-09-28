@@ -220,7 +220,17 @@ func (u *statusUseCase) transition(
 				return err
 			}
 		}
-		if err := u.bookings.UpdateStatus(ctx, b.ID, to, at); err != nil {
+		// CompareAndSwapStatus, not UpdateStatus: b.Status was read by GetByID
+		// above, OUTSIDE this transaction and with no row lock, so a concurrent
+		// transition (the confirm-SLA worker cancelling this same booking, a
+		// second click, Telegram and the cabinet answering at once) can commit in
+		// the gap. A CAS miss means exactly that happened — reported as an
+		// invalid transition, the same 422 a stale client already gets for
+		// racing against a read it never overlapped with.
+		if err := u.bookings.CompareAndSwapStatus(ctx, b.ID, from, to, at); err != nil {
+			if errors.Is(err, domain.ErrAlreadyExists) {
+				return fmt.Errorf("%s → %s: %w", from, to, domain.ErrInvalidStatus)
+			}
 			return err
 		}
 		return recordTransition(ctx, u.history, u.outbox, b, &from, acc.actorType(), actorID(actor), reason, at)
@@ -297,14 +307,28 @@ func (u *statusUseCase) cancelBySystemIf(ctx context.Context, id uuid.UUID, code
 		if err := u.bookings.Update(ctx, cur); err != nil {
 			return err
 		}
-		if err := u.bookings.UpdateStatus(ctx, cur.ID, domain.BookingCancelled, at); err != nil {
+		// CompareAndSwapStatus: the ValidateTransition check above ran against a
+		// read taken before this transaction, with no row lock. If a venue action
+		// commits in that gap, the CAS fails instead of stamping cancelled_by /
+		// cancelled_at (just written by Update, above) onto a row that is no
+		// longer ours to cancel — returning the error here rolls that Update back
+		// too, atomically.
+		if err := u.bookings.CompareAndSwapStatus(ctx, cur.ID, from, domain.BookingCancelled, at); err != nil {
 			return err
 		}
 		b = cur
 		return recordTransition(ctx, u.history, u.outbox, cur, &from, domain.ActorSystem, nil, &code, at)
 	})
-	if err != nil || b == nil {
+	if err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			// Lost the race to another transition (the venue answered first,
+			// or a different cancel path won): nothing left for us to cancel.
+			return nil
+		}
 		return err
+	}
+	if b == nil {
+		return nil
 	}
 	u.settleDepositAfterTransition(ctx, b, domain.BookingCancelled)
 	return nil

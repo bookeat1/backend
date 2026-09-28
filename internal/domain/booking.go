@@ -326,9 +326,25 @@ type BookingRepository interface {
 	// List returns bookings matching f plus the total count, ordered by
 	// starts_at DESC.
 	List(ctx context.Context, f BookingFilter) ([]Booking, int, error)
-	// UpdateStatus writes the new status and its timestamp columns. Call inside
-	// a TxManager together with the history and outbox inserts.
+	// UpdateStatus writes the new status and its timestamp columns
+	// unconditionally. Call inside a TxManager together with the history and
+	// outbox inserts. It is a BLIND write: safe only when the caller already
+	// holds an exclusive claim on the row for the duration of the same
+	// transaction (a prior FOR UPDATE / conditional UPDATE that locked it, e.g.
+	// ClaimDue or release.go's own Release call). Use CompareAndSwapStatus for
+	// any transition a concurrent request could also be racing.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status BookingStatus, at time.Time) error
+	// CompareAndSwapStatus is UpdateStatus guarded by a precondition on the
+	// CURRENT status: the write only takes effect if the row is still `from`.
+	// This is the guard the venue-confirm / guest-cancel / worker-timeout race
+	// depends on: none of those paths hold a row lock across their own
+	// GetByID-then-decide gap, so without this the last writer wins
+	// unconditionally and a booking already cancelled by the worker can be
+	// resurrected as confirmed by a venue action that started a moment earlier.
+	// Zero rows affected because the id does not exist -> ErrNotFound; because
+	// the row exists but is no longer in `from` -> ErrAlreadyExists (mirrors
+	// PaymentRepository.CompareAndSwapStatus).
+	CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to BookingStatus, at time.Time) error
 	// ClaimDue locks up to limit bookings in the given statuses whose `by`
 	// column is older than before, using FOR UPDATE SKIP LOCKED so parallel
 	// workers do not collide. Results are ordered by that same column, oldest

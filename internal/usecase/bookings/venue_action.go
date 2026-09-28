@@ -2,6 +2,7 @@ package bookings
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -107,13 +108,22 @@ func (u *statusUseCase) DecideAsVenue(
 				return err
 			}
 		}
-		if err := u.bookings.UpdateStatus(ctx, b.ID, to, at); err != nil {
+		// CompareAndSwapStatus: b.Status came from the GetByID above, taken
+		// outside this transaction with no row lock — the guest, another
+		// channel, or the confirm-SLA worker can move the booking in that gap
+		// (this is the exact channel of PR #104's confirmed-lock race). A CAS
+		// miss is reported as Conflict, the same way the stale-read
+		// ValidateTransition check above already is, not as a 500.
+		if err := u.bookings.CompareAndSwapStatus(ctx, b.ID, from, to, at); err != nil {
 			return err
 		}
 		return recordTransition(ctx, u.history, u.outbox, b, &from,
 			domain.ActorManager, nil, &reason, at)
 	})
 	if err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			return VenueDecisionResult{Conflict: true}, nil
+		}
 		return VenueDecisionResult{}, err
 	}
 	u.settleDepositAfterTransition(ctx, b, to)
