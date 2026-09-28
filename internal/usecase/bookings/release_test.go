@@ -77,7 +77,7 @@ func newTestReleaser(t *testing.T, agg *domain.RestaurantAggregate, holds Preord
 
 	allOpts := opts
 	if holds != nil {
-		allOpts = append([]ReleaserOption{WithReleaserVenueNotice(holds, 24 * time.Hour)}, opts...)
+		allOpts = append([]ReleaserOption{WithReleaserVenueNotice(holds, 24*time.Hour)}, opts...)
 	}
 	r := NewReleaser(bookings, release, history, outbox, rests, Config{}, allOpts...).(*releaser)
 	return r, bookings, release, outbox, bookingID
