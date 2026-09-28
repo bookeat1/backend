@@ -23,12 +23,28 @@ type PaymentMethodsSettings struct {
 	// with a non-empty reference — without it the kaspi method stays unavailable
 	// to guests even when switched on. Managed via the acquirer-account endpoints.
 	KaspiAccountBound bool
+	// PaymentsEnabledGlobal is the platform-wide PAYMENTS_ENABLED value
+	// (usecase/payments.Config.Enabled, same source resolveSettings uses),
+	// read-only. When PaymentsEnabled is nil the venue inherits this value —
+	// without surfacing it the panel cannot tell an admin what "as on the
+	// platform" currently means.
+	PaymentsEnabledGlobal bool
 }
 
 // PaymentMethodsInput is what the platform admin writes.
 type PaymentMethodsInput struct {
 	PaymentsEnabled *bool
 	Methods         []domain.PaymentMethod
+}
+
+// WithPaymentsGlobalEnabled wires the platform-wide PAYMENTS_ENABLED value
+// (bootstrap wires it from the same usecase/payments.Config.Enabled that
+// resolveSettings falls back to) so GetPaymentMethods/SetPaymentMethods can
+// surface it read-only as PaymentsEnabledGlobal. Not setting this option
+// leaves it at the zero value (false) — the bootstrap wiring must always pass
+// it, PUT never accepts it back.
+func WithPaymentsGlobalEnabled(enabled bool) Option {
+	return func(u *UseCase) { u.paymentsEnabledGlobal = enabled }
 }
 
 func requirePlatformAdmin(actor Actor) error {
@@ -51,7 +67,11 @@ func (u *UseCase) GetPaymentMethods(ctx context.Context, actor Actor, restaurant
 	if err != nil {
 		return PaymentMethodsSettings{}, err
 	}
-	out := PaymentMethodsSettings{PaymentsEnabled: o.PaymentsEnabled, Methods: []domain.PaymentMethod{}}
+	out := PaymentMethodsSettings{
+		PaymentsEnabled:       o.PaymentsEnabled,
+		Methods:               []domain.PaymentMethod{},
+		PaymentsEnabledGlobal: u.paymentsEnabledGlobal,
+	}
 	if o.KaspiEnabled != nil && *o.KaspiEnabled {
 		out.Methods = append(out.Methods, domain.MethodKaspi)
 	}
