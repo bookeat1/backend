@@ -45,6 +45,12 @@ type UseCase struct {
 	// acquirerAccounts is optional (see Option / WithAcquirerAccounts): nil in
 	// a deployment that maps no venue to an acquirer-side account.
 	acquirerAccounts acquirerAccountStore
+	// paymentsEnabledGlobal is the platform-wide PAYMENTS_ENABLED value (see
+	// Option / WithPaymentsGlobalEnabled), surfaced read-only on
+	// PaymentMethodsSettings.PaymentsEnabledGlobal. Defaults to false, same as
+	// bootstrap.Config's PAYMENTS_ENABLED default, for a caller that never
+	// wires the option (e.g. table-driven tests that don't care about it).
+	paymentsEnabledGlobal bool
 }
 
 // NewUseCase constructs the admin-panel usecase.

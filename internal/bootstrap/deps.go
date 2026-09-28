@@ -649,6 +649,10 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// inside our Kaspi service). The SAME repo instance the checkout reads
 		// at Authorize time, so the panel and the charge can never disagree.
 		admin.WithAcquirerAccounts(paymentSplitAccounts),
+		// Read-only platform default for the panel's "as on the platform"
+		// label — same paymentsCfg.Enabled resolveSettings falls back to when
+		// a venue's payments_enabled is NULL.
+		admin.WithPaymentsGlobalEnabled(paymentsCfg.Enabled),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates

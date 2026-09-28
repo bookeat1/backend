@@ -287,9 +287,13 @@ func acquirerAccountToResponse(a uc.AcquirerAccount) acquirerAccountResponse {
 }
 
 type paymentMethodsResponse struct {
-	PaymentsEnabled   *bool    `json:"payments_enabled"`
-	Methods           []string `json:"methods"`
-	KaspiAccountBound bool     `json:"kaspi_account_bound"`
+	PaymentsEnabled *bool    `json:"payments_enabled"`
+	Methods         []string `json:"methods"`
+	// PaymentsEnabledGlobal (read-only) is the platform's PAYMENTS_ENABLED
+	// value; when PaymentsEnabled is null the venue inherits this. Ignored on
+	// PUT — see request.go's paymentMethodsRequest, which has no such field.
+	PaymentsEnabledGlobal bool `json:"payments_enabled_global"`
+	KaspiAccountBound     bool `json:"kaspi_account_bound"`
 }
 
 func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsResponse {
@@ -297,5 +301,10 @@ func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsRespons
 	for _, m := range v.Methods {
 		ms = append(ms, string(m))
 	}
-	return paymentMethodsResponse{PaymentsEnabled: v.PaymentsEnabled, Methods: ms, KaspiAccountBound: v.KaspiAccountBound}
+	return paymentMethodsResponse{
+		PaymentsEnabled:       v.PaymentsEnabled,
+		Methods:               ms,
+		PaymentsEnabledGlobal: v.PaymentsEnabledGlobal,
+		KaspiAccountBound:     v.KaspiAccountBound,
+	}
 }
