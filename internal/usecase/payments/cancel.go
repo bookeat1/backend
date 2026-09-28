@@ -344,7 +344,19 @@ func (u *depositCancellationUseCase) CaptureOnConfirm(ctx context.Context, booki
 			// (cabinet + Telegram): that caller owns the single /payments/confirm.
 			return p, nil
 		}
-		return out, err
+		if err != nil {
+			return nil, err
+		}
+		// The booking is re-read here, not trusted from before the (external,
+		// unbounded-latency) gw.Capture call above: a guest cancel that raced
+		// the capture and lost the CAS in settlePreorder (booking already
+		// `capturing`, only logged — see settleHeldPreorder) must still be
+		// refunded once the capture lands, not left as a captured payment on
+		// a cancelled booking until a replayed webhook happens to fix it.
+		if serr := settleIfBookingAlreadyCancelled(ctx, u.bookings, u, out); serr != nil {
+			return nil, fmt.Errorf("capture succeeded but settling a race-cancelled booking failed: %w", serr)
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("%w: pre-order hold is %s, cannot capture on confirmation", domain.ErrInvalidStatus, p.Status)
 	}

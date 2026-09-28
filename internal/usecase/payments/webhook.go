@@ -368,7 +368,12 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 }
 
 // settleIfBookingAlreadyCancelled settles money that arrived for a booking the
-// venue has already closed (see WithLateCancelSettlement).
+// venue has already closed (see WithLateCancelSettlement). Thin wrapper around
+// the package-level settleIfBookingAlreadyCancelled, which is also called from
+// depositCancellationUseCase.CaptureOnConfirm and Reconciler.finishCapture /
+// captureHeldPreorderIfConfirmed — any code path that can leave a payment
+// holding money on a booking that raced to cancelled/no_show must run the same
+// check, not just the HTTP webhook.
 //
 // It runs only after the callback was applied successfully, so the payment's
 // status is the truth before any decision is taken. An error is RETURNED,
@@ -376,7 +381,15 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 // for a cancelled booking that nobody settled must stay visible, not be
 // swallowed by an acknowledged callback.
 func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p *domain.Payment) error {
-	if u.lateSettler == nil || u.bookings == nil || p.BookingID == uuid.Nil {
+	return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
+}
+
+// settleIfBookingAlreadyCancelled is the shared "money is held/taken for a
+// booking that is already closed" guard — see the method above for why it must
+// be reachable from more than the HTTP webhook path. settler is nil-checked
+// because not every deployment/test wires WithLateCancelSettlement.
+func settleIfBookingAlreadyCancelled(ctx context.Context, bookings bookingReader, settler DepositCancellationUseCase, p *domain.Payment) error {
+	if settler == nil || bookings == nil || p.BookingID == uuid.Nil {
 		return nil
 	}
 	// Only a payment that is holding or has taken money is worth settling; a
@@ -384,7 +397,7 @@ func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p 
 	if !p.Status.HoldsMoney() {
 		return nil
 	}
-	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	b, err := bookings.GetByID(ctx, p.BookingID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return nil
@@ -402,7 +415,7 @@ func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p 
 		slog.String("booking_status", string(b.Status)),
 		slog.String("trigger", string(trigger)),
 	)
-	_, err = u.lateSettler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
+	_, err = settler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
 		Trigger:     trigger,
 		CancelledAt: b.CancelledAt,
 		Reason:      strPtr("payment arrived after the booking was already closed"),
@@ -539,8 +552,13 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 // captureHeldPreorderIfConfirmed captures a pre-order HOLD whose booking is
 // already confirmed: a venue with confirm_on_create, or an old client that
 // attached the pre-order after the venue had answered. A pending booking is
-// left alone (the venue's confirmation captures it); a closed one is settled by
-// settleIfBookingAlreadyCancelled (void). Never captures a booking that is not
+// left alone (the venue's confirmation captures it); a closed one is settled
+// HERE, immediately, by calling settleIfBookingAlreadyCancelled directly — the
+// caller (resolveLostWebhook's equal-status branch) never runs apply(), so
+// nothing else in this call path would ever settle it. Before this fix the
+// hold simply sat authorized until HOLD_TTL (96h) expired, on the strength of
+// a comment ("a cancelled booking is voided by the same replay") that this
+// call path never actually delivered on. Never CAPTURES a booking that is not
 // confirmed — a cancelled booking is never charged.
 func (u *webhookUseCase) captureHeldPreorderIfConfirmed(ctx context.Context, p *domain.Payment) error {
 	if p.Purpose != domain.PurposePreorder || p.BookingID == uuid.Nil || u.bookings == nil {
@@ -551,7 +569,10 @@ func (u *webhookUseCase) captureHeldPreorderIfConfirmed(ctx context.Context, p *
 		return err
 	}
 	if b.Status != domain.BookingConfirmed {
-		return nil
+		// Not (yet) confirmed: pending still waits for the venue, but a
+		// cancelled / no-show booking is already closed and its hold must be
+		// released now rather than left for the TTL.
+		return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
 	}
 	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
 	if _, err := cv.captureHold(ctx, p); err != nil {

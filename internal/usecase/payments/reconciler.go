@@ -415,7 +415,8 @@ func (r *Reconciler) finishCapture(ctx context.Context, p *domain.Payment, at ti
 		return publishPaymentEvent(ctx, r.outbox, p, domain.EventPaymentCaptured, at)
 	})
 	if err == nil {
-		return nil
+		p.Status = domain.PaymentCaptured
+		return r.settleIfRaceCancelled(ctx, p)
 	}
 	if errors.Is(err, domain.ErrAlreadyExists) {
 		current, rerr := r.payments.GetByID(ctx, p.ID)
@@ -423,10 +424,25 @@ func (r *Reconciler) finishCapture(ctx context.Context, p *domain.Payment, at ti
 			return rerr
 		}
 		if current.Status == domain.PaymentCaptured {
-			return nil
+			return r.settleIfRaceCancelled(ctx, current)
 		}
 	}
 	return err
+}
+
+// settleIfRaceCancelled runs the same "booking already closed" guard the HTTP
+// webhook applies at the end of every apply() (settleIfBookingAlreadyCancelled)
+// against the booking/late-settlement hooks the reconciler was wired with —
+// see applier(). Money-safety review finding (PR #156): finishCapture wrote
+// the transition directly and never ran this check, so a capture that landed
+// while the guest's cancel was in flight left a captured payment on a
+// cancelled booking with no refund until a replayed webhook happened to fix
+// it. A reconciler with no WithReconcilerWebhookOptions (bookings not wired at
+// all) is a no-op here, same as the HTTP path with no
+// WithLateCancelSettlement.
+func (r *Reconciler) settleIfRaceCancelled(ctx context.Context, p *domain.Payment) error {
+	u := r.applier()
+	return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
 }
 
 // finishVoid mirrors finishCapture for the release path.

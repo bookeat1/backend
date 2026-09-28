@@ -62,6 +62,11 @@ type Event struct {
 	HoldAmountMinor       *int64
 	HoldCurrency          domain.Currency
 	VenueAnswerDeadlineAt *time.Time
+	// ReleasedToVenueAt is nil when the booking that generated this event was
+	// still hidden behind an unpaid pre-order (never shown to the venue). A
+	// staff channel (Telegram) must not announce a cancellation for such a
+	// booking — see TelegramNotifier.Notify.
+	ReleasedToVenueAt *time.Time
 }
 
 // Notifier is one outbound channel. Notify MUST be idempotent under redelivery
@@ -94,6 +99,7 @@ type outboxPayload struct {
 	HoldAmountMinor        *int64             `json:"hold_amount_minor,omitempty"`
 	HoldCurrency           domain.Currency    `json:"hold_currency,omitempty"`
 	VenueAnswerDeadlineAt  *time.Time         `json:"venue_answer_deadline_at,omitempty"`
+	ReleasedToVenueAt      *time.Time         `json:"released_to_venue_at,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -117,5 +123,6 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		HoldAmountMinor:        p.HoldAmountMinor,
 		HoldCurrency:           p.HoldCurrency,
 		VenueAnswerDeadlineAt:  p.VenueAnswerDeadlineAt,
+		ReleasedToVenueAt:      p.ReleasedToVenueAt,
 	}, nil
 }

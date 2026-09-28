@@ -162,6 +162,17 @@ func (t *TelegramNotifier) Notify(ctx context.Context, e Event) error {
 		return nil
 	}
 
+	// A booking still hidden behind an unpaid pre-order was never shown to the
+	// venue (spec §2). Cancelling it — timeout on processUnpaidHidden, or the
+	// guest cancelling before paying — must not announce a cancellation for a
+	// booking the venue never knew existed.
+	if e.Type == domain.EventBookingCancelled && e.ReleasedToVenueAt == nil {
+		t.log.Info("telegram skipped: booking was never released to the venue, no cancel alert",
+			slog.String("booking_id", e.BookingID.String()),
+			slog.String("restaurant_id", e.RestaurantID.String()))
+		return nil
+	}
+
 	cfg, err := t.settings.TelegramSettings(ctx, e.RestaurantID)
 	if err != nil {
 		return fmt.Errorf("telegram: read settings: %w", err)
