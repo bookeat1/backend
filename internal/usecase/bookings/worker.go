@@ -119,8 +119,6 @@ const (
 	DefaultConfirmMax      = 24 * time.Hour
 	// MaxConfirmMax is the hard ceiling checked at startup (spec criterion 23).
 	MaxConfirmMax = 72 * time.Hour
-	// minVenueAnswer: the venue always gets at least this long after release.
-	minVenueAnswer = 15 * time.Minute
 )
 
 func (c WorkerConfig) withDefaults() WorkerConfig {
@@ -582,18 +580,7 @@ func (w *Worker) transition(
 // venueDeadline is D_venue: min(released + venue SLA, released + ConfirmMax,
 // starts_at), but never earlier than released + 15 minutes.
 func (w *Worker) venueDeadline(b domain.Booking, policy domain.BookingPolicy) time.Time {
-	rel := *b.ReleasedToVenueAt
-	d := rel.Add(policy.ConfirmSLA)
-	if m := rel.Add(w.wcfg.ConfirmMax); m.Before(d) {
-		d = m
-	}
-	if b.StartsAt.Before(d) {
-		d = b.StartsAt
-	}
-	if floor := rel.Add(minVenueAnswer); d.Before(floor) {
-		d = floor
-	}
-	return d
+	return domain.VenueAnswerDeadline(*b.ReleasedToVenueAt, b.StartsAt, policy.ConfirmSLA, w.wcfg.ConfirmMax)
 }
 
 // processUnpaidHidden cancels bookings that stayed hidden behind an unpaid

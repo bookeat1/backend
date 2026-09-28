@@ -639,7 +639,12 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		bookingMessages, bookingSurveys, bookingHistory, bookingOutbox, restaurantManagers, txm,
 		bookings.WithFreeCancelDeadlineResolver(cancelDeadline), // same window as the money path
 		bookings.WithVenueLocationResolver(venueLocationAdapter{restaurants: restRepo, cfg: bookingCfg}),
-		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}))
+		bookings.WithBookingRulesResolver(bookingRulesAdapter{reader: restRepo, defaults: newBookingRulesDefaults(cfg)}),
+		// Same restaurant reader + hold checker the confirm-SLA worker uses
+		// (bookings.WithWorkerPreorderGate below), so venue_answer_deadline_at
+		// can never disagree with the deadline the worker actually enforces.
+		bookings.WithVenueAnswerDeadlineResolver(bookings.NewVenueAnswerDeadlineResolver(
+			restRepo, preorderHoldAdapter{payments: paymentsRepo}, bookingCfg, cfg.Payments.PreorderConfirmMax)))
 	bookingStatus := bookings.NewStatusUseCase(bookingRepo, bookingHistory, bookingOutbox,
 		restRepo, restaurantManagers, txm, bookingCfg,
 		bookings.WithDepositSettler(depositSettlerAdapter{uc: paymentDepositCancel}),

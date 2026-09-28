@@ -32,6 +32,13 @@ type BookingDetails struct {
 	// the resolver is not wired or the lookup failed (an enhancement, not a
 	// hard dependency — same posture as FreeCancelDeadline).
 	BookingRules *domain.EffectiveBookingRules
+	// VenueAnswerDeadline is D_venue (spec §3, criterion 24): the moment a
+	// booking held by a pre-order is cancelled, with its hold voided, because
+	// the venue never answered. Nil when not applicable (not pending, still
+	// hidden behind an unpaid pre-order, or no live hold) or when the resolver
+	// is not wired / its lookup failed — additive, same posture as
+	// FreeCancelDeadline.
+	VenueAnswerDeadline *time.Time
 }
 
 // freeCancelDeadlineResolver derives starts_at − free_cancel_window_minutes for
@@ -47,6 +54,12 @@ type freeCancelDeadlineResolver interface {
 // an adapter over the restaurant repository, mirroring cancelDeadlineAdapter.
 type bookingRulesResolver interface {
 	EffectiveBookingRules(ctx context.Context, restaurantID uuid.UUID) (domain.EffectiveBookingRules, error)
+}
+
+// venueAnswerDeadlineResolver computes BookingDetails.VenueAnswerDeadline.
+// Bound in bootstrap to *VenueAnswerDeadlineResolver (venue_answer_deadline.go).
+type venueAnswerDeadlineResolver interface {
+	VenueAnswerDeadline(ctx context.Context, b domain.Booking) (*time.Time, error)
 }
 
 // Facade exposes booking reads plus the chat and survey side-channels.
@@ -106,6 +119,7 @@ type facade struct {
 	freeCancel freeCancelDeadlineResolver
 	venueZone  venueLocationResolver
 	rules      bookingRulesResolver
+	venueSLA   venueAnswerDeadlineResolver
 }
 
 // FacadeOption configures optional facade dependencies without breaking the
@@ -131,6 +145,13 @@ func WithVenueLocationResolver(r venueLocationResolver) FacadeOption {
 // wired, in which case the field is simply omitted (nil).
 func WithBookingRulesResolver(r bookingRulesResolver) FacadeOption {
 	return func(f *facade) { f.rules = r }
+}
+
+// WithVenueAnswerDeadlineResolver wires the D_venue lookup used to populate
+// BookingDetails.VenueAnswerDeadline. Left nil in tests / when payments are not
+// wired, in which case the field is simply omitted (nil).
+func WithVenueAnswerDeadlineResolver(r venueAnswerDeadlineResolver) FacadeOption {
+	return func(f *facade) { f.venueSLA = r }
 }
 
 // NewFacade constructs the bookings Facade.
@@ -170,6 +191,7 @@ func (f *facade) Get(ctx context.Context, actor Actor, id uuid.UUID) (*BookingDe
 	}
 	out.FreeCancelDeadline = f.freeCancelDeadline(ctx, b)
 	out.BookingRules = f.bookingRules(ctx, b)
+	out.VenueAnswerDeadline = f.venueAnswerDeadline(ctx, b)
 	return out, nil
 }
 
@@ -220,6 +242,20 @@ func (f *facade) freeCancelDeadline(ctx context.Context, b *domain.Booking) *tim
 		return nil
 	}
 	return &deadline
+}
+
+// venueAnswerDeadline computes BookingDetails.VenueAnswerDeadline, or nil.
+// Mirrors freeCancelDeadline's posture: a resolver error is swallowed, because
+// this field is auxiliary and a booking read must not fail over it.
+func (f *facade) venueAnswerDeadline(ctx context.Context, b *domain.Booking) *time.Time {
+	if f.venueSLA == nil {
+		return nil
+	}
+	deadline, err := f.venueSLA.VenueAnswerDeadline(ctx, *b)
+	if err != nil {
+		return nil
+	}
+	return deadline
 }
 
 // ListMine returns the caller's own bookings. The user filter is overwritten

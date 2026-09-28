@@ -277,6 +277,35 @@ func (b Booking) AwaitingPreorderPayment() bool {
 	return b.ReleasedToVenueAt == nil && b.Status == BookingPending
 }
 
+// MinVenueAnswerWindow is the floor the venue always gets to answer a booking
+// held by a pre-order, however tight its own ConfirmSLA or the platform's
+// ConfirmMax are (owner decision 2026-09-24, spec §3 D_venue).
+const MinVenueAnswerWindow = 15 * time.Minute
+
+// VenueAnswerDeadline is D_venue (spec §3): the moment a booking held by a
+// pre-order is cancelled and its hold voided because the venue never answered.
+// min(releasedAt + confirmSLA, releasedAt + confirmMax, startsAt), floored at
+// releasedAt + MinVenueAnswerWindow so a venue is never given less than that
+// regardless of how tight the other three bounds are.
+//
+// This is the SAME computation the confirm-SLA worker enforces
+// (usecase/bookings.Worker.venueDeadline) and the one a booking response's
+// venue_answer_deadline_at field reports to the guest — kept here, in domain,
+// so the two call sites cannot drift apart.
+func VenueAnswerDeadline(releasedAt, startsAt time.Time, confirmSLA, confirmMax time.Duration) time.Time {
+	d := releasedAt.Add(confirmSLA)
+	if m := releasedAt.Add(confirmMax); m.Before(d) {
+		d = m
+	}
+	if startsAt.Before(d) {
+		d = startsAt
+	}
+	if floor := releasedAt.Add(MinVenueAnswerWindow); d.Before(floor) {
+		d = floor
+	}
+	return d
+}
+
 // BookingReleaseRepository is the gate between a pre-order booking and the
 // venue. It is separate from BookingRepository so existing fakes stay valid.
 type BookingReleaseRepository interface {
