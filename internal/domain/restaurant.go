@@ -177,6 +177,16 @@ type Restaurant struct {
 	IsPremium          *bool
 	HiddenFromHome     bool
 	DisplayOrder       *int
+	// LoyaltyEnabled reports whether this venue has the bonus/loyalty program
+	// switched on (restaurants.loyalty_enabled, migration 0119). Purely a
+	// display flag: no loyalty engine exists behind it yet, and turning it on
+	// does not unlock any server-side behaviour. It only tells the mobile app
+	// whether to show the "loyalty QR code" button added on the venue screen
+	// (frontend PR #275, decorative placeholder). DEFAULT false — the flag
+	// must never come on for a venue by accident. Same bool (not *bool) shape
+	// as IsActive: unlike IsPopular/IsPremium (editorial "maybe unset" flags),
+	// this one always has a definite value.
+	LoyaltyEnabled bool
 	// BookingPolicy holds the venue's optional overrides of the global booking
 	// policy (Wave 3). Nil fields fall back to the BOOKING_DEFAULT_* env values;
 	// resolution lives in usecase/bookings.

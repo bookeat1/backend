@@ -73,6 +73,24 @@ const bookingRulesCols = `hold_minutes, late_arrival_text, late_arrival_text_i18
 // placeholder numbering stays untouched.
 const serviceFeeCols = `service_fee_bps`
 
+// loyaltyCols is the venue's loyalty-program display toggle
+// (restaurants.loyalty_enabled, migration 0119). It is kept out of cols for the
+// same reason preorderCols/serviceFeeCols are: a freshly created restaurant must
+// default to the column's DEFAULT false (loyalty is opt-in per venue, never on
+// by default) rather than depend on Create's fixed placeholder list, and old
+// rows/older migration floors must not break on a column that did not exist
+// yet. Unlike its siblings, the public payload publishes this flag on BOTH the
+// detail read (GetByID) and the catalog listings (ListActive/Search), so it is
+// selected explicitly in all of those, not just GetByID — see LoyaltyColumns,
+// exported so favorite.Repository (which reuses the listing column set) can do
+// the same.
+const loyaltyCols = `loyalty_enabled`
+
+// LoyaltyColumns is loyaltyCols, exported for the same reason Columns is: so
+// favorite.Repository can select it through its own join and stay in lockstep
+// with ScanListItem's scan order.
+const LoyaltyColumns = loyaltyCols
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -119,7 +137,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		price_category=$14, email=$15, phone=$16, latitude=$17, longitude=$18,
 		kwaaka_restaurant_id=$19, is_active=$20, is_new=$21, is_popular=$22,
 		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$26,
-		price_min=$27, price_max=$28
+		price_min=$27, price_max=$28, loyalty_enabled=$29
 		WHERE id=$1`
 	// Built explicitly (not sliced out of r.args) so adding an INSERT column
 	// can't silently shift the UPDATE placeholders out of alignment. Update
@@ -131,6 +149,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
 		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
 		m.HiddenFromHome, m.DisplayOrder, m.UpdatedAt, m.PriceMin, m.PriceMax,
+		m.LoyaltyEnabled,
 	}
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
@@ -382,7 +401,7 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
+		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+`, `+loyaltyCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -463,7 +482,7 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		ORDER BY r.display_order ASC NULLS LAST, r.name ASC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -787,7 +806,7 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r ` + joinSQL + ` WHERE ` + whereSQL + `
 		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -945,6 +964,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&m.PreorderMinAmountMinor,
 		&m.ServiceFeeBps,
 		&br.HoldMinutes, &br.LateArrivalText, &lateArrivalI18n, &m.FreeCancelWindowMinutes,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, err
 	}
@@ -977,9 +997,10 @@ const Columns = cols
 // a compile error.
 const ListExtraColumns = listExtraCols
 
-// ScanListItem scans one row shaped like ListActive's SELECT (Columns followed
-// by ListExtraColumns) into a Restaurant plus its primary image URL. Exported
-// for the same reason as Columns.
+// ScanListItem scans one row shaped like ListActive's SELECT (Columns, then
+// ListExtraColumns, then LoyaltyColumns — see loyaltyCols for why the toggle is
+// a separate trailing column rather than folded into Columns) into a Restaurant
+// plus its primary image URL. Exported for the same reason as Columns.
 func ScanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	return scanListItem(row)
 }
@@ -1003,6 +1024,7 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&m.PriceMin, &m.PriceMax, &primary,
 		&m.BookingPolicy.Timezone,
 		&capacityMode, &m.BookingPolicy.BookingCapacitySeats,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, nil, err
 	}

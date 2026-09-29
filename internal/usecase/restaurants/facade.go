@@ -161,6 +161,12 @@ type SaveInput struct {
 	IsPopular    *bool
 	IsPremium    *bool
 	DisplayOrder *int
+	// LoyaltyEnabled switches the venue's loyalty/bonus-program display flag
+	// (restaurants.loyalty_enabled, migration 0119). Same PATCH semantics as
+	// the rest of this bucket: nil = leave unchanged (Update) / default false
+	// (Create, see the Create zero-value Restaurant). Admin-only, same gate as
+	// IsPremium/IsPopular — see transport/rest/restaurants.Handler.update.
+	LoyaltyEnabled *bool
 	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator for the
 	// menu-sync worker (usecase/kwaakasync) — the ONLY way to set it before this
 	// field existed was hand-editing the row. Same PATCH semantics as every
@@ -616,6 +622,9 @@ func applyRestaurant(m *domain.Restaurant, in SaveInput) {
 	}
 	if in.DisplayOrder != nil {
 		m.DisplayOrder = in.DisplayOrder
+	}
+	if in.LoyaltyEnabled != nil {
+		m.LoyaltyEnabled = *in.LoyaltyEnabled
 	}
 	if in.KwaakaRestaurantID != nil {
 		if trimmed := strings.TrimSpace(*in.KwaakaRestaurantID); trimmed == "" {

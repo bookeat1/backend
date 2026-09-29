@@ -56,6 +56,12 @@ type restaurantResponse struct {
 	IsPopular    *bool               `json:"is_popular"`
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
+	// LoyaltyEnabled is restaurants.loyalty_enabled (migration 0119), always
+	// present (never omitted) exactly like IsActive: the mobile app reads it
+	// on every venue card/detail to decide whether to show the loyalty QR
+	// button (frontend PR #275). Public — a guest is meant to see it, not
+	// just the cabinet.
+	LoyaltyEnabled bool `json:"loyalty_enabled"`
 	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator
 	// (restaurants.kwaaka_restaurant_id). Unlike the fields above, it is NOT
 	// filled by baseFromDomain — it is attached explicitly, only by the
@@ -474,7 +480,7 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 		PriceRange: priceRange,
 		Email:      r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
 		IsActive: r.IsActive, IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium,
-		DisplayOrder: r.DisplayOrder, CreatedAt: r.CreatedAt,
+		DisplayOrder: r.DisplayOrder, LoyaltyEnabled: r.LoyaltyEnabled, CreatedAt: r.CreatedAt,
 	}
 }
 
