@@ -383,6 +383,73 @@ func TestGuestEditorialPickBonusAppliesInsideForYou(t *testing.T) {
 	}
 }
 
+// Bug: a guest with a declared seafood allergy was shown a seafood-cuisine
+// venue (Ocean Basket) in /restaurants/picks even though it would otherwise
+// be a strong cuisine match — allergy exclusion must win over any positive
+// taste score, not just lower it.
+func TestGuestAllergyConflictExcludesVenueEvenWithAStrongMatch(t *testing.T) {
+	profile := domain.TasteProfile{
+		CuisineCodes: []string{"seafood"}, // explicit preference — would score 400
+		Allergies:    []string{domain.FoodieAllergySeafood},
+	}
+	oceanBasket := venueItem("Ocean Basket", []string{"seafood"}, "", false, nil)
+	safe := venueItem("Итальянское", []string{"italian", "seafood"}, "", false, nil) // ANY overlap excludes
+	loader := &fakeLoader{profile: profile}
+	catalog := &fakeCatalog{items: []domain.RestaurantListItem{oceanBasket, safe}}
+	rail := &fakeRail{manual: map[uuid.UUID]bool{}}
+	f := NewFacade(loader, catalog, rail)
+
+	userID := uuid.New()
+	res, err := f.Guest(context.Background(), &userID, "Алматы", 8)
+	if err != nil {
+		t.Fatalf("guest: %v", err)
+	}
+	// Both candidates share the allergen cuisine, so NEITHER survives — this
+	// must degrade to the fallback rail exactly like criterion 9 (zero
+	// matched candidates), never surface an allergen venue as a padding card
+	// either (the fallback rail here is empty).
+	if res.Mode != ModePopular {
+		t.Fatalf("mode = %q, want popular (fallback, no safe matched candidate)", res.Mode)
+	}
+	if len(res.Items) != 0 {
+		t.Fatalf("items = %v, want none — every candidate conflicted with the guest's allergy", names(res.Items))
+	}
+	if rail.resolvedCalls == 0 {
+		t.Fatal("must have fallen through to the fallback rail")
+	}
+}
+
+// Regression: a venue that does NOT conflict with the guest's allergies is
+// scored exactly as before — the allergy filter must not touch unrelated
+// candidates.
+func TestGuestAllergyConflictDoesNotAffectUnrelatedVenues(t *testing.T) {
+	profile := domain.TasteProfile{
+		CuisineCodes: []string{"italian"},
+		Allergies:    []string{domain.FoodieAllergySeafood},
+	}
+	match := venueItem("Итальянское", []string{"italian"}, domain.PriceMid, false, intPtr(1))
+	allergenNoise := venueItem("Ocean Basket", []string{"seafood"}, domain.PriceMid, false, intPtr(2))
+	loader := &fakeLoader{profile: profile}
+	catalog := &fakeCatalog{items: []domain.RestaurantListItem{match, allergenNoise}}
+	rail := &fakeRail{manual: map[uuid.UUID]bool{}}
+	f := NewFacade(loader, catalog, rail)
+
+	userID := uuid.New()
+	res, err := f.Guest(context.Background(), &userID, "Алматы", 8)
+	if err != nil {
+		t.Fatalf("guest: %v", err)
+	}
+	if res.Mode != ModeForYou {
+		t.Fatalf("mode = %q, want for_you", res.Mode)
+	}
+	if len(res.Items) != 1 || res.Items[0].Restaurant.Name != "Итальянское" {
+		t.Fatalf("items = %v, want only Итальянское (Ocean Basket excluded, not swapped in)", names(res.Items))
+	}
+	if res.Items[0].Match.Score != 400 {
+		t.Fatalf("score = %d, want 400 (cuisine_match unaffected by the allergy filter)", res.Items[0].Match.Score)
+	}
+}
+
 // criterion 10: any failure on the personalized path — profile, candidates,
 // or the manual-pick read — degrades to the fallback rail, never an error.
 func TestGuestDegradesOnEveryFailureAlongThePersonalizedPath(t *testing.T) {
