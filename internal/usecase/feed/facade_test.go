@@ -416,6 +416,54 @@ func TestMain_MatchingGuestGetsTheTasteBoost(t *testing.T) {
 	}
 }
 
+// Bug: a guest with a declared seafood allergy was shown a card for a
+// seafood-cuisine venue (Ocean Basket) even though it would otherwise score
+// a strong cuisine_match — the card must be dropped from the candidate set
+// entirely, not merely scored down.
+func TestMain_AllergyConflictExcludesTheCardEvenWithAStrongMatch(t *testing.T) {
+	rid := uuid.New()
+	userID := uuid.New()
+	repo := newFakeRepo()
+	it := livePromo(rid)
+	it.RestaurantCuisineCodes = []string{"seafood"}
+	repo.put(it)
+
+	taste := &fakeTasteLoader{profiles: map[uuid.UUID]domain.TasteProfile{
+		userID: {CuisineCodes: []string{"seafood"}, Allergies: []string{domain.FoodieAllergySeafood}},
+	}}
+	f := newFacadeAtWithTaste(repo, &fakePerms{}, taste)
+	res, err := f.Main(context.Background(), MainInput{City: domain.CityAlmaty, UserID: &userID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Items) != 0 || res.Total != 0 {
+		t.Fatalf("items = %+v total = %d, want none — the only card conflicts with the guest's allergy", res.Items, res.Total)
+	}
+}
+
+// Regression: a card whose venue does NOT conflict with the guest's
+// allergies is scored exactly as before.
+func TestMain_AllergyConflictDoesNotAffectUnrelatedCards(t *testing.T) {
+	rid := uuid.New()
+	userID := uuid.New()
+	repo := newFakeRepo()
+	it := livePromo(rid)
+	it.RestaurantCuisineCodes = []string{"italian"}
+	repo.put(it)
+
+	taste := &fakeTasteLoader{profiles: map[uuid.UUID]domain.TasteProfile{
+		userID: {CuisineCodes: []string{"italian"}, Allergies: []string{domain.FoodieAllergySeafood}},
+	}}
+	f := newFacadeAtWithTaste(repo, &fakePerms{}, taste)
+	res, err := f.Main(context.Background(), MainInput{City: domain.CityAlmaty, UserID: &userID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Items) != 1 || res.Items[0].Score.Total != 400 { // cuisine_match alone
+		t.Fatalf("items = %+v, want the one unaffected card scoring 400", res.Items)
+	}
+}
+
 func TestMain_PaginationSlicesOneTotalOrder(t *testing.T) {
 	rid := uuid.New()
 	repo := newFakeRepo()

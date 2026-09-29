@@ -50,6 +50,15 @@ type TasteProfile struct {
 	// recommendation) from "a DIFFERENT booked venue shares a cuisine with
 	// this candidate" (the bonus).
 	BookedRestaurantIDs []uuid.UUID
+	// Allergies are the guest's wizard allergy ids (FoodieAllergy*,
+	// foodie_options kind "allergy"), verbatim — no mapping/expansion, unlike
+	// CuisineCodes. ScoreTasteMatch never reads this field: an allergy is a
+	// safety exclusion, not a taste-preference signal to score, so it must
+	// never be able to earn a venue points. Callers use it with
+	// HasAllergyConflict, BEFORE (or instead of) calling ScoreTasteMatch, to
+	// drop a conflicting venue from the candidate set entirely — see that
+	// function's doc for why a scored-down venue is not good enough here.
+	Allergies []string
 }
 
 // VenueTasteSignals is the venue-side input of ScoreTasteMatch: only values
@@ -422,6 +431,35 @@ func ScoreTasteMatch(profile TasteProfile, venue VenueTasteSignals) (total int, 
 		total += r.Points
 	}
 	return total, reasons
+}
+
+// HasAllergyConflict reports whether venue conflicts with ANY of the guest's
+// declared allergies — true when venue.CuisineCodes and profile.Allergies
+// share at least one code (§3.10-adjacent bug: a guest allergic to seafood
+// was still shown Ocean Basket, a seafood-cuisine venue, in /restaurants/picks
+// and /feed's personalized rails).
+//
+// Deliberately a hard exclusion, not a ScoreTasteMatch signal: every existing
+// row in that formula only ADDS points (never negative — see its own
+// "never returns a negative value" comments), which is right for a taste
+// preference a guest might still enjoy despite a low score, but wrong for an
+// allergy — a false positive here reads to the guest as "the app ignored my
+// allergy", not as a middling recommendation. A caller with an active
+// TasteProfile.Allergies MUST call this before/instead of scoring a
+// candidate and drop it entirely on a true result, never fold it into Total.
+//
+// The check is plain string-code equality between profile.Allergies (wizard
+// allergy ids, e.g. FoodieAllergySeafood = "seafood") and venue.CuisineCodes
+// (cuisine-dictionary codes) — a coincidence of vocabulary, not a formal
+// mapping table: today only the "seafood" allergy id happens to spell the
+// same code as the cuisine dictionary's "seafood" entry (migrations/0079),
+// so this only catches that one overlap. An allergy with no cuisine-shaped
+// counterpart (nuts/dairy/eggs/soy/wheat/shellfish/sesame today) never
+// excludes a venue by this rule — there is no ingredient-level menu data in
+// this schema to check it against, and dish/menu-level allergen filtering is
+// a deliberately separate, larger feature this does not attempt.
+func HasAllergyConflict(profile TasteProfile, venue VenueTasteSignals) bool {
+	return len(intersectInOrder(venue.CuisineCodes, profile.Allergies)) > 0
 }
 
 // containsString reports whether v is present in set.

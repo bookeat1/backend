@@ -193,6 +193,34 @@ func TestLoadTasteProfile_ExplicitCuisines(t *testing.T) {
 	}
 }
 
+// TestLoadTasteProfile_Allergies pins that prefs.Allergies is passed through
+// to TasteProfile.Allergies VERBATIM, no mapping (unlike Cuisines) — this is
+// the read half of the allergy-exclusion bug fix (domain.HasAllergyConflict
+// relies on this field actually being populated).
+func TestLoadTasteProfile_Allergies(t *testing.T) {
+	loader, pool, ctx := setup(t)
+	uid := seedUser(ctx, t, pool, nil)
+	if err := foodieprofile.New(pool).Replace(ctx, uid, domain.FoodieProfilePreferences{
+		Allergies: []string{domain.FoodieAllergySeafood, domain.FoodieAllergyNuts},
+	}); err != nil {
+		t.Fatalf("replace foodie profile: %v", err)
+	}
+
+	got, err := loader.LoadTasteProfile(ctx, uid)
+	if err != nil {
+		t.Fatalf("LoadTasteProfile: %v", err)
+	}
+	want := map[string]bool{domain.FoodieAllergySeafood: true, domain.FoodieAllergyNuts: true}
+	if len(got.Allergies) != 2 {
+		t.Fatalf("Allergies = %v, want 2 entries matching %v", got.Allergies, want)
+	}
+	for _, a := range got.Allergies {
+		if !want[a] {
+			t.Errorf("unexpected allergy code %q in %v", a, got.Allergies)
+		}
+	}
+}
+
 // TestLoadTasteProfile_NoExplicitCuisinesButBooked: a guest who never opened
 // the wizard's cuisine step but has booking history gets ONLY the implicit
 // signal — CuisineCodes stays empty (ScoreTasteMatch's own job to fall back),
@@ -241,7 +269,7 @@ func TestLoadTasteProfile_NoProfileNoBookings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadTasteProfile: %v", err)
 	}
-	if len(got.CuisineCodes) != 0 || len(got.Diets) != 0 || len(got.BookedCuisineCodes) != 0 || len(got.BookedRestaurantIDs) != 0 {
+	if len(got.CuisineCodes) != 0 || len(got.Diets) != 0 || len(got.Allergies) != 0 || len(got.BookedCuisineCodes) != 0 || len(got.BookedRestaurantIDs) != 0 {
 		t.Fatalf("got %+v, want every collection empty", got)
 	}
 	if got.Budget != nil {

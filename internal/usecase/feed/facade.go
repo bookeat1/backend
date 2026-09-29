@@ -189,6 +189,27 @@ func (f *facade) Main(ctx context.Context, in MainInput) (*MainResult, error) {
 		}
 	}
 
+	// Drop any card whose OWN venue conflicts with the guest's declared
+	// allergies — a hard exclusion from the candidate set, not a ranking
+	// penalty, same posture as the moderation gate above (package doc) and
+	// the same rule usecase/foryou applies before scoring (bug: a
+	// seafood-allergic guest was shown a card for Ocean Basket, a
+	// seafood-cuisine venue). Cheap no-op for the common case (no allergies
+	// declared, or an anonymous guest whose taste is the zero value).
+	// domain.VenueTasteSignalsOf returns the zero VenueTasteSignals for a
+	// PLATFORM card (nil RestaurantID), so HasAllergyConflict is always false
+	// for those — a platform card cannot "specialize" in an allergen cuisine.
+	if len(taste.Allergies) > 0 {
+		filtered := candidates[:0]
+		for _, it := range candidates {
+			if domain.HasAllergyConflict(taste, domain.VenueTasteSignalsOf(it)) {
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		candidates = filtered
+	}
+
 	// Ranking is a pure domain function over the whole candidate set, and the
 	// page is a slice of its total order. Paginating BEFORE ranking would let a
 	// card appear on two pages (or on none) as scores shift between requests.

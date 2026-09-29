@@ -30,8 +30,9 @@ import (
 type Loader interface {
 	// LoadTasteProfile never returns domain.ErrNotFound: a guest who never
 	// opened the foodie-profile wizard and never booked anything gets a
-	// zero-value TasteProfile (empty CuisineCodes/Diets/BookedCuisineCodes/
-	// BookedRestaurantIDs, nil Budget) — same "empty, not an error"
+	// zero-value TasteProfile (empty CuisineCodes/Diets/Allergies/
+	// BookedCuisineCodes/BookedRestaurantIDs, nil Budget) — same "empty, not
+	// an error"
 	// convention as domain.FoodieProfileRepository.Get and
 	// usecase/users.Facade.GetFoodieProfile, which this reuses the shape of.
 	LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain.TasteProfile, error)
@@ -149,6 +150,9 @@ func (l *loader) LoadTasteProfile(ctx context.Context, userID uuid.UUID) (domain
 		Diets:               prefs.Diets,
 		BookedCuisineCodes:  bookedCuisineCodes,
 		BookedRestaurantIDs: bookedRestaurantIDs,
+		// Allergies is passed through verbatim, no mapping (unlike Cuisines) —
+		// see domain.TasteProfile.Allergies and domain.HasAllergyConflict.
+		Allergies: prefs.Allergies,
 	}, nil
 }
 

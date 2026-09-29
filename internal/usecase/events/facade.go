@@ -131,9 +131,13 @@ type Facade interface {
 	// scores are not stable across an unranked page boundary (same
 	// reasoning as usecase/feed.Main). A PLATFORM event (no host venue)
 	// scores from a zero domain.VenueTasteSignals — never excluded, just
-	// never favoured either. No authorization; callers only reach this when
-	// the caller IS signed in (an anonymous guest has no userID to score
-	// against — see the transport layer).
+	// never favoured either. An event whose host venue conflicts with the
+	// guest's declared foodie-profile allergies (domain.HasAllergyConflict)
+	// IS excluded, hard, before scoring — a safety exclusion, not a ranking
+	// penalty, same rule usecase/foryou and usecase/feed apply. No
+	// authorization; callers only reach this when the caller IS signed in
+	// (an anonymous guest has no userID to score against — see the
+	// transport layer).
 	ListPublicUpcomingForYou(ctx context.Context, f domain.PublicEventFilter, userID uuid.UUID) ([]RankedEventListItem, int, error)
 	// GetPublicDetail returns ONE published, not-yet-ended event by its own id,
 	// with its venue when it has one. This is the event's own page — the target
@@ -827,6 +831,21 @@ func (f *facade) ListPublicUpcomingForYou(ctx context.Context, flt domain.Public
 		var v domain.VenueTasteSignals
 		if it.Restaurant != nil {
 			v = signals[it.Restaurant.ID]
+		}
+		// A safety exclusion, not a ranking penalty: an event hosted at a
+		// venue the guest is allergic to (e.g. its cuisine is seafood) is
+		// dropped from the for_you list entirely rather than scored down —
+		// same rule and same reasoning as usecase/foryou and usecase/feed
+		// (bug: a seafood-allergic guest was shown a venue specializing in
+		// seafood in a personalized rail). A PLATFORM event (it.Restaurant
+		// nil) scores from the zero v, which never conflicts — unaffected,
+		// exactly as the package doc already promises for editorial_pick/
+		// popularity.
+		if domain.HasAllergyConflict(profile, v) {
+			if total > 0 {
+				total--
+			}
+			continue
 		}
 		score, reasons := domain.ScoreTasteMatch(profile, v)
 		ranked = append(ranked, RankedEventListItem{EventListItem: it, Match: EventTasteMatch{Score: score, Reasons: reasons}})
