@@ -34,8 +34,7 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 	cuisine_type, cuisine_type_i18n, address, address_i18n, opening_hours,
 	opening_hours_i18n, city, price_category, email, phone, latitude, longitude,
 	kwaaka_restaurant_id, is_active, is_new, is_popular, is_premium,
-	hidden_from_home, display_order, created_at, updated_at, price_min, price_max,
-	loyalty_enabled`
+	hidden_from_home, display_order, created_at, updated_at, price_min, price_max`
 
 // policyCols are the venue's booking-policy overrides (all NULLABLE — NULL
 // means "use the global default"). They are read only by GetByID: the policy is
@@ -74,6 +73,24 @@ const bookingRulesCols = `hold_minutes, late_arrival_text, late_arrival_text_i18
 // placeholder numbering stays untouched.
 const serviceFeeCols = `service_fee_bps`
 
+// loyaltyCols is the venue's loyalty-program display toggle
+// (restaurants.loyalty_enabled, migration 0119). It is kept out of cols for the
+// same reason preorderCols/serviceFeeCols are: a freshly created restaurant must
+// default to the column's DEFAULT false (loyalty is opt-in per venue, never on
+// by default) rather than depend on Create's fixed placeholder list, and old
+// rows/older migration floors must not break on a column that did not exist
+// yet. Unlike its siblings, the public payload publishes this flag on BOTH the
+// detail read (GetByID) and the catalog listings (ListActive/Search), so it is
+// selected explicitly in all of those, not just GetByID — see LoyaltyColumns,
+// exported so favorite.Repository (which reuses the listing column set) can do
+// the same.
+const loyaltyCols = `loyalty_enabled`
+
+// LoyaltyColumns is loyaltyCols, exported for the same reason Columns is: so
+// favorite.Repository can select it through its own join and stay in lockstep
+// with ScanListItem's scan order.
+const LoyaltyColumns = loyaltyCols
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -104,7 +121,7 @@ func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	}
 	m.UpdatedAt = now
 	q := `INSERT INTO restaurants (` + cols + `) VALUES
-		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`
+		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(m)...)
 	if err != nil {
 		return mapWrite(err, "create restaurant")
@@ -384,7 +401,7 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
+		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+`, `+loyaltyCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -465,7 +482,7 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r WHERE ` + whereSQL + `
 		ORDER BY r.display_order ASC NULLS LAST, r.name ASC
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -789,7 +806,7 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r ` + joinSQL + ` WHERE ` + whereSQL + `
 		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -890,7 +907,6 @@ func (r *Repository) args(m *domain.Restaurant) []any {
 		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
 		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
 		m.HiddenFromHome, m.DisplayOrder, m.CreatedAt, m.UpdatedAt, m.PriceMin, m.PriceMax,
-		m.LoyaltyEnabled,
 	}
 }
 
@@ -906,7 +922,7 @@ func scanRestaurant(row scanner) (*domain.Restaurant, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled,
+		&m.PriceMin, &m.PriceMax,
 	); err != nil {
 		return nil, err
 	}
@@ -940,7 +956,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled,
+		&m.PriceMin, &m.PriceMax,
 		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
@@ -948,6 +964,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&m.PreorderMinAmountMinor,
 		&m.ServiceFeeBps,
 		&br.HoldMinutes, &br.LateArrivalText, &lateArrivalI18n, &m.FreeCancelWindowMinutes,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, err
 	}
@@ -980,9 +997,10 @@ const Columns = cols
 // a compile error.
 const ListExtraColumns = listExtraCols
 
-// ScanListItem scans one row shaped like ListActive's SELECT (Columns followed
-// by ListExtraColumns) into a Restaurant plus its primary image URL. Exported
-// for the same reason as Columns.
+// ScanListItem scans one row shaped like ListActive's SELECT (Columns, then
+// ListExtraColumns, then LoyaltyColumns — see loyaltyCols for why the toggle is
+// a separate trailing column rather than folded into Columns) into a Restaurant
+// plus its primary image URL. Exported for the same reason as Columns.
 func ScanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	return scanListItem(row)
 }
@@ -1003,9 +1021,10 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled, &primary,
+		&m.PriceMin, &m.PriceMax, &primary,
 		&m.BookingPolicy.Timezone,
 		&capacityMode, &m.BookingPolicy.BookingCapacitySeats,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, nil, err
 	}
