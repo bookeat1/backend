@@ -520,6 +520,9 @@ func (h *Handler) update(c *gin.Context) {
 	// self-promote (is_premium/is_popular/is_new/display_order) or reactivate a
 	// venue an admin deactivated (is_active). Strip them for non-admin callers;
 	// managers deactivate via DELETE, and only an admin can reactivate.
+	// loyalty_enabled joins this same admin-only bucket: it is BookEat staff
+	// deciding, venue by venue, which one gets the (still decorative) loyalty
+	// QR button — not a self-service venue setting.
 	if au, ok := middleware.GetAuthUser(c.Request.Context()); !ok || au.Role != string(domain.RoleAdmin) {
 		in.IsActive = nil
 		in.IsNew = nil
@@ -527,6 +530,7 @@ func (h *Handler) update(c *gin.Context) {
 		in.IsPremium = nil
 		in.DisplayOrder = nil
 		in.KwaakaRestaurantID = nil
+		in.LoyaltyEnabled = nil
 	}
 	agg, err := h.facade.Update(c.Request.Context(), id, in)
 	if err != nil {

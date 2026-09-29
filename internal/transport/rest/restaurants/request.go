@@ -46,6 +46,13 @@ type saveRestaurantRequest struct {
 	IsPopular        *bool              `json:"is_popular"`
 	IsPremium        *bool              `json:"is_premium"`
 	DisplayOrder     *int               `json:"display_order"`
+	// LoyaltyEnabled switches the venue's loyalty/bonus-program display flag
+	// (restaurants.loyalty_enabled, migration 0119) — purely a flag the mobile
+	// app reads to decide whether to show the loyalty QR button on the venue
+	// screen, no loyalty engine behind it. Absent = unchanged. Admin-only,
+	// same bucket as is_premium/is_popular — handler.update strips it for a
+	// non-admin caller.
+	LoyaltyEnabled *bool `json:"loyalty_enabled"`
 	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator (see
 	// uc.SaveInput's doc comment). Superadmin-only, same as the marketing/
 	// curation fields above — handler.update strips it for a non-admin caller.
@@ -111,6 +118,7 @@ func (r saveRestaurantRequest) toInput() (uc.SaveInput, error) {
 		Email: r.Email, Phone: r.Phone,
 		Latitude: r.Latitude, Longitude: r.Longitude, IsActive: r.IsActive,
 		IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium, DisplayOrder: r.DisplayOrder,
+		LoyaltyEnabled:     r.LoyaltyEnabled,
 		KwaakaRestaurantID: r.KwaakaRestaurantID,
 		HoldMinutes:        r.HoldMinutes, LateArrivalText: r.LateArrivalText,
 		LateArrivalTextI18n: domain.I18nPatch(r.LateArrivalTextI18n),

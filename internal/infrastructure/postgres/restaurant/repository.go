@@ -34,7 +34,8 @@ const cols = `id, category_id, name, name_i18n, description, description_i18n,
 	cuisine_type, cuisine_type_i18n, address, address_i18n, opening_hours,
 	opening_hours_i18n, city, price_category, email, phone, latitude, longitude,
 	kwaaka_restaurant_id, is_active, is_new, is_popular, is_premium,
-	hidden_from_home, display_order, created_at, updated_at, price_min, price_max`
+	hidden_from_home, display_order, created_at, updated_at, price_min, price_max,
+	loyalty_enabled`
 
 // policyCols are the venue's booking-policy overrides (all NULLABLE — NULL
 // means "use the global default"). They are read only by GetByID: the policy is
@@ -103,7 +104,7 @@ func (r *Repository) Create(ctx context.Context, m *domain.Restaurant) error {
 	}
 	m.UpdatedAt = now
 	q := `INSERT INTO restaurants (` + cols + `) VALUES
-		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`
+		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`
 	_, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(m)...)
 	if err != nil {
 		return mapWrite(err, "create restaurant")
@@ -119,7 +120,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		price_category=$14, email=$15, phone=$16, latitude=$17, longitude=$18,
 		kwaaka_restaurant_id=$19, is_active=$20, is_new=$21, is_popular=$22,
 		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$26,
-		price_min=$27, price_max=$28
+		price_min=$27, price_max=$28, loyalty_enabled=$29
 		WHERE id=$1`
 	// Built explicitly (not sliced out of r.args) so adding an INSERT column
 	// can't silently shift the UPDATE placeholders out of alignment. Update
@@ -131,6 +132,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
 		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
 		m.HiddenFromHome, m.DisplayOrder, m.UpdatedAt, m.PriceMin, m.PriceMax,
+		m.LoyaltyEnabled,
 	}
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
@@ -888,6 +890,7 @@ func (r *Repository) args(m *domain.Restaurant) []any {
 		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
 		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
 		m.HiddenFromHome, m.DisplayOrder, m.CreatedAt, m.UpdatedAt, m.PriceMin, m.PriceMax,
+		m.LoyaltyEnabled,
 	}
 }
 
@@ -903,7 +906,7 @@ func scanRestaurant(row scanner) (*domain.Restaurant, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax,
+		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled,
 	); err != nil {
 		return nil, err
 	}
@@ -937,7 +940,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax,
+		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled,
 		&p.Timezone, &p.BookingDurationMinutes, &p.BookingBufferMinutes,
 		&p.BookingLeadMinutes, &p.BookingHorizonDays, &p.CancelDeadlineMinutes,
 		&p.ConfirmSLAMinutes, &p.MaxGuestsPerBooking, &p.AutoConfirm, &p.ConfirmOnCreate,
@@ -1000,7 +1003,7 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&city, &price, &m.Email, &m.Phone, &m.Latitude, &m.Longitude,
 		&m.KwaakaRestaurantID, &m.IsActive, &m.IsNew, &m.IsPopular, &m.IsPremium,
 		&m.HiddenFromHome, &m.DisplayOrder, &m.CreatedAt, &m.UpdatedAt,
-		&m.PriceMin, &m.PriceMax, &primary,
+		&m.PriceMin, &m.PriceMax, &m.LoyaltyEnabled, &primary,
 		&m.BookingPolicy.Timezone,
 		&capacityMode, &m.BookingPolicy.BookingCapacitySeats,
 	); err != nil {
