@@ -392,7 +392,11 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 		}
 		return domain.PurposeDeposit, m, nil
 	}
-	return "", domain.Money{}, fmt.Errorf("%w: this booking requires no payment", domain.ErrValidation)
+	// Tagged with a stable code: HandleError replaces the message of an
+	// ErrValidation with a generic one, so the code is the only way a client can
+	// tell this refusal from any other 422 on the same call.
+	return "", domain.Money{}, domain.WithCode(domain.CodePaymentNotRequired,
+		fmt.Errorf("%w: this booking requires no payment", domain.ErrValidation))
 }
 
 // authorizeCreate decides who may start a payment for a booking: the venue's
