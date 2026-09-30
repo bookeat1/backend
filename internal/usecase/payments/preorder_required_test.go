@@ -68,6 +68,9 @@ func TestPreorderPaymentRequired_ResolutionMatchesCheckout(t *testing.T) {
 				if !errors.Is(err, domain.ErrValidation) {
 					t.Fatalf("CreateForBooking() error = %v, want ErrValidation (requires no payment)", err)
 				}
+				if code, ok := domain.CodeOf(err); !ok || code != domain.CodePaymentNotRequired {
+					t.Fatalf("code = %q (present=%v), want %q", code, ok, domain.CodePaymentNotRequired)
+				}
 				return
 			}
 			if err != nil {
@@ -100,5 +103,28 @@ func TestPreorderPaymentRequired_Errors(t *testing.T) {
 	settings.err = errors.New("db down")
 	if _, err := u.PreorderPaymentRequired(context.Background(), rid); err == nil {
 		t.Fatal("failed read: error = nil, want the settings read error to propagate")
+	}
+}
+
+// Other ErrValidation refusals on the create path must NOT carry the
+// payment_not_required code: it means exactly "this booking owes nothing".
+func TestCreateForBooking_OtherValidationErrorsKeepGenericCode(t *testing.T) {
+	// Deposit required but its amount is zero: a misconfiguration, not "no payment".
+	u, bookingID, _, _ := preorderRequiredHarness(t,
+		domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(true), DepositRequired: boolPtr(true), DepositAmountMinor: int64Ptr(0)}, Config{})
+	_, err := u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: bookingID, IdempotencyKey: "k"})
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("error = %v, want ErrValidation", err)
+	}
+	if code, ok := domain.CodeOf(err); ok {
+		t.Fatalf("misconfigured deposit carries code %q, want none (generic validation)", code)
+	}
+
+	// Payments switched off for the venue: also a different refusal.
+	u, bookingID, _, _ = preorderRequiredHarness(t,
+		domain.PaymentSettingsOverride{PaymentsEnabled: boolPtr(false)}, Config{})
+	_, err = u.CreateForBooking(context.Background(), Actor{}, CreateInput{BookingID: bookingID, IdempotencyKey: "k2"})
+	if code, ok := domain.CodeOf(err); ok {
+		t.Fatalf("payments-disabled carries code %q, want none", code)
 	}
 }

@@ -378,6 +378,14 @@ const (
 	// sanity bound, see that constant.
 	CodeSplitTooManyShares ErrorCode = "split_too_many_shares"
 
+	// CodePaymentNotRequired — a guest asked to pay a booking that owes nothing
+	// online: the venue charges neither a pre-order (its own
+	// preorder_payment_required, else the platform default) nor a deposit for
+	// it. 422. The app should not offer payment for such a booking (see the
+	// preorder_payment_required / accepts_online_payment venue fields); the
+	// booking itself is fine and needs no retry.
+	CodePaymentNotRequired ErrorCode = "payment_not_required"
+
 	// CodeSplitAmountTooBig — a confirm/refund asks for more than the split
 	// itself is worth ("Amount is too big").
 	CodeSplitAmountTooBig ErrorCode = "split_amount_too_big"
