@@ -217,6 +217,27 @@ func (u *createUseCase) PaymentFeeTerms(ctx context.Context, restaurantID uuid.U
 	return domain.PaymentFeeTerms{RateBps: s.ServiceFeeBps, MinFeeMinor: g.cfg.AcquirerMinFeeMinor}, nil
 }
 
+// PreorderPaymentRequired reports the venue's EFFECTIVE pre-order payment flag:
+// restaurants.preorder_payment_required when set, otherwise the platform default
+// (PAYMENTS_PREORDER_PAYMENT_REQUIRED) — the very resolveSettings value
+// resolveAmount reads, so the guest-facing flag cannot promise a pre-order
+// payment the checkout would refuse with "requires no payment".
+//
+// It is deliberately NOT gated on the payments master switch (the guest app
+// combines it with accepts_online_payment) and says nothing about a per-date
+// paid special day, which CreateForBooking applies on top for one booking
+// (a deposit replaces the pre-order charge).
+func (u *createUseCase) PreorderPaymentRequired(ctx context.Context, restaurantID uuid.UUID) (bool, error) {
+	if restaurantID == uuid.Nil {
+		return false, fmt.Errorf("%w: restaurant required", domain.ErrValidation)
+	}
+	override, err := u.restaurants.GetPaymentOverride(ctx, restaurantID)
+	if err != nil {
+		return false, err
+	}
+	return resolveSettings(override, u.cfg.withDefaults()).PreorderPaymentRequired, nil
+}
+
 // methodEnabled reports whether the venue has switched the method on.
 func methodEnabled(s domain.PaymentSettings, m domain.PaymentMethod) bool {
 	switch m {

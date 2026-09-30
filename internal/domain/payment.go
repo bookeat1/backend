@@ -491,6 +491,27 @@ type PaymentSettings struct {
 	FreeCancelWindow time.Duration
 }
 
+// PreorderSettingsPatch is a partial write of a venue's pre-order policy.
+// A field is written only when its Set flag is true; a Set field with a nil
+// value writes NULL (Enabled: inherit the global default; MinAmountMinor: no
+// floor). A field whose Set flag is false keeps its stored value, so a caller
+// that only changes one of the two can never clobber the other.
+type PreorderSettingsPatch struct {
+	EnabledSet     bool
+	Enabled        *bool
+	MinAmountSet   bool
+	MinAmountMinor *int64
+}
+
+// PreorderSettingsChange is the exact before/after of one PreorderSettingsPatch
+// write, captured by the same atomic statement that performed it (so an audit
+// line built from it can neither miss nor mix in a concurrent writer's value).
+type PreorderSettingsChange struct {
+	OldEnabled, NewEnabled *bool
+	OldMinAmountMinor      *int64
+	NewMinAmountMinor      *int64
+}
+
 // PaymentSettingsOverride is a restaurant's optional per-field override of the
 // global payment settings. A nil field means "use the global default".
 type PaymentSettingsOverride struct {

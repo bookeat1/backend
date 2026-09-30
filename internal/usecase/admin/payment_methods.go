@@ -52,7 +52,7 @@ func requirePlatformAdmin(actor Actor) error {
 		return fmt.Errorf("%w: no authenticated actor", domain.ErrUnauthorized)
 	}
 	if actor.Role != domain.RoleAdmin {
-		return fmt.Errorf("%w: payment methods are a platform action", domain.ErrForbidden)
+		return fmt.Errorf("%w: this payment setting is a platform action", domain.ErrForbidden)
 	}
 	return nil
 }

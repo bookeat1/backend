@@ -492,6 +492,48 @@ func TestDetailPayloadCarriesAcceptsOnlinePayment(t *testing.T) {
 	}
 }
 
+// TestDetailPayloadCarriesPreorderPaymentRequired: the effective pre-order
+// payment flag is published under exactly this key, both ways round. The name is
+// a CONTRACT with the web and mobile clients: renaming it makes them offer (or
+// hide) pre-order payment for every venue.
+func TestDetailPayloadCarriesPreorderPaymentRequired(t *testing.T) {
+	for _, required := range []bool{true, false} {
+		id := uuid.New()
+		rest := activeVenue(id)
+		st := &domain.PublicVenueState{AcceptsOnlineBookings: true, PreorderPaymentRequired: &required}
+		r := newTestRouter(&fakeFacade{
+			item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+			agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+		})
+		raw := rawVenue(t, r, "/api/v1/restaurants/"+id.String())
+		field, ok := raw["preorder_payment_required"]
+		if !ok {
+			t.Fatalf("preorder_payment_required missing from the detail payload (wanted %v)", required)
+		}
+		var got bool
+		if err := json.Unmarshal(field, &got); err != nil || got != required {
+			t.Fatalf("preorder_payment_required = %s (err %v), want %v", field, err, required)
+		}
+	}
+}
+
+// TestPayloadOmitsPreorderPaymentRequiredWhenNotComputed: absent, never false,
+// when the server did not compute it (listing rows, failed lookup).
+func TestPayloadOmitsPreorderPaymentRequiredWhenNotComputed(t *testing.T) {
+	id := uuid.New()
+	rest := activeVenue(id)
+	st := &domain.PublicVenueState{AcceptsOnlineBookings: true}
+	r := newTestRouter(&fakeFacade{
+		item: domain.RestaurantListItem{Restaurant: rest, VenueState: st},
+		agg:  &domain.RestaurantAggregate{Restaurant: rest, VenueState: st},
+	})
+	for _, path := range []string{"/api/v1/restaurants", "/api/v1/restaurants/" + id.String()} {
+		if v, ok := rawVenue(t, r, path)["preorder_payment_required"]; ok {
+			t.Fatalf("%s: preorder_payment_required must be omitted when not computed, got %s", path, v)
+		}
+	}
+}
+
 // TestPayloadOmitsAcceptsOnlinePaymentWhenNotComputed: the field disappears
 // when the server did not compute it — on the listing, which never does, and on
 // a detail read whose acquirer lookup failed. "Not computed" must never reach

@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -231,13 +233,44 @@ type freeCancelWindowRequest struct {
 	FreeCancelWindowMinutes *int `json:"free_cancel_window_minutes"`
 }
 
-// preorderSettingsRequest sets the venue's pre-order policy. min_amount_minor is
-// a pointer so an omitted field CLEARS the floor (null) and an explicit 0 is
-// distinguishable — both mean "no minimum" here, but the pointer keeps the DTO
-// honest about intent. enabled defaults to false when omitted.
+// optionalField distinguishes the three states of a JSON key that encoding/json
+// collapses into two with a plain pointer: ABSENT (Set=false: keep the stored
+// value), explicit null (Set=true, Value=nil: clear / inherit) and a value.
+type optionalField[T any] struct {
+	Set   bool
+	Value *T
+}
+
+// UnmarshalJSON is only invoked when the key is present in the payload, so an
+// absent key leaves Set false.
+func (o *optionalField[T]) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(bytes.TrimSpace(b)) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v T
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// preorderSettingsRequest writes the venue's pre-order policy. Both keys are
+// optional and independent: an ABSENT key keeps the stored value, an explicit
+// null clears it (enabled: null = inherit the platform default, min_amount_minor:
+// null = no minimum), so a UI that only sends the switch cannot wipe the minimum.
 type preorderSettingsRequest struct {
-	Enabled        bool   `json:"enabled"`
-	MinAmountMinor *int64 `json:"min_amount_minor"`
+	Enabled        optionalField[bool]  `json:"enabled"`
+	MinAmountMinor optionalField[int64] `json:"min_amount_minor"`
+}
+
+func (r preorderSettingsRequest) toInput() adminuc.PreorderSettingsInput {
+	return adminuc.PreorderSettingsInput{
+		EnabledSet: r.Enabled.Set, Enabled: r.Enabled.Value,
+		MinAmountSet: r.MinAmountMinor.Set, MinAmountMinor: r.MinAmountMinor.Value,
+	}
 }
 
 // telegramChatRequest connects the venue's Telegram alert chat. The shape is
