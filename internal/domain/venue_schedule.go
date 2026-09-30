@@ -103,8 +103,10 @@ type PublicVenueState struct {
 	// (its own restaurants.preorder_payment_required, else the platform default),
 	// the value the checkout resolves. Together with AcceptsOnlinePayment it
 	// tells the app whether to offer payment for a pre-order: only when BOTH are
-	// true; false means the pre-order is sent without online payment and asking
-	// for one is refused with 422 "requires no payment". nil = not computed
+	// true. false means the venue does not charge a PRE-ORDER online; it says
+	// nothing about deposits or a paid special day, which can still make a
+	// booking payable. Asking to pay a booking that owes neither a pre-order nor
+	// a deposit is refused with 422 "requires no payment". nil = not computed
 	// (listing rows, failed read); must reach the client as an ABSENT field.
 	PreorderPaymentRequired *bool
 	// PaymentFee is the EFFECTIVE service-fee terms a payment for this venue

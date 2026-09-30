@@ -48,9 +48,10 @@ type paymentSettingsWriter interface {
 	UpdateFreeCancelWindow(ctx context.Context, restaurantID uuid.UUID, minutes int) error
 	// UpdatePreorderSettings applies a partial write of the venue's pre-order
 	// policy (payment-required flag, NULL = inherit; optional minimum total).
-	// Only fields marked Set in the patch are written. GetPaymentOverride reads
-	// them back for the panel.
-	UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, patch domain.PreorderSettingsPatch) error
+	// Only fields marked Set in the patch are written. It returns the row's
+	// before/after values, read atomically with the write (for the audit line).
+	// GetPaymentOverride reads the state back for the panel.
+	UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, patch domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error)
 	GetPaymentOverride(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentSettingsOverride, error)
 	// UpdatePaymentMethods writes payments_enabled (nil = inherit global) and the
 	// kaspi/card method switches.

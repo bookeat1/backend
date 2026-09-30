@@ -239,7 +239,9 @@ type fakePaymentSettings struct {
 	err            error
 	preorderCalls  int
 	lastPatch      domain.PreorderSettingsPatch
-	override       domain.PaymentSettingsOverride
+	// readErrAfterWrite, when set, becomes f.err right after a preorder write.
+	readErrAfterWrite error
+	override          domain.PaymentSettingsOverride
 }
 
 func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaurantID uuid.UUID, minutes int) error {
@@ -253,21 +255,30 @@ func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaura
 }
 
 // UpdatePreorderSettings applies the patch to the fake's stored override with the
-// same semantics as the Postgres repository: only Set fields are written.
-func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) error {
+// same semantics as the Postgres repository: only Set fields are written, and the
+// before/after are captured by the write itself. readErrAfterWrite makes every
+// later GetPaymentOverride fail (a failed re-read after a committed write).
+func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error) {
 	if f.err != nil {
-		return f.err
+		return domain.PreorderSettingsChange{}, f.err
 	}
 	f.preorderCalls++
 	f.lastRestaurant = restaurantID
 	f.lastPatch = p
+	c := domain.PreorderSettingsChange{
+		OldEnabled: f.override.PreorderPaymentRequired, OldMinAmountMinor: f.override.PreorderMinAmountMinor,
+	}
 	if p.EnabledSet {
 		f.override.PreorderPaymentRequired = p.Enabled
 	}
 	if p.MinAmountSet {
 		f.override.PreorderMinAmountMinor = p.MinAmountMinor
 	}
-	return nil
+	c.NewEnabled, c.NewMinAmountMinor = f.override.PreorderPaymentRequired, f.override.PreorderMinAmountMinor
+	if f.readErrAfterWrite != nil {
+		f.err = f.readErrAfterWrite
+	}
+	return c, nil
 }
 
 func (f *fakePaymentSettings) UpdatePaymentMethods(_ context.Context, _ uuid.UUID, pe *bool, kaspi, card bool) error {
@@ -856,6 +867,58 @@ func TestSetPreorderSettings_AuditLog(t *testing.T) {
 	_, _ = h.uc.SetPreorderSettings(ctx, staffActor(uuid.New()), rid, PreorderSettingsInput{EnabledSet: true})
 	if buf.Len() != 0 {
 		t.Fatalf("refused write was logged as an update:\n%s", buf.String())
+	}
+}
+
+// A failed re-read after a committed write must neither hide the write from the
+// audit log nor change what the line says: the line carries the before/after the
+// write itself captured.
+func TestSetPreorderSettings_AuditSurvivesFailedReread(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	rid := uuid.New()
+	h := newHarness(nil)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(false)}
+	h.paySet.readErrAfterWrite = errors.New("db down")
+
+	_, err := h.uc.SetPreorderSettings(context.Background(), adminActor(), rid,
+		PreorderSettingsInput{EnabledSet: true, Enabled: boolPtr(true)})
+	if err == nil {
+		t.Fatal("re-read failed but SetPreorderSettings reported success")
+	}
+	out := buf.String()
+	if strings.Count(out, "preorder settings updated") != 1 ||
+		!strings.Contains(out, "old_enabled=false") || !strings.Contains(out, "new_enabled=true") {
+		t.Fatalf("write not audited correctly after a failed re-read:\n%s", out)
+	}
+}
+
+// {} and null (nothing Set) are a no-op: no UPDATE, no audit line, and the
+// current state comes back.
+func TestSetPreorderSettings_EmptyInputIsNoop(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := newHarness(nil)
+	min := int64(500)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(true), PreorderMinAmountMinor: &min}
+	v, err := h.uc.SetPreorderSettings(context.Background(), adminActor(), uuid.New(), PreorderSettingsInput{})
+	if err != nil {
+		t.Fatalf("no-op: %v", err)
+	}
+	if h.paySet.preorderCalls != 0 {
+		t.Fatalf("no-op reached the writer %d times", h.paySet.preorderCalls)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no-op produced a log line:\n%s", buf.String())
+	}
+	if v.Enabled == nil || !*v.Enabled || v.MinAmountMinor == nil || *v.MinAmountMinor != 500 {
+		t.Fatalf("no-op view = %+v, want the current state", v)
 	}
 }
 

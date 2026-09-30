@@ -44,26 +44,34 @@ func (r *Repository) UpdateFreeCancelWindow(ctx context.Context, restaurantID uu
 // UpdatePreorderSettings applies a partial write of the venue's pre-order
 // policy: restaurants.preorder_payment_required (NULL = inherit the global
 // default, TRUE = required, FALSE = not required) and the optional minimum
-// pre-order total restaurants.preorder_min_amount_minor (migration 0042; NULL
+// pre-order total (restaurants.preorder_min_amount_minor, migration 0042; NULL
 // clears the floor). Only the fields marked Set in the patch are written, in a
-// single atomic UPDATE, so a caller changing one can never wipe the other. The
-// min's range (NULL or >= 0) is validated by the caller (usecase/admin) and the
-// DB CHECK. ErrNotFound when the restaurant does not exist.
-func (r *Repository) UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) error {
-	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
-		`UPDATE restaurants
-		    SET preorder_payment_required = CASE WHEN $2::boolean THEN $3::boolean ELSE preorder_payment_required END,
-		        preorder_min_amount_minor = CASE WHEN $4::boolean THEN $5::bigint  ELSE preorder_min_amount_minor END,
+// single atomic UPDATE, so a caller changing one can never wipe the other.
+// The row is locked (FOR UPDATE) and its previous values are returned together
+// with the new ones by that same statement, so the caller's audit line is exact
+// even under concurrent writers. The min's range (NULL or >= 0) is validated by
+// the caller (usecase/admin) and the DB CHECK. ErrNotFound when the restaurant
+// does not exist.
+func (r *Repository) UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error) {
+	var c domain.PreorderSettingsChange
+	err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`UPDATE restaurants r
+		    SET preorder_payment_required = CASE WHEN $2::boolean THEN $3::boolean ELSE r.preorder_payment_required END,
+		        preorder_min_amount_minor = CASE WHEN $4::boolean THEN $5::bigint  ELSE r.preorder_min_amount_minor END,
 		        updated_at=now()
-		  WHERE id=$1`,
-		restaurantID, p.EnabledSet, p.Enabled, p.MinAmountSet, p.MinAmountMinor)
+		   FROM (SELECT id, preorder_payment_required AS old_req, preorder_min_amount_minor AS old_min
+		           FROM restaurants WHERE id=$1 FOR UPDATE) o
+		  WHERE r.id=o.id
+		  RETURNING o.old_req, r.preorder_payment_required, o.old_min, r.preorder_min_amount_minor`,
+		restaurantID, p.EnabledSet, p.Enabled, p.MinAmountSet, p.MinAmountMinor,
+	).Scan(&c.OldEnabled, &c.NewEnabled, &c.OldMinAmountMinor, &c.NewMinAmountMinor)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.PreorderSettingsChange{}, domain.ErrNotFound
+	}
 	if err != nil {
-		return mapWrite(err, "update preorder settings")
+		return domain.PreorderSettingsChange{}, mapWrite(err, "update preorder settings")
 	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	return c, nil
 }
 
 // GetPaymentOverride reads one restaurant's payment-settings override. It

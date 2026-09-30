@@ -189,8 +189,15 @@ func (u *UseCase) preorderView(ctx context.Context, restaurantID uuid.UUID) (Pre
 // pre-payment for pre-ordered dishes (three states: inherit / required / not
 // required) and its optional minimum. SUPERADMIN ONLY: the flag decides whether
 // a guest's pre-order is charged. A negative or absurdly large minimum is
-// rejected with 422 before it reaches the DB CHECK. Returns the stored state
-// after the write. Every successful write is logged (who, old and new values).
+// rejected with 422 before it reaches the DB CHECK. An input that sets neither
+// field ({} or null body) is a no-op: no UPDATE and no audit line, the current
+// state is returned. Returns the stored state after the write.
+//
+// Every successful write is audited (who, old and new values) from the
+// before/after the repository captured in the SAME atomic statement as the
+// write, and the line is emitted BEFORE the state is re-read for the response:
+// a failed re-read can neither leave the write unaudited nor put a concurrent
+// writer's value into the log.
 func (u *UseCase) SetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID, in PreorderSettingsInput) (PreorderSettingsView, error) {
 	if err := requirePlatformAdmin(actor); err != nil {
 		return PreorderSettingsView{}, err
@@ -200,28 +207,21 @@ func (u *UseCase) SetPreorderSettings(ctx context.Context, actor Actor, restaura
 			return PreorderSettingsView{}, fmt.Errorf("%w: min_amount_minor must be between 0 and %d", domain.ErrValidation, maxPreorderMinAmountMinor)
 		}
 	}
-	// Read the previous value for the audit line (and to 404 an unknown venue
-	// before writing). The write itself is a single atomic partial UPDATE.
-	before, err := u.paySettings.GetPaymentOverride(ctx, restaurantID)
-	if err != nil {
-		return PreorderSettingsView{}, err
+	if !in.EnabledSet && !in.MinAmountSet {
+		return u.preorderView(ctx, restaurantID) // nothing to write, nothing to audit
 	}
-	err = u.paySettings.UpdatePreorderSettings(ctx, restaurantID, domain.PreorderSettingsPatch{
+	change, err := u.paySettings.UpdatePreorderSettings(ctx, restaurantID, domain.PreorderSettingsPatch{
 		EnabledSet: in.EnabledSet, Enabled: in.Enabled,
 		MinAmountSet: in.MinAmountSet, MinAmountMinor: in.MinAmountMinor,
 	})
 	if err != nil {
 		return PreorderSettingsView{}, err
 	}
-	view, err := u.preorderView(ctx, restaurantID)
-	if err != nil {
-		return PreorderSettingsView{}, err
-	}
 	slog.InfoContext(ctx, "admin: preorder settings updated",
 		"actor_id", actor.UserID, "restaurant_id", restaurantID,
-		"old_enabled", fmtBoolPtr(before.PreorderPaymentRequired), "new_enabled", fmtBoolPtr(view.Enabled),
-		"old_min_amount_minor", fmtInt64Ptr(before.PreorderMinAmountMinor), "new_min_amount_minor", fmtInt64Ptr(view.MinAmountMinor))
-	return view, nil
+		"old_enabled", fmtBoolPtr(change.OldEnabled), "new_enabled", fmtBoolPtr(change.NewEnabled),
+		"old_min_amount_minor", fmtInt64Ptr(change.OldMinAmountMinor), "new_min_amount_minor", fmtInt64Ptr(change.NewMinAmountMinor))
+	return u.preorderView(ctx, restaurantID)
 }
 
 // fmtBoolPtr / fmtInt64Ptr render a nullable value for a log line: "null"

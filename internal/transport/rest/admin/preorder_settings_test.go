@@ -22,15 +22,17 @@ type statefulPaySettings struct {
 	writes   int
 }
 
-func (f *statefulPaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, p domain.PreorderSettingsPatch) error {
+func (f *statefulPaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, p domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error) {
 	f.writes++
+	c := domain.PreorderSettingsChange{OldEnabled: f.override.PreorderPaymentRequired, OldMinAmountMinor: f.override.PreorderMinAmountMinor}
 	if p.EnabledSet {
 		f.override.PreorderPaymentRequired = p.Enabled
 	}
 	if p.MinAmountSet {
 		f.override.PreorderMinAmountMinor = p.MinAmountMinor
 	}
-	return nil
+	c.NewEnabled, c.NewMinAmountMinor = f.override.PreorderPaymentRequired, f.override.PreorderMinAmountMinor
+	return c, nil
 }
 
 func (f *statefulPaySettings) GetPaymentOverride(context.Context, uuid.UUID) (domain.PaymentSettingsOverride, error) {
@@ -189,5 +191,29 @@ func TestPutPreorderSettings_Validation(t *testing.T) {
 	// The upper bound itself is accepted.
 	if w := do(r, http.MethodPut, url, nil, []byte(`{"min_amount_minor":10000000}`), uid); w.Code != http.StatusOK {
 		t.Fatalf("bound 10000000: status = %d, want 200 (%s)", w.Code, w.Body)
+	}
+}
+
+// A PUT with `{}` or `null` changes nothing: 200 with the current state, and the
+// store is never written.
+func TestPutPreorderSettings_EmptyBodyIsNoop(t *testing.T) {
+	rid, uid := uuid.New(), uuid.New()
+	url := base(rid) + "/payment-settings/preorder"
+	yes := true
+	min := int64(777)
+	store := &statefulPaySettings{override: domain.PaymentSettingsOverride{PreorderPaymentRequired: &yes, PreorderMinAmountMinor: &min}}
+	r := preorderRouter(domain.RoleAdmin, store, false)
+	for _, raw := range []string{`{}`, `null`} {
+		w := do(r, http.MethodPut, url, nil, []byte(raw), uid)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT %s: status = %d (%s)", raw, w.Code, w.Body)
+		}
+		d := decodePreorder(t, w.Body.Bytes())
+		if string(d["enabled"]) != "true" || string(d["min_amount_minor"]) != "777" {
+			t.Fatalf("PUT %s: %v, want the unchanged state", raw, d)
+		}
+	}
+	if store.writes != 0 {
+		t.Fatalf("no-op PUTs wrote %d times", store.writes)
 	}
 }

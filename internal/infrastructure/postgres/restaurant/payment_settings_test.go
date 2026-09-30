@@ -3,6 +3,7 @@ package restaurant
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -108,7 +109,7 @@ func TestUpdatePreorderSettings(t *testing.T) {
 	// Enable pre-order with a minimum; the reader must see both.
 	min := int64(500000)
 	yes, no := true, false
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes, MinAmountSet: true, MinAmountMinor: &min}); err != nil {
+	if _, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes, MinAmountSet: true, MinAmountMinor: &min}); err != nil {
 		t.Fatalf("update preorder settings: %v", err)
 	}
 	o, err := repo.GetPaymentOverride(ctx, m.ID)
@@ -124,7 +125,7 @@ func TestUpdatePreorderSettings(t *testing.T) {
 
 	// A patch that omits the minimum keeps it (switch-only write), and a patch
 	// that omits the flag keeps the flag.
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &no}); err != nil {
+	if _, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &no}); err != nil {
 		t.Fatalf("update preorder settings (switch only): %v", err)
 	}
 	o, err = repo.GetPaymentOverride(ctx, m.ID)
@@ -138,7 +139,7 @@ func TestUpdatePreorderSettings(t *testing.T) {
 		t.Errorf("switch-only write changed the minimum: %v, want 500000 kept", o.PreorderMinAmountMinor)
 	}
 	newMin := int64(100)
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{MinAmountSet: true, MinAmountMinor: &newMin}); err != nil {
+	if _, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{MinAmountSet: true, MinAmountMinor: &newMin}); err != nil {
 		t.Fatalf("update preorder settings (min only): %v", err)
 	}
 	o, _ = repo.GetPaymentOverride(ctx, m.ID)
@@ -148,7 +149,7 @@ func TestUpdatePreorderSettings(t *testing.T) {
 
 	// Back to inherit: an explicit NULL flag reads back as nil, and clearing the
 	// minimum reads back as nil.
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, MinAmountSet: true}); err != nil {
+	if _, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, MinAmountSet: true}); err != nil {
 		t.Fatalf("update preorder settings (clear): %v", err)
 	}
 	o, err = repo.GetPaymentOverride(ctx, m.ID)
@@ -168,8 +169,72 @@ func TestUpdatePreorderSettings(t *testing.T) {
 		t.Errorf("negative preorder_min_amount_minor was accepted, want CHECK violation")
 	}
 
-	if err := repo.UpdatePreorderSettings(ctx, uuid.New(), domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes}); err != domain.ErrNotFound {
+	if _, err := repo.UpdatePreorderSettings(ctx, uuid.New(), domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes}); err != domain.ErrNotFound {
 		t.Errorf("update on missing restaurant err = %v, want ErrNotFound", err)
+	}
+}
+
+// The write returns the row's before/after captured by the same statement, and
+// two concurrent writers each see a consistent, non-overlapping before/after
+// chain (the audit line is built from it).
+func TestUpdatePreorderSettingsReturnsBeforeAfter(t *testing.T) {
+	pool := testdb.Connect(t)
+	testdb.Truncate(t, pool, "restaurants", "restaurant_categories")
+	repo := New(pool)
+	ctx := context.Background()
+	m := &domain.Restaurant{ID: uuid.New(), Name: "Audit Bistro", City: domain.CityAlmaty, PriceCategory: domain.PriceMid, IsActive: true}
+	if err := repo.Create(ctx, m); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	yes, no := true, false
+	min := int64(900)
+
+	c, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes, MinAmountSet: true, MinAmountMinor: &min})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OldEnabled != nil || c.NewEnabled == nil || !*c.NewEnabled || c.OldMinAmountMinor != nil || c.NewMinAmountMinor == nil || *c.NewMinAmountMinor != 900 {
+		t.Fatalf("first change = %+v, want nil->true and nil->900", c)
+	}
+	// Omitted min: it stays 900 on both sides of the change.
+	c, err = repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &no})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OldEnabled == nil || !*c.OldEnabled || c.NewEnabled == nil || *c.NewEnabled ||
+		c.OldMinAmountMinor == nil || *c.OldMinAmountMinor != 900 || c.NewMinAmountMinor == nil || *c.NewMinAmountMinor != 900 {
+		t.Fatalf("second change = %+v, want true->false, min 900 both sides", c)
+	}
+
+	// Concurrent writers of the minimum: every "new" of one write must be the
+	// "old" of exactly one other, i.e. the row lock serialises them.
+	const n = 8
+	changes := make([]domain.PreorderSettingsChange, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			v := int64(1000 + i)
+			ch, err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{MinAmountSet: true, MinAmountMinor: &v})
+			if err != nil {
+				t.Errorf("writer %d: %v", i, err)
+				return
+			}
+			changes[i] = ch
+		}(i)
+	}
+	wg.Wait()
+	olds := map[int64]int{}
+	for _, ch := range changes {
+		olds[*ch.OldMinAmountMinor]++
+	}
+	for _, ch := range changes {
+		delete(olds, *ch.NewMinAmountMinor)
+	}
+	// After cancelling every "new" against an "old", only the initial 900 is left.
+	if len(olds) != 1 || olds[900] != 1 {
+		t.Fatalf("concurrent before/after chain is not serialised, unmatched olds = %v", olds)
 	}
 }
 

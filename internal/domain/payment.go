@@ -503,6 +503,15 @@ type PreorderSettingsPatch struct {
 	MinAmountMinor *int64
 }
 
+// PreorderSettingsChange is the exact before/after of one PreorderSettingsPatch
+// write, captured by the same atomic statement that performed it (so an audit
+// line built from it can neither miss nor mix in a concurrent writer's value).
+type PreorderSettingsChange struct {
+	OldEnabled, NewEnabled *bool
+	OldMinAmountMinor      *int64
+	NewMinAmountMinor      *int64
+}
+
 // PaymentSettingsOverride is a restaurant's optional per-field override of the
 // global payment settings. A nil field means "use the global default".
 type PaymentSettingsOverride struct {

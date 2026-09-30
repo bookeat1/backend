@@ -126,9 +126,11 @@ type restaurantResponse struct {
 	// PreorderPaymentRequired is the venue's effective pre-order payment flag
 	// (its own setting, else the platform default; same value the checkout
 	// uses). The app offers payment for a pre-order only when this AND
-	// accepts_online_payment are true; explicit false = the pre-order goes
-	// without online payment (asking to pay is refused with 422). Detail read
-	// only; absent = not computed, and the app must not offer payment.
+	// accepts_online_payment are true. false means the venue does not charge a
+	// pre-order online (the pre-order goes without payment); it does NOT say the
+	// booking owes nothing at all — a deposit or a paid special day may still be
+	// payable, and a payment request that owes neither is refused with 422. Detail
+	// read only; absent = not computed, and the app must not offer payment.
 	PreorderPaymentRequired *bool `json:"preorder_payment_required,omitempty"`
 	// PaymentFee is the effective service-fee terms the payment will be
 	// grossed up with (rate in bps, acquirer minimum in minor units), so the
