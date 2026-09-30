@@ -72,13 +72,14 @@ func (r *Repository) ListByUser(ctx context.Context, userID uuid.UUID) ([]domain
 }
 
 // ListRestaurantsByUser joins through restaurant_favorites, reusing
-// restaurant.Columns / restaurant.ScanListItem so a favorited restaurant
+// restaurant.Columns / restaurant.ListExtraColumns / restaurant.LoyaltyColumns
+// / restaurant.ScanListItem so a favorited restaurant
 // serializes identically to one returned by the public catalog listing
 // (including its primary image). Deactivated restaurants are excluded, same
 // visibility rule as the catalog.
 func (r *Repository) ListRestaurantsByUser(ctx context.Context, userID uuid.UUID) ([]domain.FavoriteRestaurantItem, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`SELECT `+prefixed(restaurant.Columns, "r")+`, `+restaurant.ListExtraColumns+`, f.created_at
+		`SELECT `+prefixed(restaurant.Columns, "r")+`, `+restaurant.ListExtraColumns+`, `+prefixed(restaurant.LoyaltyColumns, "r")+`, f.created_at
 		 FROM restaurant_favorites f
 		 JOIN restaurants r ON r.id = f.restaurant_id
 		 WHERE f.user_id = $1 AND r.is_active = true

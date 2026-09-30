@@ -211,6 +211,19 @@ func (f *Facade) matchedCandidates(ctx context.Context, profile domain.TasteProf
 			// is 0 for every candidate either way, so fetching an aggregate
 			// that would only ever read 0 is not worth a 5th query.
 		}
+		if domain.HasAllergyConflict(profile, signals) {
+			// A safety exclusion, not a taste score: the guest declared this
+			// venue's cuisine as an allergy, so it must never appear in the
+			// personalized rail regardless of how well it would otherwise
+			// score (bug: a seafood-allergic guest was shown Ocean Basket).
+			// Dropped entirely here, BEFORE scoring, so it cannot even land
+			// in the fallback padding below — that pads from
+			// f.rail.GuestResolved, the SAME non-personalized
+			// editorial/popular rail every guest (including an anonymous
+			// one) already sees, so leaving IT unfiltered matches ordinary
+			// catalog/search behaviour on purpose.
+			continue
+		}
 		total, reasons := domain.ScoreTasteMatch(profile, signals)
 		if coreTasteScore(reasons) <= 0 {
 			continue
