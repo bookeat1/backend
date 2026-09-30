@@ -244,11 +244,21 @@ type freeCancelWindowResponse struct {
 	FreeCancelWindowMinutes int `json:"free_cancel_window_minutes"`
 }
 
-// preorderSettingsResponse reports the venue's pre-order policy. MinAmountMinor
-// is omitted (null) when no floor is set.
+// preorderSettingsResponse reports the venue's pre-order policy. Enabled is the
+// RAW stored value: null = inherits enabled_global (never collapsed to false).
+// MinAmountMinor is null when no floor is set.
 type preorderSettingsResponse struct {
-	Enabled        bool   `json:"enabled"`
-	MinAmountMinor *int64 `json:"min_amount_minor"`
+	Enabled                  *bool  `json:"enabled"`
+	EnabledGlobal            bool   `json:"enabled_global"`
+	PaymentsEnabledEffective bool   `json:"payments_enabled_effective"`
+	MinAmountMinor           *int64 `json:"min_amount_minor"`
+}
+
+func preorderSettingsToResponse(v uc.PreorderSettingsView) preorderSettingsResponse {
+	return preorderSettingsResponse{
+		Enabled: v.Enabled, EnabledGlobal: v.EnabledGlobal,
+		PaymentsEnabledEffective: v.PaymentsEnabledEffective, MinAmountMinor: v.MinAmountMinor,
+	}
 }
 
 // whatsAppSettingsResponse reports the venue's WhatsApp alert configuration.

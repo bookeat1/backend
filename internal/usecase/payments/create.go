@@ -35,6 +35,10 @@ type CreateUseCase interface {
 	// PaymentFeeTerms returns the effective service-fee rate and acquirer
 	// minimum the checkout grosses a base amount up with for this venue.
 	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
+	// PreorderPaymentRequired reports whether the venue's pre-order is paid
+	// online: the venue's flag (restaurants.preorder_payment_required) or, when
+	// NULL, the platform default, resolved exactly as CreateForBooking does.
+	PreorderPaymentRequired(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 }
 
 // CreateInput is a checkout request.

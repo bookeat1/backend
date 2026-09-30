@@ -698,6 +698,17 @@ type fakeVenuePayments struct {
 	accepts map[uuid.UUID]bool
 	err     error
 	asked   []uuid.UUID
+	// preorder is the per-venue effective pre-order payment flag; preorderErr
+	// makes only that lookup fail.
+	preorder    map[uuid.UUID]bool
+	preorderErr error
+}
+
+func (f *fakeVenuePayments) PreorderPaymentRequired(_ context.Context, restaurantID uuid.UUID) (bool, error) {
+	if f.preorderErr != nil {
+		return false, f.preorderErr
+	}
+	return f.preorder[restaurantID], nil
 }
 
 func (f *fakeVenuePayments) AcceptsOnlinePayment(_ context.Context, restaurantID uuid.UUID) (bool, error) {
@@ -756,6 +767,59 @@ func TestDetailReportsWhetherTheVenueTakesOnlinePayment(t *testing.T) {
 		if got := *agg.VenueState.AcceptsOnlinePayment; got != accepts {
 			t.Fatalf("accepts_online_payment = %v, want %v", got, accepts)
 		}
+	}
+}
+
+// TestDetailReportsPreorderPaymentRequired: the effective pre-order payment flag
+// is published on the detail read for both values, and stays independent of
+// whether the venue takes online payment at all.
+func TestDetailReportsPreorderPaymentRequired(t *testing.T) {
+	for _, required := range []bool{true, false} {
+		for _, accepts := range []bool{true, false} {
+			id := uuid.New()
+			pay := &fakeVenuePayments{
+				accepts:  map[uuid.UUID]bool{id: accepts},
+				preorder: map[uuid.UUID]bool{id: required},
+			}
+			agg, err := newPaymentFlagFacade(t, id, pay).Get(context.Background(), id)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			got := agg.VenueState.PreorderPaymentRequired
+			if got == nil || *got != required {
+				t.Fatalf("required=%v accepts=%v: preorder_payment_required = %v", required, accepts, got)
+			}
+		}
+	}
+}
+
+// TestPreorderPaymentRequiredAbsentWhenLookupFails: a failed read leaves the field
+// absent (not false) and does not take the rest of the payment block with it.
+func TestPreorderPaymentRequiredAbsentWhenLookupFails(t *testing.T) {
+	id := uuid.New()
+	pay := &fakeVenuePayments{accepts: map[uuid.UUID]bool{id: true}, preorderErr: errors.New("db down")}
+	agg, err := newPaymentFlagFacade(t, id, pay).Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get must still succeed: %v", err)
+	}
+	if agg.VenueState.PreorderPaymentRequired != nil {
+		t.Fatalf("preorder_payment_required = %v, want absent", *agg.VenueState.PreorderPaymentRequired)
+	}
+	if agg.VenueState.AcceptsOnlinePayment == nil || !*agg.VenueState.AcceptsOnlinePayment {
+		t.Fatal("accepts_online_payment was lost along with the failed preorder lookup")
+	}
+}
+
+// TestListingDoesNotComputePreorderPaymentRequired: catalog rows never carry it.
+func TestListingDoesNotComputePreorderPaymentRequired(t *testing.T) {
+	id := uuid.New()
+	pay := &fakeVenuePayments{accepts: map[uuid.UUID]bool{id: true}, preorder: map[uuid.UUID]bool{id: true}}
+	items, _, err := newPaymentFlagFacade(t, id, pay).List(context.Background(), domain.RestaurantFilter{}, domain.VenueStateFilter{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if items[0].VenueState.PreorderPaymentRequired != nil {
+		t.Fatal("listing must not publish preorder_payment_required")
 	}
 }
 

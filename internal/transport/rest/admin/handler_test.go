@@ -472,8 +472,8 @@ func (fakePaySettings) UpdateFreeCancelWindow(_ context.Context, _ uuid.UUID, _ 
 	return nil
 }
 
-func (fakePaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, _ bool, _ *int64) error {
-	return nil
+func (fakePaySettings) UpdatePreorderSettings(_ context.Context, _ uuid.UUID, _ domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error) {
+	return domain.PreorderSettingsChange{}, nil
 }
 
 func (fakePaySettings) UpdatePaymentMethods(_ context.Context, _ uuid.UUID, _ *bool, _, _ bool) error {

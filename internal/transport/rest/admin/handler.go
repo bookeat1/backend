@@ -146,8 +146,9 @@ func (h *Handler) setFreeCancelWindow(c *gin.Context) {
 	response.OK(c.Writer, freeCancelWindowResponse{FreeCancelWindowMinutes: *req.FreeCancelWindowMinutes})
 }
 
-// getPreorderSettings returns the venue's current pre-order policy. owner/manager
-// (restaurant.manage), enforced in the usecase.
+// getPreorderSettings returns the venue's current pre-order policy (raw enabled
+// value, so inherit is distinguishable from off). owner/manager
+// (restaurant.manage) or superadmin, enforced in the usecase.
 func (h *Handler) getPreorderSettings(c *gin.Context) {
 	actor, rid, ok := actorAndRID(c)
 	if !ok {
@@ -158,12 +159,13 @@ func (h *Handler) getPreorderSettings(c *gin.Context) {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, preorderSettingsResponse{Enabled: v.Enabled, MinAmountMinor: v.MinAmountMinor})
+	response.OK(c.Writer, preorderSettingsToResponse(v))
 }
 
 // setPreorderSettings updates the venue's pre-order policy: whether it requires
-// pre-payment for pre-ordered dishes and its optional minimum. owner/manager
-// (restaurant.manage), enforced in the usecase.
+// pre-payment for pre-ordered dishes (inherit / required / not required) and its
+// optional minimum. SUPERADMIN ONLY (enforced in the usecase); an absent JSON key
+// keeps the stored value.
 func (h *Handler) setPreorderSettings(c *gin.Context) {
 	actor, rid, ok := actorAndRID(c)
 	if !ok {
@@ -174,12 +176,12 @@ func (h *Handler) setPreorderSettings(c *gin.Context) {
 		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	in := uc.PreorderSettingsInput{Enabled: req.Enabled, MinAmountMinor: req.MinAmountMinor}
-	if err := h.panel.SetPreorderSettings(c.Request.Context(), actor, rid, in); err != nil {
+	v, err := h.panel.SetPreorderSettings(c.Request.Context(), actor, rid, req.toInput())
+	if err != nil {
 		response.HandleError(c.Writer, err)
 		return
 	}
-	response.OK(c.Writer, preorderSettingsResponse{Enabled: req.Enabled, MinAmountMinor: req.MinAmountMinor})
+	response.OK(c.Writer, preorderSettingsToResponse(v))
 }
 
 // ---- Payment settings (acquirer account) -----------------------------------

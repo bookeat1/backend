@@ -1,8 +1,11 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -230,14 +233,15 @@ func (f *fakeTelegramSettings) ClearWhatsAppPhone(_ context.Context, restaurantI
 
 // fakePaymentSettings records the last free-cancel-window / preorder write.
 type fakePaymentSettings struct {
-	lastRestaurant  uuid.UUID
-	lastMinutes     int
-	calls           int
-	err             error
-	preorderCalls   int
-	lastPreorderReq bool
-	lastPreorderMin *int64
-	override        domain.PaymentSettingsOverride
+	lastRestaurant uuid.UUID
+	lastMinutes    int
+	calls          int
+	err            error
+	preorderCalls  int
+	lastPatch      domain.PreorderSettingsPatch
+	// readErrAfterWrite, when set, becomes f.err right after a preorder write.
+	readErrAfterWrite error
+	override          domain.PaymentSettingsOverride
 }
 
 func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaurantID uuid.UUID, minutes int) error {
@@ -250,15 +254,31 @@ func (f *fakePaymentSettings) UpdateFreeCancelWindow(_ context.Context, restaura
 	return nil
 }
 
-func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaurantID uuid.UUID, required bool, minMinor *int64) error {
+// UpdatePreorderSettings applies the patch to the fake's stored override with the
+// same semantics as the Postgres repository: only Set fields are written, and the
+// before/after are captured by the write itself. readErrAfterWrite makes every
+// later GetPaymentOverride fail (a failed re-read after a committed write).
+func (f *fakePaymentSettings) UpdatePreorderSettings(_ context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) (domain.PreorderSettingsChange, error) {
 	if f.err != nil {
-		return f.err
+		return domain.PreorderSettingsChange{}, f.err
 	}
 	f.preorderCalls++
 	f.lastRestaurant = restaurantID
-	f.lastPreorderReq = required
-	f.lastPreorderMin = minMinor
-	return nil
+	f.lastPatch = p
+	c := domain.PreorderSettingsChange{
+		OldEnabled: f.override.PreorderPaymentRequired, OldMinAmountMinor: f.override.PreorderMinAmountMinor,
+	}
+	if p.EnabledSet {
+		f.override.PreorderPaymentRequired = p.Enabled
+	}
+	if p.MinAmountSet {
+		f.override.PreorderMinAmountMinor = p.MinAmountMinor
+	}
+	c.NewEnabled, c.NewMinAmountMinor = f.override.PreorderPaymentRequired, f.override.PreorderMinAmountMinor
+	if f.readErrAfterWrite != nil {
+		f.err = f.readErrAfterWrite
+	}
+	return c, nil
 }
 
 func (f *fakePaymentSettings) UpdatePaymentMethods(_ context.Context, _ uuid.UUID, pe *bool, kaspi, card bool) error {
@@ -694,65 +714,256 @@ func TestCrossTenantCannotSetPaidSpecialDay(t *testing.T) {
 	}
 }
 
-func TestSetPreorderSettings(t *testing.T) {
+func adminActor() Actor { return Actor{UserID: uuid.New(), Role: domain.RoleAdmin} }
+
+func boolPtr(b bool) *bool { return &b }
+
+// The pre-order flag is SUPERADMIN ONLY: an owner or a manager, who both hold
+// restaurant.manage, are refused and nothing is written.
+func TestSetPreorderSettings_OnlySuperadmin(t *testing.T) {
 	uid, rid := uuid.New(), uuid.New()
 	ctx := context.Background()
+	for name, role := range map[string]domain.StaffRole{
+		"owner": domain.StaffRoleOwner, "manager": domain.StaffRoleManager, "hostess": domain.StaffRoleHostess,
+	} {
+		h := newHarness(grantAll(uid, rid, role))
+		_, err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid,
+			PreorderSettingsInput{EnabledSet: true, Enabled: boolPtr(true)})
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Errorf("%s: got %v, want ErrForbidden", name, err)
+		}
+		if h.paySet.preorderCalls != 0 {
+			t.Errorf("%s: writer reached despite forbidden actor", name)
+		}
+	}
+	// No authenticated actor at all.
+	h := newHarness(nil)
+	if _, err := h.uc.SetPreorderSettings(ctx, Actor{Role: domain.RoleAdmin}, rid, PreorderSettingsInput{}); !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("nil actor: got %v, want ErrUnauthorized", err)
+	}
+}
 
-	// Manager holds restaurant.manage → allowed, delegated with the values.
-	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+// All three states are reachable from each other, and the raw value is echoed.
+func TestSetPreorderSettings_ThreeStates(t *testing.T) {
+	rid := uuid.New()
+	ctx := context.Background()
+	h := newHarness(nil)
+	admin := adminActor()
+
+	for _, want := range []*bool{boolPtr(true), nil, boolPtr(false), nil, boolPtr(true), boolPtr(false)} {
+		v, err := h.uc.SetPreorderSettings(ctx, admin, rid, PreorderSettingsInput{EnabledSet: true, Enabled: want})
+		if err != nil {
+			t.Fatalf("set %v: %v", want, err)
+		}
+		switch {
+		case want == nil && v.Enabled != nil:
+			t.Fatalf("set null: view.Enabled = %v, want nil (inherit)", *v.Enabled)
+		case want != nil && (v.Enabled == nil || *v.Enabled != *want):
+			t.Fatalf("set %v: view.Enabled = %v", *want, v.Enabled)
+		}
+		if got := h.paySet.override.PreorderPaymentRequired; (got == nil) != (want == nil) || (got != nil && *got != *want) {
+			t.Fatalf("stored = %v, want %v", got, want)
+		}
+	}
+}
+
+// Changing one field must not touch the other: an omitted min_amount_minor keeps
+// the stored minimum, an omitted enabled keeps the stored flag, explicit null
+// clears the minimum.
+func TestSetPreorderSettings_OmittedFieldIsKept(t *testing.T) {
+	rid := uuid.New()
+	ctx := context.Background()
+	h := newHarness(nil)
 	min := int64(500000)
-	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &min}); err != nil {
-		t.Fatalf("manager SetPreorderSettings: %v", err)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(false), PreorderMinAmountMinor: &min}
+	admin := adminActor()
+
+	// Only the switch: the minimum survives.
+	v, err := h.uc.SetPreorderSettings(ctx, admin, rid, PreorderSettingsInput{EnabledSet: true, Enabled: boolPtr(true)})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if h.paySet.preorderCalls != 1 || !h.paySet.lastPreorderReq ||
-		h.paySet.lastPreorderMin == nil || *h.paySet.lastPreorderMin != 500000 || h.paySet.lastRestaurant != rid {
-		t.Fatalf("writer got calls=%d required=%v min=%v restaurant=%s",
-			h.paySet.preorderCalls, h.paySet.lastPreorderReq, h.paySet.lastPreorderMin, h.paySet.lastRestaurant)
+	if v.MinAmountMinor == nil || *v.MinAmountMinor != 500000 {
+		t.Fatalf("min after switch-only write = %v, want 500000 kept", v.MinAmountMinor)
+	}
+	if h.paySet.lastPatch.MinAmountSet {
+		t.Fatal("patch marked the minimum as set although it was omitted")
 	}
 
-	// A negative / absurd minimum is rejected BEFORE the writer is touched.
-	neg := int64(-1)
-	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &neg}); !errors.Is(err, domain.ErrValidation) {
-		t.Fatalf("negative minimum: got %v, want ErrValidation", err)
+	// Only the minimum: the flag survives (true).
+	newMin := int64(100)
+	v, err = h.uc.SetPreorderSettings(ctx, admin, rid, PreorderSettingsInput{MinAmountSet: true, MinAmountMinor: &newMin})
+	if err != nil {
+		t.Fatal(err)
 	}
-	big := maxPreorderMinAmountMinor + 1
-	if err := h.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true, MinAmountMinor: &big}); !errors.Is(err, domain.ErrValidation) {
-		t.Fatalf("too-large minimum: got %v, want ErrValidation", err)
-	}
-	if h.paySet.preorderCalls != 1 {
-		t.Fatalf("writer called %d times, want it untouched by the rejected values", h.paySet.preorderCalls)
+	if v.Enabled == nil || !*v.Enabled || v.MinAmountMinor == nil || *v.MinAmountMinor != 100 {
+		t.Fatalf("view = %+v, want enabled kept true and min 100", v)
 	}
 
-	// A hostess (no restaurant.manage) is forbidden.
-	hh := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
-	if err := hh.uc.SetPreorderSettings(ctx, staffActor(uid), rid, PreorderSettingsInput{Enabled: true}); !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("hostess SetPreorderSettings: got %v, want ErrForbidden", err)
+	// Explicit null clears the minimum.
+	v, err = h.uc.SetPreorderSettings(ctx, admin, rid, PreorderSettingsInput{MinAmountSet: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if hh.paySet.preorderCalls != 0 {
-		t.Fatalf("writer reached despite forbidden actor")
+	if v.MinAmountMinor != nil {
+		t.Fatalf("min after explicit null = %v, want nil", *v.MinAmountMinor)
+	}
+}
+
+func TestSetPreorderSettings_RejectsBadMinimum(t *testing.T) {
+	rid := uuid.New()
+	ctx := context.Background()
+	h := newHarness(nil)
+	for name, n := range map[string]int64{"negative": -1, "too large": maxPreorderMinAmountMinor + 1} {
+		n := n
+		_, err := h.uc.SetPreorderSettings(ctx, adminActor(), rid, PreorderSettingsInput{MinAmountSet: true, MinAmountMinor: &n})
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Errorf("%s minimum: got %v, want ErrValidation", name, err)
+		}
+	}
+	// The bounds themselves are accepted.
+	for _, n := range []int64{0, maxPreorderMinAmountMinor} {
+		n := n
+		if _, err := h.uc.SetPreorderSettings(ctx, adminActor(), rid, PreorderSettingsInput{MinAmountSet: true, MinAmountMinor: &n}); err != nil {
+			t.Errorf("bound %d: %v", n, err)
+		}
+	}
+	if h.paySet.preorderCalls != 2 {
+		t.Fatalf("writer called %d times, want 2 (only the two valid bounds)", h.paySet.preorderCalls)
+	}
+}
+
+// One audit line per successful write, none for a refused one.
+func TestSetPreorderSettings_AuditLog(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	rid := uuid.New()
+	ctx := context.Background()
+	h := newHarness(nil)
+	min := int64(700)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderMinAmountMinor: &min} // enabled = NULL
+	admin := adminActor()
+
+	if _, err := h.uc.SetPreorderSettings(ctx, admin, rid, PreorderSettingsInput{EnabledSet: true, Enabled: boolPtr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "preorder settings updated"); n != 1 {
+		t.Fatalf("audit lines = %d, want 1:\n%s", n, out)
+	}
+	for _, want := range []string{
+		"actor_id=" + admin.UserID.String(), "restaurant_id=" + rid.String(),
+		"old_enabled=null", "new_enabled=true", "old_min_amount_minor=700", "new_min_amount_minor=700",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("audit line missing %q:\n%s", want, out)
+		}
+	}
+
+	buf.Reset()
+	_, _ = h.uc.SetPreorderSettings(ctx, staffActor(uuid.New()), rid, PreorderSettingsInput{EnabledSet: true})
+	if buf.Len() != 0 {
+		t.Fatalf("refused write was logged as an update:\n%s", buf.String())
+	}
+}
+
+// A failed re-read after a committed write must neither hide the write from the
+// audit log nor change what the line says: the line carries the before/after the
+// write itself captured.
+func TestSetPreorderSettings_AuditSurvivesFailedReread(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	rid := uuid.New()
+	h := newHarness(nil)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(false)}
+	h.paySet.readErrAfterWrite = errors.New("db down")
+
+	_, err := h.uc.SetPreorderSettings(context.Background(), adminActor(), rid,
+		PreorderSettingsInput{EnabledSet: true, Enabled: boolPtr(true)})
+	if err == nil {
+		t.Fatal("re-read failed but SetPreorderSettings reported success")
+	}
+	out := buf.String()
+	if strings.Count(out, "preorder settings updated") != 1 ||
+		!strings.Contains(out, "old_enabled=false") || !strings.Contains(out, "new_enabled=true") {
+		t.Fatalf("write not audited correctly after a failed re-read:\n%s", out)
+	}
+}
+
+// {} and null (nothing Set) are a no-op: no UPDATE, no audit line, and the
+// current state comes back.
+func TestSetPreorderSettings_EmptyInputIsNoop(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	h := newHarness(nil)
+	min := int64(500)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(true), PreorderMinAmountMinor: &min}
+	v, err := h.uc.SetPreorderSettings(context.Background(), adminActor(), uuid.New(), PreorderSettingsInput{})
+	if err != nil {
+		t.Fatalf("no-op: %v", err)
+	}
+	if h.paySet.preorderCalls != 0 {
+		t.Fatalf("no-op reached the writer %d times", h.paySet.preorderCalls)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no-op produced a log line:\n%s", buf.String())
+	}
+	if v.Enabled == nil || !*v.Enabled || v.MinAmountMinor == nil || *v.MinAmountMinor != 500 {
+		t.Fatalf("no-op view = %+v, want the current state", v)
 	}
 }
 
 func TestGetPreorderSettings(t *testing.T) {
 	uid, rid := uuid.New(), uuid.New()
 	ctx := context.Background()
-
-	enabled := true
 	min := int64(300000)
-	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
-	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: &enabled, PreorderMinAmountMinor: &min}
 
+	// NULL in the column is reported as nil (inherit), NOT collapsed to false;
+	// the global default and the effective payments switch come along.
+	h := newHarness(grantAll(uid, rid, domain.StaffRoleManager))
+	WithPreorderPaymentGlobalRequired(true)(h.uc)
+	WithPaymentsGlobalEnabled(true)(h.uc)
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderMinAmountMinor: &min}
 	v, err := h.uc.GetPreorderSettings(ctx, staffActor(uid), rid)
 	if err != nil {
 		t.Fatalf("GetPreorderSettings: %v", err)
 	}
-	if !v.Enabled || v.MinAmountMinor == nil || *v.MinAmountMinor != 300000 {
-		t.Fatalf("view = %+v, want enabled + min 300000", v)
+	if v.Enabled != nil {
+		t.Fatalf("Enabled = %v, want nil for a NULL column", *v.Enabled)
+	}
+	if !v.EnabledGlobal || !v.PaymentsEnabledEffective || v.MinAmountMinor == nil || *v.MinAmountMinor != 300000 {
+		t.Fatalf("view = %+v, want global on, payments effective on, min 300000", v)
 	}
 
-	// Cross-tenant / non-staff is forbidden (no grant here).
-	hh := newHarness(nil)
+	// An explicit false stays false; a venue payments override beats the global.
+	h.paySet.override = domain.PaymentSettingsOverride{PreorderPaymentRequired: boolPtr(false), PaymentsEnabled: boolPtr(false)}
+	v, err = h.uc.GetPreorderSettings(ctx, staffActor(uid), rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Enabled == nil || *v.Enabled || v.PaymentsEnabledEffective {
+		t.Fatalf("view = %+v, want explicit false and payments effectively off", v)
+	}
+
+	// Superadmin reads any venue; a hostess and non-staff are refused.
+	if _, err := h.uc.GetPreorderSettings(ctx, adminActor(), rid); err != nil {
+		t.Fatalf("superadmin GET: %v", err)
+	}
+	hh := newHarness(grantAll(uid, rid, domain.StaffRoleHostess))
 	if _, err := hh.uc.GetPreorderSettings(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("hostess GetPreorderSettings: got %v, want ErrForbidden", err)
+	}
+	hn := newHarness(nil)
+	if _, err := hn.uc.GetPreorderSettings(ctx, staffActor(uid), rid); !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("non-staff GetPreorderSettings: got %v, want ErrForbidden", err)
 	}
 }
