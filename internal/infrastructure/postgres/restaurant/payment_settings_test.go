@@ -107,7 +107,8 @@ func TestUpdatePreorderSettings(t *testing.T) {
 
 	// Enable pre-order with a minimum; the reader must see both.
 	min := int64(500000)
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, true, &min); err != nil {
+	yes, no := true, false
+	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes, MinAmountSet: true, MinAmountMinor: &min}); err != nil {
 		t.Fatalf("update preorder settings: %v", err)
 	}
 	o, err := repo.GetPaymentOverride(ctx, m.ID)
@@ -121,16 +122,41 @@ func TestUpdatePreorderSettings(t *testing.T) {
 		t.Errorf("preorder_min_amount_minor = %v, want 500000", o.PreorderMinAmountMinor)
 	}
 
-	// Disable and clear the minimum (nil).
-	if err := repo.UpdatePreorderSettings(ctx, m.ID, false, nil); err != nil {
+	// A patch that omits the minimum keeps it (switch-only write), and a patch
+	// that omits the flag keeps the flag.
+	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &no}); err != nil {
+		t.Fatalf("update preorder settings (switch only): %v", err)
+	}
+	o, err = repo.GetPaymentOverride(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get after switch-only: %v", err)
+	}
+	if o.PreorderPaymentRequired == nil || *o.PreorderPaymentRequired {
+		t.Errorf("preorder_payment_required = %v, want false", o.PreorderPaymentRequired)
+	}
+	if o.PreorderMinAmountMinor == nil || *o.PreorderMinAmountMinor != 500000 {
+		t.Errorf("switch-only write changed the minimum: %v, want 500000 kept", o.PreorderMinAmountMinor)
+	}
+	newMin := int64(100)
+	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{MinAmountSet: true, MinAmountMinor: &newMin}); err != nil {
+		t.Fatalf("update preorder settings (min only): %v", err)
+	}
+	o, _ = repo.GetPaymentOverride(ctx, m.ID)
+	if o.PreorderPaymentRequired == nil || *o.PreorderPaymentRequired || o.PreorderMinAmountMinor == nil || *o.PreorderMinAmountMinor != 100 {
+		t.Errorf("min-only write: flag=%v min=%v, want false kept and 100", o.PreorderPaymentRequired, o.PreorderMinAmountMinor)
+	}
+
+	// Back to inherit: an explicit NULL flag reads back as nil, and clearing the
+	// minimum reads back as nil.
+	if err := repo.UpdatePreorderSettings(ctx, m.ID, domain.PreorderSettingsPatch{EnabledSet: true, MinAmountSet: true}); err != nil {
 		t.Fatalf("update preorder settings (clear): %v", err)
 	}
 	o, err = repo.GetPaymentOverride(ctx, m.ID)
 	if err != nil {
 		t.Fatalf("get after clear: %v", err)
 	}
-	if o.PreorderPaymentRequired == nil || *o.PreorderPaymentRequired {
-		t.Errorf("preorder_payment_required = %v, want false", o.PreorderPaymentRequired)
+	if o.PreorderPaymentRequired != nil {
+		t.Errorf("preorder_payment_required = %v, want nil (inherit)", *o.PreorderPaymentRequired)
 	}
 	if o.PreorderMinAmountMinor != nil {
 		t.Errorf("preorder_min_amount_minor = %v, want nil after clear", *o.PreorderMinAmountMinor)
@@ -142,7 +168,7 @@ func TestUpdatePreorderSettings(t *testing.T) {
 		t.Errorf("negative preorder_min_amount_minor was accepted, want CHECK violation")
 	}
 
-	if err := repo.UpdatePreorderSettings(ctx, uuid.New(), true, nil); err != domain.ErrNotFound {
+	if err := repo.UpdatePreorderSettings(ctx, uuid.New(), domain.PreorderSettingsPatch{EnabledSet: true, Enabled: &yes}); err != domain.ErrNotFound {
 		t.Errorf("update on missing restaurant err = %v, want ErrNotFound", err)
 	}
 }

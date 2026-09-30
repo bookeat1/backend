@@ -123,6 +123,13 @@ type restaurantResponse struct {
 	// pointer so "not computed" (absent) differs from "none" (`[]`). Detail
 	// read only, same rule as accepts_online_payment.
 	PaymentMethods *[]string `json:"payment_methods,omitempty"`
+	// PreorderPaymentRequired is the venue's effective pre-order payment flag
+	// (its own setting, else the platform default; same value the checkout
+	// uses). The app offers payment for a pre-order only when this AND
+	// accepts_online_payment are true; explicit false = the pre-order goes
+	// without online payment (asking to pay is refused with 422). Detail read
+	// only; absent = not computed, and the app must not offer payment.
+	PreorderPaymentRequired *bool `json:"preorder_payment_required,omitempty"`
 	// PaymentFee is the effective service-fee terms the payment will be
 	// grossed up with (rate in bps, acquirer minimum in minor units), so the
 	// app can show the total before a payment exists. Detail read only; absent
@@ -293,6 +300,10 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	if st.AcceptsOnlinePayment != nil {
 		pay := *st.AcceptsOnlinePayment
 		resp.AcceptsOnlinePayment = &pay
+	}
+	if st.PreorderPaymentRequired != nil {
+		req := *st.PreorderPaymentRequired
+		resp.PreorderPaymentRequired = &req
 	}
 	if st.PaymentMethods != nil {
 		ms := make([]string, 0, len(st.PaymentMethods))

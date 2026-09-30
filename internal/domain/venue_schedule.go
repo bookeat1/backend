@@ -99,6 +99,14 @@ type PublicVenueState struct {
 	// right now; the same computation as AcceptsOnlinePayment (which is true iff
 	// this is non-empty). nil = not computed, must reach the client as ABSENT.
 	PaymentMethods []PaymentMethod
+	// PreorderPaymentRequired is the venue's EFFECTIVE pre-order payment flag
+	// (its own restaurants.preorder_payment_required, else the platform default),
+	// the value the checkout resolves. Together with AcceptsOnlinePayment it
+	// tells the app whether to offer payment for a pre-order: only when BOTH are
+	// true; false means the pre-order is sent without online payment and asking
+	// for one is refused with 422 "requires no payment". nil = not computed
+	// (listing rows, failed read); must reach the client as an ABSENT field.
+	PreorderPaymentRequired *bool
 	// PaymentFee is the EFFECTIVE service-fee terms a payment for this venue
 	// would be grossed up with. nil when not computed or when the venue does
 	// not accept online payments; must reach the client as an ABSENT field.

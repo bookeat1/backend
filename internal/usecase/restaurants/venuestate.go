@@ -93,6 +93,7 @@ type venuePaymentChecker interface {
 	AcceptsOnlinePayment(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 	AvailablePaymentMethods(ctx context.Context, restaurantID uuid.UUID) ([]domain.PaymentMethod, error)
 	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
+	PreorderPaymentRequired(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 }
 
 // WithVenuePayments teaches the venue DETAIL read whether the venue can take an
@@ -243,6 +244,14 @@ func (v *VenueState) AttachOne(ctx context.Context, agg *domain.RestaurantAggreg
 func (v *VenueState) attachPayment(ctx context.Context, st *domain.PublicVenueState, restaurantID uuid.UUID) {
 	if v.payments == nil {
 		return
+	}
+	// preorder_payment_required is independent of the method lookup below: it is
+	// a plain settings read, and a failure leaves only that field absent.
+	if req, err := v.payments.PreorderPaymentRequired(ctx, restaurantID); err != nil {
+		slog.Warn("venue preorder-payment flag lookup failed, serving venue without preorder_payment_required",
+			"restaurant_id", restaurantID, "error", err)
+	} else {
+		st.PreorderPaymentRequired = &req
 	}
 	methods, err := v.payments.AvailablePaymentMethods(ctx, restaurantID)
 	if err != nil {

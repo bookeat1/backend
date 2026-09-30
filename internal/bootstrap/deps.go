@@ -676,6 +676,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// label — same paymentsCfg.Enabled resolveSettings falls back to when
 		// a venue's payments_enabled is NULL.
 		admin.WithPaymentsGlobalEnabled(paymentsCfg.Enabled),
+		// Same for the pre-order flag: what a NULL preorder_payment_required
+		// resolves to (paymentsCfg.PreorderPaymentRequired, resolveSettings' fallback).
+		admin.WithPreorderPaymentGlobalRequired(paymentsCfg.PreorderPaymentRequired),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates

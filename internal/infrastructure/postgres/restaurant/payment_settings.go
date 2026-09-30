@@ -41,19 +41,22 @@ func (r *Repository) UpdateFreeCancelWindow(ctx context.Context, restaurantID uu
 	return nil
 }
 
-// UpdatePreorderSettings sets the venue's pre-order policy: whether it requires
-// pre-payment for pre-ordered dishes (restaurants.preorder_payment_required) and
-// its optional minimum pre-order total (restaurants.preorder_min_amount_minor,
-// migration 0042; NULL clears the floor). A single atomic UPDATE. The min's
-// range (NULL or >= 0) is validated by the caller (usecase/admin) and the DB
-// CHECK, so a bad value never reaches this method silently. ErrNotFound when the
-// restaurant does not exist.
-func (r *Repository) UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, required bool, minMinor *int64) error {
+// UpdatePreorderSettings applies a partial write of the venue's pre-order
+// policy: restaurants.preorder_payment_required (NULL = inherit the global
+// default, TRUE = required, FALSE = not required) and the optional minimum
+// pre-order total restaurants.preorder_min_amount_minor (migration 0042; NULL
+// clears the floor). Only the fields marked Set in the patch are written, in a
+// single atomic UPDATE, so a caller changing one can never wipe the other. The
+// min's range (NULL or >= 0) is validated by the caller (usecase/admin) and the
+// DB CHECK. ErrNotFound when the restaurant does not exist.
+func (r *Repository) UpdatePreorderSettings(ctx context.Context, restaurantID uuid.UUID, p domain.PreorderSettingsPatch) error {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE restaurants
-		    SET preorder_payment_required=$2, preorder_min_amount_minor=$3, updated_at=now()
+		    SET preorder_payment_required = CASE WHEN $2::boolean THEN $3::boolean ELSE preorder_payment_required END,
+		        preorder_min_amount_minor = CASE WHEN $4::boolean THEN $5::bigint  ELSE preorder_min_amount_minor END,
+		        updated_at=now()
 		  WHERE id=$1`,
-		restaurantID, required, minMinor)
+		restaurantID, p.EnabledSet, p.Enabled, p.MinAmountSet, p.MinAmountMinor)
 	if err != nil {
 		return mapWrite(err, "update preorder settings")
 	}
