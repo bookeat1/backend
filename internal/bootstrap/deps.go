@@ -200,9 +200,11 @@ type Deps struct {
 	// bot token is unset, which is also when the webhook stays unmounted.
 	TelegramAnswerer telegramhook.Answerer
 	// KwaakaWebhooks is the inbox the Kwaaka status webhook writes to;
-	// KwaakaWebhookSecret is the X-Webhook-Secret value (empty = check skipped).
+	// KwaakaWebhookSecret is the X-Webhook-Secret value (empty = routes answer 404),
+	// KwaakaOrdersEnabled mirrors KWAAKA_ORDERS_ENABLED (false = routes answer 404).
 	KwaakaWebhooks      domain.KwaakaWebhookRepository
 	KwaakaWebhookSecret string
+	KwaakaOrdersEnabled bool
 	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
 	TelegramWebhookSecret string
 	// StaffBotAnswerer is the SECOND bot's own answerer. A callback query can
@@ -757,6 +759,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
 		KwaakaWebhooks:        kwaakaorder.NewWebhooks(db),
 		KwaakaWebhookSecret:   strings.TrimSpace(cfg.KwaakaOrders.WebhookSecret),
+		KwaakaOrdersEnabled:   cfg.KwaakaOrders.Enabled,
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
 		StaffBotAnswerer:      newStaffBotSender(cfg),
 		StaffBotMessenger:     newStaffBotMessenger(cfg),

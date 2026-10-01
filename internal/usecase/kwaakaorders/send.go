@@ -99,16 +99,27 @@ func (w *Worker) SendPass(ctx context.Context) error {
 
 func str(s string) *string { return &s }
 
+// sendOne drives one leased `sending` row.
+//
+// o.OutcomeUnknown on entry means "an EARLIER attempt may have reached the POS":
+// LeaseDue returns the value from before this lease, and has already written
+// true to the database (write-ahead) so that a worker killed mid-POST leaves the
+// mark behind. After a definitive outcome this method writes the entry value
+// back (a 401/429 proves nothing was created), after an uncertain one it
+// leaves/sets true.
 func (w *Worker) sendOne(ctx context.Context, o *domain.KitchenOrder) {
 	wantAttempts := o.Attempts // the lease already bumped it
 	now := w.now()
 
-	// A cancel that landed after the lease but before any request went out:
-	// nothing exists in the POS, so there is nothing to cancel.
+	// A cancel that landed before any request that could have reached the POS
+	// (no earlier attempt of uncertain outcome — NOT "this is attempt 1": an
+	// attempt answered 429/401 sent nothing either): nothing exists there, so
+	// there is nothing to cancel and nothing to send.
 	if fresh, err := w.orders.GetByID(ctx, o.ID); err == nil && fresh.Status == domain.KitchenOrderSending &&
-		fresh.CancelRequestedAt != nil && !fresh.OutcomeUnknown && wantAttempts == 1 {
-		fresh.Status, fresh.NextAttemptAt, fresh.CancelledAt = domain.KitchenOrderCancelled, nil, &now
-		w.finish(ctx, fresh, domain.KitchenOrderSending, wantAttempts, "")
+		fresh.CancelRequestedAt != nil && !o.OutcomeUnknown {
+		o.CancelRequestedAt = fresh.CancelRequestedAt
+		o.Status, o.NextAttemptAt, o.CancelledAt = domain.KitchenOrderCancelled, nil, &now
+		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "")
 		return
 	} else if err == nil && fresh.Status != domain.KitchenOrderSending {
 		return // the webhook or a sweep already moved it
@@ -133,13 +144,15 @@ func (w *Worker) sendOne(ctx context.Context, o *domain.KitchenOrder) {
 		return
 	}
 
+	earlierUnknown := o.OutcomeUnknown // before this attempt
 	res := w.pos.CreateTableOrder(ctx, o.KwaakaRestaurantID, snap)
 	now = w.now()
 	switch res.Outcome {
 	case domain.PosCreated:
 		w.markCreated(ctx, o, wantAttempts, res.PosOrderID)
 	case domain.PosRejected:
-		if !o.OutcomeUnknown {
+		if !earlierUnknown {
+			o.OutcomeUnknown = false // a definite refusal: nothing was created
 			o.Status, o.NextAttemptAt = domain.KitchenOrderFailed, nil
 			o.ErrorCode, o.LastError = str(domain.KitchenErrRejected), str(res.Message)
 			w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "failed")
@@ -150,9 +163,9 @@ func (w *Worker) sendOne(ctx context.Context, o *domain.KitchenOrder) {
 	case domain.PosAuth:
 		w.log.Error(logging.EventKwaakaOrderAuthFailed, slog.String("booking_id", o.BookingID.String()),
 			slog.String("restaurant_id", o.RestaurantID.String()))
-		w.retryLater(ctx, o, wantAttempts, res.Message, false)
+		w.retryLater(ctx, o, wantAttempts, res.Message, earlierUnknown) // nothing created by THIS attempt
 	case domain.PosRateLimit:
-		w.retryLater(ctx, o, wantAttempts, res.Message, false)
+		w.retryLater(ctx, o, wantAttempts, res.Message, earlierUnknown)
 	default: // unknown: may have been applied
 		w.retryLater(ctx, o, wantAttempts, res.Message, true)
 	}
@@ -165,6 +178,7 @@ func (w *Worker) markCreated(ctx context.Context, o *domain.KitchenOrder, wantAt
 		o.KwaakaOrderID = &posID
 	}
 	o.LastError, o.ErrorCode = nil, nil
+	o.OutcomeUnknown = false        // the POS has it: nothing left to reconcile
 	if o.CancelRequestedAt != nil { // cancel came in while sending: created → straight to cancelling
 		o.Status, o.NextAttemptAt = domain.KitchenOrderCancelling, &now
 	} else {
@@ -199,13 +213,14 @@ func (w *Worker) afterLostCAS(ctx context.Context, o *domain.KitchenOrder, err e
 }
 
 // retryLater records a retryable failure and schedules the next POST with the
-// SAME snapshot (same order_id, same table).
+// SAME snapshot (same order_id, same table). unknown is the value of
+// outcome_unknown to store (see sendOne).
 func (w *Worker) retryLater(ctx context.Context, o *domain.KitchenOrder, wantAttempts int, msg string, unknown bool) {
 	next := w.now().Add(backoff(wantAttempts))
 	o.NextAttemptAt, o.LastError = &next, &msg
-	if unknown {
-		o.OutcomeUnknown = true
-	}
+	// unknown replaces the stored write-ahead mark: true only when this or an
+	// earlier attempt may have landed.
+	o.OutcomeUnknown = unknown
 	if err := w.commit(ctx, o, domain.KitchenOrderSending, wantAttempts, ""); err != nil && !errors.Is(err, errLostCAS) {
 		w.log.Error("kwaaka order write failed", slog.String("booking_id", o.BookingID.String()), slog.String("error", err.Error()))
 	}
@@ -240,12 +255,14 @@ func (w *Worker) reconcile(ctx context.Context, o *domain.KitchenOrder, wantAtte
 		posID := got.ID
 		w.markCreated(ctx, o, wantAttempts, posID)
 	case errors.Is(err, domain.ErrNotFound):
+		o.OutcomeUnknown = false // the POS definitively has no such order
 		o.Status, o.NextAttemptAt = domain.KitchenOrderFailed, nil
 		o.ErrorCode, o.LastError = str(domain.KitchenErrRejected), str(why)
 		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "failed")
 	default:
 		msg := fmt.Sprintf("%s; could not verify in POS: %v", why, err)
 		o.Status, o.NextAttemptAt = domain.KitchenOrderFailedUnknown, nil
+		o.OutcomeUnknown = true
 		o.ErrorCode, o.LastError = str(domain.KitchenErrUnknownOutcome), &msg
 		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "failed_unknown")
 	}

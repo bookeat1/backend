@@ -7,10 +7,12 @@
 // (infrastructure/kwaaka/webhook.go).
 //
 // Authentication is a shared secret in X-Webhook-Secret (KWAAKA_WEBHOOK_SECRET).
-// An EMPTY secret skips the check (decision 24.09: Kwaaka has not agreed on a
-// secret yet) — the endpoint then trusts anything, which is acceptable only
-// because a status can at worst move a pos_state forward or raise a venue
-// alert, never touch bookings or money.
+// The endpoint exists ONLY when the kitchen-order feature is switched on
+// (KWAAKA_ORDERS_ENABLED) AND a secret is configured; otherwise both routes
+// answer a bare 404 and read/store nothing (ADR-050, same as telegramhook). An
+// empty secret never means "no auth": an open public POST that writes a bytea
+// per request into the database is a disk-fill vector, and a forged status can
+// flip a pos_state or raise a venue alert.
 package kwaakahook
 
 import (
@@ -35,14 +37,21 @@ const (
 
 // Handler serves POST /webhooks/kwaaka/{order-status,reserve-status}.
 type Handler struct {
-	inbox  domain.KwaakaWebhookRepository
-	secret string
-	log    *slog.Logger
+	inbox   domain.KwaakaWebhookRepository
+	secret  string
+	enabled bool
+	log     *slog.Logger
 }
 
-// NewHandler builds the receiver; an empty secret disables the check.
-func NewHandler(inbox domain.KwaakaWebhookRepository, secret string, log *slog.Logger) *Handler {
-	return &Handler{inbox: inbox, secret: strings.TrimSpace(secret), log: log}
+// NewHandler builds the receiver. enabled is KWAAKA_ORDERS_ENABLED; with it off
+// or with an empty secret every request is answered 404 before anything is read.
+func NewHandler(inbox domain.KwaakaWebhookRepository, secret string, enabled bool, log *slog.Logger) *Handler {
+	return &Handler{inbox: inbox, secret: strings.TrimSpace(secret), enabled: enabled, log: log}
+}
+
+// active reports whether the endpoint exists at all.
+func (h *Handler) active() bool {
+	return h.enabled && h.secret != "" && h.inbox != nil
 }
 
 // RegisterRoutes mounts both routes OUTSIDE every auth group.
@@ -53,13 +62,16 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 
 func (h *Handler) receive(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if h.secret != "" {
-			got := c.GetHeader(secretHeader)
-			if subtle.ConstantTimeCompare([]byte(got), []byte(h.secret)) != 1 {
-				h.log.Warn("kwaaka webhook rejected: bad secret", slog.String("kind", kind))
-				c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
-				return
-			}
+		if !h.active() {
+			// Indistinguishable from a route that does not exist.
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		got := c.GetHeader(secretHeader)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(h.secret)) != 1 {
+			h.log.Warn("kwaaka webhook rejected: bad secret", slog.String("kind", kind))
+			c.JSON(http.StatusUnauthorized, gin.H{"ok": false})
+			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxBody))
 		if err != nil {

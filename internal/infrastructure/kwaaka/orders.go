@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -81,7 +82,18 @@ func (o *OrderPOS) postOnce(ctx context.Context, fullURL string, body []byte) (d
 	req.Header.Set("Accept", "application/json")
 	resp, err := o.client.doer.Do(req)
 	if err != nil {
-		return domain.PosUnknown, nil, 0, "transport: " + err.Error()
+		// err (a *url.Error / *net.OpError) embeds the request URL or the dialled
+		// address: this message ends up in the venue's Telegram alert text, so only
+		// the class of failure is kept.
+		var nerr net.Error
+		switch {
+		case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()):
+			return domain.PosUnknown, nil, 0, "transport: timeout"
+		case errors.Is(err, context.Canceled):
+			return domain.PosUnknown, nil, 0, "transport: canceled"
+		default:
+			return domain.PosUnknown, nil, 0, "transport: network error"
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
@@ -197,6 +209,17 @@ func (o *OrderPOS) fetchOrders(ctx context.Context, kwaakaRestaurantID string, q
 	return out, nil
 }
 
+// GetOrder looks an order up by id and VERIFIES the id of what comes back.
+//
+// ASSUMPTION (TODO(verify) with Kwaaka): GET /orders?orderId= filters by the id
+// we sent (or Kwaaka's own id returned by POST /order). The adapter does not
+// rely on it: an order is returned only when its id matches the requested one
+// (case-insensitive). Otherwise a reconcile or a status poll would adopt a
+// stranger's order as ours.
+//   - empty list                    -> ErrNotFound (the order is definitively absent)
+//   - orders, none with a matching id -> ErrUnavailable: "cannot tell". The caller
+//     must not read this as absent (Kwaaka may be answering with ITS id for an
+//     order we created under ours), nor as present.
 func (o *OrderPOS) GetOrder(ctx context.Context, kwaakaRestaurantID, orderID string) (*domain.PosOrder, error) {
 	orders, err := o.fetchOrders(ctx, kwaakaRestaurantID, url.Values{"orderId": {orderID}})
 	if err != nil {
@@ -205,7 +228,14 @@ func (o *OrderPOS) GetOrder(ctx context.Context, kwaakaRestaurantID, orderID str
 	if len(orders) == 0 {
 		return nil, fmt.Errorf("kwaaka order %s: %w", orderID, domain.ErrNotFound)
 	}
-	return &orders[0], nil
+	want := strings.TrimSpace(orderID)
+	for i := range orders {
+		if want != "" && strings.EqualFold(strings.TrimSpace(orders[i].ID), want) {
+			return &orders[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: kwaaka order %s: %d order(s) returned, none with that id (filter not applied, or Kwaaka uses its own id)",
+		domain.ErrUnavailable, orderID, len(orders))
 }
 
 // ListOrdersByTables sends tableIds as a repeated parameter (explode: true).

@@ -1,4 +1,10 @@
 -- +goose Up
+-- REFERENCES restaurants/bookings takes SHARE ROW EXCLUSIVE on both: fail fast
+-- instead of queueing behind a long writer and stalling every booking write.
+-- SET LOCAL: scoped to the migration transaction, does not leak into the
+-- pooled session afterwards.
+SET LOCAL lock_timeout = '5s';
+
 -- Kwaaka phase 2: pre-order goes to the venue's POS as a table order.
 -- Only adds tables; nothing existing is touched. Enumerations are VARCHAR
 -- validated in domain (no CREATE TYPE ... AS ENUM).
@@ -94,6 +100,7 @@ CREATE INDEX idx_kwaaka_webhook_done ON kwaaka_webhook_events (processed_at)
     WHERE processed_at IS NOT NULL;
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 -- IRREVERSIBLE BY DATA: after the first real send do not run this in prod
 -- (it erases the order history); roll back with KWAAKA_ORDERS_ENABLED=false.
 DROP TABLE IF EXISTS kwaaka_webhook_events;

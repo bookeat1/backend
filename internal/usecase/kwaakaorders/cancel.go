@@ -35,8 +35,11 @@ func (w *Worker) CancelSweep(ctx context.Context) error {
 		switch {
 		case o.Status == domain.KitchenOrderSent:
 			o.Status, o.NextAttemptAt = domain.KitchenOrderCancelling, &now
-		case o.Status == domain.KitchenOrderSending && o.Attempts == 0:
-			// Nothing ever left for the POS.
+		case o.Status == domain.KitchenOrderSending && !o.OutcomeUnknown:
+			// No attempt that could have reached the POS: either none was made yet
+			// or every one was answered 401/429. LeaseDue writes outcome_unknown=true
+			// (and bumps attempts) before an attempt starts, so a row leased right
+			// now fails the CAS below instead of racing a POST in flight.
 			o.Status, o.NextAttemptAt, o.CancelledAt = domain.KitchenOrderCancelled, nil, &now
 		default:
 			// sending with attempts: the send outcome will route "created" to cancelling.

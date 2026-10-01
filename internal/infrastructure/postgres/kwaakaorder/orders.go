@@ -1,6 +1,6 @@
 // Package kwaakaorder is the Postgres implementation of the Kwaaka phase 2
 // repositories: kitchen orders, per-venue order settings and the webhook inbox
-// (migration 0118).
+// (migration 0120).
 package kwaakaorder
 
 import (
@@ -30,16 +30,19 @@ const orderCols = `id, booking_id, restaurant_id, kwaaka_restaurant_id, kwaaka_t
 	next_attempt_at, last_error, error_code, sent_at, cancel_requested_at, cancelled_at, cancel_reason,
 	pos_status_raw, pos_state, pos_status_at, pos_status_source, created_at, updated_at`
 
-func scanOrder(row pgx.Row) (*domain.KitchenOrder, error) {
+func scanOrder(row pgx.Row) (*domain.KitchenOrder, error) { return scanOrderExtra(row) }
+
+// scanOrderExtra scans the orderCols columns followed by extra destinations.
+func scanOrderExtra(row pgx.Row, extra ...any) (*domain.KitchenOrder, error) {
 	var o domain.KitchenOrder
 	var status, trigger string
 	var posState *string
-	err := row.Scan(&o.ID, &o.BookingID, &o.RestaurantID, &o.KwaakaRestaurantID, &o.KwaakaTableID, &o.TableShared,
+	dest := []any{&o.ID, &o.BookingID, &o.RestaurantID, &o.KwaakaRestaurantID, &o.KwaakaTableID, &o.TableShared,
 		&o.KwaakaOrderID, &status, &trigger, &o.Paid, &o.PaidAmountMinor, &o.TotalMinor, &o.Partial, &o.RequestSnapshot,
 		&o.BookingStartsAt, &o.DeadlineAt, &o.TableHoldUntil, &o.TableReleasedAt, &o.Attempts, &o.OutcomeUnknown,
 		&o.NextAttemptAt, &o.LastError, &o.ErrorCode, &o.SentAt, &o.CancelRequestedAt, &o.CancelledAt, &o.CancelReason,
-		&o.PosStatusRaw, &posState, &o.PosStatusAt, &o.PosStatusSource, &o.CreatedAt, &o.UpdatedAt)
-	if err != nil {
+		&o.PosStatusRaw, &posState, &o.PosStatusAt, &o.PosStatusSource, &o.CreatedAt, &o.UpdatedAt}
+	if err := row.Scan(append(dest, extra...)...); err != nil {
 		return nil, err
 	}
 	o.Status = domain.KitchenOrderStatus(status)
@@ -217,18 +220,45 @@ func (r *Orders) claimSubject(ctx context.Context, bookingID uuid.UUID, lock str
 	return &s, nil
 }
 
+// LeaseDue leases due rows and WRITES AHEAD that a send attempt is in flight:
+// for a `sending` row the stored outcome_unknown becomes true in the same
+// statement that bumps attempts, i.e. BEFORE any POST goes out. If the worker
+// dies mid-POST (deploy SIGTERM, OOM), the next lease sees outcome_unknown=true
+// and reconciles instead of treating a possible duplicate as a fresh create.
+//
+// The returned OutcomeUnknown is the value BEFORE this lease ("is an earlier
+// attempt's outcome unknown"), not the write-ahead value; the sender writes it
+// back via CompareAndSet after a definitive outcome (created, rejected, 401/429
+// = certainly nothing created) and leaves it true only after an uncertain one.
+// `cancelling` rows are not touched: a repeated cancel is naturally safe.
 func (r *Orders) LeaseDue(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]domain.KitchenOrder, error) {
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
-		`UPDATE kwaaka_kitchen_orders SET attempts = attempts + 1, next_attempt_at = $2, updated_at = now()
-		  WHERE id IN (SELECT id FROM kwaaka_kitchen_orders
-		                WHERE status IN ('sending','cancelling') AND next_attempt_at <= $1
-		                ORDER BY next_attempt_at
-		                LIMIT $3 FOR UPDATE SKIP LOCKED)
-		  RETURNING `+orderCols, now, now.Add(lease), limit)
+		`WITH due AS (
+		     SELECT id, outcome_unknown AS prev_unknown FROM kwaaka_kitchen_orders
+		      WHERE status IN ('sending','cancelling') AND next_attempt_at <= $1
+		      ORDER BY next_attempt_at
+		      LIMIT $3 FOR UPDATE SKIP LOCKED)
+		 UPDATE kwaaka_kitchen_orders k
+		    SET attempts = k.attempts + 1, next_attempt_at = $2,
+		        outcome_unknown = (k.outcome_unknown OR k.status = 'sending'),
+		        updated_at = now()
+		   FROM due WHERE k.id = due.id
+		RETURNING `+prefixed("k")+`, due.prev_unknown`, now, now.Add(lease), limit)
 	if err != nil {
 		return nil, fmt.Errorf("lease kitchen orders: %w", err)
 	}
-	return r.collect(rows)
+	defer rows.Close()
+	var out []domain.KitchenOrder
+	for rows.Next() {
+		var prev bool
+		o, err := scanOrderExtra(rows, &prev)
+		if err != nil {
+			return nil, err
+		}
+		o.OutcomeUnknown = prev
+		out = append(out, *o)
+	}
+	return out, rows.Err()
 }
 
 func (r *Orders) CompareAndSet(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, wantAttempts int) (bool, error) {

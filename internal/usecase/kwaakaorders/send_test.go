@@ -298,3 +298,150 @@ func TestAlertPayloadCarriesRestaurantID(t *testing.T) {
 		t.Fatalf("%v", p)
 	}
 }
+
+// leaseAndSend runs one worker cycle the way SendPass does: lease, then drive.
+func leaseAndSend(t *testing.T, w *Worker, fo *fakeOrders, now time.Time) {
+	t.Helper()
+	rows, err := fo.LeaseDue(context.Background(), now, time.Minute, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range rows {
+		o := rows[i]
+		w.sendOne(context.Background(), &o)
+	}
+}
+
+// Review finding 4: the worker dies after the POST reached Kwaaka but before the
+// outcome was stored. The restart must NOT treat attempt 2 as a fresh create:
+// a 400 "duplicate" must reconcile via GET, not become a false failed + manual entry.
+func TestRestartAfterUncertainPostReconcilesInsteadOfFailing(t *testing.T) {
+	row := sendingRow(0)
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosRejected, Message: "HTTP 400: duplicate order_id"}},
+		getOrder: &domain.PosOrder{ID: "K-existing"}}
+	ob := &fakeOutbox{}
+	w := newTestWorker(fo, fakeSettings{}, pos, ob, t0)
+
+	// attempt 1: leased (write-ahead lands), POST goes out, process dies: nothing else is stored.
+	rows, _ := fo.LeaseDue(context.Background(), t0, time.Minute, 20)
+	if len(rows) != 1 || rows[0].OutcomeUnknown {
+		t.Fatalf("first lease: %+v", rows)
+	}
+	if !fo.row.OutcomeUnknown || fo.row.Attempts != 1 {
+		t.Fatalf("write-ahead missing: unknown=%v attempts=%d", fo.row.OutcomeUnknown, fo.row.Attempts)
+	}
+	// restart: lease expired, attempt 2.
+	leaseAndSend(t, w, fo, t0.Add(2*time.Minute))
+	if fo.row.Status != domain.KitchenOrderSent || pos.gets != 1 || len(ob.events) != 0 {
+		t.Fatalf("status=%s gets=%d alerts=%d, want sent/1/0", fo.row.Status, pos.gets, len(ob.events))
+	}
+	if fo.row.KwaakaOrderID == nil || *fo.row.KwaakaOrderID != "K-existing" || fo.row.OutcomeUnknown {
+		t.Fatalf("order id / flag not settled: %+v", fo.row)
+	}
+}
+
+func TestRestartAfterUncertainPostAbsentFailsWithAlert(t *testing.T) {
+	row := sendingRow(0)
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosRejected, Message: "bad"}}, getErr: domain.ErrNotFound}
+	ob := &fakeOutbox{}
+	w := newTestWorker(fo, fakeSettings{}, pos, ob, t0)
+	_, _ = fo.LeaseDue(context.Background(), t0, time.Minute, 20) // died mid-POST
+	leaseAndSend(t, w, fo, t0.Add(2*time.Minute))
+	if fo.row.Status != domain.KitchenOrderFailed || pos.gets != 1 || len(ob.events) != 1 {
+		t.Fatalf("status=%s gets=%d alerts=%d", fo.row.Status, pos.gets, len(ob.events))
+	}
+}
+
+// A first-ever 400 is still a definite refusal (no GET, failed + alert).
+func TestFirstAttemptRejectionIsDefinite(t *testing.T) {
+	row := sendingRow(0)
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosRejected, Message: "bad"}}}
+	ob := &fakeOutbox{}
+	w := newTestWorker(fo, fakeSettings{}, pos, ob, t0)
+	leaseAndSend(t, w, fo, t0)
+	if fo.row.Status != domain.KitchenOrderFailed || pos.gets != 0 || len(ob.events) != 1 || fo.row.OutcomeUnknown {
+		t.Fatalf("status=%s gets=%d alerts=%d unknown=%v", fo.row.Status, pos.gets, len(ob.events), fo.row.OutcomeUnknown)
+	}
+}
+
+// 401/429 prove nothing was created: the write-ahead mark must be cleared again,
+// otherwise every later reject/cancel is judged as "maybe landed".
+func TestAuthAndRateLimitClearWriteAheadMark(t *testing.T) {
+	for _, out := range []domain.PosCallOutcome{domain.PosAuth, domain.PosRateLimit} {
+		row := sendingRow(0)
+		fo := &fakeOrders{row: row}
+		pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: out}}}
+		w := newTestWorker(fo, fakeSettings{}, pos, &fakeOutbox{}, t0)
+		leaseAndSend(t, w, fo, t0)
+		if fo.row.Status != domain.KitchenOrderSending || fo.row.OutcomeUnknown {
+			t.Fatalf("outcome %v: status=%s unknown=%v", out, fo.row.Status, fo.row.OutcomeUnknown)
+		}
+	}
+	// ...but an earlier genuinely uncertain attempt stays uncertain through a 429.
+	row := sendingRow(0)
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosUnknown}, {Outcome: domain.PosRateLimit}}}
+	w := newTestWorker(fo, fakeSettings{}, pos, &fakeOutbox{}, t0)
+	leaseAndSend(t, w, fo, t0)
+	leaseAndSend(t, w, fo, t0.Add(time.Hour))
+	if !fo.row.OutcomeUnknown {
+		t.Fatal("uncertain outcome must survive a later 429")
+	}
+}
+
+// Review finding 5: cancel before send holds on a retry after 429/401, not only on attempt 1.
+func TestCancelBeforeSendHoldsAfterRateLimitRetry(t *testing.T) {
+	row := sendingRow(0)
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosRateLimit}, {Outcome: domain.PosCreated, PosOrderID: "K"}}}
+	ob := &fakeOutbox{}
+	w := newTestWorker(fo, fakeSettings{}, pos, ob, t0)
+	leaseAndSend(t, w, fo, t0) // attempt 1: 429
+	if len(pos.creates) != 1 || fo.row.OutcomeUnknown {
+		t.Fatalf("setup: creates=%d unknown=%v", len(pos.creates), fo.row.OutcomeUnknown)
+	}
+	// the booking is cancelled while the row waits for its retry
+	if err := w.CancelSweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fo.row.Status != domain.KitchenOrderCancelled {
+		t.Fatalf("sweep must cancel directly, status=%s", fo.row.Status)
+	}
+	leaseAndSend(t, w, fo, t0.Add(time.Hour))
+	if len(pos.creates) != 1 || len(pos.cancels) != 0 {
+		t.Fatalf("a cancelled booking's order reached the kitchen: creates=%d cancels=%d", len(pos.creates), len(pos.cancels))
+	}
+	if len(ob.events) != 0 {
+		t.Fatalf("alerts: %d", len(ob.events))
+	}
+}
+
+// Same, when the cancel flag lands without a status change (the row was leased):
+// sendOne itself must refuse to POST after a 429.
+func TestSendOneCancelRequestedAfterRateLimitDoesNotPost(t *testing.T) {
+	row := sendingRow(2)
+	c := t0
+	row.CancelRequestedAt = &c
+	row.OutcomeUnknown = false // entry value: earlier attempts were 429/401
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosCreated, PosOrderID: "K"}}}
+	fo, ob := run(t, row, pos, nil)
+	if fo.row.Status != domain.KitchenOrderCancelled || len(pos.creates) != 0 || len(ob.events) != 0 {
+		t.Fatalf("status=%s creates=%d alerts=%d", fo.row.Status, len(pos.creates), len(ob.events))
+	}
+}
+
+// After an uncertain attempt the sweep must NOT cancel locally: the order may exist.
+func TestCancelSweepKeepsUncertainSendingRow(t *testing.T) {
+	row := sendingRow(2)
+	row.OutcomeUnknown = true
+	fo := &fakeOrders{row: row}
+	pos := &fakePOS{}
+	w := newTestWorker(fo, fakeSettings{}, pos, &fakeOutbox{}, t0)
+	_ = w.CancelSweep(context.Background())
+	if fo.row.Status != domain.KitchenOrderSending || fo.row.CancelRequestedAt == nil {
+		t.Fatalf("status=%s cancelReq=%v", fo.row.Status, fo.row.CancelRequestedAt)
+	}
+}

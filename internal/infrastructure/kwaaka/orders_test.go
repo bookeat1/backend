@@ -125,6 +125,12 @@ func TestCancelAndOrdersEndpoints(t *testing.T) {
 				_, _ = w.Write([]byte(`{"orders":[{"id":"o-closed","status":"weird","when_closed":"2026-09-24T12:00:00Z"}]}`))
 			case "o-none":
 				_, _ = w.Write([]byte(`{"orders":[]}`))
+			case "o-ours":
+				// the filter is ignored: foreign orders first, ours somewhere in the list
+				_, _ = w.Write([]byte(`{"orders":[{"id":"stranger","status":"closed"},{"id":"O-OURS","status":"New"}]}`))
+			case "o-foreign":
+				// the filter is ignored and ours is not there
+				_, _ = w.Write([]byte(`{"orders":[{"id":"stranger-1","status":"closed"},{"id":"stranger-2","status":"New"}]}`))
 			default:
 				w.WriteHeader(400)
 			}
@@ -153,6 +159,13 @@ func TestCancelAndOrdersEndpoints(t *testing.T) {
 	if _, err := pos.GetOrder(ctx, "rest-1", "o-none"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("empty orders must be ErrNotFound: %v", err)
 	}
+	// id is verified, never orders[0]
+	if o, err := pos.GetOrder(ctx, "rest-1", "o-ours"); err != nil || o.ID != "O-OURS" || o.State != domain.PosStateOpen {
+		t.Fatalf("must pick the order with the matching id: %+v %v", o, err)
+	}
+	if o, err := pos.GetOrder(ctx, "rest-1", "o-foreign"); err == nil || errors.Is(err, domain.ErrNotFound) || !errors.Is(err, domain.ErrUnavailable) || o != nil {
+		t.Fatalf("foreign orders only must be ErrUnavailable (cannot tell), got %+v %v", o, err)
+	}
 	if _, err := pos.GetOrder(ctx, "rest-1", "o-400"); !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("400 must be ErrUnavailable: %v", err)
 	}
@@ -168,5 +181,19 @@ func TestMapPosStatusUnknownIsUnknown(t *testing.T) {
 	}
 	if MapPosStatus(" Closed ") != domain.PosStateClosed {
 		t.Fatal("case/space insensitive")
+	}
+}
+
+func TestTransportErrorMessageDoesNotLeakURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	pos := NewOrderPOS(testClient(t, srv))
+	host := strings.TrimPrefix(srv.URL, "http://")
+	srv.Close() // connection refused
+	res := pos.CreateTableOrder(context.Background(), "rest-secret-id", snap())
+	if res.Outcome != domain.PosUnknown {
+		t.Fatalf("outcome %v", res.Outcome)
+	}
+	if strings.Contains(res.Message, host) || strings.Contains(res.Message, "rest-secret-id") || strings.Contains(res.Message, "http://") {
+		t.Fatalf("message leaks the request URL: %q", res.Message)
 	}
 }

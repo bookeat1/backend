@@ -79,8 +79,27 @@ func (f *fakeOrders) GetByPosOrderID(_ context.Context, id string) (*domain.Kitc
 func (f *fakeOrders) ListByBookingIDs(context.Context, []uuid.UUID) (map[uuid.UUID]domain.KitchenOrderView, error) {
 	return nil, nil
 }
-func (f *fakeOrders) LeaseDue(context.Context, time.Time, time.Duration, int) ([]domain.KitchenOrder, error) {
-	return nil, nil
+
+// LeaseDue mirrors the Postgres semantics: a due sending/cancelling row gets
+// attempts+1 and next_attempt_at=now+lease; a SENDING row's stored
+// outcome_unknown becomes true (write-ahead) while the returned copy carries the
+// value from BEFORE the lease.
+func (f *fakeOrders) LeaseDue(_ context.Context, now time.Time, lease time.Duration, _ int) ([]domain.KitchenOrder, error) {
+	r := f.row
+	if r == nil || (r.Status != domain.KitchenOrderSending && r.Status != domain.KitchenOrderCancelling) ||
+		r.NextAttemptAt == nil || r.NextAttemptAt.After(now) {
+		return nil, nil
+	}
+	prev := r.OutcomeUnknown
+	r.Attempts++
+	next := now.Add(lease)
+	r.NextAttemptAt = &next
+	if r.Status == domain.KitchenOrderSending {
+		r.OutcomeUnknown = true
+	}
+	c := *r
+	c.OutcomeUnknown = prev
+	return []domain.KitchenOrder{c}, nil
 }
 func (f *fakeOrders) CompareAndSet(_ context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, attempts int) (bool, error) {
 	if f.row.Status != want || f.row.Attempts != attempts {

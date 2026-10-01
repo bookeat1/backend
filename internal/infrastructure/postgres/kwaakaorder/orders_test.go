@@ -113,6 +113,78 @@ func TestLeaseDueParallelTakesEachRowOnce(t *testing.T) {
 	}
 }
 
+// LeaseDue writes ahead "an attempt is in flight" (outcome_unknown=true in the
+// DB) for a sending row, while handing the caller the value from BEFORE the
+// lease. A worker killed mid-POST therefore leaves the mark behind.
+func TestLeaseDueWritesAheadOutcomeUnknown(t *testing.T) {
+	pool := testdb.Connect(t)
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	find := func(rows []domain.KitchenOrder, id uuid.UUID) *domain.KitchenOrder {
+		for i := range rows {
+			if rows[i].ID == id {
+				return &rows[i]
+			}
+		}
+		return nil
+	}
+
+	s := seed(t, pool, time.Hour, "confirmed")
+	o := newOrder(s, "T1")
+	if _, err := repo.Insert(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	// attempt 1: caller sees "no earlier uncertainty", DB already says "in flight".
+	rows, err := repo.LeaseDue(ctx, time.Now(), time.Minute, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l1 := find(rows, o.ID)
+	if l1 == nil || l1.Attempts != 1 || l1.OutcomeUnknown {
+		t.Fatalf("first lease: %+v", l1)
+	}
+	stored, _ := repo.GetByID(ctx, o.ID)
+	if !stored.OutcomeUnknown || stored.Attempts != 1 {
+		t.Fatalf("write-ahead missing in DB: unknown=%v attempts=%d", stored.OutcomeUnknown, stored.Attempts)
+	}
+	// the worker "dies"; once the lease lapses the next attempt sees the mark.
+	rows, err = repo.LeaseDue(ctx, time.Now().Add(2*time.Minute), time.Minute, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2 := find(rows, o.ID)
+	if l2 == nil || l2.Attempts != 2 || !l2.OutcomeUnknown {
+		t.Fatalf("restart lease must carry outcome_unknown=true: %+v", l2)
+	}
+
+	// A definitive negative (401/429) written back via CAS clears the mark.
+	l2.OutcomeUnknown = false
+	next := time.Now().Add(-time.Second)
+	l2.NextAttemptAt = &next
+	if ok, err := repo.CompareAndSet(ctx, l2, domain.KitchenOrderSending, l2.Attempts); err != nil || !ok {
+		t.Fatalf("cas: %v %v", ok, err)
+	}
+	rows, _ = repo.LeaseDue(ctx, time.Now(), time.Minute, 100)
+	if l3 := find(rows, o.ID); l3 == nil || l3.OutcomeUnknown {
+		t.Fatalf("after a cleared mark the next lease must report false: %+v", l3)
+	}
+
+	// cancelling rows are not marked: a repeated cancel is safe.
+	s2 := seed(t, pool, time.Hour, "confirmed")
+	c := newOrder(s2, "T2")
+	c.Status = domain.KitchenOrderCancelling
+	if _, err := repo.Insert(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = repo.LeaseDue(ctx, time.Now(), time.Minute, 100)
+	if lc := find(rows, c.ID); lc == nil || lc.OutcomeUnknown {
+		t.Fatalf("cancelling lease: %+v", lc)
+	}
+	if st, _ := repo.GetByID(ctx, c.ID); st.OutcomeUnknown {
+		t.Fatal("cancelling row must not get the write-ahead mark")
+	}
+}
+
 func TestCompareAndSetLosesToNewerWriter(t *testing.T) {
 	pool := testdb.Connect(t)
 	repo := NewOrders(pool)

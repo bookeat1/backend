@@ -507,7 +507,7 @@ type KwaakaOrdersConfig struct {
 	Lead        time.Duration // env: KWAAKA_KITCHEN_LEAD, default 60m: how long before starts_at a paid order goes
 	MaxAttempts int           // env: KWAAKA_ORDER_MAX_ATTEMPTS
 	Tick        time.Duration // env: KWAAKA_ORDER_TICK
-	// WebhookSecret is the X-Webhook-Secret value; empty skips the check.
+	// WebhookSecret is the X-Webhook-Secret value; empty (or Enabled=false) makes the webhook routes answer 404.
 	WebhookSecret string // env: KWAAKA_WEBHOOK_SECRET
 	// StatusReconcile is the poll interval for orders whose webhook never came; 0 = off.
 	StatusReconcile time.Duration // env: KWAAKA_STATUS_RECONCILE_INTERVAL

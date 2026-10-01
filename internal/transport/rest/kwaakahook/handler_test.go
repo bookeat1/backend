@@ -54,7 +54,7 @@ func do(t *testing.T, h *Handler, path, body string, hdr map[string]string) *htt
 }
 
 func newH(secret string, in *fakeInbox) *Handler {
-	return NewHandler(in, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewHandler(in, secret, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func TestReceive(t *testing.T) {
@@ -90,20 +90,51 @@ func TestReceiveAuth(t *testing.T) {
 	if len(in.rows) != 0 {
 		t.Fatal("unauthenticated body stored")
 	}
-	// empty configured secret = check skipped
-	if w := do(t, newH("", in), "/webhooks/kwaaka/order-status", `{"orderId":"a","status":"b"}`, nil); w.Code != 200 {
-		t.Fatal(w.Code)
+}
+
+// An empty secret must NEVER disable auth: the routes answer 404 and the
+// anonymous POST writes nothing (ADR-050).
+func TestEmptySecretIs404AndWritesNothing(t *testing.T) {
+	in := &fakeInbox{rows: map[string]domain.KwaakaWebhookEvent{}}
+	for _, secret := range []string{"", "   "} {
+		h := newH(secret, in)
+		for _, path := range []string{"/webhooks/kwaaka/order-status", "/webhooks/kwaaka/reserve-status"} {
+			// anonymous, and also with a header guess (empty secret must not match "")
+			for _, hdr := range []map[string]string{nil, {secretHeader: ""}, {secretHeader: "x"}} {
+				if w := do(t, h, path, `{"orderId":"a","status":"b"}`, hdr); w.Code != 404 {
+					t.Fatalf("secret=%q %s hdr=%v: got %d, want 404", secret, path, hdr, w.Code)
+				}
+			}
+		}
+	}
+	if len(in.rows) != 0 {
+		t.Fatalf("anonymous POST wrote %d rows", len(in.rows))
+	}
+}
+
+// KWAAKA_ORDERS_ENABLED=false: 404 even with a correct secret, nothing stored.
+func TestFlagOffIs404AndWritesNothing(t *testing.T) {
+	in := &fakeInbox{rows: map[string]domain.KwaakaWebhookEvent{}}
+	h := NewHandler(in, "s3", false, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, hdr := range []map[string]string{nil, {secretHeader: "s3"}} {
+		if w := do(t, h, "/webhooks/kwaaka/order-status", `{"orderId":"a","status":"b"}`, hdr); w.Code != 404 {
+			t.Fatalf("hdr=%v: got %d, want 404", hdr, w.Code)
+		}
+	}
+	if len(in.rows) != 0 {
+		t.Fatal("flag-off endpoint stored a body")
 	}
 }
 
 func TestReceiveLimitsAndDBError(t *testing.T) {
 	in := &fakeInbox{rows: map[string]domain.KwaakaWebhookEvent{}}
 	big := strings.Repeat("a", maxBody+1)
-	if w := do(t, newH("", in), "/webhooks/kwaaka/order-status", big, nil); w.Code != 413 || len(in.rows) != 0 {
+	ok := map[string]string{secretHeader: "s3"}
+	if w := do(t, newH("s3", in), "/webhooks/kwaaka/order-status", big, ok); w.Code != 413 || len(in.rows) != 0 {
 		t.Fatal(w.Code)
 	}
 	in.err = errors.New("db down")
-	if w := do(t, newH("", in), "/webhooks/kwaaka/order-status", `{}`, nil); w.Code != 503 {
+	if w := do(t, newH("s3", in), "/webhooks/kwaaka/order-status", `{}`, ok); w.Code != 503 {
 		t.Fatal(w.Code)
 	}
 }
