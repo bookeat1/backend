@@ -184,6 +184,52 @@ func TestPaymentMethodsSuperadminRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPaymentMethodsSurfacesGlobalFlag guards against B1's original bug: when
+// a venue's payments_enabled is NULL (inherits the platform switch) the panel
+// still needs to tell the admin what "as on the platform" currently means.
+// Without WithPaymentsGlobalEnabled wired, PaymentsEnabledGlobal used to be
+// unreachable from the response entirely — the UI could not distinguish
+// "inherits, and the platform is ON" from "inherits, and the platform is OFF".
+func TestPaymentMethodsSurfacesGlobalFlag(t *testing.T) {
+	rid := uuid.New()
+	ctx := context.Background()
+
+	for _, global := range []bool{true, false} {
+		h, _ := newAcquirerHarness(nil)
+		WithPaymentsGlobalEnabled(global)(h.uc)
+
+		// Venue leaves payments_enabled at NULL (inherits).
+		got, err := h.uc.GetPaymentMethods(ctx, superadmin(), rid)
+		if err != nil {
+			t.Fatalf("GetPaymentMethods: %v", err)
+		}
+		if got.PaymentsEnabled != nil {
+			t.Fatalf("got PaymentsEnabled = %v, want nil (inherit) for a venue with no override", got.PaymentsEnabled)
+		}
+		if got.PaymentsEnabledGlobal != global {
+			t.Fatalf("global=%v: got PaymentsEnabledGlobal = %v, want %v", global, got.PaymentsEnabledGlobal, global)
+		}
+
+		// The global value is read-only informational metadata: it must not
+		// change what the venue's own override resolves to, and it must
+		// survive an explicit override being set (SetPaymentMethods reuses
+		// GetPaymentMethods to build its response).
+		on := true
+		got, err = h.uc.SetPaymentMethods(ctx, superadmin(), rid, PaymentMethodsInput{
+			PaymentsEnabled: &on, Methods: []domain.PaymentMethod{domain.MethodCard},
+		})
+		if err != nil {
+			t.Fatalf("SetPaymentMethods: %v", err)
+		}
+		if got.PaymentsEnabled == nil || !*got.PaymentsEnabled {
+			t.Fatalf("got PaymentsEnabled = %v, want explicit true, unaffected by the global flag", got.PaymentsEnabled)
+		}
+		if got.PaymentsEnabledGlobal != global {
+			t.Fatalf("global=%v: after SetPaymentMethods got PaymentsEnabledGlobal = %v, want %v", global, got.PaymentsEnabledGlobal, global)
+		}
+	}
+}
+
 func TestPaymentMethodsForbiddenForNonSuperadminAndRejectsUnknown(t *testing.T) {
 	h, _ := newAcquirerHarness(nil)
 	rid := uuid.New()

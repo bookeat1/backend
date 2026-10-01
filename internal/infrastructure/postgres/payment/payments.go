@@ -27,7 +27,7 @@ const paymentCols = `id, booking_id, restaurant_id, user_id, provider, provider_
 	expires_at, failure_code, failure_message,
 	settled_at, settled_trigger, settlement_idempotency_key,
 	status_changed_at, reconcile_attempts, last_reconcile_attempt_at, needs_manual_review,
-	created_at, updated_at, event_ticket_id`
+	created_at, updated_at, event_ticket_id, requires_confirmation`
 
 // liveStatuses mirrors domain.PaymentStatus.HoldsMoney and
 // idx_payments_live_per_booking exactly — keep all three in sync (the
@@ -55,7 +55,7 @@ func (r *Repository) Create(ctx context.Context, p *domain.Payment) error {
 	}
 	q := `INSERT INTO payments (` + paymentCols + `) VALUES (
 		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-		$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`
+		$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(p)...); err != nil {
 		return mapWrite(err, "create payment")
 	}
@@ -490,7 +490,7 @@ func (r *Repository) args(p *domain.Payment) []any {
 		p.ExpiresAt, p.FailureCode, p.FailureMessage,
 		p.SettledAt, triggerToDB(p.SettledTrigger), p.SettlementIdempotencyKey,
 		p.StatusChangedAt, p.ReconcileAttempts, p.LastReconcileAttemptAt, p.NeedsManualReview,
-		p.CreatedAt, p.UpdatedAt, p.EventTicketID,
+		p.CreatedAt, p.UpdatedAt, p.EventTicketID, p.RequiresConfirmation,
 	}
 }
 
@@ -529,7 +529,7 @@ func scanPayment(row scanner) (*domain.Payment, error) {
 		&p.ExpiresAt, &p.FailureCode, &p.FailureMessage,
 		&p.SettledAt, &settledTrigger, &p.SettlementIdempotencyKey,
 		&p.StatusChangedAt, &p.ReconcileAttempts, &p.LastReconcileAttemptAt, &p.NeedsManualReview,
-		&p.CreatedAt, &p.UpdatedAt, &p.EventTicketID,
+		&p.CreatedAt, &p.UpdatedAt, &p.EventTicketID, &p.RequiresConfirmation,
 	); err != nil {
 		return nil, err
 	}

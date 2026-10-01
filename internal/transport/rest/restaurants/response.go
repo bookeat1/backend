@@ -56,6 +56,12 @@ type restaurantResponse struct {
 	IsPopular    *bool               `json:"is_popular"`
 	IsPremium    *bool               `json:"is_premium"`
 	DisplayOrder *int                `json:"display_order"`
+	// LoyaltyEnabled is restaurants.loyalty_enabled (migration 0119), always
+	// present (never omitted) exactly like IsActive: the mobile app reads it
+	// on every venue card/detail to decide whether to show the loyalty QR
+	// button (frontend PR #275). Public — a guest is meant to see it, not
+	// just the cabinet.
+	LoyaltyEnabled bool `json:"loyalty_enabled"`
 	// KwaakaRestaurantID links this venue to Kwaaka's POS aggregator
 	// (restaurants.kwaaka_restaurant_id). Unlike the fields above, it is NOT
 	// filled by baseFromDomain — it is attached explicitly, only by the
@@ -117,6 +123,15 @@ type restaurantResponse struct {
 	// pointer so "not computed" (absent) differs from "none" (`[]`). Detail
 	// read only, same rule as accepts_online_payment.
 	PaymentMethods *[]string `json:"payment_methods,omitempty"`
+	// PreorderPaymentRequired is the venue's effective pre-order payment flag
+	// (its own setting, else the platform default; same value the checkout
+	// uses). The app offers payment for a pre-order only when this AND
+	// accepts_online_payment are true. false means the venue does not charge a
+	// pre-order online (the pre-order goes without payment); it does NOT say the
+	// booking owes nothing at all — a deposit or a paid special day may still be
+	// payable, and a payment request that owes neither is refused with 422. Detail
+	// read only; absent = not computed, and the app must not offer payment.
+	PreorderPaymentRequired *bool `json:"preorder_payment_required,omitempty"`
 	// PaymentFee is the effective service-fee terms the payment will be
 	// grossed up with (rate in bps, acquirer minimum in minor units), so the
 	// app can show the total before a payment exists. Detail read only; absent
@@ -287,6 +302,10 @@ func applyVenueState(resp *restaurantResponse, st *domain.PublicVenueState) {
 	if st.AcceptsOnlinePayment != nil {
 		pay := *st.AcceptsOnlinePayment
 		resp.AcceptsOnlinePayment = &pay
+	}
+	if st.PreorderPaymentRequired != nil {
+		req := *st.PreorderPaymentRequired
+		resp.PreorderPaymentRequired = &req
 	}
 	if st.PaymentMethods != nil {
 		ms := make([]string, 0, len(st.PaymentMethods))
@@ -474,7 +493,7 @@ func baseFromDomain(r domain.Restaurant, lang string) restaurantResponse {
 		PriceRange: priceRange,
 		Email:      r.Email, Phone: r.Phone, Latitude: r.Latitude, Longitude: r.Longitude,
 		IsActive: r.IsActive, IsNew: r.IsNew, IsPopular: r.IsPopular, IsPremium: r.IsPremium,
-		DisplayOrder: r.DisplayOrder, CreatedAt: r.CreatedAt,
+		DisplayOrder: r.DisplayOrder, LoyaltyEnabled: r.LoyaltyEnabled, CreatedAt: r.CreatedAt,
 	}
 }
 

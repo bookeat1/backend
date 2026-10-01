@@ -28,7 +28,8 @@ const cols = `id, restaurant_id, user_id, name, phone, email, phone_normalized,
 	cancelled_by, cancellation_reason_code, cancellation_reason,
 	late_notification_sent, user_notified_late_at, user_late_message,
 	reminder_60_sent_at, reminder_30_sent_at, original_booking_time_text,
-	promo_code_id, promo_code, attribution_source, created_at, updated_at`
+	promo_code_id, promo_code, attribution_source, created_at, updated_at,
+	released_to_venue_at`
 
 func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	now := time.Now()
@@ -38,7 +39,7 @@ func (r *Repository) Create(ctx context.Context, b *domain.Booking) error {
 	b.UpdatedAt = now
 	q := `INSERT INTO bookings (` + cols + `) VALUES
 		($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)`
+		 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)`
 	if _, err := sqltx.From(ctx, r.pool).Exec(ctx, q, r.args(b)...); err != nil {
 		return mapWrite(err, "create booking")
 	}
@@ -148,6 +149,9 @@ func (r *Repository) List(ctx context.Context, f domain.BookingFilter) ([]domain
 	}
 	if f.PromotionID != nil {
 		add("promotion_id = $%d", *f.PromotionID)
+	}
+	if f.HideUnreleased {
+		where = append(where, "released_to_venue_at IS NOT NULL")
 	}
 	if len(f.Statuses) > 0 {
 		add("status = ANY($%d)", statusStrings(f.Statuses))
@@ -262,6 +266,50 @@ func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 	return nil
 }
 
+// CompareAndSwapStatus is UpdateStatus with a precondition on the CURRENT
+// status, in one statement (never a read followed by a write). A concurrent
+// transition that already moved the row away from `from` — the confirm-SLA
+// worker cancelling it while a venue action is in flight, Telegram and the
+// cabinet answering at once — makes this affect zero rows instead of clobbering
+// that transition; classifyStatusMiss then tells "no such booking" apart from
+// "booking changed under us".
+func (r *Repository) CompareAndSwapStatus(ctx context.Context, id uuid.UUID, from, to domain.BookingStatus, at time.Time) error {
+	set := []string{"status=$2", "updated_at=$3"}
+	switch to {
+	case domain.BookingConfirmed:
+		set = append(set, "confirmed_at=$3")
+	case domain.BookingArrived:
+		set = append(set, "arrived_at=$3")
+	case domain.BookingCancelled:
+		set = append(set, "cancelled_at=$3")
+	}
+	q := `UPDATE bookings SET ` + strings.Join(set, ", ") + ` WHERE id=$1 AND status=$4`
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, id, string(to), at, string(from))
+	if err != nil {
+		return mapCapacityWrite(err, "compare-and-swap booking status")
+	}
+	if tag.RowsAffected() == 0 {
+		return r.classifyStatusMiss(ctx, id)
+	}
+	return nil
+}
+
+// classifyStatusMiss is called after a CAS-style UPDATE affected zero rows. It
+// makes exactly one extra read — after the write already failed, not before a
+// decision to write — solely to report ErrNotFound vs ErrAlreadyExists
+// accurately; it introduces no new race because no further write follows it.
+func (r *Repository) classifyStatusMiss(ctx context.Context, id uuid.UUID) error {
+	var exists bool
+	if err := sqltx.From(ctx, r.pool).QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM bookings WHERE id=$1)`, id).Scan(&exists); err != nil {
+		return fmt.Errorf("check booking existence: %w", err)
+	}
+	if !exists {
+		return domain.ErrNotFound
+	}
+	return domain.ErrAlreadyExists
+}
+
 // ClaimDue locks due bookings with FOR UPDATE SKIP LOCKED. It must run inside a
 // TxManager transaction — outside one the locks are released immediately and
 // two workers can pick up the same row.
@@ -316,7 +364,7 @@ func (r *Repository) args(b *domain.Booking) []any {
 		// (migration 0115, spec §5) for the same reason: "which channel this
 		// booking was created under" is a fact about the moment of creation.
 		b.PromoCodeID, b.PromoCode, b.AttributionSource,
-		b.CreatedAt, b.UpdatedAt,
+		b.CreatedAt, b.UpdatedAt, b.ReleasedToVenueAt,
 	}
 }
 
@@ -344,7 +392,7 @@ func scanBooking(row scanner) (*domain.Booking, error) {
 		&b.CancellationReasonCode, &b.CancellationReason, &b.LateNotificationSent,
 		&b.UserNotifiedLateAt, &b.UserLateMessage, &b.Reminder60SentAt,
 		&b.Reminder30SentAt, &b.OriginalBookingTime, &b.PromoCodeID, &b.PromoCode,
-		&b.AttributionSource, &b.CreatedAt, &b.UpdatedAt,
+		&b.AttributionSource, &b.CreatedAt, &b.UpdatedAt, &b.ReleasedToVenueAt,
 	); err != nil {
 		return nil, err
 	}
@@ -431,4 +479,34 @@ func (r *Repository) ListBookedRestaurantIDs(ctx context.Context, userID uuid.UU
 		return nil, fmt.Errorf("list booked restaurant ids: %w", err)
 	}
 	return ids, nil
+}
+
+// Release implements domain.BookingReleaseRepository.
+func (r *Repository) Release(ctx context.Context, id uuid.UUID, at time.Time) (bool, error) {
+	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
+		`UPDATE bookings SET released_to_venue_at = $2, updated_at = $2
+		 WHERE id = $1 AND status = 'pending' AND released_to_venue_at IS NULL`, id, at)
+	if err != nil {
+		return false, fmt.Errorf("release booking: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClaimUnpaidHidden implements domain.BookingReleaseRepository.
+func (r *Repository) ClaimUnpaidHidden(ctx context.Context, before time.Time, limit int) ([]domain.Booking, error) {
+	limit, _ = window(limit, 0)
+	q := `SELECT ` + cols + ` FROM bookings b
+		WHERE b.status = 'pending' AND b.released_to_venue_at IS NULL
+		  AND b.created_at < $1
+		  AND NOT EXISTS (SELECT 1 FROM payments p
+		        WHERE p.booking_id = b.id AND p.status = 'created' AND p.expires_at > now())
+		ORDER BY b.created_at, b.id
+		LIMIT $2
+		FOR UPDATE OF b SKIP LOCKED`
+	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim unpaid hidden bookings: %w", err)
+	}
+	defer rows.Close()
+	return scanBookings(rows)
 }

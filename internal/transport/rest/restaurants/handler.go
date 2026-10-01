@@ -153,6 +153,7 @@ func (h *Handler) list(c *gin.Context) {
 	f.Features = featureKeys(c)
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
+	f.GuestLat, f.GuestLng = guestCoords(c)
 
 	items, total, err := h.facade.List(c.Request.Context(), f, venueStateFilter(c))
 	if err != nil {
@@ -228,6 +229,33 @@ func venueStateFilter(c *gin.Context) domain.VenueStateFilter {
 	return vs
 }
 
+// guestCoords reads the optional ?lat=&lng= pair used to order the catalog by
+// distance from the guest (domain.RestaurantFilter.GuestLat/GuestLng /
+// RestaurantSearchFilter.GuestLat/GuestLng).
+//
+// Both must be present and parse as valid coordinates (latitude -90..90,
+// longitude -180..180) — same range domain/gastroguide's normalizeCoords
+// enforces for a stop's pin. Half a pair, garbage, or an out-of-range value
+// degrades to "no distance sort" (nil, nil) rather than failing the request:
+// like is_popular/is_new/open_now above, this is a ranking hint, not the
+// guest's whole question, so a bad value should not turn a working catalog
+// browse into a 400.
+func guestCoords(c *gin.Context) (*float64, *float64) {
+	latRaw, lngRaw := strings.TrimSpace(c.Query("lat")), strings.TrimSpace(c.Query("lng"))
+	if latRaw == "" || lngRaw == "" {
+		return nil, nil
+	}
+	lat, err := strconv.ParseFloat(latRaw, 64)
+	if err != nil || lat < -90 || lat > 90 {
+		return nil, nil
+	}
+	lng, err := strconv.ParseFloat(lngRaw, 64)
+	if err != nil || lng < -180 || lng > 180 {
+		return nil, nil
+	}
+	return &lat, &lng
+}
+
 // availabilityFilter reads the "гости + дата" filter: ?date=2026-08-20&guests=2
 // plus the optional window ?time_from=19:00&time_to=21:00.
 //
@@ -301,6 +329,7 @@ func (h *Handler) search(c *gin.Context) {
 	}
 	f.Page, _ = strconv.Atoi(c.Query("page"))
 	f.PerPage, _ = strconv.Atoi(c.Query("per_page"))
+	f.GuestLat, f.GuestLng = guestCoords(c)
 
 	items, total, err := h.facade.Search(c.Request.Context(), f, venueStateFilter(c))
 	if err != nil {
@@ -520,6 +549,9 @@ func (h *Handler) update(c *gin.Context) {
 	// self-promote (is_premium/is_popular/is_new/display_order) or reactivate a
 	// venue an admin deactivated (is_active). Strip them for non-admin callers;
 	// managers deactivate via DELETE, and only an admin can reactivate.
+	// loyalty_enabled joins this same admin-only bucket: it is BookEat staff
+	// deciding, venue by venue, which one gets the (still decorative) loyalty
+	// QR button — not a self-service venue setting.
 	if au, ok := middleware.GetAuthUser(c.Request.Context()); !ok || au.Role != string(domain.RoleAdmin) {
 		in.IsActive = nil
 		in.IsNew = nil
@@ -527,6 +559,7 @@ func (h *Handler) update(c *gin.Context) {
 		in.IsPremium = nil
 		in.DisplayOrder = nil
 		in.KwaakaRestaurantID = nil
+		in.LoyaltyEnabled = nil
 	}
 	agg, err := h.facade.Update(c.Request.Context(), id, in)
 	if err != nil {

@@ -37,6 +37,13 @@ type webhookUseCase struct {
 	// together by WithLateCancelSettlement. Both nil = the previous behaviour.
 	bookings    bookingReader
 	lateSettler DepositCancellationUseCase
+	// releaser hands a hidden pre-order booking to the venue in the SAME
+	// transaction as the payment's created -> authorized transition. Optional
+	// (WithBookingReleaser); nil = no gate (the previous behaviour).
+	releaser bookingReleaser
+	// holdLost cancels a still-pending booking whose pre-order hold the acquirer
+	// released on its own (voided / expired). Optional (WithHoldLostCanceller).
+	holdLost holdLostCanceller
 	// holdTTL, when set, re-bases a deposit hold's expires_at at the moment it
 	// is authorised: the pre-payment expires_at is the (short) link lifetime,
 	// which must not void a hold the guest has just placed.
@@ -97,6 +104,44 @@ func WithLateCancelSettlement(bookings bookingReader, settler DepositCancellatio
 		u.bookings = bookings
 		u.lateSettler = settler
 	}
+}
+
+// bookingReleaser is the local port (usecase/payments never imports the
+// bookings usecase) for the booking gate: it makes a hidden booking visible to
+// the venue, writes booking.created to the outbox and — for a venue with
+// confirm_on_create — confirms it, all through the ctx-carried transaction.
+// It is idempotent: releasing an already-released booking changes nothing.
+type bookingReleaser interface {
+	ReleaseForPayment(ctx context.Context, bookingID uuid.UUID) error
+}
+
+// holdLostCanceller is the local port for scenario 12: the acquirer voided or
+// expired a pre-order hold before the venue confirmed the booking, so the
+// booking has no money behind it and is cancelled by the system. It must be a
+// no-op for any booking that is not pending, and idempotent.
+type holdLostCanceller interface {
+	CancelPendingOnHoldLost(ctx context.Context, bookingID uuid.UUID) error
+}
+
+// WithHoldLostCanceller wires the hold-lost cancellation (see holdLostCanceller).
+func WithHoldLostCanceller(c holdLostCanceller) WebhookOption {
+	return func(u *webhookUseCase) { u.holdLost = c }
+}
+
+// cancelBookingIfHoldLost runs after a voided/expired transition of a payment
+// that WAS an authorized pre-order hold. Its error is returned so the event
+// stays unprocessed and is retried.
+func (u *webhookUseCase) cancelBookingIfHoldLost(ctx context.Context, was domain.PaymentStatus, p *domain.Payment) error {
+	if u.holdLost == nil || was != domain.PaymentAuthorized || !p.RequiresConfirmation ||
+		p.Purpose != domain.PurposePreorder || p.BookingID == uuid.Nil {
+		return nil
+	}
+	return u.holdLost.CancelPendingOnHoldLost(ctx, p.BookingID)
+}
+
+// WithBookingReleaser wires the booking gate (see bookingReleaser).
+func WithBookingReleaser(r bookingReleaser) WebhookOption {
+	return func(u *webhookUseCase) { u.releaser = r }
 }
 
 // NewWebhookUseCase constructs the webhook-processing usecase.
@@ -323,7 +368,12 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 }
 
 // settleIfBookingAlreadyCancelled settles money that arrived for a booking the
-// venue has already closed (see WithLateCancelSettlement).
+// venue has already closed (see WithLateCancelSettlement). Thin wrapper around
+// the package-level settleIfBookingAlreadyCancelled, which is also called from
+// depositCancellationUseCase.CaptureOnConfirm and Reconciler.finishCapture /
+// captureHeldPreorderIfConfirmed — any code path that can leave a payment
+// holding money on a booking that raced to cancelled/no_show must run the same
+// check, not just the HTTP webhook.
 //
 // It runs only after the callback was applied successfully, so the payment's
 // status is the truth before any decision is taken. An error is RETURNED,
@@ -331,7 +381,15 @@ func (u *webhookUseCase) apply(ctx context.Context, gw domain.PaymentGateway, p 
 // for a cancelled booking that nobody settled must stay visible, not be
 // swallowed by an acknowledged callback.
 func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p *domain.Payment) error {
-	if u.lateSettler == nil || u.bookings == nil || p.BookingID == uuid.Nil {
+	return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
+}
+
+// settleIfBookingAlreadyCancelled is the shared "money is held/taken for a
+// booking that is already closed" guard — see the method above for why it must
+// be reachable from more than the HTTP webhook path. settler is nil-checked
+// because not every deployment/test wires WithLateCancelSettlement.
+func settleIfBookingAlreadyCancelled(ctx context.Context, bookings bookingReader, settler DepositCancellationUseCase, p *domain.Payment) error {
+	if settler == nil || bookings == nil || p.BookingID == uuid.Nil {
 		return nil
 	}
 	// Only a payment that is holding or has taken money is worth settling; a
@@ -339,7 +397,7 @@ func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p 
 	if !p.Status.HoldsMoney() {
 		return nil
 	}
-	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	b, err := bookings.GetByID(ctx, p.BookingID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return nil
@@ -357,7 +415,7 @@ func (u *webhookUseCase) settleIfBookingAlreadyCancelled(ctx context.Context, p 
 		slog.String("booking_status", string(b.Status)),
 		slog.String("trigger", string(trigger)),
 	)
-	_, err = u.lateSettler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
+	_, err = settler.SettleDepositOnCancel(ctx, systemActor, p.BookingID, DepositCancelInput{
 		Trigger:     trigger,
 		CancelledAt: b.CancelledAt,
 		Reason:      strPtr("payment arrived after the booking was already closed"),
@@ -424,17 +482,18 @@ func (u *webhookUseCase) applyToPayment(ctx context.Context, gw domain.PaymentGa
 // released — this is the saga compensation from spec §6 applied to two
 // concurrent checkouts on one booking instead of a lost table.
 func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, event *domain.WebhookEvent) error {
-	// Idempotency for this callback is PURPOSE-aware. A PRE-ORDER is captured
-	// immediately on authorization (captureIfPreorder), so the authorized →
-	// captured range is all "this callback's work is done or resumable":
-	//   - already captured / refunded → nothing left to do, ack;
-	//   - still only authorized → a previous immediate-capture attempt was
-	//     declined (captureHold released the hold back to authorized) or never
-	//     ran; a redelivery must RESUME the capture, not ack it as done —
-	//     otherwise a failed pre-order capture is never retried and the money
-	//     is left as an uncaptured hold that auto-expires (silent revenue loss).
-	// A DEPOSIT is a plain created → authorized and is done once authorized.
-	if p.Purpose.CapturesImmediately() {
+	// Idempotency for this callback follows HOW the payment was sent to the
+	// acquirer (p.RequiresConfirmation), never its purpose:
+	//   - ONE-STAGE (ticket, Kaspi pre-order, a TipTopPay pre-order link issued
+	//     before the hold rollout): the authorized -> captured range is "this
+	//     callback's work is done or resumable". Already captured / refunded ->
+	//     ack; still only authorized -> a previous immediate capture was
+	//     declined or never ran: RESUME it, otherwise a failed capture is never
+	//     retried and the money is left as an uncaptured hold that auto-expires.
+	//   - HOLD (deposit, and since 2026-09-24 a pre-order): authorized is done.
+	//     A pre-order hold is captured later, when the venue confirms; the one
+	//     exception, a booking that is ALREADY confirmed, is resumed here.
+	if !p.RequiresConfirmation {
 		switch p.Status {
 		case domain.PaymentCaptured, domain.PaymentRefunded, domain.PaymentPartiallyRefunded:
 			return nil
@@ -442,7 +501,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 			return u.captureIfPreorder(ctx, p)
 		}
 	} else if p.Status == domain.PaymentAuthorized {
-		return nil // deposit already applied; events.Create dedups the common case
+		return u.captureHeldPreorderIfConfirmed(ctx, p) // hold already applied; resume a pending capture only
 	}
 	if err := domain.ValidatePaymentTransition(p.Status, domain.PaymentAuthorized); err != nil {
 		return fmt.Errorf("webhook authorized on payment %s (currently %s): %w", p.ID, p.Status, err)
@@ -453,7 +512,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 		if err := u.payments.CompareAndSwapStatus(ctx, p.ID, from, domain.PaymentAuthorized, now); err != nil {
 			return err
 		}
-		if u.holdTTL > 0 && !p.Purpose.CapturesImmediately() {
+		if u.holdTTL > 0 && p.RequiresConfirmation {
 			exp := now.Add(u.holdTTL)
 			if err := u.payments.ExtendHoldExpiry(ctx, p.ID, exp); err != nil {
 				return err
@@ -462,20 +521,64 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 		}
 		p.Status = domain.PaymentAuthorized
 		p.AuthorizedAt = &now
-		return publishPaymentEvent(ctx, u.outbox, p, domain.EventPaymentAuthorized, now)
+		if err := publishPaymentEvent(ctx, u.outbox, p, domain.EventPaymentAuthorized, now); err != nil {
+			return err
+		}
+		// The booking gate: the venue first hears about a pre-order booking in
+		// the very transaction that makes its money real. A duplicate delivery
+		// never gets here (the CAS above fails), and Release is idempotent.
+		if p.Purpose != domain.PurposeTicket && p.BookingID != uuid.Nil && u.releaser != nil {
+			return u.releaser.ReleaseForPayment(ctx, p.BookingID)
+		}
+		return nil
 	})
 	if txErr == nil {
 		logging.FromContext(ctx).Info(logging.EventPaymentAuthorized, slog.String("payment_id", p.ID.String()))
-		// The authorization is durably committed. The immediate pre-order
-		// capture is a follow-on; if it fails, its error is PROPAGATED so
-		// resolveAndApply leaves the webhook event UNPROCESSED (report item #9)
-		// and a redelivery / the reconciler retries it — never swallowed.
-		return u.captureIfPreorder(ctx, p)
+		// The authorization is durably committed. What follows is a follow-on;
+		// if it fails, its error is PROPAGATED so resolveAndApply leaves the
+		// webhook event UNPROCESSED and a redelivery / the reconciler retries
+		// it — never swallowed.
+		if !p.RequiresConfirmation {
+			return u.captureIfPreorder(ctx, p)
+		}
+		return u.captureHeldPreorderIfConfirmed(ctx, p)
 	}
 	if !errors.Is(txErr, domain.ErrAlreadyExists) {
 		return txErr
 	}
 	return u.compensateLostRace(ctx, gw, p)
+}
+
+// captureHeldPreorderIfConfirmed captures a pre-order HOLD whose booking is
+// already confirmed: a venue with confirm_on_create, or an old client that
+// attached the pre-order after the venue had answered. A pending booking is
+// left alone (the venue's confirmation captures it); a closed one is settled
+// HERE, immediately, by calling settleIfBookingAlreadyCancelled directly — the
+// caller (resolveLostWebhook's equal-status branch) never runs apply(), so
+// nothing else in this call path would ever settle it. Before this fix the
+// hold simply sat authorized until HOLD_TTL (96h) expired, on the strength of
+// a comment ("a cancelled booking is voided by the same replay") that this
+// call path never actually delivered on. Never CAPTURES a booking that is not
+// confirmed — a cancelled booking is never charged.
+func (u *webhookUseCase) captureHeldPreorderIfConfirmed(ctx context.Context, p *domain.Payment) error {
+	if p.Purpose != domain.PurposePreorder || p.BookingID == uuid.Nil || u.bookings == nil {
+		return nil
+	}
+	b, err := u.bookings.GetByID(ctx, p.BookingID)
+	if err != nil {
+		return err
+	}
+	if b.Status != domain.BookingConfirmed {
+		// Not (yet) confirmed: pending still waits for the venue, but a
+		// cancelled / no-show booking is already closed and its hold must be
+		// released now rather than left for the TTL.
+		return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
+	}
+	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
+	if _, err := cv.captureHold(ctx, p); err != nil {
+		return fmt.Errorf("capture pre-order hold %s of a confirmed booking: %w", p.ID, err)
+	}
+	return nil
 }
 
 // captureIfPreorder captures a PRE-ORDER hold the instant it is authorized: the
@@ -491,7 +594,7 @@ func (u *webhookUseCase) applyAuthorized(ctx context.Context, gw domain.PaymentG
 // webhook event unprocessed so it is retried, otherwise the food is prepared
 // while the money stays an uncaptured hold that silently auto-expires.
 func (u *webhookUseCase) captureIfPreorder(ctx context.Context, p *domain.Payment) error {
-	if !p.Purpose.CapturesImmediately() {
+	if p.RequiresConfirmation {
 		return nil
 	}
 	cv := &captureVoidUseCase{payments: u.payments, ledger: u.ledger, outbox: u.outbox, gateways: u.gateways, tx: u.tx}
@@ -652,7 +755,7 @@ func (u *webhookUseCase) applyCaptured(ctx context.Context, gw domain.PaymentGat
 		return nil
 	}
 	from := p.Status
-	if from == domain.PaymentCreated && !settlesImmediately(gw, p.Purpose) {
+	if from == domain.PaymentCreated && p.RequiresConfirmation {
 		// domain.PaymentCreated → PaymentCaptured is a legal STATE transition
 		// (a genuinely one-stage acquirer charge), but this specific acquirer
 		// does not claim to settle THIS purpose in one stage — so `captured`
@@ -768,7 +871,7 @@ func (u *webhookUseCase) applyVoided(ctx context.Context, p *domain.Payment, eve
 		return err
 	}
 	logging.FromContext(ctx).Info(logging.EventPaymentVoided, slog.String("payment_id", p.ID.String()))
-	return nil
+	return u.cancelBookingIfHoldLost(ctx, from, p)
 }
 
 func (u *webhookUseCase) applyExpired(ctx context.Context, p *domain.Payment, event *domain.WebhookEvent) error {
@@ -791,7 +894,7 @@ func (u *webhookUseCase) applyExpired(ctx context.Context, p *domain.Payment, ev
 		return err
 	}
 	logging.FromContext(ctx).Info(logging.EventPaymentExpired, slog.String("payment_id", p.ID.String()))
-	return nil
+	return u.cancelBookingIfHoldLost(ctx, from, p)
 }
 
 // storeInvalidEvent records an unverified callback as evidence (spec §7:

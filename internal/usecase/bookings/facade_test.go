@@ -35,7 +35,7 @@ func newFacadeHarness(t *testing.T, status domain.BookingStatus) *facadeHarness 
 	t.Helper()
 	rid := uuid.New()
 	guestID := uuid.New()
-	b := &domain.Booking{
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Name: "Дамир",
 		Guests: 2, Status: status, StartsAt: time.Now().Add(24 * time.Hour),
 		EndsAt: time.Now().Add(26 * time.Hour), Source: domain.SourceApp,
@@ -266,7 +266,7 @@ func (r fakeWindowResolver) CancelDeadlineFor(_ context.Context, b domain.Bookin
 func TestFacadeGet_FreeCancelDeadline(t *testing.T) {
 	rid, guestID := uuid.New(), uuid.New()
 	start := time.Now().Add(24 * time.Hour)
-	b := &domain.Booking{
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Guests: 2,
 		Status: domain.BookingConfirmed, StartsAt: start, EndsAt: start.Add(2 * time.Hour), Source: domain.SourceApp,
 	}
@@ -304,7 +304,7 @@ func TestFacadeGet_FreeCancelDeadline(t *testing.T) {
 func TestFacadeGet_FreeCancelDeadline_NilForTerminal(t *testing.T) {
 	rid, guestID := uuid.New(), uuid.New()
 	start := time.Now().Add(24 * time.Hour)
-	b := &domain.Booking{
+	b := &domain.Booking{ReleasedToVenueAt: releasedAt(),
 		ID: uuid.New(), RestaurantID: rid, UserID: &guestID, Guests: 2,
 		Status: domain.BookingCancelled, StartsAt: start, EndsAt: start.Add(2 * time.Hour), Source: domain.SourceApp,
 	}

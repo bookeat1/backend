@@ -350,6 +350,32 @@ func (g *GuestPushNotifier) bookingRulesFooter(ctx context.Context, e Event, loc
 	}
 }
 
+// cancelledGuestCopy renders the guest-facing title/body for a cancelled
+// booking. The four pre-order-hold system reasons (owner decisions
+// 2026-09-24, spec §3/§9) get their own copy — "у guest never paid" reads
+// nothing like "the venue never answered", and both need the guest to know
+// whether their card is still touched. Every other cancellation (a venue
+// reject/cancel, or a system reason with no dedicated copy yet) keeps the
+// original generic text.
+func cancelledGuestCopy(e Event, at, when string) (title, body string) {
+	title = "Бронь отменена"
+	suffix := ""
+	if e.CancellationReasonCode != nil {
+		switch *e.CancellationReasonCode {
+		case domain.CancelReasonPreorderPaymentNotCompleted:
+			suffix = " Оплата предзаказа не прошла вовремя, стол освобождён. Деньги не списывались."
+		case domain.CancelReasonVenueNoAnswer:
+			suffix = " Заведение не ответило вовремя. Деньги на карте разблокированы."
+		case domain.CancelReasonPreorderCaptureFailed:
+			suffix = " Не удалось списать предоплату. Деньги на карте разблокированы."
+		case domain.CancelReasonPreorderHoldReleased:
+			suffix = " Банк снял блокировку карты раньше ответа заведения. Оформите бронь заново, если место ещё нужно."
+		}
+	}
+	body = fmt.Sprintf("%s%s · %d чел.%s", at, when, e.Guests, suffix)
+	return title, body
+}
+
 // buildGuestMessage renders the Russian guest-facing text. It carries ONLY what
 // the guest already knows about their own booking — venue, date/time, party
 // size. No phone, no payment data, no token. Returns ok=false for an event type
@@ -373,8 +399,7 @@ func buildGuestMessage(e Event, venue string, rulesFooter string, loc *time.Loca
 		title = "Бронь подтверждена"
 		body = fmt.Sprintf("%s%s · %d чел.%s", at, when, e.Guests, rulesFooter)
 	case domain.EventBookingCancelled:
-		title = "Бронь отменена"
-		body = fmt.Sprintf("%s%s · %d чел.", at, when, e.Guests)
+		title, body = cancelledGuestCopy(e, at, when)
 	case domain.EventBookingReminder:
 		title = "Напоминание о брони"
 		body = fmt.Sprintf("Напоминаем о брони %s%s · %d чел.%s", at, when, e.Guests, rulesFooter)

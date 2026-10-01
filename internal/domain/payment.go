@@ -253,6 +253,11 @@ func (p PaymentPurpose) CapturesImmediately() bool {
 // computes these numbers (spec §8).
 type Payment struct {
 	ID uuid.UUID
+	// RequiresConfirmation records HOW this payment was sent to the acquirer:
+	// true = two-stage hold (confirm or void later), false = one-stage charge.
+	// Fixed at Authorize time; the webhook decides by it, never by purpose, so a
+	// link issued one-stage before a rollout and paid after is still one-stage.
+	RequiresConfirmation bool
 	// BookingID is the booking this payment pays for, or uuid.Nil for a payment
 	// whose subject is an event ticket instead (EventTicketID set). Exactly one
 	// of BookingID / EventTicketID is set — enforced by chk_payments_subject.
@@ -484,6 +489,27 @@ type PaymentSettings struct {
 	// no-show forfeits the deposit to the venue (the hold is captured). Always
 	// present (the column is NOT NULL, owner-confirmed default 120m).
 	FreeCancelWindow time.Duration
+}
+
+// PreorderSettingsPatch is a partial write of a venue's pre-order policy.
+// A field is written only when its Set flag is true; a Set field with a nil
+// value writes NULL (Enabled: inherit the global default; MinAmountMinor: no
+// floor). A field whose Set flag is false keeps its stored value, so a caller
+// that only changes one of the two can never clobber the other.
+type PreorderSettingsPatch struct {
+	EnabledSet     bool
+	Enabled        *bool
+	MinAmountSet   bool
+	MinAmountMinor *int64
+}
+
+// PreorderSettingsChange is the exact before/after of one PreorderSettingsPatch
+// write, captured by the same atomic statement that performed it (so an audit
+// line built from it can neither miss nor mix in a concurrent writer's value).
+type PreorderSettingsChange struct {
+	OldEnabled, NewEnabled *bool
+	OldMinAmountMinor      *int64
+	NewMinAmountMinor      *int64
 }
 
 // PaymentSettingsOverride is a restaurant's optional per-field override of the

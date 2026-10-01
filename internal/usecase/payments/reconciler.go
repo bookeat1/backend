@@ -73,6 +73,22 @@ type Reconciler struct {
 	// paid guest with no ticket (capture). Optional (WithReconcilerObserver);
 	// nil for a deploy with no ticketing wired.
 	ticketObserver PaymentSubjectObserver
+	// webhookOpts carries the same booking-side WebhookOptions (late-cancel
+	// settlement, booking gate release, hold-lost cancellation, hold TTL) a
+	// real HTTP webhook is wired with, so a transition the reconciler replays
+	// applies identically — see applier() and WithReconcilerWebhookOptions.
+	webhookOpts []WebhookOption
+	// holdTTL mirrors webhookUseCase.holdTTL (WithHoldTTL) — see applier(). A
+	// deposit the reconciler confirms authorized via resolveLostWebhook goes
+	// through the EXACT SAME applyAuthorized code path a real webhook would,
+	// which only re-bases ExpiresAt when holdTTL is set; without it the
+	// pre-payment (short link) ExpiresAt survives into the confirmed hold, and
+	// the very next reconcileExpiredHolds pass voids a deposit that was just
+	// paid. Optional (WithReconcilerHoldTTL); zero means "do not re-base" (the
+	// webhookUseCase default too). Usually redundant with a WithHoldTTL inside
+	// webhookOpts (applier() sets both), kept as its own field so it holds even
+	// when webhookOpts is empty.
+	holdTTL time.Duration
 }
 
 // ReconcilerOption configures the reconciler without breaking the positional
@@ -87,6 +103,16 @@ func WithReconcilerObserver(obs PaymentSubjectObserver) ReconcilerOption {
 	return func(r *Reconciler) { r.ticketObserver = obs }
 }
 
+// WithReconcilerHoldTTL wires the same deposit hold-TTL the HTTP webhook uses
+// (bootstrap's payments.WithHoldTTL(cfg.Payments.HoldTTL)) into the
+// reconciler's own applier, so a deposit the reconciler confirms authorized
+// gets its ExpiresAt re-based exactly like a real webhook delivery would —
+// see the field doc on Reconciler.holdTTL for why this is money-safety
+// critical, not cosmetic.
+func WithReconcilerHoldTTL(ttl time.Duration) ReconcilerOption {
+	return func(r *Reconciler) { r.holdTTL = ttl }
+}
+
 // applier builds a webhookUseCase that shares the reconciler's repos, gateway
 // resolver AND ticket observer, so a transition the reconciler replays applies
 // identically to the way a real webhook would — including the immediate-capture
@@ -94,10 +120,24 @@ func WithReconcilerObserver(obs PaymentSubjectObserver) ReconcilerOption {
 // (needs ticketObserver). Both were previously nil in the two ad-hoc literals,
 // which is exactly why reconciler-driven transitions never reached the ticket.
 func (r *Reconciler) applier() *webhookUseCase {
-	return &webhookUseCase{
+	u := &webhookUseCase{
 		payments: r.payments, ledger: r.ledger, outbox: r.outbox,
 		gateways: r.gateways, tx: r.tx, ticketObserver: r.ticketObserver,
+		holdTTL: r.holdTTL,
 	}
+	// The same booking-side hooks a real webhook has (late-cancel settlement,
+	// booking gate release, hold TTL): a transition found by the reconciler must
+	// hand the booking to the venue exactly as a delivered webhook would.
+	for _, o := range r.webhookOpts {
+		o(u)
+	}
+	return u
+}
+
+// WithReconcilerWebhookOptions passes webhook options through to the state
+// machine the reconciler replays lost events with.
+func WithReconcilerWebhookOptions(opts ...WebhookOption) ReconcilerOption {
+	return func(r *Reconciler) { r.webhookOpts = append(r.webhookOpts, opts...) }
 }
 
 // ReconcilerConfig is the worker's own scheduling and safety configuration,
@@ -375,7 +415,8 @@ func (r *Reconciler) finishCapture(ctx context.Context, p *domain.Payment, at ti
 		return publishPaymentEvent(ctx, r.outbox, p, domain.EventPaymentCaptured, at)
 	})
 	if err == nil {
-		return nil
+		p.Status = domain.PaymentCaptured
+		return r.settleIfRaceCancelled(ctx, p)
 	}
 	if errors.Is(err, domain.ErrAlreadyExists) {
 		current, rerr := r.payments.GetByID(ctx, p.ID)
@@ -383,10 +424,25 @@ func (r *Reconciler) finishCapture(ctx context.Context, p *domain.Payment, at ti
 			return rerr
 		}
 		if current.Status == domain.PaymentCaptured {
-			return nil
+			return r.settleIfRaceCancelled(ctx, current)
 		}
 	}
 	return err
+}
+
+// settleIfRaceCancelled runs the same "booking already closed" guard the HTTP
+// webhook applies at the end of every apply() (settleIfBookingAlreadyCancelled)
+// against the booking/late-settlement hooks the reconciler was wired with —
+// see applier(). Money-safety review finding (PR #156): finishCapture wrote
+// the transition directly and never ran this check, so a capture that landed
+// while the guest's cancel was in flight left a captured payment on a
+// cancelled booking with no refund until a replayed webhook happened to fix
+// it. A reconciler with no WithReconcilerWebhookOptions (bookings not wired at
+// all) is a no-op here, same as the HTTP path with no
+// WithLateCancelSettlement.
+func (r *Reconciler) settleIfRaceCancelled(ctx context.Context, p *domain.Payment) error {
+	u := r.applier()
+	return settleIfBookingAlreadyCancelled(ctx, u.bookings, u.lateSettler, p)
 }
 
 // finishVoid mirrors finishCapture for the release path.
@@ -648,6 +704,14 @@ func (r *Reconciler) reconcileLostWebhook(ctx context.Context, now time.Time, re
 // "unknown", it is confirmed correct).
 func (r *Reconciler) resolveLostWebhook(ctx context.Context, gw domain.PaymentGateway, p *domain.Payment, resp *domain.GatewayPayment, now time.Time) (bool, string, error) {
 	if resp.Status == p.Status {
+		if p.Status == domain.PaymentAuthorized && p.RequiresConfirmation {
+			// Nothing was lost at the acquirer, but a pre-order hold on an
+			// ALREADY CONFIRMED booking whose capture did not go through is
+			// finished here (a cancelled booking is voided by the same replay).
+			if err := r.applier().captureHeldPreorderIfConfirmed(ctx, p); err != nil {
+				return false, "", err
+			}
+		}
 		return true, "", nil
 	}
 	eventType, ok := eventTypeForStatus(resp.Status)

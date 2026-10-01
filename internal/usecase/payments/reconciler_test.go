@@ -34,7 +34,7 @@ type reconcilerHarness struct {
 // ago" relative to h.now() unless they are the same instant.
 var reconcilerHarnessNow = time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
 
-func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain.Payment, refunds []*domain.PaymentRefund) *reconcilerHarness {
+func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain.Payment, refunds []*domain.PaymentRefund, opts ...ReconcilerOption) *reconcilerHarness {
 	t.Helper()
 	pr := newFakePaymentRepo(payments...)
 	rr := newFakeRefundRepo()
@@ -54,7 +54,7 @@ func newReconcilerHarness(t *testing.T, cfg ReconcilerConfig, payments []*domain
 		payments: pr, refunds: rr, ledger: ledger, outbox: outbox, gw: gw,
 		now: reconcilerHarnessNow,
 	}
-	h.r = NewReconciler(pr, rr, ledger, outbox, resolver, tx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.r = NewReconciler(pr, rr, ledger, outbox, resolver, tx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), opts...)
 	h.r.now = func() time.Time { return h.now }
 	return h
 }
@@ -278,6 +278,157 @@ func TestReconciler_StuckVoiding_AcquirerVoided_Finishes(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("outbox events = %v, want payment.voided", h.outbox.types())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// lost webhook: deposit hold TTL must be re-based, same as a real webhook
+// ---------------------------------------------------------------------------
+
+// lostWebhookDepositPayment builds a deposit that never got its authorization
+// webhook: still `created` locally, but the acquirer already assigned a
+// provider id and (unbeknownst to us) authorized it. ExpiresAt is left at the
+// short pre-payment (link) lifetime, already in the past by the time the
+// reconciler gets to it — exactly PR #152's shorter TTL default.
+func lostWebhookDepositPayment(bookingID uuid.UUID, providerPaymentID string, now time.Time) *domain.Payment {
+	p := testPayment(bookingID, domain.PaymentCreated, providerPaymentID)
+	p.StatusChangedAt = now.Add(-2 * time.Hour) // stale past LostWebhookAfter
+	expired := now.Add(-5 * time.Minute)        // pre-payment link TTL, already lapsed
+	p.ExpiresAt = &expired
+	return p
+}
+
+// TestReconciler_LostDepositWebhook_ConfirmsAndDoesNotVoidAsExpired is the
+// PR #158 code-review bug: a lost webhook confirmed through applier() (built
+// without WithHoldTTL) left the pre-payment ExpiresAt untouched, so the SAME
+// tick's reconcileExpiredHolds pass then voided the just-confirmed deposit as
+// "expired" — cancelling money the guest had actually already paid. The fix
+// wires WithReconcilerHoldTTL through applier() so the replayed webhook
+// re-bases ExpiresAt exactly like a real one would.
+func TestReconciler_LostDepositWebhook_ConfirmsAndDoesNotVoidAsExpired(t *testing.T) {
+	bookingID := uuid.New()
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: time.Hour, BatchSize: 10, MaxAttempts: 3}
+	const holdTTL = 96 * time.Hour
+	h := newReconcilerHarness(t, cfg, nil, nil, WithReconcilerHoldTTL(holdTTL))
+	p := lostWebhookDepositPayment(bookingID, "gw-1", h.now)
+	h.payments.byID[p.ID] = p
+	// The acquirer's own view: the hold went through.
+	h.gw.getResp = &domain.GatewayPayment{ProviderPaymentID: "gw-1", Status: domain.PaymentAuthorized}
+
+	res, err := h.r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if res.Resolved < 1 {
+		t.Fatalf("got %+v, want at least 1 resolved (the lost-webhook pass)", res)
+	}
+	got, _ := h.payments.GetByID(context.Background(), p.ID)
+	if got.Status != domain.PaymentAuthorized {
+		t.Fatalf("status = %s, want authorized — the reconciler voided a deposit it had just confirmed", got.Status)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.After(h.now) {
+		t.Fatalf("expires_at = %v, want re-based to roughly now+%s (matching WithHoldTTL's own behaviour)", got.ExpiresAt, holdTTL)
+	}
+}
+
+// TestReconciler_LostPreorderAuthorizationWebhook_ReleasesBookingToVenue is a
+// codex-review addition to PR #156: a pre-order's created -> authorized
+// webhook never arrives (the acquirer's callback is dropped before it reaches
+// us). The reconciler's lost-webhook pass must replay it through the EXACT
+// SAME state machine a live webhook would (applier().apply(), not some
+// reconciler-only shortcut) — releasing the booking to the venue and taking
+// no capture (it is still pending) — rather than leave the guest's money on
+// an unreleased hold forever.
+func TestReconciler_LostPreorderAuthorizationWebhook_ReleasesBookingToVenue(t *testing.T) {
+	bookingID := uuid.New()
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: time.Hour, BatchSize: 10, MaxAttempts: 3}
+	p := testPayment(bookingID, domain.PaymentCreated, "gw-1")
+	p.Purpose = domain.PurposePreorder
+	p.RequiresConfirmation = true
+	p.StatusChangedAt = reconcilerHarnessNow.Add(-2 * time.Hour) // stale past LostWebhookAfter
+
+	h := newReconcilerHarness(t, cfg, []*domain.Payment{p}, nil)
+	h.gw.getResp = &domain.GatewayPayment{ProviderPaymentID: "gw-1", Status: domain.PaymentAuthorized, Amount: p.Total()}
+
+	rel := &fakeReleaser{}
+	bookings := newFakeBookingReader(&domain.Booking{ID: bookingID, Status: domain.BookingPending})
+	WithReconcilerWebhookOptions(
+		WithBookingReleaser(rel),
+		WithLateCancelSettlement(bookings, nil),
+	)(h.r)
+
+	res, err := h.r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if res.Resolved < 1 {
+		t.Fatalf("got %+v, want at least 1 resolved (the lost-webhook pass)", res)
+	}
+	got, err := h.payments.GetByID(context.Background(), p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.PaymentAuthorized {
+		t.Fatalf("status = %s, want authorized", got.Status)
+	}
+	if len(rel.calls) != 1 || rel.calls[0] != bookingID {
+		t.Fatalf("release calls = %v, want exactly one for %s", rel.calls, bookingID)
+	}
+	if h.gw.callCount("capture") != 0 {
+		t.Fatalf("capture called for a still-pending booking's hold")
+	}
+}
+
+// TestReconciler_LostWebhookEqualStatus_VoidsHeldPreorderOnAlreadyCancelledBooking
+// is PR #156 review Blocking 3 (part 2): resolveLostWebhook's equal-status
+// branch (the acquirer confirms the local `authorized` is still correct, i.e.
+// nothing was actually lost) ran captureHeldPreorderIfConfirmed, which is a
+// no-op for anything but a CONFIRMED booking — including a CANCELLED one. The
+// comment above it claimed "a cancelled booking is voided by the same
+// replay", which was never true: the hold just sat authorized until
+// HOLD_TTL (96h) instead of being released the moment the reconciler noticed
+// the booking was already closed. Fix: captureHeldPreorderIfConfirmed now
+// settles (voids, since this booking was never confirmed) immediately.
+func TestReconciler_LostWebhookEqualStatus_VoidsHeldPreorderOnAlreadyCancelledBooking(t *testing.T) {
+	bookingID := uuid.New()
+	cfg := ReconcilerConfig{StuckAfter: 10 * time.Minute, LostWebhookAfter: time.Hour, BatchSize: 10, MaxAttempts: 3}
+	p := heldPreorder(bookingID) // Authorized, Purpose=Preorder, RequiresConfirmation=true
+	p.ProviderPaymentID = strPtr("gw-1")
+	p.StatusChangedAt = reconcilerHarnessNow.Add(-2 * time.Hour) // stale past LostWebhookAfter
+
+	h := newReconcilerHarness(t, cfg, []*domain.Payment{p}, nil)
+	// The acquirer confirms nothing changed: still just authorized. Nothing was
+	// "lost" in the sense of a missed transition, but the booking behind it
+	// raced to cancelled/never-confirmed in the meantime and its hold has not
+	// been released yet.
+	h.gw.getResp = &domain.GatewayPayment{ProviderPaymentID: "gw-1", Status: domain.PaymentAuthorized}
+
+	booking := &domain.Booking{ID: bookingID, Status: domain.BookingCancelled} // ConfirmedAt nil: never confirmed
+	bookings := newFakeBookingReader(booking)
+	managers := newFakeManagerChecker()
+	dl := &fakeCancelDeadlineResolver{deadline: reconcilerHarnessNow}
+	resolver := newFakeGatewayResolver(h.gw)
+	tx := &fakeTx{payments: h.payments, ledger: h.ledger, outbox: h.outbox, refunds: h.refunds}
+	refundUC := NewRefundUseCase(h.payments, h.refunds, h.ledger, h.outbox, resolver, managers, bookings, dl, tx, Config{}.withDefaults())
+	settler := NewDepositCancellationUseCase(h.payments, h.ledger, h.outbox, resolver, managers, bookings, dl, refundUC, tx)
+	WithReconcilerWebhookOptions(WithLateCancelSettlement(bookings, settler))(h.r)
+
+	res, err := h.r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if res.Resolved < 1 {
+		t.Fatalf("got %+v, want at least 1 resolved", res)
+	}
+	got, err := h.payments.GetByID(context.Background(), p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.PaymentVoided {
+		t.Fatalf("status = %s, want voided immediately — a held pre-order on an already-cancelled, never-confirmed booking must not wait for HOLD_TTL", got.Status)
+	}
+	if h.gw.callCount("void") != 1 {
+		t.Fatalf("void called %d times, want 1", h.gw.callCount("void"))
 	}
 }
 

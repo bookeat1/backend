@@ -73,6 +73,24 @@ const bookingRulesCols = `hold_minutes, late_arrival_text, late_arrival_text_i18
 // placeholder numbering stays untouched.
 const serviceFeeCols = `service_fee_bps`
 
+// loyaltyCols is the venue's loyalty-program display toggle
+// (restaurants.loyalty_enabled, migration 0119). It is kept out of cols for the
+// same reason preorderCols/serviceFeeCols are: a freshly created restaurant must
+// default to the column's DEFAULT false (loyalty is opt-in per venue, never on
+// by default) rather than depend on Create's fixed placeholder list, and old
+// rows/older migration floors must not break on a column that did not exist
+// yet. Unlike its siblings, the public payload publishes this flag on BOTH the
+// detail read (GetByID) and the catalog listings (ListActive/Search), so it is
+// selected explicitly in all of those, not just GetByID — see LoyaltyColumns,
+// exported so favorite.Repository (which reuses the listing column set) can do
+// the same.
+const loyaltyCols = `loyalty_enabled`
+
+// LoyaltyColumns is loyaltyCols, exported for the same reason Columns is: so
+// favorite.Repository can select it through its own join and stay in lockstep
+// with ScanListItem's scan order.
+const LoyaltyColumns = loyaltyCols
+
 // listExtraCols are the columns a catalog LISTING row needs beyond cols, in the
 // order scanListItem reads them.
 //
@@ -119,7 +137,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		price_category=$14, email=$15, phone=$16, latitude=$17, longitude=$18,
 		kwaaka_restaurant_id=$19, is_active=$20, is_new=$21, is_popular=$22,
 		is_premium=$23, hidden_from_home=$24, display_order=$25, updated_at=$26,
-		price_min=$27, price_max=$28
+		price_min=$27, price_max=$28, loyalty_enabled=$29
 		WHERE id=$1`
 	// Built explicitly (not sliced out of r.args) so adding an INSERT column
 	// can't silently shift the UPDATE placeholders out of alignment. Update
@@ -131,6 +149,7 @@ func (r *Repository) Update(ctx context.Context, m *domain.Restaurant) error {
 		string(m.City), string(m.PriceCategory), m.Email, m.Phone, m.Latitude, m.Longitude,
 		m.KwaakaRestaurantID, m.IsActive, m.IsNew, m.IsPopular, m.IsPremium,
 		m.HiddenFromHome, m.DisplayOrder, m.UpdatedAt, m.PriceMin, m.PriceMax,
+		m.LoyaltyEnabled,
 	}
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx, q, args...)
 	if err != nil {
@@ -382,7 +401,7 @@ func (r *Repository) exists(ctx context.Context, id uuid.UUID) error {
 
 func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.RestaurantAggregate, error) {
 	row := sqltx.From(ctx, r.pool).QueryRow(ctx,
-		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+` FROM restaurants WHERE id=$1`, id)
+		`SELECT `+cols+`, `+policyCols+`, `+preorderCols+`, `+serviceFeeCols+`, `+bookingRulesCols+`, `+loyaltyCols+` FROM restaurants WHERE id=$1`, id)
 	base, err := scanRestaurantWithPolicy(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -461,11 +480,17 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 		return nil, 0, fmt.Errorf("count restaurants: %w", err)
 	}
 
+	orderSQL := `ORDER BY r.display_order ASC NULLS LAST, r.name ASC`
+	if distExpr, distArgs, ok := distanceOrderExpr(f.GuestLat, f.GuestLng, args); ok {
+		args = distArgs
+		orderSQL = `ORDER BY ` + distExpr + ` ASC NULLS LAST, r.display_order ASC NULLS LAST, r.name ASC`
+	}
+
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r WHERE ` + whereSQL + `
-		ORDER BY r.display_order ASC NULLS LAST, r.name ASC
+		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
 
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx, q, args...)
@@ -783,11 +808,17 @@ func (r *Repository) Search(ctx context.Context, f domain.RestaurantSearchFilter
 			 word_similarity($%d::text, %s) DESC,
 			 COALESCE(mm.fts_rank, 0) DESC, COALESCE(mm.sim, 0) DESC, r.id ASC`,
 			venueMatch, searchTextExpr, qN, qN, searchTextExpr)
+	} else if distExpr, distArgs, ok := distanceOrderExpr(f.GuestLat, f.GuestLng, args); ok {
+		// Distance only replaces the plain-browse order (no text query) — see
+		// RestaurantSearchFilter.GuestLat for why a text query keeps ranking by
+		// relevance instead.
+		args = distArgs
+		orderSQL = `ORDER BY ` + distExpr + ` ASC NULLS LAST, r.display_order ASC NULLS LAST, r.name ASC, r.id ASC`
 	}
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
 	args = append(args, limit, offset)
-	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `
+	q2 := `SELECT ` + prefixed(cols, "r") + `, ` + listExtraCols + `, ` + prefixed(loyaltyCols, "r") + `
 		FROM restaurants r ` + joinSQL + ` WHERE ` + whereSQL + `
 		` + orderSQL + `
 		LIMIT $` + fmt.Sprint(len(args)-1) + ` OFFSET $` + fmt.Sprint(len(args))
@@ -945,6 +976,7 @@ func scanRestaurantWithPolicy(row scanner) (*domain.Restaurant, error) {
 		&m.PreorderMinAmountMinor,
 		&m.ServiceFeeBps,
 		&br.HoldMinutes, &br.LateArrivalText, &lateArrivalI18n, &m.FreeCancelWindowMinutes,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, err
 	}
@@ -977,9 +1009,10 @@ const Columns = cols
 // a compile error.
 const ListExtraColumns = listExtraCols
 
-// ScanListItem scans one row shaped like ListActive's SELECT (Columns followed
-// by ListExtraColumns) into a Restaurant plus its primary image URL. Exported
-// for the same reason as Columns.
+// ScanListItem scans one row shaped like ListActive's SELECT (Columns, then
+// ListExtraColumns, then LoyaltyColumns — see loyaltyCols for why the toggle is
+// a separate trailing column rather than folded into Columns) into a Restaurant
+// plus its primary image URL. Exported for the same reason as Columns.
 func ScanListItem(row scanner) (*domain.Restaurant, *string, error) {
 	return scanListItem(row)
 }
@@ -1003,6 +1036,7 @@ func scanListItem(row scanner) (*domain.Restaurant, *string, error) {
 		&m.PriceMin, &m.PriceMax, &primary,
 		&m.BookingPolicy.Timezone,
 		&capacityMode, &m.BookingPolicy.BookingCapacitySeats,
+		&m.LoyaltyEnabled,
 	); err != nil {
 		return nil, nil, err
 	}
@@ -1037,6 +1071,36 @@ func limitOffset(page, perPage int, unpaginated bool) (int, int) {
 	}
 	page, perPage = domain.NormalizePaging(page, perPage)
 	return perPage, (page - 1) * perPage
+}
+
+// distanceOrderExpr builds the "closest to the guest first" ORDER BY
+// expression plus the args slice to bind for it (args with lat/lng appended).
+// ok is false — and args is returned unchanged — when either coordinate is
+// nil, meaning "the caller asked for no distance sort".
+//
+// This is the Haversine great-circle distance in kilometers, computed
+// straight in SQL against r.latitude/r.longitude (nullable, plain
+// double precision — this project does not use PostGIS, see
+// docs/ARCHITECTURE.md). NULL propagates through the arithmetic, so a venue
+// with no coordinates of its own evaluates to a NULL distance and the
+// caller's own `... ASC NULLS LAST` puts it after every venue that has one,
+// rather than dropping it. LEAST/GREATEST clamp the acos argument to
+// [-1, 1]: floating-point rounding can push it a hair outside that range for
+// two very close (or identical) points, and acos of anything outside it is
+// NaN in Postgres — a whole page ordered by NaN sorts arbitrarily instead of
+// "these are basically the same spot".
+func distanceOrderExpr(lat, lng *float64, args []any) (expr string, newArgs []any, ok bool) {
+	if lat == nil || lng == nil {
+		return "", args, false
+	}
+	newArgs = append(args, *lat, *lng)
+	latN, lngN := len(newArgs)-1, len(newArgs)
+	expr = fmt.Sprintf(
+		`6371 * acos(LEAST(1, GREATEST(-1,
+			cos(radians($%d)) * cos(radians(r.latitude)) * cos(radians(r.longitude) - radians($%d))
+			+ sin(radians($%d)) * sin(radians(r.latitude))
+		)))`, latN, lngN, latN)
+	return expr, newArgs, true
 }
 
 // escapeLike escapes the LIKE/ILIKE metacharacters (backslash first) so a

@@ -159,6 +159,58 @@ func TestListPublicUpcomingForYou_OrdersByScoreThenStartsAtThenID(t *testing.T) 
 	}
 }
 
+// Bug: a guest with a declared seafood allergy was shown an event hosted at
+// a seafood-cuisine venue (Ocean Basket) even though it would otherwise
+// score a strong cuisine_match — the event must be dropped from the for_you
+// list entirely, not merely scored down.
+func TestListPublicUpcomingForYou_AllergyConflictExcludesTheEvent(t *testing.T) {
+	oceanBasketID := uuid.New()
+	repo := newFakeRepo()
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	repo.publicItems = []domain.EventListItem{eventItem(uuid.New(), oceanBasketID, now.Add(time.Hour), domain.CityAlmaty)}
+
+	venues := &fakeVenueSignals{byID: map[uuid.UUID]domain.RestaurantListItem{
+		oceanBasketID: venueItem(oceanBasketID, false, domain.PriceMid, "seafood"),
+	}}
+	taste := &fakeTasteLoader{profile: domain.TasteProfile{
+		CuisineCodes: []string{"seafood"}, Allergies: []string{domain.FoodieAllergySeafood},
+	}}
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{}, WithTasteMatch(taste, venues, nil))
+
+	ranked, total, err := f.ListPublicUpcomingForYou(context.Background(), domain.PublicEventFilter{Page: 1, PerPage: 20}, uuid.New())
+	if err != nil {
+		t.Fatalf("ListPublicUpcomingForYou: %v", err)
+	}
+	if total != 0 || len(ranked) != 0 {
+		t.Fatalf("total=%d len=%d, want 0/0 — the only event conflicts with the guest's allergy", total, len(ranked))
+	}
+}
+
+// Regression: an event hosted at a venue that does NOT conflict with the
+// guest's allergies is ranked exactly as before.
+func TestListPublicUpcomingForYou_AllergyConflictDoesNotAffectUnrelatedEvents(t *testing.T) {
+	italianID := uuid.New()
+	repo := newFakeRepo()
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	repo.publicItems = []domain.EventListItem{eventItem(uuid.New(), italianID, now.Add(time.Hour), domain.CityAlmaty)}
+
+	venues := &fakeVenueSignals{byID: map[uuid.UUID]domain.RestaurantListItem{
+		italianID: venueItem(italianID, false, domain.PriceMid, "italian"),
+	}}
+	taste := &fakeTasteLoader{profile: domain.TasteProfile{
+		CuisineCodes: []string{"italian"}, Allergies: []string{domain.FoodieAllergySeafood},
+	}}
+	f := NewFacade(repo, &fakePerms{}, &fakeFeed{}, WithTasteMatch(taste, venues, nil))
+
+	ranked, total, err := f.ListPublicUpcomingForYou(context.Background(), domain.PublicEventFilter{Page: 1, PerPage: 20}, uuid.New())
+	if err != nil {
+		t.Fatalf("ListPublicUpcomingForYou: %v", err)
+	}
+	if total != 1 || len(ranked) != 1 || ranked[0].Match.Score != 400 {
+		t.Fatalf("total=%d ranked=%+v, want the one unaffected event scoring 400", total, ranked)
+	}
+}
+
 // A PLATFORM event (no host venue) is never excluded — it is simply scored
 // from the zero domain.VenueTasteSignals and ranked on equal footing.
 func TestListPublicUpcomingForYou_PlatformEventScoresZeroSignalsAndIsNotExcluded(t *testing.T) {

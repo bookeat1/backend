@@ -49,6 +49,27 @@ type Event struct {
 	// KitchenReason / KitchenError are set only for EventBookingKitchenOrderAttention.
 	KitchenReason string
 	KitchenError  string
+	// CancellationReasonCode is the machine-readable system-cancellation reason
+	// (domain.CancelReason*), so the guest push can render distinct copy for
+	// "you never paid" / "the venue never answered" / "the charge failed" /
+	// "the bank released the hold" instead of one generic message for all four.
+	// Empty on a venue/guest cancellation and on every non-cancel event.
+	CancellationReasonCode *string
+	// HoldAmountMinor / HoldCurrency and VenueAnswerDeadlineAt carry the
+	// pre-order hold's money and answer deadline (spec
+	// preorder-hold-capture-on-confirm-20260924 §criterion 25) — nil/zero on
+	// every event except a booking.created release with a live hold that still
+	// needs a venue answer. A staff channel uses them to add the "заблокировано
+	// N ₸, ответьте до…" line; a channel that ignores them (web push, WhatsApp's
+	// fixed approved template) is unaffected.
+	HoldAmountMinor       *int64
+	HoldCurrency          domain.Currency
+	VenueAnswerDeadlineAt *time.Time
+	// ReleasedToVenueAt is nil when the booking that generated this event was
+	// still hidden behind an unpaid pre-order (never shown to the venue). A
+	// staff channel (Telegram) must not announce a cancellation for such a
+	// booking — see TelegramNotifier.Notify.
+	ReleasedToVenueAt *time.Time
 }
 
 // Notifier is one outbound channel. Notify MUST be idempotent under redelivery
@@ -70,15 +91,21 @@ type Notifier interface {
 // is the contract between the booking usecase (producer) and this dispatcher
 // (consumer), so only additive changes are safe on either side.
 type outboxPayload struct {
-	RestaurantID uuid.UUID          `json:"restaurant_id"`
-	UserID       *uuid.UUID         `json:"user_id,omitempty"`
-	Name         string             `json:"name"`
-	Phone        string             `json:"phone"`
-	Guests       int                `json:"guests"`
-	StartsAt     time.Time          `json:"starts_at"`
-	CancelledBy  domain.CancelledBy `json:"cancelled_by,omitempty"`
-	Reason       string             `json:"reason,omitempty"`
-	ErrorText    string             `json:"error_text,omitempty"`
+	RestaurantID           uuid.UUID          `json:"restaurant_id"`
+	UserID                 *uuid.UUID         `json:"user_id,omitempty"`
+	Name                   string             `json:"name"`
+	Phone                  string             `json:"phone"`
+	Guests                 int                `json:"guests"`
+	StartsAt               time.Time          `json:"starts_at"`
+	CancelledBy            domain.CancelledBy `json:"cancelled_by,omitempty"`
+	CancellationReasonCode *string            `json:"cancellation_reason_code,omitempty"`
+	HoldAmountMinor        *int64             `json:"hold_amount_minor,omitempty"`
+	HoldCurrency           domain.Currency    `json:"hold_currency,omitempty"`
+	VenueAnswerDeadlineAt  *time.Time         `json:"venue_answer_deadline_at,omitempty"`
+	ReleasedToVenueAt      *time.Time         `json:"released_to_venue_at,omitempty"`
+	// Reason / ErrorText are set only for booking.kitchen_order_attention.
+	Reason    string `json:"reason,omitempty"`
+	ErrorText string `json:"error_text,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -88,18 +115,23 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		return Event{}, fmt.Errorf("decode outbox payload: %w", err)
 	}
 	return Event{
-		OutboxEventID: row.ID,
-		BookingID:     row.BookingID,
-		RestaurantID:  p.RestaurantID,
-		Type:          row.EventType,
-		GuestName:     p.Name,
-		GuestPhone:    p.Phone,
-		Guests:        p.Guests,
-		StartsAt:      p.StartsAt,
-		GuestUserID:   p.UserID,
-		CancelledBy:   p.CancelledBy,
-		KitchenReason: p.Reason,
-		KitchenError:  p.ErrorText,
+		OutboxEventID:          row.ID,
+		BookingID:              row.BookingID,
+		RestaurantID:           p.RestaurantID,
+		Type:                   row.EventType,
+		GuestName:              p.Name,
+		GuestPhone:             p.Phone,
+		Guests:                 p.Guests,
+		StartsAt:               p.StartsAt,
+		GuestUserID:            p.UserID,
+		CancelledBy:            p.CancelledBy,
+		CancellationReasonCode: p.CancellationReasonCode,
+		HoldAmountMinor:        p.HoldAmountMinor,
+		HoldCurrency:           p.HoldCurrency,
+		VenueAnswerDeadlineAt:  p.VenueAnswerDeadlineAt,
+		ReleasedToVenueAt:      p.ReleasedToVenueAt,
+		KitchenReason:          p.Reason,
+		KitchenError:           p.ErrorText,
 	}, nil
 }
 

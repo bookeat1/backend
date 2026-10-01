@@ -49,6 +49,10 @@ type createBookingRequest struct {
 	// capacity does not fit it. Staff-only and blanked on the guest route, like
 	// Force — see createMine.
 	Overbook bool `json:"overbook"`
+	// AwaitPreorderPayment: the client will attach a pre-order and pay for it
+	// next; the booking stays hidden from the venue until that payment is
+	// authorized. Additive; an old client that omits it gets the old behaviour.
+	AwaitPreorderPayment bool `json:"await_preorder_payment"`
 }
 
 type bookingItemRequest struct {
@@ -65,7 +69,7 @@ func (r createBookingRequest) toInput() (uc.CreateInput, error) {
 		Name: r.Name, Phone: r.Phone, Email: r.Email, Guests: r.Guests,
 		StartsAt: r.StartsAt, Notes: r.Notes, Force: r.Force, Overbook: r.Overbook,
 		PromoCode: r.PromoCode, Source: domain.SourceApp,
-		AttributionSource: r.AttributionSource,
+		AttributionSource: r.AttributionSource, AwaitPreorderPayment: r.AwaitPreorderPayment,
 	}
 	var err error
 	if in.RestaurantID, err = parseUUID(r.RestaurantID, "restaurant_id"); err != nil {

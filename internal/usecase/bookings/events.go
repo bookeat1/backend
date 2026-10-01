@@ -108,14 +108,22 @@ func logTransition(ctx context.Context, b *domain.Booking, from *domain.BookingS
 }
 
 // publish inserts one outbox event describing the booking's current state.
+// opts augment the payload with data available only at the call site (not a
+// Booking field) — today, exactly one: the release path's hold amount +
+// venue-answer deadline (withHoldNotice).
 func publish(
 	ctx context.Context,
 	outbox domain.BookingOutboxRepository,
 	b *domain.Booking,
 	eventType domain.BookingEventType,
 	at time.Time,
+	opts ...payloadOption,
 ) error {
-	payload, err := json.Marshal(newBookingPayload(b))
+	p := newBookingPayload(b)
+	for _, opt := range opts {
+		opt(&p)
+	}
+	payload, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
@@ -147,6 +155,12 @@ type bookingPayload struct {
 	// from one the guest performed themselves — the guest-facing notifier does
 	// not echo the latter back at them. Empty on every non-cancel event.
 	CancelledBy domain.CancelledBy `json:"cancelled_by,omitempty"`
+	// CancellationReasonCode is the machine-readable reason (domain.CancelReason*)
+	// a SYSTEM cancellation carries, so the guest push can tell "you never paid"
+	// apart from "the venue never answered" apart from a plain venue rejection
+	// instead of one generic "Бронь отменена" for all four. Empty on every
+	// non-system cancellation and every non-cancel event.
+	CancellationReasonCode *string `json:"cancellation_reason_code,omitempty"`
 	// PromotionID tags the booking with the campaign it was attached to at
 	// creation (e.g. the Almaty marathon's platform promo) — see
 	// createUseCase.validatePromotion, which already confirmed it names a real,
@@ -161,6 +175,40 @@ type bookingPayload struct {
 	// see createUseCase.sanitizedAttributionSource. Omitted for the vast
 	// majority of bookings that carry no channel tag.
 	AttributionSource *string `json:"attribution_source,omitempty"`
+	// HoldAmountMinor / HoldCurrency and VenueAnswerDeadlineAt are populated
+	// ONLY on the booking.created event the release path (release.go) publishes
+	// for a booking that still carries a live pre-order hold and must wait for
+	// the venue to answer — never on any other event, and never when the venue
+	// auto-confirms on create (no deadline applies then). See withHoldNotice.
+	// Spec preorder-hold-capture-on-confirm-20260924 §criterion 25: "the venue
+	// notification about a booking with a hold carries the pre-order amount and
+	// D_venue".
+	HoldAmountMinor       *int64          `json:"hold_amount_minor,omitempty"`
+	HoldCurrency          domain.Currency `json:"hold_currency,omitempty"`
+	VenueAnswerDeadlineAt *time.Time      `json:"venue_answer_deadline_at,omitempty"`
+	// ReleasedToVenueAt mirrors domain.Booking.ReleasedToVenueAt as of the
+	// moment this event was published: nil when the booking is still hidden
+	// behind an unpaid pre-order (spec §2 — the venue has never been shown
+	// it). A staff-facing channel MUST check this before announcing a
+	// cancellation: the venue cannot be told a booking it was never told
+	// about was cancelled. Guest-facing channels ignore it.
+	ReleasedToVenueAt *time.Time `json:"released_to_venue_at,omitempty"`
+}
+
+// payloadOption augments a bookingPayload with data the caller has but that is
+// not itself a Booking field — see publish.
+type payloadOption func(*bookingPayload)
+
+// withHoldNotice fills the money+deadline line release.go's ReleaseForPayment
+// computes right before publishing booking.created for a booking released with
+// a live pre-order hold.
+func withHoldNotice(amount domain.Money, deadline time.Time) payloadOption {
+	return func(p *bookingPayload) {
+		minor := amount.AmountMinor
+		p.HoldAmountMinor = &minor
+		p.HoldCurrency = amount.Currency
+		p.VenueAnswerDeadlineAt = &deadline
+	}
 }
 
 func newBookingPayload(b *domain.Booking) bookingPayload {
@@ -169,9 +217,11 @@ func newBookingPayload(b *domain.Booking) bookingPayload {
 		Phone: b.PhoneNormalized, Email: b.Email, Guests: b.Guests,
 		StartsAt: b.StartsAt, EndsAt: b.EndsAt, Status: b.Status, Source: b.Source,
 		PromotionID: b.PromotionID, AttributionSource: b.AttributionSource,
+		ReleasedToVenueAt: b.ReleasedToVenueAt,
 	}
 	if b.CancelledBy != nil {
 		p.CancelledBy = *b.CancelledBy
 	}
+	p.CancellationReasonCode = b.CancellationReasonCode
 	return p
 }

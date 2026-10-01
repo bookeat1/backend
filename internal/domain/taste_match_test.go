@@ -515,6 +515,65 @@ func TestMapFoodieCuisinesToDictionaryCodes(t *testing.T) {
 	}
 }
 
+// TestHasAllergyConflict pins the bug report: a guest allergic to seafood
+// must be flagged against a seafood-cuisine venue (e.g. Ocean Basket), by
+// plain code overlap between profile.Allergies and venue.CuisineCodes — see
+// HasAllergyConflict's own doc for why this is a hard exclusion, never a
+// ScoreTasteMatch signal.
+func TestHasAllergyConflict(t *testing.T) {
+	venueID := uuid.New()
+	tests := []struct {
+		name    string
+		profile TasteProfile
+		venue   VenueTasteSignals
+		want    bool
+	}{
+		{
+			name:    "seafood allergy conflicts with a venue whose ONLY cuisine is seafood",
+			profile: TasteProfile{Allergies: []string{FoodieAllergySeafood}},
+			venue:   VenueTasteSignals{RestaurantID: venueID, CuisineCodes: []string{"seafood"}},
+			want:    true,
+		},
+		{
+			name:    "seafood allergy conflicts even when seafood is only ONE of several cuisines",
+			profile: TasteProfile{Allergies: []string{FoodieAllergySeafood}},
+			venue:   VenueTasteSignals{RestaurantID: venueID, CuisineCodes: []string{"european", "seafood"}},
+			want:    true,
+		},
+		{
+			name:    "no allergy overlap: an italian venue is not excluded",
+			profile: TasteProfile{Allergies: []string{FoodieAllergySeafood}},
+			venue:   VenueTasteSignals{RestaurantID: venueID, CuisineCodes: []string{"italian"}},
+			want:    false,
+		},
+		{
+			name:    "no declared allergies: never excludes anything",
+			profile: TasteProfile{},
+			venue:   VenueTasteSignals{RestaurantID: venueID, CuisineCodes: []string{"seafood"}},
+			want:    false,
+		},
+		{
+			name:    "an allergy with no cuisine-shaped counterpart (nuts) never excludes: no ingredient data to check",
+			profile: TasteProfile{Allergies: []string{FoodieAllergyNuts}},
+			venue:   VenueTasteSignals{RestaurantID: venueID, CuisineCodes: []string{"seafood"}},
+			want:    false,
+		},
+		{
+			name:    "a venue with no cuisines at all is never excluded, never panics",
+			profile: TasteProfile{Allergies: []string{FoodieAllergySeafood}},
+			venue:   VenueTasteSignals{RestaurantID: venueID},
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HasAllergyConflict(tt.profile, tt.venue); got != tt.want {
+				t.Fatalf("HasAllergyConflict(%+v, %+v) = %v, want %v", tt.profile, tt.venue, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestScoreTasteMatchCuisineCodesAreMutuallyExclusive pins §5.3 rows 1/1':
 // exactly one of cuisine_match / cuisine_match_implicit is ever present in
 // Reasons, never both, regardless of what data the guest has.

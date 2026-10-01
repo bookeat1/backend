@@ -244,11 +244,21 @@ type freeCancelWindowResponse struct {
 	FreeCancelWindowMinutes int `json:"free_cancel_window_minutes"`
 }
 
-// preorderSettingsResponse reports the venue's pre-order policy. MinAmountMinor
-// is omitted (null) when no floor is set.
+// preorderSettingsResponse reports the venue's pre-order policy. Enabled is the
+// RAW stored value: null = inherits enabled_global (never collapsed to false).
+// MinAmountMinor is null when no floor is set.
 type preorderSettingsResponse struct {
-	Enabled        bool   `json:"enabled"`
-	MinAmountMinor *int64 `json:"min_amount_minor"`
+	Enabled                  *bool  `json:"enabled"`
+	EnabledGlobal            bool   `json:"enabled_global"`
+	PaymentsEnabledEffective bool   `json:"payments_enabled_effective"`
+	MinAmountMinor           *int64 `json:"min_amount_minor"`
+}
+
+func preorderSettingsToResponse(v uc.PreorderSettingsView) preorderSettingsResponse {
+	return preorderSettingsResponse{
+		Enabled: v.Enabled, EnabledGlobal: v.EnabledGlobal,
+		PaymentsEnabledEffective: v.PaymentsEnabledEffective, MinAmountMinor: v.MinAmountMinor,
+	}
 }
 
 // whatsAppSettingsResponse reports the venue's WhatsApp alert configuration.
@@ -287,9 +297,13 @@ func acquirerAccountToResponse(a uc.AcquirerAccount) acquirerAccountResponse {
 }
 
 type paymentMethodsResponse struct {
-	PaymentsEnabled   *bool    `json:"payments_enabled"`
-	Methods           []string `json:"methods"`
-	KaspiAccountBound bool     `json:"kaspi_account_bound"`
+	PaymentsEnabled *bool    `json:"payments_enabled"`
+	Methods         []string `json:"methods"`
+	// PaymentsEnabledGlobal (read-only) is the platform's PAYMENTS_ENABLED
+	// value; when PaymentsEnabled is null the venue inherits this. Ignored on
+	// PUT — see request.go's paymentMethodsRequest, which has no such field.
+	PaymentsEnabledGlobal bool `json:"payments_enabled_global"`
+	KaspiAccountBound     bool `json:"kaspi_account_bound"`
 }
 
 func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsResponse {
@@ -297,5 +311,10 @@ func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsRespons
 	for _, m := range v.Methods {
 		ms = append(ms, string(m))
 	}
-	return paymentMethodsResponse{PaymentsEnabled: v.PaymentsEnabled, Methods: ms, KaspiAccountBound: v.KaspiAccountBound}
+	return paymentMethodsResponse{
+		PaymentsEnabled:       v.PaymentsEnabled,
+		Methods:               ms,
+		PaymentsEnabledGlobal: v.PaymentsEnabledGlobal,
+		KaspiAccountBound:     v.KaspiAccountBound,
+	}
 }

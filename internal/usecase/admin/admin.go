@@ -3,7 +3,9 @@ package admin
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +47,16 @@ type UseCase struct {
 	// acquirerAccounts is optional (see Option / WithAcquirerAccounts): nil in
 	// a deployment that maps no venue to an acquirer-side account.
 	acquirerAccounts acquirerAccountStore
+	// paymentsEnabledGlobal is the platform-wide PAYMENTS_ENABLED value (see
+	// Option / WithPaymentsGlobalEnabled), surfaced read-only on
+	// PaymentMethodsSettings.PaymentsEnabledGlobal. Defaults to false, same as
+	// bootstrap.Config's PAYMENTS_ENABLED default, for a caller that never
+	// wires the option (e.g. table-driven tests that don't care about it).
+	paymentsEnabledGlobal bool
+	// preorderPaymentGlobalRequired is the platform-wide
+	// PAYMENTS_PREORDER_PAYMENT_REQUIRED value (see
+	// WithPreorderPaymentGlobalRequired), what a NULL preorder flag resolves to.
+	preorderPaymentGlobalRequired bool
 }
 
 // NewUseCase constructs the admin-panel usecase.
@@ -96,21 +108,50 @@ func (u *UseCase) SetFreeCancelWindow(ctx context.Context, actor Actor, restaura
 	return u.paySettings.UpdateFreeCancelWindow(ctx, restaurantID, minutes)
 }
 
-// PreorderSettingsInput is the venue's pre-order policy. Enabled = the venue
-// requires pre-payment for pre-ordered dishes (restaurants.preorder_payment_required,
-// which usecase/payments.resolveAmount reads to charge the pre-order total as
-// PurposePreorder). MinAmountMinor is an OPTIONAL floor in int64 MINOR units
-// (nil = no minimum) enforced when a guest attaches a pre-order.
+// PreorderSettingsInput is a partial write of the venue's pre-order policy,
+// SUPERADMIN ONLY. Each field is written only when its *Set flag is true (the
+// JSON key was present); a Set field with a nil value writes NULL:
+//   - Enabled (restaurants.preorder_payment_required, which
+//     usecase/payments.resolveAmount reads to charge the pre-order total as
+//     PurposePreorder): nil = inherit the platform default, true = the venue
+//     requires online pre-payment, false = pre-order is free of online payment;
+//   - MinAmountMinor: an OPTIONAL floor in int64 MINOR units (nil = no minimum)
+//     enforced when a guest attaches a pre-order.
+//
+// A field that is not Set keeps its stored value, so a caller that only flips
+// the switch cannot wipe the minimum (and vice versa).
 type PreorderSettingsInput struct {
-	Enabled        bool
+	EnabledSet     bool
+	Enabled        *bool
+	MinAmountSet   bool
 	MinAmountMinor *int64
 }
 
-// PreorderSettingsView echoes the venue's stored pre-order policy back to the
-// panel. MinAmountMinor is nil when no floor is set.
+// PreorderSettingsView is the panel's view of the venue's pre-order policy.
 type PreorderSettingsView struct {
-	Enabled        bool
+	// Enabled is the RAW stored value: nil = inherits EnabledGlobal. Never
+	// collapsed to false, or "inherits" and "not required" would be
+	// indistinguishable.
+	Enabled *bool
+	// EnabledGlobal is the platform default (PAYMENTS_PREORDER_PAYMENT_REQUIRED,
+	// the value a nil Enabled resolves to), read-only.
+	EnabledGlobal bool
+	// PaymentsEnabledEffective is the venue's payments master switch with the
+	// platform default applied (restaurants.payments_enabled over
+	// PAYMENTS_ENABLED). The panel needs it to warn about a combination that
+	// leaves the guest without a working payment.
+	PaymentsEnabledEffective bool
+	// MinAmountMinor is nil when no floor is set.
 	MinAmountMinor *int64
+}
+
+// WithPreorderPaymentGlobalRequired wires the platform-wide
+// PAYMENTS_PREORDER_PAYMENT_REQUIRED value (bootstrap passes the same
+// usecase/payments.Config field resolveSettings falls back to) so the view can
+// tell the panel what "as on the platform" currently means. Not setting the
+// option leaves it false, the env default.
+func WithPreorderPaymentGlobalRequired(required bool) Option {
+	return func(u *UseCase) { u.preorderPaymentGlobalRequired = required }
 }
 
 // maxPreorderMinAmountMinor bounds the configurable minimum (10,000,000 tiyn =
@@ -119,36 +160,84 @@ type PreorderSettingsView struct {
 const maxPreorderMinAmountMinor int64 = 10_000_000
 
 // GetPreorderSettings returns the venue's current pre-order policy for the
-// panel. owner/manager (PermRestaurantManage).
+// panel. owner/manager (PermRestaurantManage) or superadmin.
 func (u *UseCase) GetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID) (PreorderSettingsView, error) {
 	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
 		return PreorderSettingsView{}, err
 	}
-	override, err := u.paySettings.GetPaymentOverride(ctx, restaurantID)
+	return u.preorderView(ctx, restaurantID)
+}
+
+func (u *UseCase) preorderView(ctx context.Context, restaurantID uuid.UUID) (PreorderSettingsView, error) {
+	o, err := u.paySettings.GetPaymentOverride(ctx, restaurantID)
 	if err != nil {
 		return PreorderSettingsView{}, err
 	}
-	view := PreorderSettingsView{MinAmountMinor: override.PreorderMinAmountMinor}
-	if override.PreorderPaymentRequired != nil {
-		view.Enabled = *override.PreorderPaymentRequired
+	payments := u.paymentsEnabledGlobal
+	if o.PaymentsEnabled != nil {
+		payments = *o.PaymentsEnabled
 	}
-	return view, nil
+	return PreorderSettingsView{
+		Enabled:                  o.PreorderPaymentRequired,
+		EnabledGlobal:            u.preorderPaymentGlobalRequired,
+		PaymentsEnabledEffective: payments,
+		MinAmountMinor:           o.PreorderMinAmountMinor,
+	}, nil
 }
 
 // SetPreorderSettings updates the venue's pre-order policy: whether it requires
-// pre-payment for pre-ordered dishes and its optional minimum. owner/manager
-// (PermRestaurantManage). A negative or absurdly large minimum is rejected here
-// with 422 before it reaches the DB CHECK.
-func (u *UseCase) SetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID, in PreorderSettingsInput) error {
-	if err := u.authorize(ctx, actor, restaurantID, domain.PermRestaurantManage); err != nil {
-		return err
+// pre-payment for pre-ordered dishes (three states: inherit / required / not
+// required) and its optional minimum. SUPERADMIN ONLY: the flag decides whether
+// a guest's pre-order is charged. A negative or absurdly large minimum is
+// rejected with 422 before it reaches the DB CHECK. An input that sets neither
+// field ({} or null body) is a no-op: no UPDATE and no audit line, the current
+// state is returned. Returns the stored state after the write.
+//
+// Every successful write is audited (who, old and new values) from the
+// before/after the repository captured in the SAME atomic statement as the
+// write, and the line is emitted BEFORE the state is re-read for the response:
+// a failed re-read can neither leave the write unaudited nor put a concurrent
+// writer's value into the log.
+func (u *UseCase) SetPreorderSettings(ctx context.Context, actor Actor, restaurantID uuid.UUID, in PreorderSettingsInput) (PreorderSettingsView, error) {
+	if err := requirePlatformAdmin(actor); err != nil {
+		return PreorderSettingsView{}, err
 	}
-	if in.MinAmountMinor != nil {
+	if in.MinAmountSet && in.MinAmountMinor != nil {
 		if *in.MinAmountMinor < 0 || *in.MinAmountMinor > maxPreorderMinAmountMinor {
-			return fmt.Errorf("%w: preorder_min_amount_minor must be between 0 and %d", domain.ErrValidation, maxPreorderMinAmountMinor)
+			return PreorderSettingsView{}, fmt.Errorf("%w: min_amount_minor must be between 0 and %d", domain.ErrValidation, maxPreorderMinAmountMinor)
 		}
 	}
-	return u.paySettings.UpdatePreorderSettings(ctx, restaurantID, in.Enabled, in.MinAmountMinor)
+	if !in.EnabledSet && !in.MinAmountSet {
+		return u.preorderView(ctx, restaurantID) // nothing to write, nothing to audit
+	}
+	change, err := u.paySettings.UpdatePreorderSettings(ctx, restaurantID, domain.PreorderSettingsPatch{
+		EnabledSet: in.EnabledSet, Enabled: in.Enabled,
+		MinAmountSet: in.MinAmountSet, MinAmountMinor: in.MinAmountMinor,
+	})
+	if err != nil {
+		return PreorderSettingsView{}, err
+	}
+	slog.InfoContext(ctx, "admin: preorder settings updated",
+		"actor_id", actor.UserID, "restaurant_id", restaurantID,
+		"old_enabled", fmtBoolPtr(change.OldEnabled), "new_enabled", fmtBoolPtr(change.NewEnabled),
+		"old_min_amount_minor", fmtInt64Ptr(change.OldMinAmountMinor), "new_min_amount_minor", fmtInt64Ptr(change.NewMinAmountMinor))
+	return u.preorderView(ctx, restaurantID)
+}
+
+// fmtBoolPtr / fmtInt64Ptr render a nullable value for a log line: "null"
+// (inherit / unset) stays distinguishable from false / 0.
+func fmtBoolPtr(b *bool) string {
+	if b == nil {
+		return "null"
+	}
+	return strconv.FormatBool(*b)
+}
+
+func fmtInt64Ptr(n *int64) string {
+	if n == nil {
+		return "null"
+	}
+	return strconv.FormatInt(*n, 10)
 }
 
 // telegramChatIDPattern validates the shape of a Telegram chat id staff paste

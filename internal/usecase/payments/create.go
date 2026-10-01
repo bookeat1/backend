@@ -35,6 +35,10 @@ type CreateUseCase interface {
 	// PaymentFeeTerms returns the effective service-fee rate and acquirer
 	// minimum the checkout grosses a base amount up with for this venue.
 	PaymentFeeTerms(ctx context.Context, restaurantID uuid.UUID) (domain.PaymentFeeTerms, error)
+	// PreorderPaymentRequired reports whether the venue's pre-order is paid
+	// online: the venue's flag (restaurants.preorder_payment_required) or, when
+	// NULL, the platform default, resolved exactly as CreateForBooking does.
+	PreorderPaymentRequired(ctx context.Context, restaurantID uuid.UUID) (bool, error)
 }
 
 // CreateInput is a checkout request.
@@ -294,7 +298,8 @@ func (u *createUseCase) CreateForBooking(ctx context.Context, actor Actor, in Cr
 		Provider: provider, ProviderPaymentID: nullableStr(gwResp.ProviderPaymentID), Purpose: purpose,
 		Status: domain.PaymentCreated, AmountMinor: total.AmountMinor, BaseAmountMinor: base.AmountMinor,
 		FeeMinor: fee.AmountMinor, Currency: total.Currency, IdempotencyKey: dbKey,
-		PaymentURL: nullableStr(gwResp.PaymentURL), ExpiresAt: &expiresAt,
+		RequiresConfirmation: requiresConfirmation(gw, purpose),
+		PaymentURL:           nullableStr(gwResp.PaymentURL), ExpiresAt: &expiresAt,
 		CreatedAt: now, UpdatedAt: now,
 	}
 
@@ -387,7 +392,11 @@ func (u *createUseCase) resolveAmount(ctx context.Context, b domain.Booking, set
 		}
 		return domain.PurposeDeposit, m, nil
 	}
-	return "", domain.Money{}, fmt.Errorf("%w: this booking requires no payment", domain.ErrValidation)
+	// Tagged with a stable code: HandleError replaces the message of an
+	// ErrValidation with a generic one, so the code is the only way a client can
+	// tell this refusal from any other 422 on the same call.
+	return "", domain.Money{}, domain.WithCode(domain.CodePaymentNotRequired,
+		fmt.Errorf("%w: this booking requires no payment", domain.ErrValidation))
 }
 
 // authorizeCreate decides who may start a payment for a booking: the venue's
@@ -511,4 +520,26 @@ func roundToGatewayGranularity(gw domain.PaymentGateway, base, fee, total domain
 			"%w: rounding to the acquirer's %d-minor step broke base+fee=total", domain.ErrValidation, unit)
 	}
 	return newFee, newTotal, nil
+}
+
+// onePayGateway is an OPTIONAL acquirer capability: the acquirer is one-stage
+// for every purpose (Kaspi Pay), so nothing it takes can be voided later.
+type onePayGateway interface {
+	CapturesOnPay() bool
+}
+
+// requiresConfirmation decides, ONCE, whether a payment is a two-stage hold
+// (true: capture on the venue's confirmation, void otherwise) or a one-stage
+// charge. A ticket is always one-stage; a deposit and — since the owner
+// decision of 2026-09-24 — a pre-order are holds unless the acquirer cannot
+// hold at all. The answer is stored on the payment: the webhook and every
+// settlement branch read the stored value, never the purpose.
+func requiresConfirmation(gw domain.PaymentGateway, purpose domain.PaymentPurpose) bool {
+	if purpose == domain.PurposeTicket {
+		return false
+	}
+	if g, ok := gw.(onePayGateway); ok && g.CapturesOnPay() {
+		return false
+	}
+	return true
 }

@@ -172,6 +172,7 @@ func kaspiPreorder(bookingID uuid.UUID, providerPaymentID string) *domain.Paymen
 	p := testPayment(bookingID, domain.PaymentCreated, providerPaymentID)
 	p.Provider = domain.ProviderKaspi
 	p.Purpose = domain.PurposePreorder
+	p.RequiresConfirmation = false // Kaspi is one-stage for every purpose
 	p.AmountMinor, p.BaseAmountMinor, p.FeeMinor = 253_900, 250_000, 3_900
 	return p
 }

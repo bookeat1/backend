@@ -453,3 +453,10 @@ func sanitise(msg string) string {
 	}
 	return msg
 }
+
+// CapturesOnPay reports that Kaspi is one-stage for every purpose: the money is
+// taken when the guest pays and a Void of a paid order is refused, so a
+// pre-order paid through Kaspi is captured the instant it is authorized and
+// refunded (never voided) on refusal. usecase/payments reads it (optional
+// capability) to record requires_confirmation=false on the payment.
+func (g *Gateway) CapturesOnPay() bool { return true }

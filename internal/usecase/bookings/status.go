@@ -2,8 +2,10 @@ package bookings
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,6 +48,29 @@ type statusUseCase struct {
 	tx          domain.TxManager
 	cfg         Config
 	deposits    DepositSettler
+	capturer    PreorderCapturer
+}
+
+// PreorderCapturer takes the money of a pre-order HOLD when the venue confirms
+// the booking (owner decision 2026-09-24). Bound in bootstrap to
+// payments.PreorderConfirmationUseCase; nil = no capture (tests, payments off).
+// It runs AFTER the confirmation commits, never inside its transaction.
+// domain.ErrProviderDeclined means the acquirer definitively refused.
+type PreorderCapturer interface {
+	CaptureOnConfirm(ctx context.Context, bookingID uuid.UUID) error
+}
+
+// WithPreorderCapturer wires the capture-on-confirmation hook.
+func WithPreorderCapturer(c PreorderCapturer) StatusOption {
+	return func(u *statusUseCase) { u.capturer = c }
+}
+
+// errAwaitingPayment is the venue-side refusal to act on a booking that is still
+// hidden because the guest's pre-order payment is not authorized yet. It maps to
+// 409 through ErrAlreadyExists; the narrow code is what clients branch on.
+func errAwaitingPayment() error {
+	return domain.WithCode(domain.CodeBookingAwaitingPayment,
+		fmt.Errorf("%w: the guest's pre-order payment is not authorized yet", domain.ErrAlreadyExists))
 }
 
 // DepositSettler settles a booking's HELD deposit as a CONSEQUENCE of a cancel
@@ -165,6 +190,11 @@ func (u *statusUseCase) transition(
 	if err := u.authorizeTransition(ctx, acc, b, to, staffOnly); err != nil {
 		return nil, err
 	}
+	// A booking hidden behind an unpaid pre-order cannot be answered by the
+	// venue; the guest may still cancel it (A -> D).
+	if acc.staff() && b.AwaitingPreorderPayment() && to != domain.BookingCancelled {
+		return nil, errAwaitingPayment()
+	}
 	if err := domain.ValidateTransition(b.Status, to); err != nil {
 		return nil, fmt.Errorf("%s → %s: %w", b.Status, to, err)
 	}
@@ -190,7 +220,17 @@ func (u *statusUseCase) transition(
 				return err
 			}
 		}
-		if err := u.bookings.UpdateStatus(ctx, b.ID, to, at); err != nil {
+		// CompareAndSwapStatus, not UpdateStatus: b.Status was read by GetByID
+		// above, OUTSIDE this transaction and with no row lock, so a concurrent
+		// transition (the confirm-SLA worker cancelling this same booking, a
+		// second click, Telegram and the cabinet answering at once) can commit in
+		// the gap. A CAS miss means exactly that happened — reported as an
+		// invalid transition, the same 422 a stale client already gets for
+		// racing against a read it never overlapped with.
+		if err := u.bookings.CompareAndSwapStatus(ctx, b.ID, from, to, at); err != nil {
+			if errors.Is(err, domain.ErrAlreadyExists) {
+				return fmt.Errorf("%s → %s: %w", from, to, domain.ErrInvalidStatus)
+			}
 			return err
 		}
 		return recordTransition(ctx, u.history, u.outbox, b, &from, acc.actorType(), actorID(actor), reason, at)
@@ -199,7 +239,99 @@ func (u *statusUseCase) transition(
 		return nil, err
 	}
 	u.settleDepositAfterTransition(ctx, b, to)
+	if to == domain.BookingConfirmed {
+		u.captureAfterConfirm(ctx, b)
+	}
 	return b, nil
+}
+
+// captureAfterConfirm takes the pre-order hold once the confirmation is durable
+// (confirm first, capture second: the other order would let a guest cancel win
+// the status after the money was already taken). An unknown outcome is logged
+// and left to the reconciler; a definitive refusal cancels the booking as the
+// system, because the venue must not honour a booking whose money is not there.
+func (u *statusUseCase) captureAfterConfirm(ctx context.Context, b *domain.Booking) {
+	if u.capturer == nil {
+		return
+	}
+	err := u.capturer.CaptureOnConfirm(ctx, b.ID)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, domain.ErrProviderDeclined) {
+		logging.FromContext(ctx).Error("booking.preorder_capture_pending",
+			slog.String("booking_id", b.ID.String()), slog.String("error", err.Error()))
+		return
+	}
+	if cerr := u.cancelBySystem(ctx, b.ID, domain.CancelReasonPreorderCaptureFailed); cerr != nil {
+		logging.FromContext(ctx).Error("booking.preorder_capture_cancel_failed",
+			slog.String("booking_id", b.ID.String()), slog.String("error", cerr.Error()))
+	}
+}
+
+// CancelPendingOnHoldLost cancels a PENDING booking as the system because the
+// acquirer released its pre-order hold (scenario 12). Any other status is left
+// alone: a confirmed booking's money is the capture/refund path's business.
+// Bound in bootstrap to payments.WithHoldLostCanceller.
+func (u *statusUseCase) CancelPendingOnHoldLost(ctx context.Context, id uuid.UUID) error {
+	return u.cancelBySystemIf(ctx, id, domain.CancelReasonPreorderHoldReleased, domain.BookingPending)
+}
+
+// cancelBySystem cancels a live booking as the system with a machine-readable
+// reason code, then releases any hold. Idempotent: a booking that already left
+// a cancellable state is left alone.
+func (u *statusUseCase) cancelBySystem(ctx context.Context, id uuid.UUID, code string) error {
+	return u.cancelBySystemIf(ctx, id, code)
+}
+
+// cancelBySystemIf is cancelBySystem restricted to the given current statuses
+// (none = any cancellable one).
+func (u *statusUseCase) cancelBySystemIf(ctx context.Context, id uuid.UUID, code string, only ...domain.BookingStatus) error {
+	var b *domain.Booking
+	at := time.Now()
+	err := u.tx.WithinTx(ctx, func(ctx context.Context) error {
+		cur, err := u.bookings.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if domain.ValidateTransition(cur.Status, domain.BookingCancelled) != nil {
+			return nil
+		}
+		if len(only) > 0 && !slices.Contains(only, cur.Status) {
+			return nil
+		}
+		from := cur.Status
+		by := domain.CancelledBySystem
+		cur.Status, cur.CancelledBy, cur.CancelledAt = domain.BookingCancelled, &by, &at
+		cur.CancellationReasonCode = &code
+		if err := u.bookings.Update(ctx, cur); err != nil {
+			return err
+		}
+		// CompareAndSwapStatus: the ValidateTransition check above ran against a
+		// read taken before this transaction, with no row lock. If a venue action
+		// commits in that gap, the CAS fails instead of stamping cancelled_by /
+		// cancelled_at (just written by Update, above) onto a row that is no
+		// longer ours to cancel — returning the error here rolls that Update back
+		// too, atomically.
+		if err := u.bookings.CompareAndSwapStatus(ctx, cur.ID, from, domain.BookingCancelled, at); err != nil {
+			return err
+		}
+		b = cur
+		return recordTransition(ctx, u.history, u.outbox, cur, &from, domain.ActorSystem, nil, &code, at)
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			// Lost the race to another transition (the venue answered first,
+			// or a different cancel path won): nothing left for us to cancel.
+			return nil
+		}
+		return err
+	}
+	if b == nil {
+		return nil
+	}
+	u.settleDepositAfterTransition(ctx, b, domain.BookingCancelled)
+	return nil
 }
 
 // settleDepositAfterTransition drives the held-deposit money decision as a

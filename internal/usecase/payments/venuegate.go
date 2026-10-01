@@ -217,6 +217,27 @@ func (u *createUseCase) PaymentFeeTerms(ctx context.Context, restaurantID uuid.U
 	return domain.PaymentFeeTerms{RateBps: s.ServiceFeeBps, MinFeeMinor: g.cfg.AcquirerMinFeeMinor}, nil
 }
 
+// PreorderPaymentRequired reports the venue's EFFECTIVE pre-order payment flag:
+// restaurants.preorder_payment_required when set, otherwise the platform default
+// (PAYMENTS_PREORDER_PAYMENT_REQUIRED) — the very resolveSettings value
+// resolveAmount reads, so the guest-facing flag cannot promise a pre-order
+// payment the checkout would refuse with "requires no payment".
+//
+// It is deliberately NOT gated on the payments master switch (the guest app
+// combines it with accepts_online_payment) and says nothing about a per-date
+// paid special day, which CreateForBooking applies on top for one booking
+// (a deposit replaces the pre-order charge).
+func (u *createUseCase) PreorderPaymentRequired(ctx context.Context, restaurantID uuid.UUID) (bool, error) {
+	if restaurantID == uuid.Nil {
+		return false, fmt.Errorf("%w: restaurant required", domain.ErrValidation)
+	}
+	override, err := u.restaurants.GetPaymentOverride(ctx, restaurantID)
+	if err != nil {
+		return false, err
+	}
+	return resolveSettings(override, u.cfg.withDefaults()).PreorderPaymentRequired, nil
+}
+
 // methodEnabled reports whether the venue has switched the method on.
 func methodEnabled(s domain.PaymentSettings, m domain.PaymentMethod) bool {
 	switch m {
@@ -268,14 +289,28 @@ func (g venueGate) resolveEnabledMethod(ctx context.Context, s domain.PaymentSet
 // pickMethodGateway chooses the acquirer for a NEW payment.
 //
 // With an explicit method that method is used or the call is refused with a
-// 422 — never a silent switch to the other one. Without one (older clients) the
-// venue's legacy preferred provider orders the methods (kaspi first when it
-// preferred kaspi, otherwise card first) and the first AVAILABLE one wins.
+// 422 — never a silent switch to the other one. account (check 3) is
+// deliberately NOT probed here even then: CreateForBooking's own account()
+// call right after this one is the single, authoritative read for whichever
+// provider ends up chosen, and a refusal for a bad account surfaces through
+// resolveSplitPlan / the adapter's own refusal, not from here.
 //
-// A method that is enabled and has an acquirer but no usable venue account is
-// deliberately still returned when nothing better exists: the checkout then
-// fails further down with the specific, long-standing error (split_account_missing
-// / the adapter's refusal) instead of a generic one.
+// Without one (older clients) the venue's legacy preferred provider orders
+// the methods (kaspi first when it preferred kaspi, otherwise card first),
+// and every method that is switched on with a resolvable acquirer is a
+// CANDIDATE. With at most one candidate there is nothing to choose between,
+// so it is returned as-is — no account probe, same one-read-downstream shape
+// as the explicit-method path. With two or more candidates, though, a
+// mechanical "first in order" pick is how a venue whose PREFERRED method
+// (e.g. Kaspi) is enabled but not yet bound to an acquirer account ends up
+// refusing a guest who never chose that method, while a working method
+// (e.g. card) sat right there unpicked — the PR #158 code-review bug. So with
+// a genuine choice on the table, each candidate is probed (check 3,
+// accountUsable) in order and the first ACCOUNT-USABLE one wins; only if none
+// of them are does the mechanical first-in-order candidate win regardless,
+// exactly the previous fallback behaviour — the checkout then fails further
+// down with the specific, long-standing error (split_account_missing / the
+// adapter's refusal) instead of a generic one.
 func (g venueGate) pickMethodGateway(ctx context.Context, restaurantID uuid.UUID, s domain.PaymentSettings, requested domain.PaymentMethod) (domain.PaymentGateway, error) {
 	notAvailable := func(m domain.PaymentMethod) error {
 		return fmt.Errorf("%w: payment method %s is not available for this restaurant", domain.ErrValidation, m)
@@ -297,16 +332,36 @@ func (g venueGate) pickMethodGateway(ctx context.Context, restaurantID uuid.UUID
 	if s.Provider == domain.ProviderKaspi {
 		order = []domain.PaymentMethod{domain.MethodKaspi, domain.MethodCard}
 	}
+
+	type candidate struct {
+		gw domain.PaymentGateway
+	}
+	var candidates []candidate
 	for _, m := range order {
 		gw, ok, err := g.resolveEnabledMethod(ctx, s, m)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
-			return gw, nil
+			candidates = append(candidates, candidate{gw: gw})
 		}
 	}
-	return nil, errVenuePaymentsDisabled
+	if len(candidates) == 0 {
+		return nil, errVenuePaymentsDisabled
+	}
+	if len(candidates) == 1 {
+		return candidates[0].gw, nil
+	}
+	for _, c := range candidates {
+		ok, err := g.accountUsable(ctx, c.gw, restaurantID)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return c.gw, nil
+		}
+	}
+	return candidates[0].gw, nil
 }
 
 // providerUnusable separates "this deployment cannot take a new payment through

@@ -32,7 +32,7 @@ func TestKitchenAttentionEventAndText(t *testing.T) {
 	if e.RestaurantID != rid || e.KitchenReason != "cancel_failed" {
 		t.Fatalf("%+v", e)
 	}
-	txt := buildTelegramText(e)
+	txt := buildTelegramText(e, time.UTC)
 	if !strings.Contains(txt, "вручную") || strings.Contains(txt, strings.Repeat("я", 250)) {
 		t.Fatalf("text: %s", txt)
 	}
