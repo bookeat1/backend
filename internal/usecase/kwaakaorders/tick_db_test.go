@@ -28,6 +28,8 @@ func tickSeed(t *testing.T, pool *pgxpool.Pool) (bookingID, orderID uuid.UUID) {
 	ctx := context.Background()
 	// Tick works on EVERY due row, so leftovers of other tests would be driven too.
 	testdb.Truncate(t, pool, "kwaaka_kitchen_orders")
+	// Same for the claim stage: venues left enabled by other tests would be claimed.
+	testdb.Truncate(t, pool, "restaurant_kwaaka_order_settings")
 	rid, bid := uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `INSERT INTO restaurants (id, name, city, price_category, kwaaka_restaurant_id, timezone)
 		VALUES ($1,'R','Алматы','₸','kw-1','Asia/Almaty')`, rid); err != nil {

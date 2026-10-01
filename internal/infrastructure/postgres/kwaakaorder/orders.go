@@ -308,9 +308,11 @@ func (r *Orders) CompareAndSet(ctx context.Context, o *domain.KitchenOrder, want
 
 func (r *Orders) TableLoads(ctx context.Context, restaurantID uuid.UUID, now time.Time) (domain.KitchenTableLoad, error) {
 	out := domain.KitchenTableLoad{Inflight: map[string]int{}, Live: map[string]int{}}
+	// $2 is cast explicitly (see ListPollDue): `$2 - interval` alone would make
+	// Postgres infer $2 as interval and break `table_hold_until > $2`.
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT kwaaka_table_id,
-		        count(*) FILTER (WHERE status = 'sending' OR (status = 'sent' AND sent_at > $2 - interval '5 minutes')),
+		        count(*) FILTER (WHERE status = 'sending' OR (status = 'sent' AND sent_at > $2::timestamptz - interval '5 minutes')),
 		        count(*)
 		   FROM kwaaka_kitchen_orders
 		  WHERE restaurant_id = $1 AND status IN ('sending','sent','cancelling','failed_unknown')
@@ -376,11 +378,14 @@ func (r *Orders) ListRescheduled(ctx context.Context, limit int) ([]domain.Kitch
 }
 
 func (r *Orders) ListPollDue(ctx context.Context, now, staleBefore time.Time, limit int) ([]domain.KitchenOrder, error) {
+	// $1 is cast explicitly: in `sent_at > $1 - interval '12 hours'` Postgres
+	// resolves the untyped $1 to interval (interval - interval) and the statement
+	// then fails with "operator does not exist: timestamptz > interval".
 	rows, err := sqltx.From(ctx, r.pool).Query(ctx,
 		`SELECT `+orderCols+` FROM kwaaka_kitchen_orders
 		  WHERE status IN ('sent','cancelling')
 		    AND (pos_state IS NULL OR pos_state NOT IN ('closed','deleted'))
-		    AND sent_at > $1 - interval '12 hours'
+		    AND sent_at > $1::timestamptz - interval '12 hours'
 		    AND (pos_status_at IS NULL OR pos_status_at < $2)
 		  ORDER BY COALESCE(pos_status_at, sent_at) LIMIT $3`, now, staleBefore, limit)
 	if err != nil {
