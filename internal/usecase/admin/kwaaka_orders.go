@@ -244,8 +244,12 @@ func (u *UseCase) GetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 //
 // The POS call happens OUTSIDE the transaction; inside it the settings row is
 // locked FOR UPDATE (the same row the claim step locks, after its booking lock,
-// so no new lock order appears) and replaced. Two concurrent PUTs both succeed
-// and the later commit wins, as for any full-replace PUT.
+// so no new lock order appears) and replaced. Concurrent PUTs that agree on
+// whether the POS is needed both succeed and the later commit wins, as for any
+// full-replace PUT; a PUT that decided "no POS needed" on the unlocked read and
+// finds a different pool under the lock is refused with the 503 above (nothing
+// written, never a mixed pool), so under heavy concurrency some PUTs may
+// legitimately answer 503 and the caller must retry them.
 //
 // Every write is audited with an slog line (who, old and new values) emitted
 // after the commit.

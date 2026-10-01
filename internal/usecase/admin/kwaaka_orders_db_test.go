@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -117,6 +118,16 @@ func TestKwaakaOrdersDB_LifecycleAndEnabledAt(t *testing.T) {
 	}
 }
 
+// Many concurrent full-replace PUTs on one venue. Each request either commits
+// its whole pool or is refused with 503 (domain.ErrUnavailable, "the settings
+// changed concurrently, retry") when the row changed between its unlocked read
+// and the row lock so that it would now need a POS proof it did not collect
+// (see TestKwaakaOrdersDB_PutRefusedWhenPoolChangesUnderTheLock for that path,
+// forced deterministically). Nothing may be written by a refused request, and
+// any other error (PK clash, deadlock, lock error) is a failure. The final pool
+// must be exactly one of the requested pools, never a mix, and at least one PUT
+// must have succeeded (the first writer on an empty row always needs the POS and
+// always has its proof, so it cannot be refused).
 func TestKwaakaOrdersDB_ConcurrentPutsLeaveOneWholePool(t *testing.T) {
 	uc, pool, rid, admin := newKwDBHarness(t)
 	ctx := context.Background()
@@ -135,11 +146,21 @@ func TestKwaakaOrdersDB_ConcurrentPutsLeaveOneWholePool(t *testing.T) {
 	}
 	wg.Wait()
 	close(errs)
+	succeeded, refused := 0, 0
 	for err := range errs {
-		if err != nil {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, domain.ErrUnavailable):
+			refused++ // legitimate: lost the race, nothing written, the caller retries
+		default:
 			t.Fatalf("concurrent PUT failed (PK clash or lock error?): %v", err)
 		}
 	}
+	if succeeded == 0 {
+		t.Fatalf("no PUT succeeded (%d refused with 503)", refused)
+	}
+	t.Logf("concurrent PUTs: %d succeeded, %d refused with 503", succeeded, refused)
 	got, err := kwaakaorder.NewSettings(pool).Get(ctx, rid)
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +178,79 @@ func TestKwaakaOrdersDB_ConcurrentPutsLeaveOneWholePool(t *testing.T) {
 		}
 	}
 	t.Fatalf("final pool %v is a mix, not any one requested pool", ids)
+}
+
+// afterGetStore wraps a settings store and runs hook once, right after the
+// first unlocked Get returns. It forces the interleaving "request A has read
+// the row without a lock, request B commits, request A takes the lock" with no
+// dependence on timing.
+type afterGetStore struct {
+	kwaakaOrderSettingsStore
+	hook func()
+}
+
+func (s *afterGetStore) Get(ctx context.Context, id uuid.UUID) (*domain.KwaakaOrderSettings, error) {
+	row, err := s.kwaakaOrderSettingsStore.Get(ctx, id)
+	if h := s.hook; h != nil {
+		s.hook = nil
+		h()
+	}
+	return row, err
+}
+
+// The 503 path of SetKwaakaOrders on a real Postgres. Stored pool {T1,T2},
+// enabled. Request A repeats {T1,T2}: on its unlocked read nothing changes, so
+// it decides it needs no POS. Before A takes the row lock, request B commits
+// {T3}. Under the lock A sees a different pool, would now need a POS proof it
+// did not collect, and must answer ErrUnavailable and write nothing.
+func TestKwaakaOrdersDB_PutRefusedWhenPoolChangesUnderTheLock(t *testing.T) {
+	uc, pool, rid, admin := newKwDBHarness(t)
+	ctx := context.Background()
+	if _, err := uc.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool0("T1", "T2")}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+	pos := uc.kwaaka.pos.(*kwPOS)
+	pos.mu.Lock()
+	pos.calls = 0
+	pos.mu.Unlock()
+
+	repo := kwaakaorder.NewSettings(pool)
+	var bErr error
+	uc.kwaaka.store = &afterGetStore{kwaakaOrderSettingsStore: repo, hook: func() {
+		// Request B, complete (its own POS call included), between A's read and lock.
+		other := *uc
+		other.kwaaka.store = repo
+		_, bErr = other.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool0("T3")})
+	}}
+
+	_, err := uc.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool0("T1", "T2")})
+	if bErr != nil {
+		t.Fatalf("request B: %v", bErr)
+	}
+	if !errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("request A err = %v, want ErrUnavailable", err)
+	}
+	pos.mu.Lock()
+	calls := pos.calls
+	pos.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("POS calls = %d, want 1 (only B's; A decided it needed none)", calls)
+	}
+	got, err := repo.Get(ctx, rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Pool) != 1 || got.Pool[0].KwaakaTableID != "T3" {
+		t.Fatalf("stored pool = %+v, want exactly B's {T3}: the refused A must write nothing", got.Pool)
+	}
+
+	// The documented remedy: A retries and now succeeds (it has the POS proof).
+	if _, err := uc.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool0("T1", "T2")}); err != nil {
+		t.Fatalf("retry after 503: %v", err)
+	}
+	if got, err = repo.Get(ctx, rid); err != nil || len(got.Pool) != 2 || got.Pool[0].KwaakaTableID != "T1" {
+		t.Fatalf("after retry: %+v err=%v", got, err)
+	}
 }
 
 func pool0(ids ...string) []KwaakaPoolTableInput { return pool(ids...) }
