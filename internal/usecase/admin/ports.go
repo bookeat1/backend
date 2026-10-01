@@ -58,6 +58,24 @@ type paymentSettingsWriter interface {
 	UpdatePaymentMethods(ctx context.Context, restaurantID uuid.UUID, paymentsEnabled *bool, kaspi, card bool) error
 }
 
+// kwaakaOrderSettingsStore is the slice of domain.KwaakaOrderSettingsRepository
+// the Kwaaka kitchen-order settings endpoints need. Implemented by
+// *kwaakaorder.Settings (internal/infrastructure/postgres/kwaakaorder), the
+// SAME repository the sending loop reads, so the panel and the worker can
+// never disagree about what is stored.
+type kwaakaOrderSettingsStore interface {
+	Get(ctx context.Context, restaurantID uuid.UUID) (*domain.KwaakaOrderSettings, error)
+	LockForUpdate(ctx context.Context, restaurantID uuid.UUID) (*domain.KwaakaOrderSettings, error)
+	Save(ctx context.Context, s *domain.KwaakaOrderSettings) error
+}
+
+// kwaakaTablesPOS is the one POS call this package makes: the venue's table
+// list, to prove a pool table exists before it is saved (ADR-049). Implemented
+// by *kwaaka.OrderPOS; nil when KWAAKA_BASE_URL/KWAAKA_TOKEN are not set.
+type kwaakaTablesPOS interface {
+	GetTables(ctx context.Context, kwaakaRestaurantID string) ([]domain.PosTable, error)
+}
+
 // telegramSettings is the slice of the notification-settings repo this package
 // needs to manage a venue's Telegram alert target. The chat-id shape is
 // validated in the usecase, not the DB. Implemented by

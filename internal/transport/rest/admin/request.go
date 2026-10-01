@@ -322,3 +322,39 @@ func (r paymentMethodsRequest) toInput() adminuc.PaymentMethodsInput {
 	}
 	return adminuc.PaymentMethodsInput{PaymentsEnabled: r.PaymentsEnabled, Methods: ms}
 }
+
+// kwaakaOrdersRequest replaces a venue's Kwaaka kitchen-order settings (full
+// replace). orders_enabled and pool are REQUIRED so a body that merely forgot a
+// key cannot silently switch a venue off or wipe its pool (send "pool": [] to
+// clear it). lead_minutes: null/absent = the platform default. The order of
+// pool is its priority. kwaaka_restaurant_id is an optional confirmation of the
+// linkage the form was loaded with; the stored value always comes from the
+// venue, never from here.
+type kwaakaOrdersRequest struct {
+	OrdersEnabled      *bool                   `json:"orders_enabled"`
+	LeadMinutes        *int                    `json:"lead_minutes"`
+	KwaakaRestaurantID string                  `json:"kwaaka_restaurant_id"`
+	Pool               *[]kwaakaPoolTableInput `json:"pool"`
+}
+
+type kwaakaPoolTableInput struct {
+	KwaakaTableID string `json:"kwaaka_table_id"`
+	Label         string `json:"label"`
+}
+
+func (r kwaakaOrdersRequest) toInput() (adminuc.KwaakaOrdersInput, error) {
+	if r.OrdersEnabled == nil {
+		return adminuc.KwaakaOrdersInput{}, fmt.Errorf("orders_enabled is required")
+	}
+	if r.Pool == nil {
+		return adminuc.KwaakaOrdersInput{}, fmt.Errorf("pool is required (send [] to clear it)")
+	}
+	pool := make([]adminuc.KwaakaPoolTableInput, 0, len(*r.Pool))
+	for _, t := range *r.Pool {
+		pool = append(pool, adminuc.KwaakaPoolTableInput{KwaakaTableID: t.KwaakaTableID, Label: t.Label})
+	}
+	return adminuc.KwaakaOrdersInput{
+		OrdersEnabled: *r.OrdersEnabled, LeadMinutes: r.LeadMinutes,
+		KwaakaRestaurantID: r.KwaakaRestaurantID, Pool: pool,
+	}, nil
+}
