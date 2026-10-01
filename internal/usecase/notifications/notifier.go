@@ -46,6 +46,9 @@ type Event struct {
 	// The guest channel uses it to avoid echoing a cancellation the guest
 	// themselves just performed in the app.
 	CancelledBy domain.CancelledBy
+	// KitchenReason / KitchenError are set only for EventBookingKitchenOrderAttention.
+	KitchenReason string
+	KitchenError  string
 	// CancellationReasonCode is the machine-readable system-cancellation reason
 	// (domain.CancelReason*), so the guest push can render distinct copy for
 	// "you never paid" / "the venue never answered" / "the charge failed" /
@@ -100,6 +103,9 @@ type outboxPayload struct {
 	HoldCurrency           domain.Currency    `json:"hold_currency,omitempty"`
 	VenueAnswerDeadlineAt  *time.Time         `json:"venue_answer_deadline_at,omitempty"`
 	ReleasedToVenueAt      *time.Time         `json:"released_to_venue_at,omitempty"`
+	// Reason / ErrorText are set only for booking.kitchen_order_attention.
+	Reason    string `json:"reason,omitempty"`
+	ErrorText string `json:"error_text,omitempty"`
 }
 
 // toEvent decodes an outbox row into the channel-agnostic Event.
@@ -124,5 +130,42 @@ func toEvent(row domain.BookingOutboxEvent) (Event, error) {
 		HoldCurrency:           p.HoldCurrency,
 		VenueAnswerDeadlineAt:  p.VenueAnswerDeadlineAt,
 		ReleasedToVenueAt:      p.ReleasedToVenueAt,
+		KitchenReason:          p.Reason,
+		KitchenError:           p.ErrorText,
 	}, nil
+}
+
+// kitchenAttentionText is the venue-facing text of a kitchen-order alert. The
+// error text is Kwaaka's own message about the order, never guest data; it is
+// capped so a chatty POS cannot flood a chat.
+func kitchenAttentionText(e Event) string {
+	name := e.GuestName
+	if name == "" {
+		name = "Гость"
+	}
+	when := e.StartsAt.Local().Format("02.01 15:04")
+	var head string
+	switch e.KitchenReason {
+	case "failed":
+		head = "⚠️ Предзаказ не попал в кассу. Внесите его вручную."
+	case "failed_unknown":
+		head = "⚠️ Не удалось проверить, дошёл ли предзаказ до кассы. Проверьте кассу, при необходимости внесите вручную."
+	case "cancel_failed":
+		head = "⚠️ Бронь отменена, но заказ в кассе не удалился. Отмените его в кассе вручную."
+	case "rescheduled":
+		head = "ℹ️ Бронь перенесена, заказ в кассе уже создан. Проверьте время в кассе."
+	case "pos_cancelled":
+		head = "ℹ️ Заказ по предзаказу удалён в кассе."
+	default:
+		head = "⚠️ Заказ на кухню требует внимания."
+	}
+	text := fmt.Sprintf("%s\nБронь: %s, %s", head, when, name)
+	if e.KitchenError != "" {
+		msg := e.KitchenError
+		if r := []rune(msg); len(r) > 200 {
+			msg = string(r[:200]) + "…"
+		}
+		text += "\nПричина: " + msg
+	}
+	return text
 }

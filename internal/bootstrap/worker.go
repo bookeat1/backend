@@ -108,13 +108,14 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	// is started only when KWAAKA_BASE_URL/KWAAKA_TOKEN are configured — see
 	// NewKwaakaSyncWorker.
 	kwaakaSync := NewKwaakaSyncWorker(cfg, db, log)
+	kwaakaOrders := NewKwaakaOrdersWorker(cfg, db, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
 	var bookingErr, paymentsErr, notifyErr, payoutErr, dailyPayoutErr, ticketSweepErr, analyticsErr, legacyErr error
-	var recurrenceErr, pushReceiptErr, pushCampaignsErr, kwaakaSyncErr error
+	var recurrenceErr, pushReceiptErr, pushCampaignsErr, kwaakaSyncErr, kwaakaOrdersErr error
 	wg.Add(8)
 	go func() {
 		defer wg.Done()
@@ -176,6 +177,13 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 			kwaakaSyncErr = kwaakaSync.Run(ctx)
 		}()
 	}
+	if kwaakaOrders != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kwaakaOrdersErr = kwaakaOrders.Run(ctx, cfg.KwaakaOrders.Tick)
+		}()
+	}
 	wg.Wait()
 
 	if bookingErr != nil {
@@ -213,6 +221,9 @@ func RunWorker(cfg Config, log *slog.Logger) error {
 	}
 	if kwaakaSyncErr != nil {
 		return fmt.Errorf("kwaaka menu sync: %w", kwaakaSyncErr)
+	}
+	if kwaakaOrdersErr != nil {
+		return fmt.Errorf("kwaaka kitchen orders: %w", kwaakaOrdersErr)
 	}
 	return nil
 }

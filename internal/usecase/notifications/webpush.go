@@ -59,7 +59,7 @@ func (w *WebPushNotifier) Channel() domain.NotificationChannel { return domain.C
 
 // Interested: increment 1 alerts staff only on a NEW booking.
 func (w *WebPushNotifier) Interested(t domain.BookingEventType) bool {
-	return t == domain.EventBookingCreated
+	return t == domain.EventBookingCreated || t == domain.EventBookingKitchenOrderAttention
 }
 
 // pushPayload is the minimal, non-sensitive notification body the service
@@ -163,6 +163,10 @@ func (w *WebPushNotifier) Notify(ctx context.Context, e Event) error {
 }
 
 func buildPayload(e Event) pushPayload {
+	if e.Type == domain.EventBookingKitchenOrderAttention {
+		return pushPayload{Title: "Предзаказ и касса", Body: kitchenAttentionText(e), Event: string(e.Type),
+			BookingID: e.BookingID, RestaurantID: e.RestaurantID, StartsAt: e.StartsAt}
+	}
 	name := e.GuestName
 	if name == "" {
 		name = "Гость"

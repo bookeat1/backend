@@ -269,8 +269,10 @@ var routeTiers = map[string]RateLimitTier{
 	"GET /api/v1/payments/:id":      TierSoft,
 
 	// Acquirer webhooks — see RateLimit's doc for why this is its own tier.
-	"POST /webhooks/payments/freedompay":      TierWebhook,
-	"POST /webhooks/payments/tiptoppay/:type": TierWebhook,
+	"POST /api/v1/webhooks/kwaaka/order-status":   TierWebhook,
+	"POST /api/v1/webhooks/kwaaka/reserve-status": TierWebhook,
+	"POST /webhooks/payments/freedompay":          TierWebhook,
+	"POST /webhooks/payments/tiptoppay/:type":     TierWebhook,
 }
 
 // RateLimit enforces a per-client-IP request budget, classified by route into

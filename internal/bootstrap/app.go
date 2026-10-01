@@ -30,6 +30,7 @@ import (
 	foodieoptionsrest "backend-core/internal/transport/rest/foodieoptions"
 	gastroguiderest "backend-core/internal/transport/rest/gastroguide"
 	kaspiadminrest "backend-core/internal/transport/rest/kaspiadmin"
+	"backend-core/internal/transport/rest/kwaakahook"
 	mediarest "backend-core/internal/transport/rest/media"
 	menurest "backend-core/internal/transport/rest/menu"
 	"backend-core/internal/transport/rest/middleware"
@@ -213,6 +214,12 @@ func NewApp(cfg Config, deps *Deps, db *pgxpool.Pool, log *slog.Logger) *gin.Eng
 		deps.BookingStatus, deps.NotificationSettings,
 		deps.TelegramAnswerer, deps.TelegramWebhookSecret,
 	).RegisterRoutes(api)
+
+	// Kwaaka status webhooks (phase 2). Outside every auth group: Kwaaka authenticates
+	// with a shared secret header. Registered unconditionally, but the handler
+	// answers a bare 404 unless KWAAKA_ORDERS_ENABLED=true AND the secret is set
+	// (an empty secret never disables auth — ADR-050).
+	kwaakahook.NewHandler(deps.KwaakaWebhooks, deps.KwaakaWebhookSecret, deps.KwaakaOrdersEnabled, log).RegisterRoutes(api)
 
 	// The SECOND staff bot (@book_eat_restaurants_bot) during the staged
 	// migration of venue alerts (spec §7). Its own path, its own secret and its
