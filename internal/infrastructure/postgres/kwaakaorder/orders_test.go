@@ -279,3 +279,63 @@ func TestWebhookInboxDedupAndPrune(t *testing.T) {
 		t.Fatalf("prune: %d %v", n, err)
 	}
 }
+
+// A caller holding a copy of the row from BEFORE another worker flagged the
+// cancel must not erase the flag on write-back (e.g. the 429 retry commit).
+func TestCompareAndSetKeepsCancelFlagSetByAnotherWorker(t *testing.T) {
+	pool := testdb.Connect(t)
+	s := seed(t, pool, time.Hour, "confirmed")
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	if _, err := repo.Insert(ctx, newOrder(s, "T1")); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := repo.GetByBookingID(ctx, s.booking) // copy without the flag
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagged := *stale
+	at := time.Now().Truncate(time.Microsecond)
+	reason := "booking_cancelled"
+	flagged.CancelRequestedAt, flagged.CancelReason = &at, &reason
+	if ok, err := repo.CompareAndSet(ctx, &flagged, domain.KitchenOrderSending, stale.Attempts); err != nil || !ok {
+		t.Fatalf("flag write: ok=%v err=%v", ok, err)
+	}
+	next := time.Now().Add(time.Minute)
+	stale.NextAttemptAt = &next // what retryLater does with its stale copy
+	if ok, err := repo.CompareAndSet(ctx, stale, domain.KitchenOrderSending, stale.Attempts); err != nil || !ok {
+		t.Fatalf("stale write: ok=%v err=%v", ok, err)
+	}
+	got, _ := repo.GetByBookingID(ctx, s.booking)
+	if got.CancelRequestedAt == nil || got.CancelReason == nil || *got.CancelReason != reason {
+		t.Fatalf("cancel flag erased by a stale write: %+v", got)
+	}
+}
+
+// A stale copy saying `sent` over a row that already carries a cancel flag must
+// land as `cancelling`, due now: `sent` + flag would never be cancelled.
+func TestCompareAndSetSentOverCancelFlagBecomesCancelling(t *testing.T) {
+	pool := testdb.Connect(t)
+	s := seed(t, pool, time.Hour, "confirmed")
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	if _, err := repo.Insert(ctx, newOrder(s, "T1")); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := repo.GetByBookingID(ctx, s.booking)
+	flagged := *stale
+	at := time.Now().Add(-time.Second)
+	flagged.CancelRequestedAt = &at
+	if ok, err := repo.CompareAndSet(ctx, &flagged, domain.KitchenOrderSending, stale.Attempts); err != nil || !ok {
+		t.Fatalf("flag write: ok=%v err=%v", ok, err)
+	}
+	now := time.Now()
+	stale.Status, stale.NextAttemptAt, stale.SentAt = domain.KitchenOrderSent, nil, &now
+	if ok, err := repo.CompareAndSet(ctx, stale, domain.KitchenOrderSending, stale.Attempts); err != nil || !ok {
+		t.Fatalf("sent write: ok=%v err=%v", ok, err)
+	}
+	got, _ := repo.GetByBookingID(ctx, s.booking)
+	if got.Status != domain.KitchenOrderCancelling || got.NextAttemptAt == nil || got.CancelRequestedAt == nil {
+		t.Fatalf("status=%s next=%v flag=%v, want cancelling/due/set", got.Status, got.NextAttemptAt, got.CancelRequestedAt)
+	}
+}

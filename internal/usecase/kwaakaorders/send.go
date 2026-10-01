@@ -121,6 +121,15 @@ func (w *Worker) sendOne(ctx context.Context, o *domain.KitchenOrder) {
 		o.Status, o.NextAttemptAt, o.CancelledAt = domain.KitchenOrderCancelled, nil, &now
 		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "")
 		return
+	} else if err == nil && fresh.Status == domain.KitchenOrderSending && fresh.CancelRequestedAt != nil && o.OutcomeUnknown {
+		// Cancelled, but an earlier attempt may have reached the POS: a second
+		// create would put a phantom order on the kitchen screen. Skip the create
+		// and go straight to cancel; cancelOne resolves "never existed" itself
+		// (404 -> GetOrder -> not found -> cancelled).
+		o.CancelRequestedAt, o.CancelReason = fresh.CancelRequestedAt, fresh.CancelReason
+		o.Status, o.NextAttemptAt = domain.KitchenOrderCancelling, &now
+		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "")
+		return
 	} else if err == nil && fresh.Status != domain.KitchenOrderSending {
 		return // the webhook or a sweep already moved it
 	} else if err == nil {

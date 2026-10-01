@@ -261,12 +261,26 @@ func (r *Orders) LeaseDue(ctx context.Context, now time.Time, lease time.Duratio
 	return out, rows.Err()
 }
 
+// CompareAndSet writes o when the row is still at (want, wantAttempts).
+//
+// cancel_requested_at / cancel_reason are set-only-if-null: the caller's copy of
+// o may predate a cancel flag another worker's CancelSweep stored while this
+// caller's POST was in flight, and a plain overwrite would erase it. For the
+// same reason a write that would leave the row `sent` while the stored row
+// carries a cancel flag lands as `cancelling` (due now) instead: `sent` +
+// flag is not picked up by ListCancelledPending (it selects flag IS NULL), so
+// the order would never be cancelled in the POS.
 func (r *Orders) CompareAndSet(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, wantAttempts int) (bool, error) {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE kwaaka_kitchen_orders SET
-		   kwaaka_table_id=$4, table_shared=$5, kwaaka_order_id=$6, status=$7, partial=$8, table_released_at=$9,
-		   outcome_unknown=$10, next_attempt_at=$11, last_error=$12, error_code=$13, sent_at=$14,
-		   cancel_requested_at=$15, cancelled_at=$16, cancel_reason=$17, pos_status_raw=$18, pos_state=$19,
+		   kwaaka_table_id=$4, table_shared=$5, kwaaka_order_id=$6,
+		   status = CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN 'cancelling' ELSE $7::varchar END,
+		   partial=$8, table_released_at=$9,
+		   outcome_unknown=$10,
+		   next_attempt_at = CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN COALESCE($11, now()) ELSE $11 END,
+		   last_error=$12, error_code=$13, sent_at=$14,
+		   cancel_requested_at=COALESCE(cancel_requested_at, $15), cancelled_at=$16,
+		   cancel_reason=COALESCE(cancel_reason, $17), pos_status_raw=$18, pos_state=$19,
 		   pos_status_at=$20, pos_status_source=$21, booking_starts_at=$22, attempts=$23, updated_at=now()
 		 WHERE id=$1 AND status=$2 AND attempts=$3`,
 		o.ID, string(want), wantAttempts,

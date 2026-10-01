@@ -145,13 +145,20 @@ func TestSendCancelledBookingGetsNoFailureAlert(t *testing.T) {
 	_ = fo
 }
 
-func TestSendCreatedWhileCancelRequestedGoesToCancelling(t *testing.T) {
+// sendOne no longer POSTs a create for a row that already carries a cancel flag
+// (see TestSendCancelledWithUnknownOutcome...), so "created while cancel
+// requested" is only reachable when the flag lands DURING the POST. markCreated
+// must then route to cancelling; the stale-copy case is covered against the
+// real repository in TestCompareAndSetSentOverCancelFlagBecomesCancelling.
+func TestMarkCreatedWithCancelRequestedGoesToCancelling(t *testing.T) {
 	row := sendingRow(2)
 	row.OutcomeUnknown = true
 	c := t0
 	row.CancelRequestedAt = &c
-	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosCreated, PosOrderID: "K"}}}
-	fo, _ := run(t, row, pos, nil)
+	fo := &fakeOrders{row: row}
+	w := newTestWorker(fo, fakeSettings{}, &fakePOS{}, &fakeOutbox{}, t0)
+	cp := *row
+	w.markCreated(context.Background(), &cp, cp.Attempts, "K")
 	if fo.row.Status != domain.KitchenOrderCancelling || fo.row.KwaakaOrderID == nil {
 		t.Fatalf("%s", fo.row.Status)
 	}
@@ -443,5 +450,22 @@ func TestCancelSweepKeepsUncertainSendingRow(t *testing.T) {
 	_ = w.CancelSweep(context.Background())
 	if fo.row.Status != domain.KitchenOrderSending || fo.row.CancelRequestedAt == nil {
 		t.Fatalf("status=%s cancelReq=%v", fo.row.Status, fo.row.CancelRequestedAt)
+	}
+}
+
+// Cancelled booking + an earlier attempt of unknown outcome: no second create.
+func TestSendCancelledWithUnknownOutcomeSkipsCreateAndGoesToCancelling(t *testing.T) {
+	row := sendingRow(2)
+	row.OutcomeUnknown = true
+	c := t0
+	row.CancelRequestedAt = &c
+	row.CancelReason = str("booking_cancelled")
+	pos := &fakePOS{create: []domain.PosCreateResult{{Outcome: domain.PosCreated, PosOrderID: "K"}}}
+	fo, ob := run(t, row, pos, nil)
+	if len(pos.creates) != 0 {
+		t.Fatalf("a create was sent for a cancelled booking: %d", len(pos.creates))
+	}
+	if fo.row.Status != domain.KitchenOrderCancelling || fo.row.NextAttemptAt == nil || len(ob.events) != 0 {
+		t.Fatalf("status=%s next=%v alerts=%d, want cancelling/due/0", fo.row.Status, fo.row.NextAttemptAt, len(ob.events))
 	}
 }
