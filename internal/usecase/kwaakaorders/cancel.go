@@ -57,8 +57,12 @@ func (w *Worker) cancelOne(ctx context.Context, o *domain.KitchenOrder) {
 	if o.CancelRequestedAt != nil {
 		start = *o.CancelRequestedAt
 	}
-	if now.After(start.Add(cancelWindow)) || wantAttempts > w.cfg.MaxAttempts {
+	if now.After(start.Add(cancelWindow)) {
 		w.cancelFailed(ctx, o, wantAttempts, domain.KitchenErrCancelWindow, "cancel window ended")
+		return
+	}
+	if wantAttempts > w.cfg.MaxAttempts {
+		w.cancelFailed(ctx, o, wantAttempts, domain.KitchenErrCancelAttempts, "cancel attempts exhausted")
 		return
 	}
 	posID := o.ID.String()
@@ -101,7 +105,7 @@ func (w *Worker) cancelFailed(ctx context.Context, o *domain.KitchenOrder, wantA
 	// The booking IS cancelled here, so the generic "no alert for a cancelled
 	// booking" rule must not apply: this alert is exactly for that case.
 	err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		ok, err := w.orders.CompareAndSet(ctx, o, domain.KitchenOrderCancelling, wantAttempts)
+		ok, err := w.orders.CompareAndSet(ctx, o, domain.KitchenOrderCancelling, wantAttempts, w.now())
 		if err != nil {
 			return err
 		}
@@ -132,7 +136,7 @@ func (w *Worker) RescheduleSweep(ctx context.Context) error {
 		want, attempts := o.Status, o.Attempts
 		o.BookingStartsAt = rows[i].NewStartsAt
 		err := w.tx.WithinTx(ctx, func(ctx context.Context) error {
-			ok, err := w.orders.CompareAndSet(ctx, &o, want, attempts)
+			ok, err := w.orders.CompareAndSet(ctx, &o, want, attempts, w.now())
 			if err != nil {
 				return err
 			}

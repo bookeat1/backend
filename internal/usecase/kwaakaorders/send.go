@@ -38,7 +38,7 @@ func (w *Worker) alert(ctx context.Context, o *domain.KitchenOrder, reason, errT
 // alert exists exactly when the transition did. A lost CAS returns errLostCAS.
 func (w *Worker) commit(ctx context.Context, o *domain.KitchenOrder, wantStatus domain.KitchenOrderStatus, wantAttempts int, reason string) error {
 	return w.tx.WithinTx(ctx, func(ctx context.Context) error {
-		ok, err := w.orders.CompareAndSet(ctx, o, wantStatus, wantAttempts)
+		ok, err := w.orders.CompareAndSet(ctx, o, wantStatus, wantAttempts, w.now())
 		if err != nil {
 			return err
 		}
@@ -119,6 +119,18 @@ func (w *Worker) sendOne(ctx context.Context, o *domain.KitchenOrder) {
 		fresh.CancelRequestedAt != nil && !o.OutcomeUnknown {
 		o.CancelRequestedAt = fresh.CancelRequestedAt
 		o.Status, o.NextAttemptAt, o.CancelledAt = domain.KitchenOrderCancelled, nil, &now
+		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "")
+		return
+	} else if err == nil && fresh.Status == domain.KitchenOrderSending && fresh.CancelRequestedAt != nil && o.OutcomeUnknown {
+		// Cancelled, but an earlier attempt may have reached the POS: a second
+		// create would put a phantom order on the kitchen screen. Skip the create
+		// and go straight to cancel; cancelOne resolves "never existed" itself
+		// (404 -> GetOrder -> not found -> cancelled).
+		o.CancelRequestedAt, o.CancelReason = fresh.CancelRequestedAt, fresh.CancelReason
+		// The cancel phase starts with a fresh attempt budget: the send budget may
+		// be spent on timeouts, and cancelOne must still ask the POS (the store
+		// resets attempts on entering cancelling as well).
+		o.Status, o.NextAttemptAt, o.Attempts = domain.KitchenOrderCancelling, &now, 0
 		w.finish(ctx, o, domain.KitchenOrderSending, wantAttempts, "")
 		return
 	} else if err == nil && fresh.Status != domain.KitchenOrderSending {
@@ -209,7 +221,7 @@ func (w *Worker) afterLostCAS(ctx context.Context, o *domain.KitchenOrder, err e
 		now := w.now()
 		fresh.SentAt = &now
 	}
-	_, _ = w.orders.CompareAndSet(ctx, fresh, fresh.Status, fresh.Attempts)
+	_, _ = w.orders.CompareAndSet(ctx, fresh, fresh.Status, fresh.Attempts, w.now())
 }
 
 // retryLater records a retryable failure and schedules the next POST with the

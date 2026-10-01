@@ -118,6 +118,7 @@ const (
 	KitchenErrAttemptsSpent  = "attempts_exhausted"
 	KitchenErrCancelRefused  = "cancel_refused"
 	KitchenErrCancelWindow   = "cancel_window_expired"
+	KitchenErrCancelAttempts = "cancel_attempts_exhausted"
 	KitchenErrPosCancelled   = "pos_cancelled"
 	KitchenErrUnknownOutcome = "unknown_outcome"
 )
@@ -247,7 +248,10 @@ type KitchenOrderRepository interface {
 	// CompareAndSet writes every mutable field of o iff the stored row still has
 	// status wantStatus and attempts wantAttempts. swapped=false = someone else
 	// (webhook, cancel sweep) moved the row; the caller re-reads and reconciles.
-	CompareAndSet(ctx context.Context, o *KitchenOrder, wantStatus KitchenOrderStatus, wantAttempts int) (swapped bool, err error)
+	// now is the caller's clock: it becomes next_attempt_at when a stored cancel
+	// flag turns a `sent` write into `cancelling` (due immediately), so the row
+	// obeys the worker's time rather than the database's.
+	CompareAndSet(ctx context.Context, o *KitchenOrder, wantStatus KitchenOrderStatus, wantAttempts int, now time.Time) (swapped bool, err error)
 	// TableLoads counts inflight and live orders per table for a venue.
 	TableLoads(ctx context.Context, restaurantID uuid.UUID, now time.Time) (KitchenTableLoad, error)
 	// ListCancelledPending returns sending/sent rows whose booking is cancelled

@@ -65,6 +65,21 @@ func TestApplySendingBecomesSentAndKeepsID(t *testing.T) {
 	}
 }
 
+// A webhook that proves creation while the POST outcome was still unknown must
+// clear the mark: the row is `sent` and there is nothing left to reconcile.
+func TestApplySendingBecomesSentClearsOutcomeUnknown(t *testing.T) {
+	row := sendingRow(2)
+	row.OutcomeUnknown = true
+	fo := &fakeOrders{row: row}
+	w := newTestWorker(fo, fakeSettings{}, &fakePOS{}, &fakeOutbox{}, t0)
+	if _, _, err := w.ApplyPOSStatus(context.Background(), evt(row.ID.String(), domain.PosStateOpen), "webhook"); err != nil {
+		t.Fatal(err)
+	}
+	if fo.row.Status != domain.KitchenOrderSent || fo.row.OutcomeUnknown {
+		t.Fatalf("status=%s outcome_unknown=%v, want sent/false", fo.row.Status, fo.row.OutcomeUnknown)
+	}
+}
+
 func TestApplyDeletedRules(t *testing.T) {
 	ctx := context.Background()
 	// live booking: exactly one pos_cancelled alert, however many deliveries

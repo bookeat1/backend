@@ -53,6 +53,7 @@ func (w *Worker) ApplyPOSStatus(ctx context.Context, ev domain.KwaakaOrderStatus
 		// Any status proves the order exists.
 		o.SentAt = &now
 		o.NextAttemptAt = nil
+		o.OutcomeUnknown = false // the status proves the order exists: nothing left to reconcile
 		o.Status = domain.KitchenOrderSent
 		if o.CancelRequestedAt != nil {
 			o.Status, o.NextAttemptAt = domain.KitchenOrderCancelling, &now
@@ -84,7 +85,7 @@ func (w *Worker) ApplyPOSStatus(ctx context.Context, ev domain.KwaakaOrderStatus
 }
 
 func (w *Worker) cas(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, attempts int) error {
-	ok, err := w.orders.CompareAndSet(ctx, o, want, attempts)
+	ok, err := w.orders.CompareAndSet(ctx, o, want, attempts, w.now())
 	if err != nil {
 		return err
 	}

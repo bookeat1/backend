@@ -161,7 +161,7 @@ func TestLeaseDueWritesAheadOutcomeUnknown(t *testing.T) {
 	l2.OutcomeUnknown = false
 	next := time.Now().Add(-time.Second)
 	l2.NextAttemptAt = &next
-	if ok, err := repo.CompareAndSet(ctx, l2, domain.KitchenOrderSending, l2.Attempts); err != nil || !ok {
+	if ok, err := repo.CompareAndSet(ctx, l2, domain.KitchenOrderSending, l2.Attempts, time.Now()); err != nil || !ok {
 		t.Fatalf("cas: %v %v", ok, err)
 	}
 	rows, _ = repo.LeaseDue(ctx, time.Now(), time.Minute, 100)
@@ -204,12 +204,12 @@ func TestCompareAndSetLosesToNewerWriter(t *testing.T) {
 		}
 	}
 	o.Status = domain.KitchenOrderSent
-	ok, err := repo.CompareAndSet(ctx, &o, domain.KitchenOrderSending, o.Attempts)
+	ok, err := repo.CompareAndSet(ctx, &o, domain.KitchenOrderSending, o.Attempts, time.Now())
 	if err != nil || !ok {
 		t.Fatalf("first CAS: %v %v", ok, err)
 	}
 	o.Status = domain.KitchenOrderFailed
-	ok, err = repo.CompareAndSet(ctx, &o, domain.KitchenOrderSending, o.Attempts)
+	ok, err = repo.CompareAndSet(ctx, &o, domain.KitchenOrderSending, o.Attempts, time.Now())
 	if err != nil || ok {
 		t.Fatalf("stale CAS must not swap: %v %v", ok, err)
 	}
@@ -277,5 +277,112 @@ func TestWebhookInboxDedupAndPrune(t *testing.T) {
 	n, err := repo.PruneProcessed(ctx, time.Now().Add(-30*24*time.Hour), 100)
 	if err != nil || n < 1 {
 		t.Fatalf("prune: %d %v", n, err)
+	}
+}
+
+// A caller holding a copy of the row from BEFORE another worker flagged the
+// cancel must not erase the flag on write-back (e.g. the 429 retry commit).
+func TestCompareAndSetKeepsCancelFlagSetByAnotherWorker(t *testing.T) {
+	pool := testdb.Connect(t)
+	s := seed(t, pool, time.Hour, "confirmed")
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	if _, err := repo.Insert(ctx, newOrder(s, "T1")); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := repo.GetByBookingID(ctx, s.booking) // copy without the flag
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagged := *stale
+	at := time.Now().Truncate(time.Microsecond)
+	reason := "booking_cancelled"
+	flagged.CancelRequestedAt, flagged.CancelReason = &at, &reason
+	if ok, err := repo.CompareAndSet(ctx, &flagged, domain.KitchenOrderSending, stale.Attempts, time.Now()); err != nil || !ok {
+		t.Fatalf("flag write: ok=%v err=%v", ok, err)
+	}
+	next := time.Now().Add(time.Minute)
+	stale.NextAttemptAt = &next // what retryLater does with its stale copy
+	if ok, err := repo.CompareAndSet(ctx, stale, domain.KitchenOrderSending, stale.Attempts, time.Now()); err != nil || !ok {
+		t.Fatalf("stale write: ok=%v err=%v", ok, err)
+	}
+	got, _ := repo.GetByBookingID(ctx, s.booking)
+	if got.CancelRequestedAt == nil || got.CancelReason == nil || *got.CancelReason != reason {
+		t.Fatalf("cancel flag erased by a stale write: %+v", got)
+	}
+}
+
+// A stale copy saying `sent` over a row that already carries a cancel flag must
+// land as `cancelling`, due now: `sent` + flag would never be cancelled.
+func TestCompareAndSetSentOverCancelFlagBecomesCancelling(t *testing.T) {
+	pool := testdb.Connect(t)
+	s := seed(t, pool, time.Hour, "confirmed")
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	if _, err := repo.Insert(ctx, newOrder(s, "T1")); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := repo.GetByBookingID(ctx, s.booking)
+	flagged := *stale
+	at := time.Now().Add(-time.Second)
+	flagged.CancelRequestedAt = &at
+	if ok, err := repo.CompareAndSet(ctx, &flagged, domain.KitchenOrderSending, stale.Attempts, time.Now()); err != nil || !ok {
+		t.Fatalf("flag write: ok=%v err=%v", ok, err)
+	}
+	now := time.Now()
+	stale.Status, stale.NextAttemptAt, stale.SentAt = domain.KitchenOrderSent, nil, &now
+	// A worker clock far from the DB clock: next_attempt_at must follow the worker.
+	workerNow := time.Now().Add(-6 * time.Hour).Truncate(time.Microsecond)
+	stale.Attempts = 5
+	if _, err := pool.Exec(ctx, `UPDATE kwaaka_kitchen_orders SET attempts = 5 WHERE id = $1`, stale.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := repo.CompareAndSet(ctx, stale, domain.KitchenOrderSending, 5, workerNow); err != nil || !ok {
+		t.Fatalf("sent write: ok=%v err=%v", ok, err)
+	}
+	got, _ := repo.GetByBookingID(ctx, s.booking)
+	if got.Status != domain.KitchenOrderCancelling || got.NextAttemptAt == nil || got.CancelRequestedAt == nil {
+		t.Fatalf("status=%s next=%v flag=%v, want cancelling/due/set", got.Status, got.NextAttemptAt, got.CancelRequestedAt)
+	}
+	if !got.NextAttemptAt.Equal(workerNow) {
+		t.Errorf("next_attempt_at=%v, want the worker clock %v (not the DB clock)", got.NextAttemptAt, workerNow)
+	}
+	if got.Attempts != 0 {
+		t.Errorf("attempts=%d, want 0: entering cancelling starts a fresh budget", got.Attempts)
+	}
+}
+
+// Entering `cancelling` resets attempts; staying in it (a cancel retry) does not.
+func TestCompareAndSetEnteringCancellingResetsAttemptsOnlyOnEntry(t *testing.T) {
+	pool := testdb.Connect(t)
+	s := seed(t, pool, time.Hour, "confirmed")
+	repo := NewOrders(pool)
+	ctx := context.Background()
+	if _, err := repo.Insert(ctx, newOrder(s, "T1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE kwaaka_kitchen_orders SET attempts = 8 WHERE booking_id = $1`, s.booking); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := repo.GetByBookingID(ctx, s.booking)
+	now := time.Now()
+	o.Status, o.NextAttemptAt = domain.KitchenOrderCancelling, &now
+	if ok, err := repo.CompareAndSet(ctx, o, domain.KitchenOrderSending, 8, now); err != nil || !ok {
+		t.Fatalf("enter cancelling: ok=%v err=%v", ok, err)
+	}
+	got, _ := repo.GetByBookingID(ctx, s.booking)
+	if got.Status != domain.KitchenOrderCancelling || got.Attempts != 0 {
+		t.Fatalf("status=%s attempts=%d, want cancelling with 0", got.Status, got.Attempts)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE kwaaka_kitchen_orders SET attempts = 3 WHERE booking_id = $1`, s.booking); err != nil {
+		t.Fatal(err)
+	}
+	got.Attempts = 3
+	if ok, err := repo.CompareAndSet(ctx, got, domain.KitchenOrderCancelling, 3, now); err != nil || !ok {
+		t.Fatalf("cancel retry: ok=%v err=%v", ok, err)
+	}
+	again, _ := repo.GetByBookingID(ctx, s.booking)
+	if again.Attempts != 3 {
+		t.Errorf("attempts=%d after a cancel retry, want 3 (reset only on entry)", again.Attempts)
 	}
 }
