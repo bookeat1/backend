@@ -366,8 +366,9 @@ type RestaurantFilter struct {
 	// When BOTH are set, ListActive orders the result by great-circle
 	// distance from this point (nearest first) instead of the default
 	// display_order/name order — see RestaurantRepository.ListActive.
-	// A venue with no Latitude/Longitude of its own sorts last, it is never
-	// dropped. Either one nil (including a half pair) means "no distance
+	// A venue with no Latitude/Longitude of its own, or farther than 50 km from
+	// the guest, sorts after the near ones in the default display_order/name
+	// order; it is never dropped. Either one nil (including a half pair) means "no distance
 	// sort", the existing default order.
 	GuestLat *float64
 	GuestLng *float64
@@ -419,8 +420,8 @@ type RestaurantRepository interface {
 	// ListActive returns active restaurants matching f plus the total count.
 	// Ordering: display_order (NULLs last), then name — unless f.GuestLat/
 	// GuestLng are both set, in which case distance from that point comes
-	// first (nearest first, a venue without coordinates NULLs last), with
-	// display_order/name as the tie-break. PrimaryImage is populated.
+	// first (nearest first within 50 km; a venue without coordinates or
+	// farther away NULLs last), with display_order/name/id as the tie-break. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
 	// Search returns active restaurants matching f's text query and filters plus
 	// the total count. When f.Query is non-empty, venues matched by their own

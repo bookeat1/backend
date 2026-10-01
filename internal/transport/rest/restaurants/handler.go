@@ -4,6 +4,7 @@ package restaurants
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -233,10 +234,13 @@ func venueStateFilter(c *gin.Context) domain.VenueStateFilter {
 // distance from the guest (domain.RestaurantFilter.GuestLat/GuestLng /
 // RestaurantSearchFilter.GuestLat/GuestLng).
 //
-// Both must be present and parse as valid coordinates (latitude -90..90,
-// longitude -180..180) — same range domain/gastroguide's normalizeCoords
-// enforces for a stop's pin. Half a pair, garbage, or an out-of-range value
-// degrades to "no distance sort" (nil, nil) rather than failing the request:
+// Both must be present and parse as valid coordinates (finite, latitude
+// -90..90, longitude -180..180) — same range domain/gastroguide's
+// normalizeCoords enforces for a stop's pin. strconv.ParseFloat happily
+// accepts "NaN", "Inf" and "-Infinity", and NaN slips through a plain range
+// comparison (every comparison with NaN is false), so non-finite values are
+// rejected explicitly. Half a pair, garbage, a non-finite or an out-of-range
+// value degrades to "no distance sort" (nil, nil) rather than failing the request:
 // like is_popular/is_new/open_now above, this is a ranking hint, not the
 // guest's whole question, so a bad value should not turn a working catalog
 // browse into a 400.
@@ -246,15 +250,17 @@ func guestCoords(c *gin.Context) (*float64, *float64) {
 		return nil, nil
 	}
 	lat, err := strconv.ParseFloat(latRaw, 64)
-	if err != nil || lat < -90 || lat > 90 {
+	if err != nil || !isFinite(lat) || lat < -90 || lat > 90 {
 		return nil, nil
 	}
 	lng, err := strconv.ParseFloat(lngRaw, 64)
-	if err != nil || lng < -180 || lng > 180 {
+	if err != nil || !isFinite(lng) || lng < -180 || lng > 180 {
 		return nil, nil
 	}
 	return &lat, &lng
 }
+
+func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // availabilityFilter reads the "гости + дата" filter: ?date=2026-08-20&guests=2
 // plus the optional window ?time_from=19:00&time_to=21:00.

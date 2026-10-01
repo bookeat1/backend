@@ -13,7 +13,7 @@ import (
 // TestGuestCoordsReachTheUsecase covers the ?lat=&lng= plumbing on both list
 // and search: a valid pair reaches domain.RestaurantFilter/
 // RestaurantSearchFilter unchanged, and anything else (half a pair, garbage,
-// out-of-range) degrades to "no distance sort" rather than a 400 — the same
+// out-of-range, NaN/Inf) degrades to "no distance sort" rather than a 400 — the same
 // convention TestCatalogFiltersReachTheUsecase documents for open_now.
 func TestGuestCoordsReachTheUsecase(t *testing.T) {
 	tests := []struct {
@@ -31,6 +31,12 @@ func TestGuestCoordsReachTheUsecase(t *testing.T) {
 		{name: "lng out of range is ignored", query: "?lat=43.23&lng=190"},
 		{name: "garbage is ignored, not a 400", query: "?lat=north&lng=east"},
 		{name: "empty values are ignored", query: "?lat=&lng="},
+		{name: "NaN lat is ignored", query: "?lat=NaN&lng=76.94"},
+		{name: "NaN lng is ignored", query: "?lat=43.23&lng=nan"},
+		{name: "NaN both is ignored", query: "?lat=NaN&lng=NaN"},
+		{name: "+Inf lat is ignored", query: "?lat=%2BInf&lng=76.94"},
+		{name: "-Inf lng is ignored", query: "?lat=43.23&lng=-Inf"},
+		{name: "Infinity word is ignored", query: "?lat=Infinity&lng=infinity"},
 	}
 
 	for _, tc := range tests {
