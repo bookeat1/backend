@@ -270,24 +270,36 @@ func (r *Orders) LeaseDue(ctx context.Context, now time.Time, lease time.Duratio
 // carries a cancel flag lands as `cancelling` (due now) instead: `sent` +
 // flag is not picked up by ListCancelledPending (it selects flag IS NULL), so
 // the order would never be cancelled in the POS.
-func (r *Orders) CompareAndSet(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, wantAttempts int) (bool, error) {
+//
+// Entering `cancelling` (from any other status) resets attempts to 0: the send
+// phase and the cancel phase have separate budgets (MaxAttempts each), and a
+// row that spent its send budget on timeouts must still get real cancel
+// requests. The cancel phase stays bounded by the cancel window.
+//
+// now is the worker's clock, used for next_attempt_at of the forced
+// `cancelling` (due immediately).
+func (r *Orders) CompareAndSet(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, wantAttempts int, now time.Time) (bool, error) {
 	tag, err := sqltx.From(ctx, r.pool).Exec(ctx,
 		`UPDATE kwaaka_kitchen_orders SET
 		   kwaaka_table_id=$4, table_shared=$5, kwaaka_order_id=$6,
 		   status = CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN 'cancelling' ELSE $7::varchar END,
 		   partial=$8, table_released_at=$9,
 		   outcome_unknown=$10,
-		   next_attempt_at = CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN COALESCE($11, now()) ELSE $11 END,
+		   next_attempt_at = CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN COALESCE($11, $24::timestamptz) ELSE $11 END,
 		   last_error=$12, error_code=$13, sent_at=$14,
 		   cancel_requested_at=COALESCE(cancel_requested_at, $15), cancelled_at=$16,
 		   cancel_reason=COALESCE(cancel_reason, $17), pos_status_raw=$18, pos_state=$19,
-		   pos_status_at=$20, pos_status_source=$21, booking_starts_at=$22, attempts=$23, updated_at=now()
+		   pos_status_at=$20, pos_status_source=$21, booking_starts_at=$22,
+		   attempts = CASE WHEN status <> 'cancelling'
+		                    AND (CASE WHEN $7::varchar = 'sent' AND cancel_requested_at IS NOT NULL THEN 'cancelling' ELSE $7::varchar END) = 'cancelling'
+		                   THEN 0 ELSE $23 END,
+		   updated_at=now()
 		 WHERE id=$1 AND status=$2 AND attempts=$3`,
 		o.ID, string(want), wantAttempts,
 		o.KwaakaTableID, o.TableShared, o.KwaakaOrderID, string(o.Status), o.Partial, o.TableReleasedAt,
 		o.OutcomeUnknown, o.NextAttemptAt, o.LastError, o.ErrorCode, o.SentAt,
 		o.CancelRequestedAt, o.CancelledAt, o.CancelReason, o.PosStatusRaw, posStateArg(o.PosState),
-		o.PosStatusAt, o.PosStatusSource, o.BookingStartsAt, o.Attempts)
+		o.PosStatusAt, o.PosStatusSource, o.BookingStartsAt, o.Attempts, now)
 	if err != nil {
 		return false, fmt.Errorf("cas kitchen order: %w", err)
 	}

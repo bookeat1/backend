@@ -101,7 +101,7 @@ func (f *fakeOrders) LeaseDue(_ context.Context, now time.Time, lease time.Durat
 	c.OutcomeUnknown = prev
 	return []domain.KitchenOrder{c}, nil
 }
-func (f *fakeOrders) CompareAndSet(_ context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, attempts int) (bool, error) {
+func (f *fakeOrders) CompareAndSet(_ context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, attempts int, _ time.Time) (bool, error) {
 	if f.row.Status != want || f.row.Attempts != attempts {
 		return false, nil
 	}

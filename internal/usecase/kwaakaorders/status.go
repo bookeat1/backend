@@ -85,7 +85,7 @@ func (w *Worker) ApplyPOSStatus(ctx context.Context, ev domain.KwaakaOrderStatus
 }
 
 func (w *Worker) cas(ctx context.Context, o *domain.KitchenOrder, want domain.KitchenOrderStatus, attempts int) error {
-	ok, err := w.orders.CompareAndSet(ctx, o, want, attempts)
+	ok, err := w.orders.CompareAndSet(ctx, o, want, attempts, w.now())
 	if err != nil {
 		return err
 	}
