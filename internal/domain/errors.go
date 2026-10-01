@@ -736,3 +736,11 @@ func RetryAfterOf(err error) (time.Duration, bool) {
 	}
 	return 0, false
 }
+
+// CodeKwaakaLinkMismatch — PUT /admin/restaurants/:id/kwaaka-orders named a
+// kwaaka_restaurant_id that is not the venue's current link: the form is stale
+// (the venue was re-linked meanwhile). 422, nothing written; reload and
+// re-confirm the pool against the new POS. The sibling codes of this endpoint
+// (kwaaka_not_linked, kwaaka_table_pool_required, kwaaka_table_unknown) are
+// declared with the Kwaaka codes above.
+const CodeKwaakaLinkMismatch ErrorCode = "kwaaka_link_mismatch"

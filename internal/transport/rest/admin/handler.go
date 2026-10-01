@@ -53,6 +53,12 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/admin/restaurants/:id/payment-settings/methods", h.getPaymentMethods)
 	rg.PUT("/admin/restaurants/:id/payment-settings/methods", h.setPaymentMethods)
 
+	// Kwaaka kitchen orders: per-venue switch, lead and POS table pool.
+	// Superadmin only (usecase). The global KWAAKA_ORDERS_ENABLED is the master
+	// switch and is reported in the response.
+	rg.GET("/admin/restaurants/:id/kwaaka-orders", h.getKwaakaOrders)
+	rg.PUT("/admin/restaurants/:id/kwaaka-orders", h.setKwaakaOrders)
+
 	// Notification settings: the venue's Telegram alert chat.
 	rg.GET("/admin/restaurants/:id/notification-settings/telegram", h.getTelegramSettings)
 	rg.PUT("/admin/restaurants/:id/notification-settings/telegram", h.setTelegramChat)
@@ -263,6 +269,47 @@ func (h *Handler) setPaymentMethods(c *gin.Context) {
 		return
 	}
 	response.OK(c.Writer, paymentMethodsToResponse(v))
+}
+
+// getKwaakaOrders returns the venue's Kwaaka kitchen-order settings, the global
+// master switch, the verdict (will_send / blockers) and, best effort, the live
+// POS table list. SUPERADMIN ONLY (enforced in the usecase).
+func (h *Handler) getKwaakaOrders(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	v, err := h.panel.GetKwaakaOrders(c.Request.Context(), actor, rid)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, kwaakaOrdersToResponse(v))
+}
+
+// setKwaakaOrders replaces the venue's Kwaaka kitchen-order settings (switch,
+// lead, pool). SUPERADMIN ONLY (enforced in the usecase).
+func (h *Handler) setKwaakaOrders(c *gin.Context) {
+	actor, rid, ok := actorAndRID(c)
+	if !ok {
+		return
+	}
+	var req kwaakaOrdersRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	in, err := req.toInput()
+	if err != nil {
+		response.Error(c.Writer, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	v, err := h.panel.SetKwaakaOrders(c.Request.Context(), actor, rid, in)
+	if err != nil {
+		response.HandleError(c.Writer, err)
+		return
+	}
+	response.OK(c.Writer, kwaakaOrdersToResponse(v))
 }
 
 // ---- Notification settings (Telegram) --------------------------------------

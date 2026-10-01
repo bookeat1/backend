@@ -687,6 +687,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// Same for the pre-order flag: what a NULL preorder_payment_required
 		// resolves to (paymentsCfg.PreorderPaymentRequired, resolveSettings' fallback).
 		admin.WithPreorderPaymentGlobalRequired(paymentsCfg.PreorderPaymentRequired),
+		// Kwaaka kitchen-order settings (superadmin): the SAME settings repo the
+		// sending loop reads. The POS is only used to prove pool tables exist;
+		// KWAAKA_ORDERS_ENABLED stays the master switch and is just reported.
+		admin.WithKwaakaOrders(kwaakaorder.NewSettings(db), newKwaakaTablesPOS(log), txm,
+			admin.KwaakaOrdersGlobal{Enabled: cfg.KwaakaOrders.Enabled, DefaultLead: cfg.KwaakaOrders.Lead}),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -2136,6 +2141,20 @@ func NewKwaakaSyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaaka
 		kwaakasync.Config{TickInterval: cfg.KwaakaSync.TickInterval},
 		log,
 	)
+}
+
+// newKwaakaTablesPOS returns the Kwaaka POS adapter used by the admin panel to
+// verify pool tables, or a genuine nil interface when KWAAKA_BASE_URL /
+// KWAAKA_TOKEN are not set (a typed nil would defeat the usecase's nil check).
+func newKwaakaTablesPOS(log *slog.Logger) interface {
+	GetTables(ctx context.Context, kwaakaRestaurantID string) ([]domain.PosTable, error)
+} {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka admin: POS adapter not configured, pool tables cannot be verified", slog.String("reason", err.Error()))
+		return nil
+	}
+	return kwaaka.NewOrderPOS(kwaaka.NewClient(nil, kwCfg))
 }
 
 // NewKwaakaOrdersWorker wires the kitchen-order loop (phase 2), or nil when the

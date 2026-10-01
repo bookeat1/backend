@@ -57,6 +57,9 @@ type UseCase struct {
 	// PAYMENTS_PREORDER_PAYMENT_REQUIRED value (see
 	// WithPreorderPaymentGlobalRequired), what a NULL preorder flag resolves to.
 	preorderPaymentGlobalRequired bool
+	// kwaaka is the optional Kwaaka kitchen-order settings capability (see
+	// WithKwaakaOrders). Zero value = endpoints answer ErrUnavailable.
+	kwaaka kwaakaOrdersDeps
 }
 
 // NewUseCase constructs the admin-panel usecase.
