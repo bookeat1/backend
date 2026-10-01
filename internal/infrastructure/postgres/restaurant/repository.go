@@ -483,7 +483,7 @@ func (r *Repository) ListActive(ctx context.Context, f domain.RestaurantFilter) 
 	orderSQL := `ORDER BY r.display_order ASC NULLS LAST, r.name ASC`
 	if distExpr, distArgs, ok := distanceOrderExpr(f.GuestLat, f.GuestLng, args); ok {
 		args = distArgs
-		orderSQL = `ORDER BY ` + distExpr + ` ASC NULLS LAST, r.display_order ASC NULLS LAST, r.name ASC`
+		orderSQL = `ORDER BY ` + distExpr + ` ASC NULLS LAST, r.display_order ASC NULLS LAST, r.name ASC, r.id ASC`
 	}
 
 	limit, offset := limitOffset(f.Page, f.PerPage, f.Unpaginated)
@@ -1073,6 +1073,14 @@ func limitOffset(page, perPage int, unpaginated bool) (int, int) {
 	return perPage, (page - 1) * perPage
 }
 
+// maxGuestDistanceKm is the radius beyond which a venue stops being "near the
+// guest". A venue farther than this sorts in the tail together with the venues
+// that have no coordinates, i.e. in the ordinary display_order/name order. The
+// catalog is city-scoped: a guest in Astana looking at an Almaty-only catalog
+// would otherwise get an order by distance from Astana, which is noise.
+// Interpolated into the SQL as a constant, never from user input.
+const maxGuestDistanceKm = 50
+
 // distanceOrderExpr builds the "closest to the guest first" ORDER BY
 // expression plus the args slice to bind for it (args with lat/lng appended).
 // ok is false — and args is returned unchanged — when either coordinate is
@@ -1080,26 +1088,29 @@ func limitOffset(page, perPage int, unpaginated bool) (int, int) {
 //
 // This is the Haversine great-circle distance in kilometers, computed
 // straight in SQL against r.latitude/r.longitude (nullable, plain
-// double precision — this project does not use PostGIS, see
-// docs/ARCHITECTURE.md). NULL propagates through the arithmetic, so a venue
-// with no coordinates of its own evaluates to a NULL distance and the
-// caller's own `... ASC NULLS LAST` puts it after every venue that has one,
-// rather than dropping it. LEAST/GREATEST clamp the acos argument to
-// [-1, 1]: floating-point rounding can push it a hair outside that range for
-// two very close (or identical) points, and acos of anything outside it is
-// NaN in Postgres — a whole page ordered by NaN sorts arbitrarily instead of
-// "these are basically the same spot".
+// double precision — this project does not use PostGIS: no migration creates
+// the extension and no geography/geometry column exists). NULL propagates
+// through the arithmetic, so a venue with no coordinates of its own evaluates
+// to a NULL distance. The CASE turns a distance over maxGuestDistanceKm into
+// NULL too, so the caller's own `... ASC NULLS LAST` puts both kinds after
+// every venue that is actually near, rather than dropping them, and orders
+// them among themselves by the caller's next keys. LEAST/GREATEST clamp the
+// acos argument to [-1, 1]: floating-point rounding can push it a hair outside
+// that range for two very close (or identical) points, and acos of anything
+// outside it is NaN in Postgres — a whole page ordered by NaN sorts
+// arbitrarily instead of "these are basically the same spot".
 func distanceOrderExpr(lat, lng *float64, args []any) (expr string, newArgs []any, ok bool) {
 	if lat == nil || lng == nil {
 		return "", args, false
 	}
 	newArgs = append(args, *lat, *lng)
 	latN, lngN := len(newArgs)-1, len(newArgs)
-	expr = fmt.Sprintf(
+	haversine := fmt.Sprintf(
 		`6371 * acos(LEAST(1, GREATEST(-1,
-			cos(radians($%d)) * cos(radians(r.latitude)) * cos(radians(r.longitude) - radians($%d))
-			+ sin(radians($%d)) * sin(radians(r.latitude))
-		)))`, latN, lngN, latN)
+			cos(radians($%[1]d)) * cos(radians(r.latitude)) * cos(radians(r.longitude) - radians($%[2]d))
+			+ sin(radians($%[1]d)) * sin(radians(r.latitude))
+		)))`, latN, lngN)
+	expr = fmt.Sprintf(`CASE WHEN %[1]s <= %[2]d THEN %[1]s END`, haversine, maxGuestDistanceKm)
 	return expr, newArgs, true
 }
 
