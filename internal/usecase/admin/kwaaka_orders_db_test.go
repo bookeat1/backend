@@ -160,3 +160,43 @@ func TestKwaakaOrdersDB_ConcurrentPutsLeaveOneWholePool(t *testing.T) {
 }
 
 func pool0(ids ...string) []KwaakaPoolTableInput { return pool(ids...) }
+
+// PR #168 gate finding 1, on a real Postgres: a venue enabled with pool T1 and
+// then unlinked (as the #149 endpoint does: kwaaka_restaurant_id NULL) must be
+// switchable OFF, and re-linking to the same id must not resume sending.
+func TestKwaakaOrdersDB_DisableWhileUnlinkedStaysOffAfterRelink(t *testing.T) {
+	uc, pool, rid, admin := newKwDBHarness(t)
+	ctx := context.Background()
+
+	if v, err := uc.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool0("T1")}); err != nil || !v.WillSend {
+		t.Fatalf("enable: %+v err=%v", v, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE restaurants SET kwaaka_restaurant_id=NULL WHERE id=$1`, rid); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := uc.SetKwaakaOrders(ctx, admin, rid, KwaakaOrdersInput{OrdersEnabled: false, Pool: pool0("T1")})
+	if err != nil {
+		t.Fatalf("PUT orders_enabled=false on an unlinked venue: %v", err)
+	}
+	if v.OrdersEnabled || v.WillSend {
+		t.Fatalf("view after disable: %+v", v)
+	}
+	var enabled bool
+	var snapshot string
+	if err := pool.QueryRow(ctx, `SELECT orders_enabled, kwaaka_restaurant_id FROM restaurant_kwaaka_order_settings WHERE restaurant_id=$1`, rid).
+		Scan(&enabled, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if enabled || snapshot != "kw-1" {
+		t.Fatalf("db: orders_enabled=%v snapshot=%q, want false/kw-1", enabled, snapshot)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE restaurants SET kwaaka_restaurant_id='kw-1' WHERE id=$1`, rid); err != nil {
+		t.Fatal(err)
+	}
+	g, err := uc.GetKwaakaOrders(ctx, admin, rid)
+	if err != nil || g.WillSend || g.OrdersEnabled {
+		t.Fatalf("re-link to the same id resumed sending: %+v err=%v", g, err)
+	}
+}

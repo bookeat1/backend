@@ -29,6 +29,10 @@ type Envelope struct {
 	Data  any    `json:"data,omitempty"`
 	Error string `json:"error,omitempty"`
 	Code  string `json:"code,omitempty"`
+	// Details carries optional structured context of a refusal (for example the
+	// list of offending ids). Omitted when empty; present only on the few
+	// endpoints that opt in through ErrorWithDetails.
+	Details any `json:"details,omitempty"`
 }
 
 // Page is the uniform envelope for a paginated list. Wrap list results in it and
@@ -76,6 +80,13 @@ func Error(w http.ResponseWriter, status int, msg string) {
 // wrote for the caller.
 func ErrorWithCode(w http.ResponseWriter, status int, code domain.ErrorCode, msg string) {
 	write(w, status, Envelope{Error: msg, Code: string(code)})
+}
+
+// ErrorWithDetails is ErrorWithCode plus a structured details payload the client
+// can act on. The caller owns what goes into details: never put internal text
+// or secrets there.
+func ErrorWithDetails(w http.ResponseWriter, status int, code domain.ErrorCode, msg string, details any) {
+	write(w, status, Envelope{Error: msg, Code: string(code), Details: details})
 }
 
 // HandleError maps a domain sentinel error to the matching HTTP status and a

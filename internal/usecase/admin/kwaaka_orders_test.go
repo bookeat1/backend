@@ -436,3 +436,154 @@ func TestKwaakaOrders_NotWiredIsUnavailable(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
 }
+
+// Disabling an existing row must not depend on the venue's link (PR #168 gate
+// finding 1): no 422, no POS call, the stored snapshot (and so the stale mark)
+// is kept.
+func TestKwaakaOrders_DisableWorksOnUnlinkedVenue(t *testing.T) {
+	h := newKwHarness(true)
+	ctx := context.Background()
+	if _, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool("T1")}); err != nil {
+		t.Fatal(err)
+	}
+	h.rest.link = nil // unlinked through the #149 path
+	h.pos.calls = 0
+
+	v, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: false, Pool: pool("T1")})
+	if err != nil {
+		t.Fatalf("disable on an unlinked venue: %v", err)
+	}
+	if v.OrdersEnabled || h.store.row.OrdersEnabled {
+		t.Fatalf("orders_enabled still true: view=%+v row=%+v", v, h.store.row)
+	}
+	if h.store.row.KwaakaRestaurantID != "kw-1" {
+		t.Fatalf("snapshot not kept: %q", h.store.row.KwaakaRestaurantID)
+	}
+	if h.pos.calls != 0 {
+		t.Fatal("disable called the POS")
+	}
+	// Re-link to the SAME id: it must not resume sending.
+	l := "kw-1"
+	h.rest.link = &l
+	g, err := h.uc.GetKwaakaOrders(ctx, h.admin, h.rid)
+	if err != nil || g.WillSend {
+		t.Fatalf("re-link resumed sending: %+v err=%v", g, err)
+	}
+	// Re-link to ANOTHER id after a disable: still stale, still blocked.
+	h.rest.link = nil
+	if _, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: false, Pool: pool("T1")}); err != nil {
+		t.Fatal(err)
+	}
+	l2 := "kw-2"
+	h.rest.link = &l2
+	g, _ = h.uc.GetKwaakaOrders(ctx, h.admin, h.rid)
+	if !g.PoolStale || g.WillSend {
+		t.Fatalf("stale snapshot lost: %+v", g)
+	}
+}
+
+func TestKwaakaOrders_UnlinkedVenueRules(t *testing.T) {
+	ctx := context.Background()
+	t.Run("enable still needs the link", func(t *testing.T) {
+		h := newKwHarness(true)
+		h.rest.link = nil
+		_, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool("T1")})
+		wantCode(t, err, domain.ErrValidation, domain.CodeKwaakaNotLinked)
+	})
+	t.Run("a changed pool needs the link", func(t *testing.T) {
+		h := newKwHarness(true)
+		if _, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool("T1")}); err != nil {
+			t.Fatal(err)
+		}
+		h.rest.link = nil
+		_, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{Pool: pool("T2")})
+		wantCode(t, err, domain.ErrValidation, domain.CodeKwaakaNotLinked)
+		if !h.store.row.OrdersEnabled || h.store.row.Pool[0].KwaakaTableID != "T1" {
+			t.Fatalf("a refused PUT changed the row: %+v", h.store.row)
+		}
+	})
+	t.Run("disable with an emptied pool works and keeps the snapshot", func(t *testing.T) {
+		h := newKwHarness(true)
+		if _, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{OrdersEnabled: true, Pool: pool("T1")}); err != nil {
+			t.Fatal(err)
+		}
+		h.rest.link = nil
+		// A stale confirmation of the old link must not block the kill switch.
+		if _, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{Pool: pool(), KwaakaRestaurantID: "kw-1"}); err != nil {
+			t.Fatal(err)
+		}
+		if h.store.row.OrdersEnabled || len(h.store.row.Pool) != 0 || h.store.row.KwaakaRestaurantID != "kw-1" {
+			t.Fatalf("row = %+v", h.store.row)
+		}
+	})
+	t.Run("no row, disable, empty pool is a no-op 200", func(t *testing.T) {
+		h := newKwHarness(true)
+		h.rest.link = nil
+		v, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{Pool: pool()})
+		if err != nil || v.Configured {
+			t.Fatalf("view=%+v err=%v", v, err)
+		}
+		if h.store.row != nil || h.store.saves != 0 {
+			t.Fatalf("a no-op created a row: %+v saves=%d", h.store.row, h.store.saves)
+		}
+	})
+	t.Run("unknown venue is still 404", func(t *testing.T) {
+		h := newKwHarness(true)
+		h.rest.err = domain.ErrNotFound
+		_, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{Pool: pool()})
+		wantCode(t, err, domain.ErrNotFound, "")
+	})
+}
+
+// raceStore returns a different row from LockForUpdate than from the earlier
+// unlocked Get, as if a concurrent PUT committed in between (finding 2).
+type raceStore struct {
+	kwStore
+	locked *domain.KwaakaOrderSettings
+}
+
+func (s *raceStore) LockForUpdate(context.Context, uuid.UUID) (*domain.KwaakaOrderSettings, error) {
+	c := *s.locked
+	return &c, nil
+}
+
+func TestKwaakaOrders_KeepSnapshotDecidedUnderLock(t *testing.T) {
+	ctx := context.Background()
+	h := newKwHarness(true)
+	// Unlocked read: enabled, pool P=[T1], snapshot kw-1. Under the lock: another
+	// PUT already moved it to snapshot kw-9 with pool Q=[T2].
+	rs := &raceStore{locked: &domain.KwaakaOrderSettings{
+		RestaurantID: h.rid, OrdersEnabled: true, KwaakaRestaurantID: "kw-9",
+		Pool: []domain.KwaakaPoolTable{{KwaakaTableID: "T2"}},
+	}}
+	rs.row = &domain.KwaakaOrderSettings{
+		RestaurantID: h.rid, OrdersEnabled: true, KwaakaRestaurantID: "kw-1",
+		Pool: []domain.KwaakaPoolTable{{KwaakaTableID: "T1"}},
+	}
+	h.uc = NewUseCase(fakePerms{}, h.rest, &fakeMenu{}, &fakeWH{}, &fakeOverrides{}, &fakeGuests{},
+		&fakeBookingList{}, &fakeBookingTx{}, &fakePaymentSettings{}, &fakeTelegramSettings{},
+		WithKwaakaOrders(rs, h.pos, kwTx{}, KwaakaOrdersGlobal{Enabled: true, DefaultLead: time.Hour}))
+
+	// Disable with pool P: on the stale read that is "unchanged pool, keep
+	// snapshot, no POS"; on the locked row P is NEW and unproven. Must not be
+	// written as a verified pool.
+	_, err := h.uc.SetKwaakaOrders(ctx, h.admin, h.rid, KwaakaOrdersInput{Pool: pool("T1")})
+	wantCode(t, err, domain.ErrUnavailable, "")
+	if rs.saves != 0 {
+		t.Fatalf("wrote a pool that was never proven for the locked row (saves=%d)", rs.saves)
+	}
+}
+
+func TestKwaakaOrders_UnknownTablesListed(t *testing.T) {
+	h := newKwHarness(true)
+	_, err := h.uc.SetKwaakaOrders(context.Background(), h.admin, h.rid,
+		KwaakaOrdersInput{OrdersEnabled: true, Pool: pool("T1", "GONE", "ALSO")})
+	wantCode(t, err, domain.ErrValidation, domain.CodeKwaakaTableUnknown)
+	var ute *KwaakaUnknownTablesError
+	if !errors.As(err, &ute) || fmt.Sprint(ute.IDs) != "[GONE ALSO]" {
+		t.Fatalf("unknown ids = %+v (err=%v)", ute, err)
+	}
+	if h.store.row != nil {
+		t.Fatal("a refused PUT wrote")
+	}
+}

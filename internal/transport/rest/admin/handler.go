@@ -11,6 +11,8 @@
 package admin
 
 import (
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -306,6 +308,14 @@ func (h *Handler) setKwaakaOrders(c *gin.Context) {
 	}
 	v, err := h.panel.SetKwaakaOrders(c.Request.Context(), actor, rid, in)
 	if err != nil {
+		var unknown *uc.KwaakaUnknownTablesError
+		if errors.As(err, &unknown) {
+			slog.Warn("request rejected", "status", http.StatusUnprocessableEntity,
+				"code", string(domain.CodeKwaakaTableUnknown), "error", err)
+			response.ErrorWithDetails(c.Writer, http.StatusUnprocessableEntity, domain.CodeKwaakaTableUnknown,
+				"validation failed", gin.H{"unknown_table_ids": unknown.IDs})
+			return
+		}
 		response.HandleError(c.Writer, err)
 		return
 	}

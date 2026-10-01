@@ -138,14 +138,24 @@ type KwaakaOrdersView struct {
 }
 
 func requireSuperadmin(actor Actor) error {
-	if actor.UserID == uuid.Nil {
-		return fmt.Errorf("%w: no authenticated actor", domain.ErrUnauthorized)
-	}
-	if actor.Role != domain.RoleAdmin {
-		return fmt.Errorf("%w: Kwaaka order settings are a platform action", domain.ErrForbidden)
-	}
-	return nil
+	return requirePlatformActor(actor, "Kwaaka order settings")
 }
+
+func errKwaakaNotLinked() error {
+	return domain.WithCode(domain.CodeKwaakaNotLinked,
+		fmt.Errorf("%w: the venue is not linked to Kwaaka (restaurants.kwaaka_restaurant_id is empty)", domain.ErrValidation))
+}
+
+// KwaakaUnknownTablesError: pool tables that do not exist in the venue's POS.
+// It is a 422 kwaaka_table_unknown (ErrValidation + code) and the transport
+// layer additionally returns IDs to the panel.
+type KwaakaUnknownTablesError struct{ IDs []string }
+
+func (e *KwaakaUnknownTablesError) Error() string {
+	return "pool tables not found in the venue's POS: " + strings.Join(e.IDs, ", ")
+}
+func (e *KwaakaUnknownTablesError) Unwrap() error               { return domain.ErrValidation }
+func (e *KwaakaUnknownTablesError) ErrorCode() domain.ErrorCode { return domain.CodeKwaakaTableUnknown }
 
 func (u *UseCase) kwaakaReady() error {
 	if u.kwaaka.store == nil || u.kwaaka.tx == nil {
@@ -212,7 +222,13 @@ func (u *UseCase) GetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 //   - lead_minutes is nil or within 0..720;
 //   - the venue must be linked to Kwaaka (restaurants.kwaaka_restaurant_id); the
 //     linkage stored with the pool is taken from there, and a client-supplied
-//     kwaaka_restaurant_id that differs is refused as a stale form;
+//     kwaaka_restaurant_id that differs is refused as a stale form. The ONE
+//     exception is switching OFF a venue that already has a settings row while
+//     it is unlinked (with the stored pool or an empty one): that always
+//     succeeds, keeps the stored snapshot and needs no POS, because the kill
+//     switch must not depend on the link (a re-link to the same id would
+//     otherwise resume sending). Unlinked + no row + disabled + empty pool is
+//     a no-op 200 (nothing is created);
 //   - enabling needs a non-empty pool;
 //   - a pool table must exist in the venue's POS (GET /tables) whenever the pool
 //     changes, the venue is switched on, or the stored pool was chosen for an
@@ -220,6 +236,11 @@ func (u *UseCase) GetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 //     (the kill switch must work while Kwaaka is down) and keeps the stored
 //     linkage, so a stale pool stays visibly stale;
 //   - enabled_at moves only on false->true (repository), updated_by is the actor.
+//
+// Whether the stored snapshot is kept is decided twice: on the unlocked read (to
+// know if the POS is needed) and again on the row under the lock; if the locked
+// row now needs a POS proof that was not collected, the call answers 503 and the
+// caller retries.
 //
 // The POS call happens OUTSIDE the transaction; inside it the settings row is
 // locked FOR UPDATE (the same row the claim step locks, after its booking lock,
@@ -252,15 +273,6 @@ func (u *UseCase) SetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 	if err != nil {
 		return KwaakaOrdersView{}, err
 	}
-	if link == "" {
-		return KwaakaOrdersView{}, domain.WithCode(domain.CodeKwaakaNotLinked,
-			fmt.Errorf("%w: the venue is not linked to Kwaaka (restaurants.kwaaka_restaurant_id is empty)", domain.ErrValidation))
-	}
-	if c := strings.TrimSpace(in.KwaakaRestaurantID); c != "" && c != link {
-		return KwaakaOrdersView{}, domain.WithCode(domain.CodeKwaakaLinkMismatch,
-			fmt.Errorf("%w: kwaaka_restaurant_id does not match the venue's current linkage", domain.ErrValidation))
-	}
-
 	old, err := u.kwaaka.store.Get(ctx, restaurantID)
 	if err != nil {
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -268,11 +280,40 @@ func (u *UseCase) SetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 		}
 		old = nil
 	}
-	poolChanged := (old == nil && len(pool) > 0) || (old != nil && !samePoolIDs(old.Pool, pool))
-	enabling := in.OrdersEnabled && (old == nil || !old.OrdersEnabled)
-	snapshotChanged := old == nil || old.KwaakaRestaurantID != link
-	keepSnapshot := old != nil && !in.OrdersEnabled && !poolChanged
-	needPOS := !keepSnapshot && len(pool) > 0 && (poolChanged || enabling || snapshotChanged)
+	linked := link != ""
+	if !linked {
+		// Unlinked venue: switching OFF must still work (the kill switch cannot
+		// depend on the link, or a re-link to the same id would silently resume
+		// sending). Enabling and any real pool change need the POS, so they need
+		// the link.
+		if in.OrdersEnabled {
+			return KwaakaOrdersView{}, errKwaakaNotLinked()
+		}
+		if len(pool) > 0 && (old == nil || !samePoolIDs(old.Pool, pool)) {
+			return KwaakaOrdersView{}, errKwaakaNotLinked() // cannot prove new tables without the POS
+		}
+		if old == nil {
+			// Nothing stored, nothing to switch off: a no-op 200, no row created.
+			return u.kwaakaView(link, nil, nil, false), nil
+		}
+	} else if c := strings.TrimSpace(in.KwaakaRestaurantID); c != "" && c != link {
+		return KwaakaOrdersView{}, domain.WithCode(domain.CodeKwaakaLinkMismatch,
+			fmt.Errorf("%w: kwaaka_restaurant_id does not match the venue's current linkage", domain.ErrValidation))
+	}
+
+	// plan decides, for the stored state cur, whether the stored linkage snapshot
+	// is kept and whether the pool must be proven in the POS. It runs twice: on
+	// the unlocked read to decide whether to call the POS at all, and again under
+	// the row lock on the row actually being replaced.
+	plan := func(cur *domain.KwaakaOrderSettings) (keepSnapshot, needPOS bool) {
+		poolChanged := (cur == nil && len(pool) > 0) || (cur != nil && !samePoolIDs(cur.Pool, pool))
+		enabling := in.OrdersEnabled && (cur == nil || !cur.OrdersEnabled)
+		snapshotChanged := cur == nil || cur.KwaakaRestaurantID != link
+		keepSnapshot = cur != nil && !in.OrdersEnabled && (!poolChanged || !linked)
+		needPOS = linked && !keepSnapshot && len(pool) > 0 && (poolChanged || enabling || snapshotChanged)
+		return keepSnapshot, needPOS
+	}
+	_, needPOS := plan(old)
 
 	var tables []domain.PosTable
 	checked := false
@@ -304,8 +345,7 @@ func (u *UseCase) SetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 			}
 		}
 		if len(unknown) > 0 {
-			return KwaakaOrdersView{}, domain.WithCode(domain.CodeKwaakaTableUnknown,
-				fmt.Errorf("%w: pool tables not found in the venue's POS: %s", domain.ErrValidation, strings.Join(unknown, ", ")))
+			return KwaakaOrdersView{}, &KwaakaUnknownTablesError{IDs: unknown}
 		}
 	}
 
@@ -315,6 +355,7 @@ func (u *UseCase) SetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 		KwaakaRestaurantID: link, UpdatedBy: &actorID, Pool: pool,
 	}
 	var before *domain.KwaakaOrderSettings
+	noop := false
 	err = u.kwaaka.tx.WithinTx(ctx, func(ctx context.Context) error {
 		cur, err := u.kwaaka.store.LockForUpdate(ctx, restaurantID)
 		if err != nil {
@@ -324,13 +365,26 @@ func (u *UseCase) SetKwaakaOrders(ctx context.Context, actor Actor, restaurantID
 			cur = nil
 		}
 		before = cur
-		if keepSnapshot && cur != nil {
+		keepSnapshot, needNow := plan(cur)
+		if needNow && !checked {
+			// The row changed between the unlocked read and the lock so that the
+			// pool now needs a POS proof we did not collect. Refuse, retry works.
+			return fmt.Errorf("%w: the settings changed concurrently, retry", domain.ErrUnavailable)
+		}
+		if !linked && cur == nil {
+			noop = true
+			return nil
+		}
+		if keepSnapshot {
 			saved.KwaakaRestaurantID = cur.KwaakaRestaurantID
 		}
 		return u.kwaaka.store.Save(ctx, saved)
 	})
 	if err != nil {
 		return KwaakaOrdersView{}, err
+	}
+	if noop {
+		return u.kwaakaView(link, nil, nil, false), nil
 	}
 
 	slog.InfoContext(ctx, "admin: kwaaka order settings updated",
