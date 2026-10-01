@@ -12,12 +12,45 @@
 # Caddy will request/renew a Let's Encrypt certificate automatically and start
 # terminating TLS on :443, redirecting :80 to :443 — no other file changes.
 
+# Guest coordinates (?lat=&lng=, catalog sort "nearest first") travel in the
+# query string of GET /restaurants and /restaurants/search. Product rule: the
+# server neither stores nor logs them. Caddy logs the full request.uri, so
+# EVERY logger in this file runs through the (redact_geo_format) snippet,
+# which deletes the lat and lng query parameters from request.uri before the
+# line is written (Caddy v2.9 `filter` encoder, `query` filter, `delete`
+# action: https://caddyserver.com/docs/caddyfile/directives/log#filter).
+# Any new `log` block must import it too.
+(redact_geo_format) {
+	format filter {
+		wrap json
+		request>uri query {
+			delete lat
+			delete lng
+		}
+		request>headers>Referer query {
+			delete lat
+			delete lng
+		}
+	}
+}
+
+# Global options. Snippets may precede this block, nothing else may.
+# The default logger is covered as well: reverse_proxy upstream errors
+# (backend restarting, 502) are logged there with the whole request, uri
+# included.
+{
+	log {
+		output stderr
+		import redact_geo_format
+	}
+}
+
 {$SITE_ADDRESS:http://:80} {
 	encode gzip zstd
 
 	log {
 		output stdout
-		format json
+		import redact_geo_format
 	}
 
 	# Static preview of the guest mobile app (Expo web build of apps/mobile in
@@ -134,7 +167,7 @@
 
 	log {
 		output stdout
-		format json
+		import redact_geo_format
 	}
 
 	root * /srv/admin/current
@@ -164,7 +197,7 @@
 
 	log {
 		output stdout
-		format json
+		import redact_geo_format
 	}
 
 	header {

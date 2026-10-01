@@ -318,3 +318,91 @@ func paymentMethodsToResponse(v uc.PaymentMethodsSettings) paymentMethodsRespons
 		KaspiAccountBound:     v.KaspiAccountBound,
 	}
 }
+
+// kwaakaOrdersResponse is a venue's Kwaaka kitchen-order settings.
+//
+// global_orders_enabled is the MASTER switch (env KWAAKA_ORDERS_ENABLED): when
+// false the platform sends NOTHING for any venue, whatever orders_enabled says.
+// will_send is the verdict that already accounts for it; blockers names what
+// stops it (global_switch_off, venue_not_linked, not_configured, venue_disabled,
+// pool_empty, pool_stale). Read-only fields are ignored on PUT.
+type kwaakaOrdersResponse struct {
+	GlobalOrdersEnabled bool `json:"global_orders_enabled"`
+	// DefaultLeadMinutes is what a null lead_minutes resolves to (KWAAKA_KITCHEN_LEAD).
+	DefaultLeadMinutes int `json:"default_lead_minutes"`
+	// KwaakaRestaurantID is the venue's CURRENT Kwaaka linkage (null = not
+	// linked); PoolKwaakaRestaurantID is the one the stored pool was chosen for.
+	KwaakaRestaurantID     *string `json:"kwaaka_restaurant_id"`
+	PoolKwaakaRestaurantID *string `json:"pool_kwaaka_restaurant_id"`
+	Configured             bool    `json:"configured"`
+	OrdersEnabled          bool    `json:"orders_enabled"`
+	LeadMinutes            *int    `json:"lead_minutes"`
+	EnabledAt              *string `json:"enabled_at"`
+	UpdatedAt              *string `json:"updated_at"`
+	UpdatedBy              *string `json:"updated_by"`
+
+	Pool      []kwaakaPoolTableResponse `json:"pool"`
+	PoolStale bool                      `json:"pool_stale"`
+	WillSend  bool                      `json:"will_send"`
+	Blockers  []string                  `json:"blockers"`
+
+	// PosChecked is true when a live GET /tables answered; pos_tables then lists
+	// what may be put in the pool. Absent/false is not an error.
+	PosChecked bool                `json:"pos_checked"`
+	PosTables  []kwaakaPosTableDTO `json:"pos_tables"`
+}
+
+type kwaakaPoolTableResponse struct {
+	KwaakaTableID string `json:"kwaaka_table_id"`
+	Position      int    `json:"position"`
+	Label         string `json:"label"`
+	// InPos: false = the table is gone from the venue's POS (every send to it
+	// would be rejected); null = the POS was not asked or did not answer.
+	InPos *bool `json:"in_pos"`
+}
+
+type kwaakaPosTableDTO struct {
+	ID              string `json:"id"`
+	Number          int    `json:"number"`
+	Name            string `json:"name"`
+	SeatingCapacity int    `json:"seating_capacity"`
+	SectionName     string `json:"section_name"`
+}
+
+func kwaakaOrdersToResponse(v uc.KwaakaOrdersView) kwaakaOrdersResponse {
+	ts := func(t *time.Time) *string {
+		if t == nil {
+			return nil
+		}
+		s := t.UTC().Format(time.RFC3339)
+		return &s
+	}
+	nonEmpty := func(s string) *string {
+		if s == "" {
+			return nil
+		}
+		return &s
+	}
+	out := kwaakaOrdersResponse{
+		GlobalOrdersEnabled: v.GlobalEnabled, DefaultLeadMinutes: v.DefaultLeadMinutes,
+		KwaakaRestaurantID: nonEmpty(v.VenueKwaakaID), PoolKwaakaRestaurantID: nonEmpty(v.SettingsKwaakaID),
+		Configured: v.Configured, OrdersEnabled: v.OrdersEnabled, LeadMinutes: v.LeadMinutes,
+		EnabledAt: ts(v.EnabledAt), UpdatedAt: ts(v.UpdatedAt),
+		Pool: make([]kwaakaPoolTableResponse, 0, len(v.Pool)), PoolStale: v.PoolStale,
+		WillSend: v.WillSend, Blockers: v.Blockers,
+		PosChecked: v.POSChecked, PosTables: make([]kwaakaPosTableDTO, 0, len(v.POSTables)),
+	}
+	if v.UpdatedBy != nil {
+		s := v.UpdatedBy.String()
+		out.UpdatedBy = &s
+	}
+	for _, t := range v.Pool {
+		out.Pool = append(out.Pool, kwaakaPoolTableResponse{
+			KwaakaTableID: t.KwaakaTableID, Position: t.Position, Label: t.Label, InPos: t.InPOS})
+	}
+	for _, t := range v.POSTables {
+		out.PosTables = append(out.PosTables, kwaakaPosTableDTO{
+			ID: t.ID, Number: t.Number, Name: t.Name, SeatingCapacity: t.SeatingCapacity, SectionName: t.SectionName})
+	}
+	return out
+}

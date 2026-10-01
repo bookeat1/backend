@@ -362,6 +362,16 @@ type RestaurantFilter struct {
 	// back. Guest-facing paths must leave this false — an inactive venue is
 	// unbookable, so showing one to a guest is a dead end.
 	IncludeInactive bool
+	// GuestLat / GuestLng are the guest's own coordinates, both optional.
+	// When BOTH are set, ListActive orders the result by great-circle
+	// distance from this point (nearest first) instead of the default
+	// display_order/name order — see RestaurantRepository.ListActive.
+	// A venue with no Latitude/Longitude of its own, or farther than 50 km from
+	// the guest, sorts after the near ones in the default display_order/name
+	// order; it is never dropped. Either one nil (including a half pair) means "no distance
+	// sort", the existing default order.
+	GuestLat *float64
+	GuestLng *float64
 }
 
 // RestaurantSearchFilter narrows a full-text restaurant search. The zero value
@@ -394,6 +404,12 @@ type RestaurantSearchFilter struct {
 	PerPage  int // <=0 means default (20), capped at 100
 	// Unpaginated — see RestaurantFilter.Unpaginated.
 	Unpaginated bool
+	// GuestLat / GuestLng — see RestaurantFilter.GuestLat/GuestLng. Applied
+	// only to the browse case (empty Query): a text search still ranks by
+	// relevance first, distance is not a tiebreaker for "did I find what I
+	// typed".
+	GuestLat *float64
+	GuestLng *float64
 }
 
 // RestaurantRepository persists restaurants. Get* return ErrNotFound when absent.
@@ -402,7 +418,10 @@ type RestaurantRepository interface {
 	Update(ctx context.Context, r *Restaurant) error
 	GetByID(ctx context.Context, id uuid.UUID) (*RestaurantAggregate, error)
 	// ListActive returns active restaurants matching f plus the total count.
-	// Ordering: display_order (NULLs last), then name. PrimaryImage is populated.
+	// Ordering: display_order (NULLs last), then name — unless f.GuestLat/
+	// GuestLng are both set, in which case distance from that point comes
+	// first (nearest first within 50 km; a venue without coordinates or
+	// farther away NULLs last), with display_order/name/id as the tie-break. PrimaryImage is populated.
 	ListActive(ctx context.Context, f RestaurantFilter) ([]RestaurantListItem, int, error)
 	// Search returns active restaurants matching f's text query and filters plus
 	// the total count. When f.Query is non-empty, venues matched by their own

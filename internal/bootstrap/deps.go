@@ -42,6 +42,7 @@ import (
 	guestrepo "backend-core/internal/infrastructure/postgres/guest"
 	homepicksrepo "backend-core/internal/infrastructure/postgres/homepicks"
 	idemrepo "backend-core/internal/infrastructure/postgres/idempotency"
+	kwaakaorder "backend-core/internal/infrastructure/postgres/kwaakaorder"
 	legacysink "backend-core/internal/infrastructure/postgres/legacysync"
 	menurepo "backend-core/internal/infrastructure/postgres/menu"
 	notificationrepo "backend-core/internal/infrastructure/postgres/notification"
@@ -89,6 +90,7 @@ import (
 	"backend-core/internal/usecase/foryou"
 	"backend-core/internal/usecase/gastroguide"
 	"backend-core/internal/usecase/homepicks"
+	"backend-core/internal/usecase/kwaakaorders"
 	"backend-core/internal/usecase/kwaakasync"
 	"backend-core/internal/usecase/legacysync"
 	"backend-core/internal/usecase/menu"
@@ -197,6 +199,12 @@ type Deps struct {
 	// TelegramAnswerer acknowledges a press and rewrites the alert. Nil when the
 	// bot token is unset, which is also when the webhook stays unmounted.
 	TelegramAnswerer telegramhook.Answerer
+	// KwaakaWebhooks is the inbox the Kwaaka status webhook writes to;
+	// KwaakaWebhookSecret is the X-Webhook-Secret value (empty = routes answer 404),
+	// KwaakaOrdersEnabled mirrors KWAAKA_ORDERS_ENABLED (false = routes answer 404).
+	KwaakaWebhooks      domain.KwaakaWebhookRepository
+	KwaakaWebhookSecret string
+	KwaakaOrdersEnabled bool
 	// TelegramWebhookSecret gates the inbound webhook; empty leaves it unmounted.
 	TelegramWebhookSecret string
 	// StaffBotAnswerer is the SECOND bot's own answerer. A callback query can
@@ -679,6 +687,11 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// Same for the pre-order flag: what a NULL preorder_payment_required
 		// resolves to (paymentsCfg.PreorderPaymentRequired, resolveSettings' fallback).
 		admin.WithPreorderPaymentGlobalRequired(paymentsCfg.PreorderPaymentRequired),
+		// Kwaaka kitchen-order settings (superadmin): the SAME settings repo the
+		// sending loop reads. The POS is only used to prove pool tables exist;
+		// KWAAKA_ORDERS_ENABLED stays the master switch and is just reported.
+		admin.WithKwaakaOrders(kwaakaorder.NewSettings(db), newKwaakaTablesPOS(log), txm,
+			admin.KwaakaOrdersGlobal{Enabled: cfg.KwaakaOrders.Enabled, DefaultLead: cfg.KwaakaOrders.Lead}),
 	).WithPreorder(bookingrepo.NewItems(db)) // состав предзаказа рядом с бронью в кабинете
 
 	// Superadmin platform dashboard (Ф1): read-only, platform-wide aggregates
@@ -749,6 +762,9 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		VenueToday:            venuedashboarduc.NewTodayUseCase(venuedashboardrepo.NewToday(db)),
 		NotificationSettings:  notificationrepo.NewSettings(db),
 		TelegramAnswerer:      newTelegramAnswerer(cfg),
+		KwaakaWebhooks:        kwaakaorder.NewWebhooks(db),
+		KwaakaWebhookSecret:   strings.TrimSpace(cfg.KwaakaOrders.WebhookSecret),
+		KwaakaOrdersEnabled:   cfg.KwaakaOrders.Enabled,
 		TelegramWebhookSecret: strings.TrimSpace(cfg.Push.TelegramWebhookSecret),
 		StaffBotAnswerer:      newStaffBotSender(cfg),
 		StaffBotMessenger:     newStaffBotMessenger(cfg),
@@ -772,7 +788,7 @@ func NewDeps(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*Deps, error) {
 		// availability lookup, restRepo = the venue's preorder minimum, paymentsRepo
 		// = the "already paid → frozen" guard.
 		Preorder: preorder.NewUseCase(bookingRepo, menuItems, bookingItems, restRepo,
-			restaurantManagers, paymentsRepo, txm),
+			restaurantManagers, paymentsRepo, txm).WithKitchenOrders(kwaakaorder.NewOrders(db)),
 		// Server-side map preview. Always constructed, even without a provider
 		// key: the endpoint then answers a clean map_not_configured instead of
 		// disappearing from the routing table, so the app gets one stable
@@ -2125,6 +2141,48 @@ func NewKwaakaSyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaaka
 		kwaakasync.Config{TickInterval: cfg.KwaakaSync.TickInterval},
 		log,
 	)
+}
+
+// newKwaakaTablesPOS returns the Kwaaka POS adapter used by the admin panel to
+// verify pool tables, or a genuine nil interface when KWAAKA_BASE_URL /
+// KWAAKA_TOKEN are not set (a typed nil would defeat the usecase's nil check).
+func newKwaakaTablesPOS(log *slog.Logger) interface {
+	GetTables(ctx context.Context, kwaakaRestaurantID string) ([]domain.PosTable, error)
+} {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka admin: POS adapter not configured, pool tables cannot be verified", slog.String("reason", err.Error()))
+		return nil
+	}
+	return kwaaka.NewOrderPOS(kwaaka.NewClient(nil, kwCfg))
+}
+
+// NewKwaakaOrdersWorker wires the kitchen-order loop (phase 2), or nil when the
+// Kwaaka adapter is not configured. The loop itself starts sending only with
+// KWAAKA_ORDERS_ENABLED=true; without it the worker still cancels orders that
+// were already sent.
+func NewKwaakaOrdersWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) *kwaakaorders.Worker {
+	kwCfg := kwaaka.ConfigFromEnv()
+	if err := kwCfg.Validate(); err != nil {
+		log.Info("kwaaka kitchen orders not started", slog.String("reason", err.Error()))
+		return nil
+	}
+	if !cfg.KwaakaOrders.Enabled {
+		log.Info("kwaaka kitchen orders: sending disabled (KWAAKA_ORDERS_ENABLED=false), cancels still run")
+	}
+	return kwaakaorders.NewWorker(
+		kwaakaorder.NewOrders(db),
+		kwaakaorder.NewSettings(db),
+		kwaaka.NewOrderPOS(kwaaka.NewClient(nil, kwCfg)),
+		bookingrepo.NewOutbox(db),
+		sqltx.NewManager(db),
+		kwaakaorders.Config{
+			Enabled:     cfg.KwaakaOrders.Enabled,
+			DefaultLead: cfg.KwaakaOrders.Lead,
+			MaxAttempts: cfg.KwaakaOrders.MaxAttempts,
+		},
+		log,
+	).WithInbox(kwaakaorder.NewWebhooks(db), cfg.KwaakaOrders.StatusReconcile)
 }
 
 func NewLegacySyncWorker(cfg Config, db *pgxpool.Pool, log *slog.Logger) (*legacysync.Worker, func(), error) {

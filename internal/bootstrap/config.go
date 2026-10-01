@@ -64,6 +64,8 @@ type Config struct {
 	// KwaakaSync configures the Kwaaka menu/stop-list background sync (phase 1
 	// of the Kwaaka POS integration). See KwaakaSyncConfig.
 	KwaakaSync KwaakaSyncConfig
+	// KwaakaOrders configures the kitchen-order loop (phase 2). See KwaakaOrdersConfig.
+	KwaakaOrders KwaakaOrdersConfig
 
 	// RateLimit configures middleware.RateLimit and the in-memory limiter
 	// backing it (per-client-IP request budgets, one per route tier — see
@@ -496,6 +498,21 @@ type KwaakaSyncConfig struct {
 	TickInterval time.Duration // env: KWAAKA_SYNC_TICK_INTERVAL
 }
 
+// KwaakaOrdersConfig configures cmd/worker's kitchen-order loop (phase 2:
+// paid pre-orders go to the POS as a table order). Sending is off until
+// KWAAKA_ORDERS_ENABLED=true AND the venue's own switch is on; cancelling an
+// already sent order runs regardless.
+type KwaakaOrdersConfig struct {
+	Enabled     bool          // env: KWAAKA_ORDERS_ENABLED (default false)
+	Lead        time.Duration // env: KWAAKA_KITCHEN_LEAD, default 60m: how long before starts_at a paid order goes
+	MaxAttempts int           // env: KWAAKA_ORDER_MAX_ATTEMPTS
+	Tick        time.Duration // env: KWAAKA_ORDER_TICK
+	// WebhookSecret is the X-Webhook-Secret value; empty (or Enabled=false) makes the webhook routes answer 404.
+	WebhookSecret string // env: KWAAKA_WEBHOOK_SECRET
+	// StatusReconcile is the poll interval for orders whose webhook never came; 0 = off.
+	StatusReconcile time.Duration // env: KWAAKA_STATUS_RECONCILE_INTERVAL
+}
+
 // TicketsSweepConfig configures the pending-event-ticket sweep worker. The
 // StaleAfter default (100h) deliberately exceeds the payments HoldTTL default
 // (96h) so a ticket whose payment hold is still legitimately in flight is never
@@ -838,6 +855,15 @@ func NewConfig() (Config, error) {
 		},
 		KwaakaSync: KwaakaSyncConfig{
 			TickInterval: getEnvDuration("KWAAKA_SYNC_TICK_INTERVAL", 5*time.Minute),
+		},
+
+		KwaakaOrders: KwaakaOrdersConfig{
+			Enabled:         getEnvBool("KWAAKA_ORDERS_ENABLED", false),
+			Lead:            getEnvDuration("KWAAKA_KITCHEN_LEAD", 60*time.Minute),
+			MaxAttempts:     getEnvInt("KWAAKA_ORDER_MAX_ATTEMPTS", 8),
+			Tick:            getEnvDuration("KWAAKA_ORDER_TICK", 30*time.Second),
+			WebhookSecret:   getEnv("KWAAKA_WEBHOOK_SECRET", ""),
+			StatusReconcile: getEnvDuration("KWAAKA_STATUS_RECONCILE_INTERVAL", 15*time.Minute),
 		},
 
 		LegacySync: LegacySyncConfig{
