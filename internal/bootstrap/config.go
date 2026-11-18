@@ -182,6 +182,13 @@ type OTPDeliveryConfig struct {
 	// happen to be present, so an old key left in the environment can never
 	// silently take over the most expensive channel.
 	SMSProvider string // env: OTP_SMS_PROVIDER
+	// SMSRoutes overrides SMSProvider per number prefix, as "<prefix>=<provider>"
+	// entries ("+7=mobizon", "+1=twilio", "+998=none"). Longest prefix wins;
+	// numbers no entry matches use SMSProvider, and get no SMS when it is empty.
+	// It exists because no provider reaches every country: Mobizon accepts and
+	// bills a US number and then fails to deliver it.
+	// env: OTP_SMS_ROUTES (default empty — SMSProvider handles every number)
+	SMSRoutes []string
 
 	TwilioAccountSID   string // env: OTP_SMS_TWILIO_ACCOUNT_SID
 	TwilioAuthToken    string // env: OTP_SMS_TWILIO_AUTH_TOKEN
@@ -1036,6 +1043,7 @@ func NewConfig() (Config, error) {
 			WhatsAppAPIURL:     getEnv("OTP_WHATSAPP_API_URL", ""),
 
 			SMSProvider:        getEnv("OTP_SMS_PROVIDER", ""),
+			SMSRoutes:          getEnvList("OTP_SMS_ROUTES", ""),
 			TwilioAccountSID:   getEnv("OTP_SMS_TWILIO_ACCOUNT_SID", ""),
 			TwilioAuthToken:    getEnv("OTP_SMS_TWILIO_AUTH_TOKEN", ""),
 			TwilioFrom:         getEnv("OTP_SMS_TWILIO_FROM", ""),

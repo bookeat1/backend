@@ -264,3 +264,102 @@ func TestDefaultOTPDeliveryBudgetFitsTheGuard(t *testing.T) {
 		t.Fatalf("the defaults logged a clamp: %q", logged.String())
 	}
 }
+
+// OTP_SMS_ROUTES decides which provider may see which numbers. The cases pin
+// the two properties that matter: an unset variable changes nothing, and a
+// broken route never hands its numbers to the default provider (Mobizon bills a
+// US number and then fails to deliver it).
+func TestNewSMSProviderRoutes(t *testing.T) {
+	withMobizonKey := func(c *Config) { c.OTPDelivery.MobizonAPIKey = "mobizon-key" }
+	withTwilioCreds := func(c *Config) {
+		c.OTPDelivery.TwilioAccountSID = "ACfake"
+		c.OTPDelivery.TwilioAuthToken = "token"
+		c.OTPDelivery.TwilioFrom = "+15005550006"
+	}
+
+	tests := []struct {
+		name     string
+		provider string
+		routes   []string
+		set      []func(*Config)
+		want     string // ProviderName(); "" = no SMS channel at all
+	}{
+		{
+			name:     "no routes keeps the plain default provider",
+			provider: "mobizon",
+			set:      []func(*Config){withMobizonKey},
+			want:     "mobizon",
+		},
+		{
+			name:     "a route overrides the default for its prefix",
+			provider: "twilio",
+			routes:   []string{"+7=mobizon"},
+			set:      []func(*Config){withMobizonKey, withTwilioCreds},
+			want:     "routed(+7=mobizon,*=twilio)",
+		},
+		{
+			name:   "routes work without a default provider",
+			routes: []string{"7 = Mobizon"},
+			set:    []func(*Config){withMobizonKey},
+			want:   "routed(+7=mobizon,*=none)",
+		},
+		{
+			name:     "a route to an unconfigured provider blocks the prefix, never falls back",
+			provider: "mobizon",
+			routes:   []string{"+1=twilio"},
+			set:      []func(*Config){withMobizonKey},
+			want:     "routed(+1=none,*=mobizon)",
+		},
+		{
+			name:     "none blocks a prefix explicitly",
+			provider: "mobizon",
+			routes:   []string{"+1=none"},
+			set:      []func(*Config){withMobizonKey},
+			want:     "routed(+1=none,*=mobizon)",
+		},
+		{
+			name:     "malformed and duplicate entries are ignored",
+			provider: "mobizon",
+			routes:   []string{"twilio", "+x=twilio", "+1=", "+7=mobizon", "+7=twilio"},
+			set:      []func(*Config){withMobizonKey, withTwilioCreds},
+			want:     "routed(+7=mobizon,*=mobizon)",
+		},
+		{
+			name:     "only malformed entries leave the default untouched",
+			provider: "mobizon",
+			routes:   []string{"garbage"},
+			set:      []func(*Config){withMobizonKey},
+			want:     "mobizon",
+		},
+		{
+			name:   "routes that can never send do not create an sms channel",
+			routes: []string{"+1=twilio", "+7=none"},
+			want:   "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseOTPConfig()
+			cfg.OTPDelivery.SMSProvider = tc.provider
+			cfg.OTPDelivery.SMSRoutes = tc.routes
+			for _, apply := range tc.set {
+				apply(&cfg)
+			}
+
+			got := newSMSProvider(cfg, time.Second, discardLogger())
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("provider = %s, want none", got.ProviderName())
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("provider = nil, want %s", tc.want)
+			}
+			if name := got.ProviderName(); name != tc.want {
+				t.Fatalf("provider = %s, want %s", name, tc.want)
+			}
+		})
+	}
+}
