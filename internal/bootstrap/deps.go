@@ -2034,17 +2034,123 @@ func newOTPSender(cfg Config, log *slog.Logger) auth.OTPSender {
 			"guests cannot receive login codes until OTP_TELEGRAM_GATEWAY_TOKEN / OTP_WHATSAPP_* / OTP_SMS_* are set")
 		return otpsender.NewStub(log, cfg.App.Environment)
 	}
-	log.Info("otp delivery configured", slog.Any("channels", waterfall.Channels()))
+	attrs := []any{slog.Any("channels", waterfall.Channels())}
+	if sms, ok := available[domain.OTPChannelSMS].(*otpsender.SMS); ok {
+		attrs = append(attrs, slog.String("sms_provider", sms.ProviderName()))
+	}
+	log.Info("otp delivery configured", attrs...)
 	return waterfall
 }
 
 // newSMSProvider selects the SMS backend. Returns nil when none is selected or
 // the selected one lacks credentials — the SMS channel then simply does not
 // exist, exactly like an unconfigured Telegram or WhatsApp.
+//
+// OTP_SMS_PROVIDER is the default provider; OTP_SMS_ROUTES ("+7=mobizon,+1=twilio")
+// overrides it per number prefix. With no routes the default is returned as is,
+// so a deployment that never sets OTP_SMS_ROUTES behaves exactly as before.
 func newSMSProvider(cfg Config, timeout time.Duration, log *slog.Logger) otpsender.SMSProvider {
-	switch strings.ToLower(strings.TrimSpace(cfg.OTPDelivery.SMSProvider)) {
-	case "":
+	defaultName := strings.ToLower(strings.TrimSpace(cfg.OTPDelivery.SMSProvider))
+	fallback, problem := buildSMSProvider(defaultName, cfg, timeout)
+	if problem != "" {
+		// A typo here must not crash the server: no SMS is survivable, a boot
+		// loop is not.
+		log.Error("OTP_SMS_PROVIDER cannot be used — it is disabled",
+			slog.String("provider", cfg.OTPDelivery.SMSProvider),
+			slog.String("problem", problem))
+	}
+
+	routes := smsRoutes(cfg, timeout, log)
+	if len(routes) == 0 {
+		return fallback
+	}
+	usable := fallback != nil
+	for _, r := range routes {
+		usable = usable || r.Provider != nil
+	}
+	if !usable {
+		// Every route is a dead end and there is no default: a channel that can
+		// never send is the same as no channel, and must not sit in the waterfall.
 		return nil
+	}
+	return otpsender.NewRoutedSMS(fallback, routes)
+}
+
+// smsRoutes parses OTP_SMS_ROUTES into prefix routes.
+//
+// Each entry is "<prefix>=<provider>": prefix is an E.164 prefix ("+7", "+1",
+// the "+" is optional), provider is "twilio", "mobizon" or "none". "none"
+// blocks SMS for the prefix outright.
+//
+// A route naming an unknown or unconfigured provider is ALSO kept as a block,
+// not dropped: the operator wrote the route precisely because the default
+// provider must not get these numbers (Mobizon bills a US number and then
+// fails it), so falling back to the default would be the one wrong answer. A
+// malformed entry carries no usable prefix and is ignored. Both are logged at
+// ERROR; neither stops the boot.
+func smsRoutes(cfg Config, timeout time.Duration, log *slog.Logger) []otpsender.SMSRoute {
+	routes := make([]otpsender.SMSRoute, 0, len(cfg.OTPDelivery.SMSRoutes))
+	built := make(map[string]otpsender.SMSProvider, 2)
+	seen := make(map[string]bool, len(cfg.OTPDelivery.SMSRoutes))
+	for _, entry := range cfg.OTPDelivery.SMSRoutes {
+		rawPrefix, rawName, ok := strings.Cut(entry, "=")
+		prefix := smsRoutePrefix(rawPrefix)
+		name := strings.ToLower(strings.TrimSpace(rawName))
+		if !ok || prefix == "" || name == "" {
+			log.Error("malformed entry in OTP_SMS_ROUTES — ignored (want \"+7=mobizon\")",
+				slog.String("entry", entry))
+			continue
+		}
+		if seen[prefix] {
+			log.Error("duplicate prefix in OTP_SMS_ROUTES — the first entry wins",
+				slog.String("entry", entry))
+			continue
+		}
+		seen[prefix] = true
+
+		if name == "none" {
+			routes = append(routes, otpsender.SMSRoute{Prefix: prefix})
+			continue
+		}
+		provider, done := built[name]
+		if !done {
+			var problem string
+			provider, problem = buildSMSProvider(name, cfg, timeout)
+			if problem != "" {
+				log.Error("OTP_SMS_ROUTES names a provider that cannot be used — SMS is disabled for this prefix",
+					slog.String("prefix", prefix),
+					slog.String("provider", name),
+					slog.String("problem", problem))
+			}
+			built[name] = provider
+		}
+		routes = append(routes, otpsender.SMSRoute{Prefix: prefix, Provider: provider})
+	}
+	return routes
+}
+
+// smsRoutePrefix normalizes a route prefix to "+<digits>", or "" when it is not
+// one. Spaces are tolerated ("+7 701").
+func smsRoutePrefix(raw string) string {
+	digits := strings.ReplaceAll(strings.TrimPrefix(strings.TrimSpace(raw), "+"), " ", "")
+	if digits == "" {
+		return ""
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return "+" + digits
+}
+
+// buildSMSProvider constructs one SMS provider by name. It returns (nil, "")
+// for the empty name (no provider selected) and (nil, problem) when the name is
+// unknown or its credentials are missing.
+func buildSMSProvider(name string, cfg Config, timeout time.Duration) (otpsender.SMSProvider, string) {
+	switch name {
+	case "":
+		return nil, ""
 	case "twilio":
 		twilio := otpsender.TwilioConfig{
 			AccountSID:          cfg.OTPDelivery.TwilioAccountSID,
@@ -2055,10 +2161,9 @@ func newSMSProvider(cfg Config, timeout time.Duration, log *slog.Logger) otpsend
 			BaseURL:             cfg.OTPDelivery.TwilioAPIURL,
 		}
 		if !twilio.Configured() {
-			log.Error("OTP_SMS_PROVIDER=twilio but its credentials are incomplete — the SMS channel is disabled")
-			return nil
+			return nil, "OTP_SMS_TWILIO_* credentials are incomplete"
 		}
-		return otpsender.NewTwilio(twilio)
+		return otpsender.NewTwilio(twilio), ""
 	case "mobizon":
 		mobizon := otpsender.MobizonConfig{
 			APIKey:  cfg.OTPDelivery.MobizonAPIKey,
@@ -2067,16 +2172,11 @@ func newSMSProvider(cfg Config, timeout time.Duration, log *slog.Logger) otpsend
 			BaseURL: cfg.OTPDelivery.MobizonAPIURL,
 		}
 		if !mobizon.Configured() {
-			log.Error("OTP_SMS_PROVIDER=mobizon but OTP_SMS_MOBIZON_API_KEY is empty — the SMS channel is disabled")
-			return nil
+			return nil, "OTP_SMS_MOBIZON_API_KEY is empty"
 		}
-		return otpsender.NewMobizon(mobizon)
+		return otpsender.NewMobizon(mobizon), ""
 	default:
-		// A typo here must not crash the server: no SMS is survivable, a boot
-		// loop is not.
-		log.Error("unknown OTP_SMS_PROVIDER — the SMS channel is disabled",
-			slog.String("provider", cfg.OTPDelivery.SMSProvider))
-		return nil
+		return nil, "unknown provider name (want twilio or mobizon)"
 	}
 }
 
